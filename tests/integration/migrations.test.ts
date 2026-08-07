@@ -15,7 +15,8 @@ const MIGRATION_FILES = [
   '011_osint_monitor_sources.sql',
   '012_threat_assertions_and_classification_log.sql',
   '013_source_catalog_expansion.sql',
-  '014_multi_channel_alert_routing.sql'
+  '014_multi_channel_alert_routing.sql',
+  '015_analytics.sql'
 ];
 
 describe.skipIf(!integrationDatabaseAvailable)('migration runner against live PostgreSQL', () => {
