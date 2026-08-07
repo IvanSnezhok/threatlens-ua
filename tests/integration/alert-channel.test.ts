@@ -2,21 +2,28 @@ import { beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import { ensureMigrated, integrationDatabaseAvailable, resetDatabase, sql } from '../helpers/db.js';
 
 /**
- * Covers the event-driven reconciliation path in `src/services/ingestion.ts`, which the official
- * alert channel https://t.me/air_alert_ua uses.
+ * Covers the event-driven reconciliation path in `src/services/ingestion.ts`, which every Tier A
+ * alert Telegram channel uses — the national https://t.me/air_alert_ua and the oblast and city
+ * military administrations registered by migration 013.
  *
- * The rule under test is the one that separates this source from the polled adapters: the channel
- * publishes *events*, so a message about one raion must leave every other raion of the same source
- * exactly as it was. Running it through `persistOfficialAlertSnapshot` instead would clear the whole
- * country every time one oblast reported an alert.
+ * The rule under test is the one that separates these sources from the polled adapters: they publish
+ * *events*, so a message about one raion must leave every other raion of the same source exactly as
+ * it was. Running them through `persistOfficialAlertSnapshot` instead would clear the whole country
+ * every time one oblast reported an alert.
  *
- * Message texts are verbatim captures from the live channel. Nothing here touches the network.
+ * Message texts are verbatim captures from the live channels. Nothing here touches the network.
  */
 
 const NIKOPOL = 'test-raion-nikopol';
 const PAVLOHRAD = 'test-raion-pavlohrad';
 const KUPIANSK = 'test-raion-kupiansk';
 const KHARKIV_CITY = 'ua-city-kharkiv';
+const BUCHA = 'test-raion-bucha';
+const VINNYTSIA = 'test-raion-vinnytsia';
+
+const AIR_ALERT_UA = 'air-alert-ua';
+const KYIV_ODA = 'gov-kyiv-oblast-oda';
+const VINNYTSIA_ODA = 'gov-vinnytsia-oda';
 
 /** Telegram publication times. The clock printed inside a message is deliberately never used. */
 const T0 = '2026-08-07T09:00:00.000Z';
@@ -25,12 +32,17 @@ const T2 = '2026-08-07T09:40:00.000Z';
 
 interface ChannelPost { id: string; at: string; text: string }
 
-async function ingest(posts: ChannelPost[]) {
+async function ingestFrom(sourceId: string, posts: ChannelPost[]) {
   const { ingestAlertChannelMessages } = await import('../../src/services/ingestion.js');
   return ingestAlertChannelMessages(
+    sourceId,
     posts.map((post) => ({ externalId: post.id, publishedAt: new Date(post.at), text: post.text })),
     { warn: () => undefined }
   );
+}
+
+async function ingest(posts: ChannelPost[]) {
+  return ingestFrom(AIR_ALERT_UA, posts);
 }
 
 async function expireStuck() {
@@ -97,9 +109,11 @@ describe.skipIf(!integrationDatabaseAvailable)('official alert channel reconcili
       `INSERT INTO locations(id,parent_id,type,name_uk,aliases) VALUES
          ($1,'ua-12','raion','Нікопольський район','{}'),
          ($2,'ua-12','raion','Павлоградський район','{}'),
-         ($3,'ua-63','raion','Куп''янський район','{}')
+         ($3,'ua-63','raion','Куп''янський район','{}'),
+         ($4,'ua-32','raion','Бучанський район','{}'),
+         ($5,'ua-05','raion','Вінницький район','{}')
        ON CONFLICT (id) DO NOTHING`,
-      [NIKOPOL, PAVLOHRAD, KUPIANSK]
+      [NIKOPOL, PAVLOHRAD, KUPIANSK, BUCHA, VINNYTSIA]
     );
   });
 
@@ -364,5 +378,121 @@ describe.skipIf(!integrationDatabaseAvailable)('official alert channel reconcili
     );
     expect(rows.rows).toEqual([{ source_id: 'ukraine-alarm', active: true }]);
     expect(await channelStates()).toHaveLength(2);
+  });
+
+  /**
+   * Several administrations reading the same event path at once.
+   *
+   * `alert_source_states` has always been keyed on `(source_id, location_id, alert_type)`, so this
+   * is the storage model doing what it was built for rather than a new mode. What is new is that a
+   * second and a third body now write to it, and every assertion here is about the boundary between
+   * them: one administration's all-clear is a statement about its own oblast and about nothing else.
+   */
+  describe('several alert channels at once', () => {
+    it('lets two administrations hold alerts over their own raions independently', async () => {
+      await ingestFrom(KYIV_ODA, [{ id: '1', at: T0, text: '🔴 Бучанський район - повітряна тривога!' }]);
+      await ingestFrom(VINNYTSIA_ODA, [{ id: '1', at: T0, text: '🔴 Вінницький район - повітряна тривога!' }]);
+
+      const states = await sql<{ source_id: string; location_id: string; active: boolean }>(
+        `SELECT source_id,location_id,active FROM alert_source_states ORDER BY source_id`
+      );
+      expect(states.rows).toEqual([
+        { source_id: KYIV_ODA, location_id: BUCHA, active: true },
+        { source_id: VINNYTSIA_ODA, location_id: VINNYTSIA, active: true }
+      ]);
+      expect(await alertPeriods()).toEqual([
+        { location_id: BUCHA, status: 'active', ended_at: null },
+        { location_id: VINNYTSIA, status: 'active', ended_at: null }
+      ]);
+    });
+
+    it('does not let one administration\'s all-clear end another administration\'s alert', async () => {
+      // The failure the per-source key exists to prevent, and the one a shared `ALERT_CHANNEL_SOURCE_ID`
+      // would have produced the moment a second channel was routed: Vinnytsia standing down would
+      // take Bucha off the map, on an oblast Vinnytsia has no mandate over.
+      await ingestFrom(KYIV_ODA, [{ id: '1', at: T0, text: '🔴 Бучанський район - повітряна тривога!' }]);
+      await ingestFrom(VINNYTSIA_ODA, [{ id: '1', at: T0, text: '🔴 Вінницький район - повітряна тривога!' }]);
+
+      await ingestFrom(VINNYTSIA_ODA, [{
+        id: '2', at: T1, text: '🟢 Вінницький район - відбій повітряної тривоги!'
+      }]);
+
+      expect(await alertPeriods()).toEqual([
+        { location_id: BUCHA, status: 'active', ended_at: null },
+        { location_id: VINNYTSIA, status: 'ended', ended_at: expect.any(String) }
+      ]);
+    });
+
+    it('keeps an alert up while any one source still holds it', async () => {
+      // Two bodies over one raion is the two-source rule's normal case, not a conflict: the national
+      // channel and the oblast administration both cover Bucha, and `bool_or` is what decides.
+      await ingestFrom(KYIV_ODA, [{ id: '1', at: T0, text: '🔴 Бучанський район - повітряна тривога!' }]);
+      await ingestFrom(AIR_ALERT_UA, [{
+        id: '1', at: T0, text: '🔴 21:54 Повітряна тривога в Бучанський район'
+      }]);
+
+      await ingestFrom(KYIV_ODA, [{
+        id: '2', at: T1, text: '🟢 Бучанський район - відбій повітряної тривоги!'
+      }]);
+      expect(await alertPeriods()).toEqual([{ location_id: BUCHA, status: 'active', ended_at: null }]);
+
+      await ingestFrom(AIR_ALERT_UA, [{ id: '2', at: T2, text: '🟢 22:41 Відбій тривоги в Бучанський район.' }]);
+      expect(await alertPeriods()).toEqual([
+        { location_id: BUCHA, status: 'ended', ended_at: expect.any(String) }
+      ]);
+    });
+
+    it('files each channel\'s messages against its own source row', async () => {
+      await ingestFrom(KYIV_ODA, [{ id: '9', at: T0, text: '🔴 Бучанський район - повітряна тривога!' }]);
+      await ingestFrom(VINNYTSIA_ODA, [{ id: '9', at: T0, text: '🔴 Вінницький район - повітряна тривога!' }]);
+
+      const rows = await sql<{ source_id: string; external_id: string }>(
+        `SELECT source_id,external_id FROM source_messages ORDER BY source_id`
+      );
+      // The same Telegram message id on two channels is two rows, not one collision: provenance is
+      // per source, and the alert-state external id carries the source id for the same reason.
+      expect(rows.rows).toEqual([
+        { source_id: KYIV_ODA, external_id: '9' },
+        { source_id: VINNYTSIA_ODA, external_id: '9' }
+      ]);
+      const states = await sql<{ external_id: string }>(
+        `SELECT external_id FROM alert_source_states ORDER BY source_id`
+      );
+      expect(states.rows.map((row) => row.external_id))
+        .toEqual([`${KYIV_ODA}:9`, `${VINNYTSIA_ODA}:9`]);
+    });
+
+    it('clears a stuck alert on every alert channel, not only the national one', async () => {
+      // The backstop used to scan one hard-coded source id. Every row it did not scan would hold its
+      // locations on the map forever the first time an all-clear went missing.
+      await ingestFrom(KYIV_ODA, [{ id: '1', at: T0, text: '🔴 Бучанський район - повітряна тривога!' }]);
+      await ingestFrom(VINNYTSIA_ODA, [{ id: '1', at: T0, text: '🔴 Вінницький район - повітряна тривога!' }]);
+      await ingest([startNikopol('1', T0)]);
+      await sql(`UPDATE alert_source_states SET provider_started_at=now()-interval '3 days'`);
+
+      expect(await expireStuck()).toBe(3);
+
+      const periods = await alertPeriods();
+      expect(periods.map((row) => row.status)).toEqual(['ended', 'ended', 'ended']);
+    });
+
+    it('releases the alerts of a channel that has since been switched off', async () => {
+      // Disabling a row stops it being read; it does not withdraw what it was holding. Without the
+      // backstop sweeping disabled rows too, the raion would stay under alert with no collector left
+      // that could ever clear it.
+      await ingestFrom(VINNYTSIA_ODA, [{ id: '1', at: T0, text: '🔴 Вінницький район - повітряна тривога!' }]);
+      await sql(`UPDATE sources SET enabled=false WHERE id=$1`, [VINNYTSIA_ODA]);
+      await sql(`UPDATE alert_source_states SET provider_started_at=now()-interval '3 days'`);
+
+      try {
+        expect(await expireStuck()).toBe(1);
+        expect(await alertPeriods()).toEqual([
+          { location_id: VINNYTSIA, status: 'ended', ended_at: expect.any(String) }
+        ]);
+      } finally {
+        // `resetDatabase` restores per-test rows, not catalogue flags.
+        await sql(`UPDATE sources SET enabled=true WHERE id=$1`, [VINNYTSIA_ODA]);
+      }
+    });
   });
 });

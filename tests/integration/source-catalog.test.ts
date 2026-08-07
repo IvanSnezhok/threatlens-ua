@@ -26,14 +26,32 @@ import { ensureMigrated, integrationDatabaseAvailable, sql } from '../helpers/db
  * from each channel, and it is the only thing that decides `enabled`.
  */
 
-/** A1: the structured alert format `src/domain/alert-parser.ts` already reads. Collected. */
+/**
+ * A1: the location-first alert format `src/domain/alert-parser.ts` reads. Collected.
+ *
+ * Migration 013 put seven channels here on the strength of a channel-level sample. Migration 014
+ * corrects the list after reading every post of each feed: three of the seven publish something the
+ * parser cannot act on (see `A_FORMAT_NOT_READABLE`), and two rows filed elsewhere turned out to
+ * publish this exact format. Every handle below is pinned as a verbatim fixture in
+ * `src/domain/alert-parser.test.ts` — that is what "confirmed" means for a Tier A row.
+ */
 const A1_ENABLED = [
-  'khersonskaODA', 'kherson_miskrada', 'odeskaODA', 'kyivoda',
-  'VinnytsiaODA', 'zoda_gov_ua', 'ivan_fedorov_zp'
+  'khersonskaODA', 'kherson_miskrada', 'kyivoda', 'VinnytsiaODA', 'oda_rv', 'slv_vca'
 ];
 
+/**
+ * Official bodies publishing alerts in a shape the parser is deliberately not given.
+ *
+ * `odeskaODA` prints its locations *above* the phrase and gives the all-clear with no location at
+ * all; the Zaporizhzhia pair write free prose with "крім <city>" exclusions the location model
+ * cannot express. Both would need a decision — a source-scoped blanket all-clear, and exclusion
+ * semantics — rather than a wider regex, and until then alert authority over three oblasts stays
+ * off. Migration 014 carries the verbatim samples.
+ */
+const A_FORMAT_NOT_READABLE = ['odeskaODA', 'zoda_gov_ua', 'ivan_fedorov_zp'];
+
 /** A2: official, real operational reporting, free prose. Not parseable, so not collected. */
-const A2_PROSE = ['kharkivoda', 'synegubov', 'Sumy_news_ODA', 'slv_vca'];
+const A2_PROSE = ['kharkivoda', 'synegubov', 'Sumy_news_ODA'];
 
 /** A3: DSNS — official, but after-action reporting rather than first alert. */
 const A3_DSNS = ['dsns_telegram', 'DSNS_Kharkiv', 'dsns_kyiv_region'];
@@ -45,13 +63,18 @@ const A3_DSNS = ['dsns_telegram', 'DSNS_Kharkiv', 'dsns_kyiv_region'];
  * alert wording has never been seen yields one of two outcomes and no third: a source that is silent
  * on an oblast we then believe is covered, or a parser that reads ordinary news as an official alert
  * for an entire oblast at the highest evidence level the system has.
+ *
+ * `ternopilskaODA` is the instructive one: it *does* publish alerts, as "Увага‼️Повітряна тривога‼️"
+ * with no location and no status circle. A body naming no place cannot move a location's state.
  */
 const A4_UNCONFIRMED_FORMAT = [
   'chernigivskaODA', 'zhytomyrskaODA', 'poltavskaOVA', 'dnipropetrovskaODA',
-  'DonetskaODA', 'oda_rv', 'ternopilskaODA'
+  'DonetskaODA', 'ternopilskaODA'
 ];
 
-const TIER_A = [...A1_ENABLED, ...A2_PROSE, ...A3_DSNS, ...A4_UNCONFIRMED_FORMAT];
+const TIER_A = [
+  ...A1_ENABLED, ...A_FORMAT_NOT_READABLE, ...A2_PROSE, ...A3_DSNS, ...A4_UNCONFIRMED_FORMAT
+];
 
 /** Tier B — national OSINT monitoring, in the two clusters described in `independence groups`. */
 const B_LAUNCH_DETECTION = ['StrategicaviationT', 'strategicontrol'];
@@ -233,7 +256,7 @@ describe.skipIf(!integrationDatabaseAvailable)('verified channel catalogue', () 
   });
 
   describe('collection state', () => {
-    it('collects exactly the seven Tier A channels whose alert format is confirmed', async () => {
+    it('collects exactly the Tier A channels whose alert format is confirmed', async () => {
       const enabledA = TIER_A.filter((handle) => get(rows, handle).enabled);
       expect(enabledA.sort()).toEqual([...A1_ENABLED].sort());
     });
@@ -248,6 +271,27 @@ describe.skipIf(!integrationDatabaseAvailable)('verified channel catalogue', () 
       for (const handle of [...A2_PROSE, ...A3_DSNS]) {
         expect(get(rows, handle).enabled).toBe(false);
       }
+    });
+
+    it('switches off the bodies whose alert format the parser cannot act on', async () => {
+      // These three publish real alerts and are switched off anyway. `enabled` on an alert-channel
+      // row means "the parser demonstrably reads this channel", not "this body is trustworthy" —
+      // the trust is `tier` and `official`, and both stay true here. A channel routed to the alert
+      // reconciler whose all-clear cannot be read is an oblast that looks covered and is not.
+      for (const handle of A_FORMAT_NOT_READABLE) {
+        expect(get(rows, handle)).toMatchObject({ official: true, tier: 'A', enabled: false });
+      }
+    });
+
+    it('leaves the national alert channel enabled by catalogue rather than by collector', async () => {
+      // Migration 010 inserted this row disabled and had the collector flip it on. That made the
+      // flag documentation rather than a gate, which a catalogue of twenty-one rows — fifteen of
+      // them switched off on purpose — cannot live with. Nothing in the application writes
+      // `sources.enabled` for this adapter type any more.
+      const airAlert = await sql<{ enabled: boolean; adapter_type: string }>(
+        `SELECT enabled,adapter_type FROM sources WHERE id='air-alert-ua'`
+      );
+      expect(airAlert.rows[0]).toEqual({ enabled: true, adapter_type: 'mtproto_alert_channel' });
     });
 
     it('switches off the Russian-language channels', async () => {
@@ -372,15 +416,26 @@ describe.skipIf(!integrationDatabaseAvailable)('verified channel catalogue', () 
 
     it('routes no Tier A row through the classifier registry', async () => {
       // `mtproto_alert_channel` is not a classifier adapter type, so an official row can never reach
-      // `ingestThreat` — and, equally, nothing about registering these rows makes them collected.
-      // The alert path still resolves one username from `config.ALERT_CHANNEL_USERNAME` to one
-      // hard-coded `ALERT_CHANNEL_SOURCE_ID`; until that reads the registry, every Tier A row here
-      // is a declared capability that no collector subscribes to. This assertion is what will fail,
-      // loudly and in the right place, if that change is made without revisiting the catalogue.
+      // `ingestThreat`. It is now also excluded by handle, so a monitoring row cannot shadow an
+      // official channel by claiming its name.
       const { loadMonitoredTelegramChannels } = await import('../../src/services/ingestion.js');
       const routed = await loadMonitoredTelegramChannels();
       const usernames = new Set(routed.map((channel) => channel.username));
       for (const handle of TIER_A) expect(usernames.has(handle.toLowerCase())).toBe(false);
+    });
+
+    it('routes exactly the enabled Tier A rows through the alert registry', async () => {
+      // The other half of the split. `loadAlertChannels` is what the collector subscribes to on the
+      // alert path, and a registered-but-switched-off row must not appear in it: registering a body
+      // records that it was checked, and only `enabled` grants it authority to declare an alert.
+      const { loadAlertChannels } = await import('../../src/services/ingestion.js');
+      const alertRoutes = new Map((await loadAlertChannels()).map((c) => [c.username, c.sourceId]));
+      for (const handle of TIER_A) {
+        const row = get(rows, handle);
+        expect(alertRoutes.get(handle.toLowerCase())).toBe(row.enabled ? row.id : undefined);
+      }
+      // The national channel from migration 010 rides the same registry, with no special case.
+      expect(alertRoutes.get('air_alert_ua')).toBe('air-alert-ua');
     });
   });
 });

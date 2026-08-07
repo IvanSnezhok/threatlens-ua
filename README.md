@@ -6,8 +6,8 @@ Evidence-first situational awareness for Ukraine: a Telegram bot, responsive sta
 
 ## What is implemented
 
-- Three official (tier A) alert sources, per-source state reconciliation, and normalized alert periods: the Ukraine Alarm and Alerts.in.ua APIs, plus the official alert channel [@air_alert_ua](https://t.me/air_alert_ua), which needs no API token and works out of the box with the Telegram collector credentials.
-- Two reconciliation models behind one aggregate: snapshot polling for the APIs, and an event-driven path for the channel, which announces raion-level alerts and all-clears one at a time and must never be read as "everything unmentioned is clear".
+- Official (tier A) alert sources, per-source state reconciliation, and normalized alert periods: the Ukraine Alarm and Alerts.in.ua APIs, plus a registry of official alert Telegram channels — the national [@air_alert_ua](https://t.me/air_alert_ua) and the oblast and city military administrations — which need no API token and work out of the box with the Telegram collector credentials. Which channels are read is a row in `sources`, gated on the parser having been shown that channel's published wording.
+- Two reconciliation models behind one aggregate: snapshot polling for the APIs, and an event-driven path for the channels, which announce raion-level alerts and all-clears one at a time and must never be read as "everything unmentioned is clear". Each channel owns its own source state, so one administration's all-clear cannot end another's alert.
 - Threat event classifier for UAVs, ballistic and cruise missiles, KABs, aviation, MLRS, artillery, and mortars.
 - Evidence levels: `unverified`, `monitoring`, `confirmed`, and `official`.
 - Corroboration by independent source groups; reposts do not count as independent confirmation.
@@ -34,7 +34,7 @@ The default configuration starts in demo mode with two clearly marked synthetic 
 1. Set strong `POSTGRES_PASSWORD` and `OPS_PASSWORD` values.
 2. Configure `PUBLIC_URL`, `PUBLIC_HOST`, and an HTTPS `SITE_ADDRESS`.
 3. Set `DEMO_SOURCE_ENABLED=false`.
-4. Add `TELEGRAM_API_ID`, `TELEGRAM_API_HASH` and `TELEGRAM_SESSION`. This is what turns official alerts on: the MTProto collector reads both the Air Force channel and the official alert channel `@air_alert_ua`. Validate in staging that the raion and hromada names the channel publishes resolve against the local catalog.
+4. Add `TELEGRAM_API_ID`, `TELEGRAM_API_HASH` and `TELEGRAM_SESSION`. This is what turns official alerts on: the MTProto collector reads the Air Force channel, the OSINT monitors and every enabled official alert channel. Validate in staging that the raion and hromada names those channels publish resolve against the local catalog.
 5. Add `TELEGRAM_BOT_TOKEN` and `TELEGRAM_BOT_USERNAME`.
 6. Optionally add `UKRAINE_ALARM_API_TOKEN` or `ALERTS_IN_UA_TOKEN` for a second independent official source, and validate its location mapping against the provider's current schema.
 7. Configure an OpenAI-compatible structured-output endpoint if AI assessments are required.
@@ -172,18 +172,21 @@ DeepState or deploy with `OCCUPATION_SOURCE_ENABLED=false`.
 
 ## Official alerts without an API contract
 
-Both official alert APIs require a token issued on written application. The official alert channel
-[@air_alert_ua](https://t.me/air_alert_ua) carries the same executive-authority and State Emergency
-Service notifications and needs no credential, so it is the source that makes official alerts work out of
-the box. It is registered as a tier A official source in its own independence group — designation and
-tier are what make a source official, not whether the bytes arrive over HTTPS or MTProto.
+Both official alert APIs require a token issued on written application. The official alert channels —
+[@air_alert_ua](https://t.me/air_alert_ua) and the oblast and city military administrations — carry the
+same executive-authority and State Emergency Service notifications and need no credential, so they are
+what makes official alerts work out of the box. Each is registered as a tier A official source with its
+own independence group; designation and tier are what make a source official, not whether the bytes
+arrive over HTTPS or MTProto.
 
-It is read with an event-driven reconciler rather than the snapshot one, because it publishes
+They are read with an event-driven reconciler rather than the snapshot one, because they publish
 transitions per raion rather than a national picture per poll. A message about one raion never touches
-another, an explicit all-clear is not delayed by the polled-source debounce, an older message can never
+another, each channel holds its own per-source state so one body's all-clear cannot end another body's
+alert, an explicit all-clear is not delayed by the polled-source debounce, an older message can never
 override a newer one, and a missing all-clear is bounded by `ALERT_CHANNEL_MAX_ALERT_SECONDS` instead of
-leaving an alert up forever. What has not changed: neither the AI engine nor OSINT channel monitoring can
-start or end an official alert. See `docs/ARCHITECTURE.md`.
+leaving an alert up forever. A channel is only switched on once its published wording is pinned as a
+parser fixture. What has not changed: neither the AI engine nor OSINT channel monitoring can start or
+end an official alert. See `docs/ARCHITECTURE.md`.
 
 ## Known integration boundary
 

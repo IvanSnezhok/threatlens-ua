@@ -6,9 +6,9 @@ This matrix is the release gate for the initial single-node Docker deployment. `
 |---|---|---|
 | One-command Docker start | Implemented | `compose.yaml` starts Caddy, app, PostgreSQL and backup services with health dependencies. |
 | PostgreSQL history and migrations | Implemented | Idempotent migrations from `001_init` onwards, applied once each by an advisory-locked runner; `/health/ready` gates on a named migration marker in `src/api/server.ts`, and `tests/integration/migrations.test.ts` pins the applied set. |
-| Official alert ingestion | Implemented | Three tier A sources — the Ukraine Alarm and Alerts.in.ua APIs plus the official channel `@air_alert_ua` — feeding per-source state and one aggregate start/end reconciler. For a polled source an alert ends only after every source that held it has been silent for `ALERT_END_DEBOUNCE_SECONDS` (default 60 = four polls), so one missed poll cannot emit a false all-clear. API tokens remain external setup; the channel needs none. |
-| Official alerts without an API token | Implemented | `@air_alert_ua` is read through the MTProto collector, parsed by a pure function (`src/domain/alert-parser.ts`) and reconciled event-by-event: 🔴/🟢 move only the raions a message names, an explicit all-clear skips the polled-source debounce, out-of-order messages are refused via `alert_source_states.last_event_at`, and a missing all-clear is bounded by `ALERT_CHANNEL_MAX_ALERT_SECONDS` (default 24 h) with a warn log and `threatlens_alert_channel_stuck_alerts_total`. |
-| Public-channel monitoring | Implemented | Telegram MTProto collector handles new and edited messages for both the Air Force channel and the official alert channel, and re-reads a bounded, order-folded history window after a reconnect. API credentials/session remain external setup. |
+| Official alert ingestion | Implemented | Tier A sources — the Ukraine Alarm and Alerts.in.ua APIs plus a registry of official alert Telegram channels (`adapter_type='mtproto_alert_channel'`, twenty-one bodies registered) — feeding per-source state and one aggregate start/end reconciler. For a polled source an alert ends only after every source that held it has been silent for `ALERT_END_DEBOUNCE_SECONDS` (default 60 = four polls), so one missed poll cannot emit a false all-clear. API tokens remain external setup; the channels need none. |
+| Official alerts without an API token | Implemented | Every enabled alert channel is read through the MTProto collector, parsed by a pure function (`src/domain/alert-parser.ts`) reading both published word orders, and reconciled event-by-event against **its own** `source_id`: 🔴/🟢 move only the raions a message names, one body's all-clear cannot end another's alert, an explicit all-clear skips the polled-source debounce, out-of-order messages are refused via `alert_source_states.last_event_at`, and a missing all-clear is bounded by `ALERT_CHANNEL_MAX_ALERT_SECONDS` (default 24 h) with a warn log and `threatlens_alert_channel_stuck_alerts_total`. `sources.enabled` gates collection: it asserts that the parser has been shown that channel's wording as a fixture. |
+| Public-channel monitoring | Implemented | Telegram MTProto collector handles new and edited messages for the Air Force channel, the OSINT monitors and every enabled alert channel, routing each handle by registry `kind` rather than by name comparison, and re-reads a bounded, order-folded history window per channel after a reconnect. API credentials/session remain external setup. |
 | Threat normalization | Implemented | UAV, ballistic/cruise missile, KAB, aviation, MLRS, artillery, mortar and combined classifications. |
 | Evidence and provenance | Implemented | Source tier, independence group, raw message, URL, revisions, corroboration and non-downgrading evidence. |
 | Event lifecycle | Implemented | Deduplication, merge, correction, withdrawal, expiry, update history and SSE event versions. |
@@ -48,10 +48,11 @@ This matrix is the release gate for the initial single-node Docker deployment. `
 - The integration suite covers subscription fanout (hierarchy in both directions, evidence threshold,
   threat-type filter, opt-out switches, idempotency), official alert reconciliation across two polled
   sources (including the end-debounce window and the identical-restart collision), event-driven
-  reconciliation of the official alert channel (per-raion isolation of starts and all-clears, the
-  refusal of a partial all-clear that repeats its own raion, out-of-order rejection, backlog folding
-  and the maximum-duration backstop), outbox delivery and stuck-message reclaim, and the migration
-  runner.
+  reconciliation of the official alert channels (per-raion isolation of starts and all-clears, the
+  refusal of a partial all-clear that repeats its own raion, out-of-order rejection, backlog folding,
+  the maximum-duration backstop, and the isolation between two administrations reporting at once),
+  the routing that decides whether a subscribed handle reaches the alert reconciler or the classifier,
+  outbox delivery and stuck-message reclaim, and the migration runner.
 - Threat de-escalation is pinned on the isolation guarantee rather than on the happy path: a
   withdrawal from one monitor leaves another monitor's assertion standing and the event alive; the
   last withdrawal moves the event to `withdrawn` and appends `threat.withdrawn`; a source that never
