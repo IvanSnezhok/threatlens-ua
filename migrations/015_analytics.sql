@@ -1,0 +1,60 @@
+-- Indexes the classification-archive analytics need, and the reasoning for the ones deliberately
+-- not created.
+--
+-- `migrations/012_threat_assertions_and_classification_log.sql` already indexed the archive for the
+-- three questions documented in docs/OPERATIONS.md § Analytical queries. The analytics service
+-- (`src/services/analytics-archive.ts`) asks a wider set, and every one of its statements is
+-- window-bounded on purpose: the pool sets `statement_timeout=15s`, `message_classifications` grows
+-- by one row per ingested message and is unbounded over a year, so no slice is allowed to be
+-- "everything since the beginning". Each query filters on a half-open `[from, to)` interval that the
+-- API layer clamps, which turns it into an index range scan proportional to the window instead of a
+-- sequential scan of the archive.
+--
+-- ================================================================================================
+-- What was missing
+-- ================================================================================================
+--
+-- "Where are attacks countered?" is a *rate*, not a count: withdrawals alone say how many claims
+-- were taken back but not out of how many. The denominator is "assertions opened in this window",
+-- which reads `threat_assertions` by `asserted_at` over a range. 012 indexed the withdrawal side
+-- (`threat_assertions_withdrawn_idx`) and the per-location history (`threat_assertions_location_idx`),
+-- but nothing led on `asserted_at`, so a range across *all* locations had to be served by the
+-- location index with `location_id` skipped over.
+--
+-- Measured on 100 000 assertions, 30-day range: 13 buffers with this index against 28 and three
+-- index searches without it. The gap is small at six distinct locations and grows with the
+-- catalogue — after the KATOTTG import `location_id` has thousands of distinct values and the skip
+-- degenerates, which is the state production is actually in.
+CREATE INDEX IF NOT EXISTS threat_assertions_asserted_idx
+  ON threat_assertions (asserted_at DESC);
+
+-- ================================================================================================
+-- What was checked and deliberately not added
+-- ================================================================================================
+--
+--   * **A rollup table or materialised view over `message_classifications`.** Every slice is already
+--     a range scan bounded by the requested window and grouped in memory; a rollup would add a
+--     staleness axis to numbers whose whole purpose is to be trusted, and would have to be keyed by
+--     `classifier_version` anyway. Measured on 300 000 classifications and 100 000 assertions
+--     spanning 400 days: the whole overview — six slices — runs in 1.5 s over the entire archive and
+--     0.36 s over 30 days, against a 15-second `statement_timeout`. Reconsider when a month-bucketed
+--     year query stops fitting that timeout, not before.
+--
+--   * **An oblast rollup of `locations`.** The analytics walk `parent_id` upward, but the recursion
+--     is seeded from *the locations named inside the window* rather than from the whole catalogue.
+--     After the KATOTTG import the catalogue is tens of thousands of rows, and the seeded walk turns
+--     an O(catalogue) recursive CTE into a handful of primary-key lookups per referenced place.
+--     `locations_parent_idx` (009) already serves the climb. A materialised rollup would be faster
+--     still and wrong every time the catalogue gains a place before the next refresh.
+--
+--   * **GIN on `candidate_threat_types` / `indicators`.** The strike-composition slice `unnest`s
+--     these over a window and never filters by an element, so a GIN index would be written on every
+--     ingest and read never.
+--
+--   * **An index on `message_classifications (source_message_id)` for the version comparison.**
+--     `UNIQUE (source_message_id, classifier_version)` from 012 is a btree with `source_message_id`
+--     leading, which already serves the "same message under the other classifier" probe.
+--
+--   * **An index on `message_classifications (event_id, ...)` for the first-reporter analysis.**
+--     `message_classifications_event_idx` (partial on `event_id IS NOT NULL`) covers the grouping,
+--     and the slice is driven from the time range rather than from an event list.

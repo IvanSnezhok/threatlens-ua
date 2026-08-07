@@ -74,6 +74,45 @@ ORDER BY withdrawal.withdrawn_at DESC;
 **What each source published that raised nothing, and why** — the query in the incident response
 above, grouped by day, source, decision and reason.
 
+### Analytics API
+
+The three statements above are the base of `src/services/analytics-archive.ts`, which serves them
+and five further slices behind operator Basic auth on `/ops/api/analytics/*`. Pinned by
+`tests/integration/analytics-archive.test.ts` and `tests/integration/analytics-routes.test.ts`.
+
+| Endpoint | Question it answers |
+| --- | --- |
+| `coverage` | Which classifier versions exist, over what span. **Ask this first** — it decides which windows can be compared. |
+| `threat-dynamics` | Threat classes over time, overall and per oblast. |
+| `strike-composition` | What waves are made of (`candidate_threat_types`), launch-side indicators, national-warning share. |
+| `geography-shift` | Which oblasts rise and which fall against the immediately preceding window. |
+| `loss-points` | Where threats are taken back: by oblast, source and class, plus the interception **rate** and how long claims stood. |
+| `sources` | Who reports first, who repeats, whose messages the classifier fails to read. |
+| `classifier-versions` | Two versions over the messages both judged: agreement rate and the decision migration matrix. |
+| `overview` / `narrative` | All of the above for one window; `narrative` adds a written conclusion. |
+
+Common query parameters: `from`, `to` (ISO), `bucket` (`day|week|month`), `version` (repeatable or
+comma-separated), `threatType`, `oblast`, `limit`. `classifier-versions` also needs `baseline` and
+`candidate`.
+
+Three properties to rely on:
+
+- **Every window is bounded.** Defaults to the last 30 days, hard maximum 400 days; a longer request
+  is rejected with `window_too_long` rather than turned into a scan of the whole archive. Measured on
+  300 000 classifications and 100 000 assertions: `overview` runs in 0.36 s over 30 days and 1.5 s
+  over 400, against a 15-second `statement_timeout`.
+- **Every series is split by `classifier_version`, and says when that is not enough.** Each response
+  carries `versionSafety`: `versionsInWindow`, `comparable` (a *period-over-period* reading is
+  version-safe only when one version covers both halves), and `unattributed` for rows whose version
+  could not be established — those are reported as `classifierVersion: null`, never folded into a
+  version. `geography-shift` refuses to call a mixed-version comparison comparable and names both
+  halves' versions in a note. **Never sum rows across versions**: the same night judged twice would be
+  counted twice.
+- **No model is involved in any number.** `narrative` writes prose over already-computed aggregates
+  and is off unless `ANALYTICS_NARRATIVE_ENABLED=true`. A narrative that states a figure the
+  aggregates do not support is discarded, the run is recorded in `ai_runs` with
+  `error='ungrounded_number:…'`, and the deterministic text is returned with the same numbers.
+
 ## Backups
 
 The backup container creates a custom-format archive, validates it with `pg_restore --list`, and writes a SHA-256 sidecar. Retention defaults to 14 days.

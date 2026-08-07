@@ -82,7 +82,27 @@ const envSchema = z.object({
   // is still stored against the source. Two minutes is far below the 30-minute validity window an
   // event carries, so a suppressed repeat cannot let a live threat expire. 0 disables coalescing;
   // above 900 the window starts approaching the validity window itself and is rejected.
-  OSINT_MONITOR_COALESCE_SECONDS: z.coerce.number().int().min(0).max(900).default(120)
+  OSINT_MONITOR_COALESCE_SECONDS: z.coerce.number().int().min(0).max(900).default(120),
+
+  // ---- Analytics narrative (optional model layer) ----------------------------------------------
+  // Everything in `src/services/analytics-archive.ts` is deterministic SQL and never reads any of
+  // these. They only control whether a model is asked to *write prose about* numbers that have
+  // already been computed. Off by default: the analytics have to be complete without a model, and a
+  // model that is quietly on is a model whose failures are quietly absorbed.
+  ANALYTICS_NARRATIVE_ENABLED: z.string().default('false').transform((value) => value === 'true'),
+  // Codex over ChatGPT OAuth. Deliberately separate from `AI_*`, which the risk engine uses with a
+  // plain API key: the two can point at different providers, and adding an auth mode to the existing
+  // variables would change the meaning of a production value that is already set.
+  //
+  // `CODEX_API_KEY` holds the OAuth access token; it is sent as `Authorization: Bearer`, exactly as
+  // an API key would be, so nothing downstream has to know which of the two it got.
+  // `CODEX_ACCOUNT_ID` is the ChatGPT account the token belongs to and is sent as
+  // `ChatGPT-Account-Id` when present. When `CODEX_*` is unset the narrative falls back to `AI_*`,
+  // and when neither is configured it falls back to the deterministic summary.
+  CODEX_BASE_URL: z.string().default(''),
+  CODEX_API_KEY: z.string().default(''),
+  CODEX_MODEL: z.string().default(''),
+  CODEX_ACCOUNT_ID: z.string().default('')
 }).superRefine((env, ctx) => {
   if (env.NODE_ENV !== 'production') return;
   if (env.OPS_PASSWORD === 'change-me' || env.OPS_PASSWORD.length < 16) {
