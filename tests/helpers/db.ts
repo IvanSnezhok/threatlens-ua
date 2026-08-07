@@ -1,3 +1,4 @@
+import { resolve } from 'node:path';
 import pg from 'pg';
 
 /**
@@ -62,19 +63,24 @@ export async function resetDatabase(): Promise<void> {
 }
 
 /**
- * Applies `migrations/001…008` when the schema is not already current.
+ * Applies the migration set when the schema is not already current.
  *
  * The state is read from the database rather than cached in a module variable on purpose: the
  * migration test drops and recreates `public`, and file ordering inside the project is not
- * something the suite should have to depend on. The probe is the newest migration, the same one
- * `/health/ready` gates on, so a database left at an older revision is migrated rather than used.
+ * something the suite should have to depend on. The probe is the newest migration *on disk* rather
+ * than a hard-coded filename, so adding a migration cannot leave a reused database silently one
+ * revision behind — which is exactly the failure the previous hard-coded probe produced.
  */
 export async function ensureMigrated(): Promise<void> {
+  const { readdir } = await import('node:fs/promises');
+  const files = (await readdir(resolve(process.cwd(), 'migrations')))
+    .filter((file) => file.endsWith('.sql')).sort();
+  const newest = files.at(-1);
   const applied = await sql(
     `SELECT 1 FROM information_schema.tables WHERE table_schema='public' AND table_name='schema_migrations'`
   );
-  if (applied.rowCount) {
-    const current = await sql(`SELECT 1 FROM schema_migrations WHERE filename='010_alert_channel_source.sql'`);
+  if (applied.rowCount && newest) {
+    const current = await sql(`SELECT 1 FROM schema_migrations WHERE filename=$1`, [newest]);
     if (current.rowCount) return;
   }
   const { migrate } = await import('../../src/db/migrate.js');

@@ -33,23 +33,38 @@ function hasValidOpsAuth(authorization?: string) {
   return safeEqual(user ?? '', config.OPS_USER) && safeEqual(password ?? '', config.OPS_PASSWORD);
 }
 
+/**
+ * Whether a source can actually collect, decided per adapter rather than per id.
+ *
+ * This used to be a map of five source ids. The catalogue is now dozens of rows and grows by
+ * migration alone, so an id list would silently classify every new source as configured and the ops
+ * page would report sources as healthy-but-idle that nothing is even subscribed to. What decides
+ * the answer is the adapter's prerequisite: every MTProto adapter needs the one set of API
+ * credentials, each polled API needs its own token, and the demo source follows its flag.
+ */
+function sourceIsConfigured(row: { id: string; adapter_type: string | null; enabled: boolean }): boolean {
+  const mtproto = Boolean(config.TELEGRAM_API_ID && config.TELEGRAM_API_HASH && config.TELEGRAM_SESSION);
+  switch (row.adapter_type) {
+    case 'mtproto':
+    case 'mtproto_alert_channel':
+    case 'mtproto_monitor':
+      return mtproto && row.enabled;
+    case 'ukraine_alarm': return Boolean(config.UKRAINE_ALARM_API_TOKEN);
+    case 'alerts_in_ua': return Boolean(config.ALERTS_IN_UA_TOKEN);
+    case 'demo': return config.DEMO_SOURCE_ENABLED;
+    default: return row.enabled;
+  }
+}
+
 async function sourceHealth() {
-  const configured: Record<string, boolean> = {
-    'ukraine-alarm': Boolean(config.UKRAINE_ALARM_API_TOKEN),
-    'alerts-in-ua': Boolean(config.ALERTS_IN_UA_TOKEN),
-    'air-force': Boolean(config.TELEGRAM_API_ID && config.TELEGRAM_API_HASH && config.TELEGRAM_SESSION),
-    'air-alert-ua': Boolean(config.TELEGRAM_API_ID && config.TELEGRAM_API_HASH && config.TELEGRAM_SESSION),
-    demo: config.DEMO_SOURCE_ENABLED
-  };
   const rows = (await pool.query(
-    `SELECT id,name,tier,official,enabled,last_success_at,last_error_at,last_error,health_status,
-      stale_after_seconds FROM sources ORDER BY tier,id`
+    `SELECT id,name,tier,official,enabled,adapter_type,last_success_at,last_error_at,last_error,
+      health_status,stale_after_seconds FROM sources ORDER BY tier,id`
   )).rows;
-  return rows.map((row) => ({
-    ...row,
-    configured: configured[row.id] ?? row.enabled,
-    status: !(configured[row.id] ?? row.enabled) ? 'unconfigured' : row.health_status
-  }));
+  return rows.map((row) => {
+    const configured = sourceIsConfigured(row);
+    return { ...row, configured, status: configured ? row.health_status : 'unconfigured' };
+  });
 }
 
 export async function buildServer() {
@@ -74,7 +89,7 @@ export async function buildServer() {
   app.get('/health/live', async () => ({ status: 'ok', version: process.env.npm_package_version ?? 'dev' }));
   app.get('/health/ready', async (_request, reply) => {
     try {
-      const migration = await pool.query(`SELECT 1 FROM schema_migrations WHERE filename='010_alert_channel_source.sql'`);
+      const migration = await pool.query(`SELECT 1 FROM schema_migrations WHERE filename='013_source_catalog_expansion.sql'`);
       if (!migration.rowCount) return reply.code(503).send({ status: 'not_ready', reason: 'migrations_pending' });
       return { status: 'ready' };
     }

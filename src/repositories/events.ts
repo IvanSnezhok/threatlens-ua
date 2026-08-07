@@ -1,5 +1,6 @@
 import { createHash } from 'node:crypto';
 import type { PoolClient } from 'pg';
+import { CLASSIFIER_VERSION } from '../domain/classifier.js';
 import { pool } from '../db/pool.js';
 import type { ClassifiedMessage, EvidenceLevel, LiveEvent, NormalizedMessage } from '../types.js';
 
@@ -85,13 +86,354 @@ function strongestEvidence(left: EvidenceLevel, right: EvidenceLevel): EvidenceL
   return evidenceRank[left] >= evidenceRank[right] ? left : right;
 }
 
-export async function ingestThreat(message: NormalizedMessage, classified: ClassifiedMessage): Promise<{ id: string; version: number; created: boolean }> {
+// ------------------------------------------------------------------------------------------------
+// Assertions: who still says a threat is happening
+// ------------------------------------------------------------------------------------------------
+
+/** Statuses in which a threat event is live and can still be withdrawn. */
+const LIVE_STATUSES = ['observed', 'confirmed', 'active'];
+
+/**
+ * Records or refreshes one source's claim over one place and one threat class.
+ *
+ * The upsert clears `withdrawn_at`, which is the re-assertion case: a source that said the threat
+ * was over and is now reporting it again is asserting, not contradicting itself, and its row has to
+ * count towards keeping the event alive. `GREATEST` on the timestamps keeps an out-of-order replay
+ * from shortening a window that a newer message already extended.
+ */
+async function assertThreat(
+  client: PoolClient,
+  values: {
+    eventId: string; sourceId: string; independenceGroup: string; locationId: string;
+    threatType: string; observedAt: Date; sourceMessageId: string;
+  }
+): Promise<void> {
+  await client.query(
+    `INSERT INTO threat_assertions(event_id,source_id,independence_group,location_id,threat_type,
+       asserted_at,asserted_message_id,valid_until)
+     VALUES ($1,$2,$3,$4,$5,$6::timestamptz,$7,$6::timestamptz + interval '30 minutes')
+     ON CONFLICT (event_id,source_id,location_id,threat_type) DO UPDATE SET
+       asserted_at=GREATEST(threat_assertions.asserted_at,EXCLUDED.asserted_at),
+       asserted_message_id=EXCLUDED.asserted_message_id,
+       valid_until=GREATEST(threat_assertions.valid_until,EXCLUDED.valid_until),
+       withdrawn_at=NULL,withdrawn_message_id=NULL,withdrawal_reason=NULL,
+       updated_at=now()`,
+    [values.eventId, values.sourceId, values.independenceGroup, values.locationId,
+      values.threatType, values.observedAt, values.sourceMessageId]
+  );
+}
+
+/**
+ * What a message takes back, resolved into the columns the withdrawal statement matches on.
+ *
+ * `null` means "every value this source has", which is how `coverage: 'unspecified'` — "у наш бік
+ * нічого не летить", with no place named — is expressed. It is safe *only* because `sourceId` is
+ * never null: an unscoped withdrawal is unscoped within one publisher's own claims and reaches
+ * nobody else's. No attempt is made to guess a scope from the text; the classifier deliberately
+ * refuses to, and inventing one here would be the same mistake one layer down.
+ */
+export interface RetractionScope {
+  sourceId: string;
+  locationIds: string[] | null;
+  threatTypes: string[] | null;
+  at: Date;
+  sourceMessageId: string | null;
+  reason: string;
+}
+
+export interface WithdrawalOutcome {
+  /** Assertions taken back. Zero is the normal, correct result for a source that never asserted. */
+  withdrawnAssertions: number;
+  /** Events touched by the withdrawal, whether or not they ended. */
+  touchedEventIds: string[];
+  /** Events that lost their last holding assertion and moved to `withdrawn`. */
+  endedEventIds: string[];
+  /** The newest claim this source held immediately before the withdrawal. */
+  lastAssertionAt: Date | null;
+  decayedSignals: number;
+}
+
+const NO_WITHDRAWAL: WithdrawalOutcome = {
+  withdrawnAssertions: 0, touchedEventIds: [], endedEventIds: [], lastAssertionAt: null, decayedSignals: 0
+};
+
+/**
+ * Applies one source's withdrawal, and nothing else.
+ *
+ * Three statements, in this order and inside the caller's transaction:
+ *
+ *  1. **Close this source's matching assertions.** `source_id=$1` is the whole safety rule and it is
+ *     enforced here, once, in SQL. A withdrawal from channel A cannot reach a row owned by channel
+ *     B, so a mis-parsed joke or a channel testing its keyboard can never clear a threat two other
+ *     monitors are still reporting — and a source that never asserted matches no rows and therefore
+ *     changes nothing at all, without needing a special case.
+ *  2. **Decay this source's risk signals** for the same places and classes, by pulling `expires_at`
+ *     back to now. Not a negative contribution: a negative term could drive a location's index to
+ *     zero while a real threat from other sources is still running, whereas expiry says only "the
+ *     basis for *this* signal is gone" and leaves the time decay in `src/services/risk.ts` to handle
+ *     the rest. Scoped on `source_messages.source_id` rather than `independence_group`, because a
+ *     repost aggregator shares its group with the channel it copies.
+ *  3. **Re-derive each touched event.** The event lives while any assertion still holds, exactly as
+ *     an official alert lives while `bool_or(holds)` over `alert_source_states`. When something
+ *     still holds, `valid_until` is recomputed as the maximum the survivors support, so it can never
+ *     be pulled below what another source is still vouching for. When nothing holds, the event moves
+ *     to `withdrawn` with its evidence level untouched — state and evidence are different axes, and
+ *     a threat that two independent monitors confirmed remains a threat that two monitors confirmed
+ *     even after both stood it down.
+ *
+ * `alert_source_states` and `alert_periods` are not read or written here, and no call path leads
+ * from this function to `reconcileAggregateAlert`. An official all-clear is a different domain with
+ * a different mandate.
+ */
+export async function applyRetraction(client: PoolClient, scope: RetractionScope): Promise<WithdrawalOutcome> {
+  const withdrawn = await client.query<{ event_id: string; asserted_at: Date }>(
+    `UPDATE threat_assertions
+        SET withdrawn_at=$2::timestamptz,withdrawn_message_id=$3,withdrawal_reason=$4,updated_at=now()
+      WHERE source_id=$1
+        AND withdrawn_at IS NULL
+        AND ($5::text[] IS NULL OR location_id = ANY($5::text[]))
+        AND ($6::text[] IS NULL OR threat_type = ANY($6::text[]))
+      RETURNING event_id,asserted_at`,
+    [scope.sourceId, scope.at, scope.sourceMessageId, scope.reason, scope.locationIds, scope.threatTypes]
+  );
+
+  const decayed = await client.query(
+    `UPDATE risk_signals rs SET expires_at=$2::timestamptz
+       FROM source_messages sm
+      WHERE sm.id=rs.source_message_id
+        AND sm.source_id=$1
+        AND rs.expires_at > $2::timestamptz
+        AND ($3::text[] IS NULL OR rs.location_id = ANY($3::text[]))
+        AND ($4::text[] IS NULL OR rs.threat_type = ANY($4::text[]))`,
+    [scope.sourceId, scope.at, scope.locationIds, scope.threatTypes]
+  );
+
+  const touchedEventIds = [...new Set(withdrawn.rows.map((row) => row.event_id))];
+  const lastAssertionAt = withdrawn.rows
+    .map((row) => new Date(row.asserted_at))
+    .sort((left, right) => right.getTime() - left.getTime())[0] ?? null;
+  const endedEventIds: string[] = [];
+
+  for (const eventId of touchedEventIds) {
+    const support = await client.query<{ held: boolean | null; supported_until: Date | null }>(
+      `SELECT bool_or(withdrawn_at IS NULL AND valid_until > now()) AS held,
+              max(valid_until) FILTER (WHERE withdrawn_at IS NULL AND valid_until > now()) AS supported_until
+         FROM threat_assertions WHERE event_id=$1`,
+      [eventId]
+    );
+    if (support.rows[0]?.held) {
+      // Only ever shortened towards what the survivors support, never extended: extending here would
+      // let a withdrawal keep an event alive longer than any message ever claimed.
+      await client.query(
+        `UPDATE threat_events SET valid_until=$2::timestamptz,updated_at=now()
+          WHERE id=$1 AND status = ANY($3::text[]) AND valid_until > $2::timestamptz`,
+        [eventId, support.rows[0].supported_until, LIVE_STATUSES]
+      );
+      continue;
+    }
+    const current = await client.query<{ status: string; evidence_level: EvidenceLevel }>(
+      `SELECT status,evidence_level FROM threat_events WHERE id=$1 FOR UPDATE`, [eventId]
+    );
+    const row = current.rows[0];
+    if (!row || !LIVE_STATUSES.includes(row.status)) continue;
+    await client.query(
+      `UPDATE threat_events SET status='withdrawn',ended_at=now(),updated_at=now() WHERE id=$1`, [eventId]
+    );
+    await client.query(
+      `INSERT INTO event_updates(event_id,previous_status,new_status,previous_evidence_level,
+         new_evidence_level,reason)
+       VALUES ($1,$2,'withdrawn',$3,$3,'last_source_assertion_withdrawn')`,
+      [eventId, row.status, row.evidence_level]
+    );
+    // Same shape as `threat.created` / `threat.expired`, so the SSE relay and every log consumer see
+    // a withdrawal the way they see any other lifecycle transition.
+    await appendSystemEvent(client, 'threat.withdrawn', {
+      eventId, sourceId: scope.sourceId, reason: scope.reason
+    });
+    endedEventIds.push(eventId);
+  }
+
+  return {
+    withdrawnAssertions: withdrawn.rowCount ?? 0,
+    touchedEventIds,
+    endedEventIds,
+    lastAssertionAt,
+    decayedSignals: decayed.rowCount ?? 0
+  };
+}
+
+/**
+ * Inserts the raw message and returns its id, without disturbing an existing row.
+ *
+ * The conflict branch is a deliberate no-op update: `ON CONFLICT DO NOTHING` returns nothing, and
+ * every caller here needs the id to attach a classification record to. Re-stamping
+ * `processing_status` instead would let a replay of an already-classified message overwrite its
+ * status with the status of the replay.
+ */
+async function insertSourceMessage(
+  client: PoolClient, message: NormalizedMessage, status: string
+): Promise<string> {
+  const hash = createHash('sha256').update(message.text).digest('hex');
+  const result = await client.query<{ id: string }>(
+    `INSERT INTO source_messages(source_id,external_id,published_at,edited_at,raw_text,raw_payload,
+       content_hash,processing_status)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+     ON CONFLICT (source_id,external_id,content_hash)
+       DO UPDATE SET received_at=source_messages.received_at
+     RETURNING id`,
+    [message.sourceId, message.externalId, message.publishedAt, message.editedAt ?? null,
+      message.text, JSON.stringify(message.rawPayload), hash, status]
+  );
+  return result.rows[0]!.id;
+}
+
+export interface DeEscalationResult {
+  sourceMessageId: string;
+  withdrawal: WithdrawalOutcome;
+}
+
+/**
+ * A source stating that what it reported is over.
+ *
+ * The message is stored under its own `processing_status` exactly as before; what is new is that it
+ * now moves state. `coverage: 'located'` withdraws this source's claims over the places it names;
+ * `coverage: 'unspecified'` — "ТУшки неактивні, у наш бік наразі нічого не летить" — withdraws every
+ * open claim this source holds and none belonging to anyone else. An empty `threatTypes` means the
+ * message named no weapon class and therefore retracts all of them, within that same source scope.
+ *
+ * Locations are matched exactly, not through the hierarchy: an all-clear for an oblast leaves this
+ * source's claim over a city inside it standing, and the 30-minute validity timer retires it. That
+ * is the conservative direction — over-narrow withdrawal costs a few minutes of a stale event,
+ * over-broad withdrawal takes a live warning off the map.
+ */
+export async function applyDeEscalation(
+  message: NormalizedMessage, classified: ClassifiedMessage
+): Promise<DeEscalationResult> {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const sourceMessageId = await insertSourceMessage(client, message, 'de_escalation');
+    const retraction = classified.retraction;
+    const withdrawal = retraction
+      ? await applyRetraction(client, {
+          sourceId: message.sourceId,
+          locationIds: retraction.coverage === 'unspecified'
+            ? null
+            : retraction.locations.map((location) => location.id),
+          threatTypes: retraction.threatTypes.length ? [...retraction.threatTypes] : null,
+          at: message.publishedAt,
+          sourceMessageId,
+          reason: 'de_escalation'
+        })
+      : NO_WITHDRAWAL;
+    await client.query('COMMIT');
+    return { sourceMessageId, withdrawal };
+  } catch (error) {
+    await client.query('ROLLBACK');
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
+// ------------------------------------------------------------------------------------------------
+// Classification archive
+// ------------------------------------------------------------------------------------------------
+
+export type ClassificationDecision =
+  'event_created' | 'event_merged' | 'redirect' | 'de_escalation' | 'ignored' | 'unrecognized' | 'coalesced';
+
+export interface ClassificationLogEntry {
+  sourceId: string;
+  sourceMessageId: string;
+  publishedAt: Date;
+  classified: ClassifiedMessage;
+  decision: ClassificationDecision;
+  ignoredReason?: string | null;
+  eventId?: string | null;
+  createdEvent?: boolean;
+  withdrawal?: WithdrawalOutcome | null;
+}
+
+/**
+ * Archives one classifier decision.
+ *
+ * Written for every message the classifier sees, including the ones it discards — the questions this
+ * archive exists to answer ("how is the strike pattern changing", "where do threats get lost")
+ * live mostly in the discarded majority, and "why was this ignored?" has no other source of truth.
+ *
+ * Called outside the ingestion transaction on purpose. A failure to record analytics must never roll
+ * back a threat event or a withdrawal; callers treat an error here as a metric, not as an outage.
+ * The cost is that a crash between the two writes loses one archive row, which is the right trade.
+ */
+export async function recordClassification(entry: ClassificationLogEntry): Promise<void> {
+  const { classified, withdrawal } = entry;
+  const retraction = classified.retraction;
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const inserted = await client.query<{ id: string }>(
+      `INSERT INTO message_classifications(source_message_id,source_id,classifier_version,published_at,
+         decision,intent,created_event,ignored_reason,threat_type,candidate_threat_types,indicators,
+         national_scope,direction_text,event_id,retraction_coverage,retracted_threat_types,
+         withdrawn_assertions,withdrawn_event_ids,last_assertion_at,decayed_risk_signals)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18::uuid[],$19,$20)
+       ON CONFLICT (source_message_id,classifier_version) DO NOTHING
+       RETURNING id`,
+      [
+        entry.sourceMessageId, entry.sourceId, CLASSIFIER_VERSION, entry.publishedAt,
+        entry.decision, classified.intent, entry.createdEvent ?? false, entry.ignoredReason ?? null,
+        classified.threatType, classified.signalThreatTypes, classified.indicators,
+        classified.nationalScope, classified.directionText ?? null, entry.eventId ?? null,
+        retraction?.coverage ?? null, retraction ? retraction.threatTypes : null,
+        withdrawal?.withdrawnAssertions ?? null, withdrawal?.touchedEventIds ?? null,
+        withdrawal?.lastAssertionAt ?? null, withdrawal?.decayedSignals ?? null
+      ]
+    );
+    const classificationId = inserted.rows[0]?.id;
+    if (classificationId) {
+      for (const location of classified.locations) {
+        await client.query(
+          `INSERT INTO message_classification_locations(classification_id,location_id,role,relation_type)
+           VALUES ($1,$2,'asserted',$3) ON CONFLICT DO NOTHING`,
+          [classificationId, location.id, location.relationType]
+        );
+      }
+      for (const location of retraction?.locations ?? []) {
+        await client.query(
+          `INSERT INTO message_classification_locations(classification_id,location_id,role,relation_type)
+           VALUES ($1,$2,'retracted',NULL) ON CONFLICT DO NOTHING`,
+          [classificationId, location.id]
+        );
+      }
+    }
+    await client.query('COMMIT');
+  } catch (error) {
+    await client.query('ROLLBACK');
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
+export interface IngestThreatResult {
+  id: string;
+  version: number;
+  created: boolean;
+  sourceMessageId: string;
+  /** Present for `redirect`: what the same message took back for the place it says was passed. */
+  withdrawal: WithdrawalOutcome;
+}
+
+export async function ingestThreat(
+  message: NormalizedMessage, classified: ClassifiedMessage
+): Promise<IngestThreatResult> {
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
     const hash = createHash('sha256').update(message.text).digest('hex');
-    const duplicate = await client.query<{ event_id: string }>(
-      `SELECT ee.event_id FROM source_messages sm
+    const duplicate = await client.query<{ id: string; event_id: string }>(
+      `SELECT sm.id,ee.event_id FROM source_messages sm
        LEFT JOIN event_evidence ee ON ee.source_message_id=sm.id
        WHERE sm.source_id=$1 AND sm.external_id=$2 AND sm.content_hash=$3
        ORDER BY sm.received_at DESC LIMIT 1`,
@@ -99,7 +441,10 @@ export async function ingestThreat(message: NormalizedMessage, classified: Class
     );
     if (duplicate.rowCount && duplicate.rows[0]?.event_id) {
       await client.query('COMMIT');
-      return { id: duplicate.rows[0].event_id, version: await systemVersion(), created: false };
+      return {
+        id: duplicate.rows[0].event_id, version: await systemVersion(), created: false,
+        sourceMessageId: duplicate.rows[0].id, withdrawal: NO_WITHDRAWAL
+      };
     }
     const previousMessage = await client.query<{ id: string; event_id: string | null }>(
       `SELECT sm.id,ee.event_id FROM source_messages sm
@@ -215,6 +560,16 @@ export async function ingestThreat(message: NormalizedMessage, classified: Class
         `INSERT INTO threat_event_locations(event_id,location_id,relation_type) VALUES ($1,$2,$3)
          ON CONFLICT DO NOTHING`, [eventId, location.id, location.relationType]
       );
+      // The source's own claim over this place, one row per constituent threat class. The event now
+      // lives while at least one such row holds, instead of purely on the 30-minute timer, and the
+      // same row is what a later withdrawal from this source — and only from this source — matches.
+      for (const signalThreatType of classified.signalThreatTypes) {
+        await assertThreat(client, {
+          eventId, sourceId: message.sourceId, independenceGroup: sourceRow.independence_group,
+          locationId: location.id, threatType: signalThreatType,
+          observedAt: message.publishedAt, sourceMessageId
+        });
+      }
     }
     const baseContribution = sourceRow.official ? 2.5 : sourceRow.tier === 'B' ? 1.5 : 0.6;
     for (const target of signalTargets) {
@@ -279,9 +634,40 @@ export async function ingestThreat(message: NormalizedMessage, classified: Class
         });
       }
     }
+    // Transit: "Балістика повз Бровари на Бориспіль". The same message asserts for the place being
+    // approached and withdraws for the place being passed, which is the whole content of the class.
+    // Both halves run in one transaction so the two statements can never be observed apart.
+    //
+    // Locations the message reports as a *direction* are excluded from the withdrawal. The classifier
+    // reads both spans out of one sentence, so a name that appears on both sides would otherwise be
+    // asserted and retracted by the same message — and withdrawal is the dangerous direction to
+    // resolve that tie in.
+    let withdrawal = NO_WITHDRAWAL;
+    if (classified.retraction && classified.intent === 'redirect') {
+      const approaching = new Set(classified.locations
+        .filter((location) => location.relationType === 'reported_direction')
+        .map((location) => location.id));
+      const passedBy = classified.retraction.locations
+        .map((location) => location.id)
+        .filter((id) => !approaching.has(id));
+      if (passedBy.length) {
+        withdrawal = await applyRetraction(client, {
+          sourceId: message.sourceId,
+          locationIds: passedBy,
+          // Never null on this path: a redirect is a statement about one threat moving on, and an
+          // unscoped withdrawal is reserved for a message that actually says nothing is flying.
+          threatTypes: classified.retraction.threatTypes.length
+            ? [...classified.retraction.threatTypes]
+            : [classified.threatType],
+          at: message.publishedAt,
+          sourceMessageId,
+          reason: 'redirect'
+        });
+      }
+    }
     const version = await appendSystemEvent(client, created ? 'threat.created' : 'threat.updated', { eventId });
     await client.query('COMMIT');
-    return { id: eventId, version, created };
+    return { id: eventId, version, created, sourceMessageId, withdrawal };
   } catch (error) {
     await client.query('ROLLBACK');
     throw error;

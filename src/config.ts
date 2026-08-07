@@ -63,7 +63,26 @@ const envSchema = z.object({
   // Reconnect backfill. Bounded twice, by count and by age; the window is folded to one terminal
   // state per location before anything is written, so old events are never replayed as new ones.
   ALERT_CHANNEL_BACKFILL_MESSAGES: z.coerce.number().int().min(0).max(500).default(300),
-  ALERT_CHANNEL_BACKFILL_SECONDS: z.coerce.number().int().min(0).default(21600)
+  ALERT_CHANNEL_BACKFILL_SECONDS: z.coerce.number().int().min(0).default(21600),
+
+  // ---- OSINT air-threat monitoring channels ----------------------------------------------------
+  // Which channels are read is data, not configuration: the list lives in `sources` and each row is
+  // gated by its own `enabled` column. These two settings are the deployment-level controls that
+  // must work without database access.
+  //
+  // Nothing collected through this path can start or end an official alert. The monitors are
+  // `official=false` Tier B sources on the classifier path; their messages become `threat_events`.
+  OSINT_MONITOR_ENABLED: z.string().default('true').transform((value) => value === 'true'),
+  // Longest a monitoring channel may go on restating the same threat type over the same places
+  // before it raises the event again.
+  //
+  // During a mass attack these channels post continuously, and a restatement that reaches
+  // `ingestThreat` re-notifies every subscriber of that location, because the outbox idempotency key
+  // carries the event-log version. The window suppresses the restatement, not the message: the text
+  // is still stored against the source. Two minutes is far below the 30-minute validity window an
+  // event carries, so a suppressed repeat cannot let a live threat expire. 0 disables coalescing;
+  // above 900 the window starts approaching the validity window itself and is rejected.
+  OSINT_MONITOR_COALESCE_SECONDS: z.coerce.number().int().min(0).max(900).default(120)
 }).superRefine((env, ctx) => {
   if (env.NODE_ENV !== 'production') return;
   if (env.OPS_PASSWORD === 'change-me' || env.OPS_PASSWORD.length < 16) {

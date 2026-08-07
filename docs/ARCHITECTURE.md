@@ -134,6 +134,70 @@ lookup as the API adapters, with its two guarantees intact: LIKE metacharacters 
 ambiguous tier is refused rather than resolved to an arbitrary row. A name that resolves to nothing is
 a catalogue gap, not a source outage — it is counted and logged, never marked as a source error.
 
+### Threat de-escalation: who still says a threat is happening
+
+A threat event used to fade on one mechanism only — a 30-minute validity timer that every new
+observation pushed forward. A channel publishing "ТУшки неактивні, у наш бік наразі нічого не летить"
+or "Полтавщина — відбій загрози ударних БпЛА" was recognised, stored and then ignored.
+
+The state model is now the same one the official alert domain already uses. `alert_source_states`
+holds one row per (source, location, alert type) and the aggregate is `bool_or(holds)`;
+`threat_assertions` holds one row per (event, source, location, threat class) and a threat event
+lives while any of its assertions still holds. Having one way to reason about "who still says this
+is true" across both domains is the point of the shape.
+
+- **A withdrawal reaches only its own publisher.** Every retraction is `WHERE source_id = <the
+  withdrawing source>`, enforced in SQL in one place. One channel — or one joke the classifier reads
+  wrongly — can never clear a threat two other channels are still reporting, and a source that never
+  asserted matches no rows and therefore changes nothing. That is a consequence of the key, not a
+  check that could be forgotten.
+- **Scoping is by publisher, not by independence group.** A repost aggregator shares its group with
+  the channel it copies (`osint-vanek-nikolaev` / `air-force`), and an all-clear from the copy must
+  not retract the original's reporting.
+- **`coverage: 'unspecified'`** — a withdrawal that names no place — closes *every* open claim of
+  that one source. The classifier deliberately refuses to guess a scope from the text, and no scope
+  is invented downstream either; what bounds the blast radius is the publisher, not the wording.
+- **A redirect asserts and withdraws in one message.** "Балістика повз Полтаву на Харків" opens a
+  claim over the place being approached and closes this source's claim over the place being passed,
+  in one transaction. A place the message reports as a *direction* is never withdrawn by it.
+- **Validity is never shortened below what the survivors support.** When an assertion is withdrawn,
+  `threat_events.valid_until` is recomputed as the maximum over the assertions that still hold, so a
+  source taking its claim back cannot cut short a window another source is still vouching for.
+- **Risk signals decay; they are never negated.** A withdrawal pulls `risk_signals.expires_at` back
+  to now for that source's signals over the same places and classes. A negative contribution could
+  drive a location's index to zero while a real threat from other sources is still running; expiry
+  says only "the basis for this signal is gone" and leaves the time decay to do the rest. The rows
+  stay in place and auditable.
+- **Evidence does not move.** An event that loses its last assertion becomes `status='withdrawn'`
+  with its `evidence_level` unchanged, and `event_updates` records
+  `new_evidence_level = previous_evidence_level`. State and evidence are different axes: a threat two
+  independent monitors confirmed remains a confirmed threat in the record after both stood it down.
+  A `threat.withdrawn` row is appended to `system_event_log` so the map and SSE see the transition.
+- **Nothing here can produce an official all-clear.** No path from the classifier reaches
+  `alert_source_states` or `alert_periods`, and the integration suite asserts that directly rather
+  than inferring it from the routing code.
+
+### Classification archive
+
+`source_messages` keeps the raw text and one `processing_status` word; everything the classifier
+concluded was computed in memory and discarded, so "why was this message ignored?" had no answer.
+`message_classifications` now records one row per decision — including the decisions to do nothing —
+with the candidate threat classes, the indicators that fired, the resolved locations and their
+relation types, the national-scope flag, the resulting event, and, for a withdrawal, what it took
+back and what the source last claimed before it.
+
+`classifier_version` (`CLASSIFIER_VERSION` in `src/domain/classifier.ts`) is mandatory on every row
+and is the reason the archive is worth keeping. Without it an improvement to this project's own rules
+is indistinguishable from a change in enemy behaviour: both look like "fewer ballistic events this
+month". Raise it whenever a rule changes what a message means. `UNIQUE (source_message_id,
+classifier_version)` makes a replay of the same version a no-op while letting a new version's verdict
+land beside the old one, which turns stored history into a golden corpus for regression-testing the
+next classifier.
+
+The archive write happens outside the ingestion transaction and its failure is a counter
+(`threatlens_classification_log_failures_total`), never an exception. During a mass attack the thing
+that must keep working is the map; an analytics row is not worth a dropped threat event.
+
 ## Event flow
 
 ```mermaid
@@ -142,9 +206,15 @@ flowchart LR
   AlertChannel[Official alert channel] --> AlertState
   AlertState --> Aggregate[Aggregated alert periods]
   Channels[Monitored public channels] --> Normalize[Normalize and classify]
+  Normalize --> Archive[(Classification archive)]
   Normalize --> Evidence[Deduplicate and correlate evidence]
+  Normalize --> Withdraw[Withdraw own assertions]
   Evidence --> Threats[(Threat events)]
+  Evidence --> Assertions[(Per-source assertions)]
   Evidence --> Signals[(Risk signals)]
+  Withdraw --> Assertions
+  Withdraw --> Signals
+  Assertions --> Threats
   Signals --> Risk[Guarded six-hour risk engine]
   Aggregate --> Log[(System event log)]
   Threats --> Log
@@ -191,6 +261,15 @@ flowchart LR
 - Reposts from the same `independence_group` count as one source.
 - Two independent Tier A/B groups may promote an event to `confirmed`.
 - Evidence never downgrades when a weaker message is merged into an event.
+- A source withdraws only its own assertions. A threat event ends as `withdrawn` when its last
+  holding assertion is taken back, and its validity is never shortened below what the remaining
+  sources still support. A source that never asserted cannot withdraw anything.
+- Withdrawal decays that source's risk signals by expiry, never by a negative contribution, and never
+  changes an event's evidence level.
+- OSINT withdrawal has no access to official alert state. `alert_source_states` and `alert_periods`
+  are unreachable from the classifier path in either direction.
+- Every classifier decision is archived with the classifier version that made it, so a change in this
+  project's rules stays distinguishable from a change in enemy behaviour.
 - Source edits create revisions; a replacement event corrects the previous event instead of silently deleting it.
 - Threat events expire after their explicit validity window and remain in history.
 - Notification fanout and delivery are separate, idempotent steps.

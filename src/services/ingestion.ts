@@ -4,8 +4,11 @@ import { Counter, type Registry } from 'prom-client';
 import { config } from '../config.js';
 import { pool } from '../db/pool.js';
 import { parseAlertChannelMessage } from '../domain/alert-parser.js';
-import { classifyMessage } from '../domain/classifier.js';
-import { ingestThreat, listLocationLexemes } from '../repositories/events.js';
+import { classifyMessage, isDeEscalation, significanceRejection } from '../domain/classifier.js';
+import {
+  applyDeEscalation, ingestThreat, listLocationLexemes, recordClassification,
+  type ClassificationLogEntry
+} from '../repositories/events.js';
 import type { NormalizedMessage } from '../types.js';
 import { markSourceError, markSourceSuccess } from './operations.js';
 
@@ -383,16 +386,44 @@ const alertChannelStuckAlerts = new Counter({
   help: 'Alert-channel states force-cleared because no all-clear arrived within the maximum duration',
   registers: []
 });
+const monitorMessages = new Counter({
+  name: 'threatlens_monitor_messages_total',
+  help: 'Messages read from the OSINT monitoring channels, by classification outcome',
+  labelNames: ['source', 'outcome'],
+  registers: []
+});
+/**
+ * Archive writes that were dropped so the pipeline could carry on.
+ *
+ * A non-zero value means the classification archive has holes and any count taken from it is a
+ * lower bound. It is deliberately a separate signal from the ingestion error path: losing analytics
+ * is not an outage, and must never be reported as one.
+ */
+const classificationLogFailures = new Counter({
+  name: 'threatlens_classification_log_failures_total',
+  help: 'Classification-archive writes that failed and were dropped without failing ingestion',
+  labelNames: ['source'],
+  registers: []
+});
+const threatWithdrawals = new Counter({
+  name: 'threatlens_threat_withdrawals_total',
+  help: 'Source assertion withdrawals, by outcome',
+  labelNames: ['source', 'outcome'],
+  registers: []
+});
 
 /**
- * Attaches the alert-channel metrics to a Prometheus registry, mirroring
- * `registerOccupationMetrics`. Nothing in `src/services` owns the HTTP registry, so the wiring lives
- * wherever the registry is created.
+ * Attaches this module's metrics to a Prometheus registry, mirroring `registerOccupationMetrics`.
+ * Nothing in `src/services` owns the HTTP registry, so the wiring lives wherever the registry is
+ * created. The monitoring-channel counter rides along rather than adding a second call site.
  */
 export function registerAlertChannelMetrics(registry: Registry): void {
   const metrics: ReadonlyArray<[string, Counter<string>]> = [
     ['threatlens_alert_channel_messages_total', alertChannelMessages],
-    ['threatlens_alert_channel_stuck_alerts_total', alertChannelStuckAlerts]
+    ['threatlens_alert_channel_stuck_alerts_total', alertChannelStuckAlerts],
+    ['threatlens_monitor_messages_total', monitorMessages],
+    ['threatlens_classification_log_failures_total', classificationLogFailures],
+    ['threatlens_threat_withdrawals_total', threatWithdrawals]
   ];
   for (const [name, metric] of metrics) {
     if (!registry.getSingleMetric(name)) registry.registerMetric(metric);
@@ -616,19 +647,241 @@ export async function enableAlertChannelSource(): Promise<void> {
   await pool.query(`UPDATE sources SET enabled=true WHERE id=$1`, [ALERT_CHANNEL_SOURCE_ID]);
 }
 
-export async function processMessage(message: NormalizedMessage) {
+// ------------------------------------------------------------------------------------------------
+// Monitoring Telegram channels: the classifier path, driven from `sources`
+// ------------------------------------------------------------------------------------------------
+
+/** Adapter type of an OSINT monitoring channel. Never reaches the alert reconciler — see below. */
+export const MONITOR_ADAPTER_TYPE = 'mtproto_monitor';
+
+/** Adapter type of the Air Force channel: the same classifier path, but an official Tier A source. */
+const CLASSIFIER_ADAPTER_TYPES = ['mtproto', MONITOR_ADAPTER_TYPE] as const;
+
+export interface MonitoredTelegramChannel {
+  sourceId: string;
+  /** Lower-cased, without the leading `@`. */
+  username: string;
+  adapterType: string;
+}
+
+/**
+ * The Telegram channels whose messages go through the classifier, read from `sources`.
+ *
+ * This is the whole list. Adding a monitoring channel is a row, not a code change, and the row is
+ * what binds a username to the `source_id` that will own its evidence — get that wrong and the
+ * independence-group rule silently attributes one publisher's reporting to another.
+ *
+ * Two things this deliberately does *not* return:
+ *
+ *  * **The official alert channel.** Its adapter type is `mtproto_alert_channel` and is not in
+ *    {@link CLASSIFIER_ADAPTER_TYPES}, and any row that claims the configured alert-channel username
+ *    is dropped outright. A monitoring row can therefore never be routed to the alert reconciler,
+ *    and cannot shadow the alert channel by claiming its name.
+ *  * **Disabled monitors.** `enabled=false` really stops collection here. It does not for the
+ *    official adapters — `syncOfficialAlerts` gates on a token and `syncAlertsInUa` sets the flag to
+ *    true itself, so for those rows the column reports configuration rather than controlling it.
+ *    That known defect is not carried into this path. The Air Force row is left on its existing
+ *    behaviour on purpose: it is an official source that must keep working exactly as it does now,
+ *    so it is not gated on a flag nothing currently sets.
+ */
+export async function loadMonitoredTelegramChannels(): Promise<MonitoredTelegramChannel[]> {
+  if (!config.OSINT_MONITOR_ENABLED) {
+    // The kill switch stops the OSINT monitors only; the Air Force channel is not OSINT.
+    const airForce = await pool.query<{ id: string; telegram_username: string; adapter_type: string }>(
+      `SELECT id,lower(telegram_username) AS telegram_username,adapter_type FROM sources
+       WHERE telegram_username IS NOT NULL AND adapter_type='mtproto' ORDER BY id`
+    );
+    return toMonitoredChannels(airForce.rows);
+  }
+  const result = await pool.query<{ id: string; telegram_username: string; adapter_type: string }>(
+    `SELECT id,lower(telegram_username) AS telegram_username,adapter_type FROM sources
+     WHERE telegram_username IS NOT NULL
+       AND adapter_type = ANY($1::text[])
+       AND (adapter_type <> $2 OR enabled = true)
+     ORDER BY id`,
+    [[...CLASSIFIER_ADAPTER_TYPES], MONITOR_ADAPTER_TYPE]
+  );
+  return toMonitoredChannels(result.rows);
+}
+
+function toMonitoredChannels(
+  rows: Array<{ id: string; telegram_username: string; adapter_type: string }>
+): MonitoredTelegramChannel[] {
+  const alertChannel = config.ALERT_CHANNEL_USERNAME;
+  return rows
+    .map((row) => ({
+      sourceId: row.id,
+      username: (row.telegram_username ?? '').trim().replace(/^@/, '').toLowerCase(),
+      adapterType: row.adapter_type
+    }))
+    .filter((channel) => channel.username && channel.username !== alertChannel);
+}
+
+/**
+ * Suppression window for a monitoring channel repeating itself.
+ *
+ * These channels publish in bursts during an attack, and a burst is mostly restatement: the same
+ * threat type over the same place, minutes apart. Every restatement that reaches `ingestThreat`
+ * lands on the existing event, appends a `threat.updated` row to the system event log and therefore
+ * fans out to *every* subscriber of that location again — the outbox idempotency key carries the
+ * event-log version, so a repeat is a new notification, not a duplicate that collapses.
+ *
+ * The key is (source, threat type, locations), so this only ever collapses a source restating the
+ * same thing. A different location, a different threat type, or the same report from a *different*
+ * channel all pass through untouched — which matters, because corroboration between two monitors is
+ * exactly what promotes an event to `confirmed`.
+ *
+ * In-process state, matching the documented single-replica deployment. Losing it on restart costs
+ * one extra notification per active threat.
+ */
+const monitorCoalesceState = new Map<string, number>();
+
+function coalesceKey(sourceId: string, classified: ReturnType<typeof classifyMessage>): string {
+  const places = classified.nationalScope
+    ? ['ua']
+    : classified.locations.map((location) => location.id).sort();
+  return `${sourceId}|${classified.threatType}|${places.join(',')}`;
+}
+
+/** Test seam: the window is wall-clock, so a suite that ingests twice in one tick needs a reset. */
+export function resetMonitorCoalescing(): void {
+  monitorCoalesceState.clear();
+}
+
+function shouldCoalesce(key: string, now: number): boolean {
+  const windowMs = config.OSINT_MONITOR_COALESCE_SECONDS * 1000;
+  if (windowMs <= 0) return false;
+  for (const [existing, at] of monitorCoalesceState) {
+    if (at < now - windowMs) monitorCoalesceState.delete(existing);
+  }
+  const previous = monitorCoalesceState.get(key);
+  if (previous !== undefined && previous >= now - windowMs) return true;
+  monitorCoalesceState.set(key, now);
+  return false;
+}
+
+/**
+ * Stores a message the pipeline is not going to act on, and returns its id.
+ *
+ * The conflict branch is a no-op update rather than `DO NOTHING` because the id is needed to attach
+ * a classification record: a replayed message must keep its original status and still be linkable.
+ */
+async function recordUnprocessedMessage(message: NormalizedMessage, status: string): Promise<string> {
+  const hash = createHash('sha256').update(message.text).digest('hex');
+  const result = await pool.query<{ id: string }>(
+    `INSERT INTO source_messages(source_id,external_id,published_at,edited_at,raw_text,raw_payload,content_hash,processing_status)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+     ON CONFLICT (source_id,external_id,content_hash)
+       DO UPDATE SET received_at=source_messages.received_at
+     RETURNING id`,
+    [message.sourceId, message.externalId, message.publishedAt, message.editedAt ?? null,
+      message.text, JSON.stringify(message.rawPayload), hash, status]
+  );
+  return result.rows[0]!.id;
+}
+
+/**
+ * Archives one decision without ever letting the archive break the pipeline.
+ *
+ * The write is outside the ingestion transaction and its failure is a counter, not an exception:
+ * during a mass attack the thing that must keep working is the map, and an analytics row is not
+ * worth a dropped threat event. What is lost when this fails is one row of history, and the counter
+ * says so.
+ */
+async function archiveClassification(entry: ClassificationLogEntry): Promise<void> {
+  try {
+    await recordClassification(entry);
+  } catch (error) {
+    classificationLogFailures.inc({ source: entry.sourceId });
+    console.warn(JSON.stringify({
+      level: 'warn', msg: 'classification archive write failed', sourceId: entry.sourceId,
+      decision: entry.decision, error: error instanceof Error ? error.message : String(error)
+    }));
+  }
+}
+
+export interface ProcessMessageOptions {
+  /**
+   * Marks the message as coming from an OSINT monitoring channel, which enables burst coalescing
+   * and the per-source metric. It grants nothing: the alert reconciler is unreachable from here for
+   * every caller alike.
+   */
+  monitor?: boolean;
+}
+
+export async function processMessage(message: NormalizedMessage, options: ProcessMessageOptions = {}) {
   const locations = await listLocationLexemes();
   const classified = classifyMessage(message.text, locations);
-  if (classified.threatType === 'unknown' && classified.indicators.length === 0) {
-    const hash = createHash('sha256').update(message.text).digest('hex');
-    await pool.query(
-      `INSERT INTO source_messages(source_id,external_id,published_at,edited_at,raw_text,raw_payload,content_hash,processing_status)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,'ignored') ON CONFLICT (source_id,external_id,content_hash) DO NOTHING`,
-      [message.sourceId, message.externalId, message.publishedAt, message.editedAt ?? null, message.text, JSON.stringify(message.rawPayload), hash]
-    );
+  const count = (outcome: string) => {
+    if (options.monitor) monitorMessages.inc({ source: message.sourceId, outcome });
+  };
+  // A source withdrawing its own earlier claim — "ТУшки неактивні", "ціль знищена", "не відмічаємо
+  // ознак застосування стратегічної авіації". This is the only evidence a publisher ever gives that
+  // a threat is over; before it moved state, a threat could fade only on the 30-minute timer.
+  //
+  // What it retracts is bounded by the publisher: `applyDeEscalation` closes this source's own
+  // assertions and decays this source's own risk signals, and an event ends only when nothing holds
+  // it any more. Nothing here reaches `alert_source_states` or `alert_periods` — an OSINT channel
+  // cannot publish an "Офіційний відбій".
+  if (isDeEscalation(classified)) {
+    const outcome = await applyDeEscalation(message, classified);
+    count('de_escalation');
+    threatWithdrawals.inc({
+      source: message.sourceId,
+      outcome: outcome.withdrawal.endedEventIds.length ? 'event_withdrawn'
+        : outcome.withdrawal.withdrawnAssertions ? 'assertions_withdrawn' : 'nothing_asserted'
+    });
+    await archiveClassification({
+      sourceId: message.sourceId, sourceMessageId: outcome.sourceMessageId,
+      publishedAt: message.publishedAt, classified, decision: 'de_escalation',
+      withdrawal: outcome.withdrawal
+    });
+    return { deEscalation: true as const, classified, withdrawal: outcome.withdrawal };
+  }
+  const rejection = significanceRejection(classified);
+  if (rejection) {
+    const sourceMessageId = await recordUnprocessedMessage(message, 'ignored');
+    count('ignored');
+    await archiveClassification({
+      sourceId: message.sourceId, sourceMessageId, publishedAt: message.publishedAt, classified,
+      // "Recognised nothing" and "recognised something that is nowhere" are different findings: the
+      // first says the vocabulary has drifted or the message was never about a threat, the second
+      // says the place is missing from the catalogue. Collapsing them into one word is what made
+      // "why was this ignored?" unanswerable. `ignored_reason` keeps the precise rejection either
+      // way; `decision` is the coarse split a dashboard groups on.
+      decision: rejection === 'no_location' ? 'ignored' : 'unrecognized',
+      ignoredReason: rejection
+    });
     return { ignored: true as const };
   }
-  return ingestThreat(message, classified);
+  if (options.monitor && shouldCoalesce(coalesceKey(message.sourceId, classified), Date.now())) {
+    // Kept as provenance with its own status: the text is preserved and auditable, it simply does
+    // not raise the event again.
+    const sourceMessageId = await recordUnprocessedMessage(message, 'coalesced');
+    count('coalesced');
+    await archiveClassification({
+      sourceId: message.sourceId, sourceMessageId, publishedAt: message.publishedAt, classified,
+      decision: 'coalesced', ignoredReason: 'restated_within_coalesce_window'
+    });
+    return { coalesced: true as const };
+  }
+  count('classified');
+  const result = await ingestThreat(message, classified);
+  if (result.withdrawal.withdrawnAssertions || result.withdrawal.endedEventIds.length) {
+    threatWithdrawals.inc({
+      source: message.sourceId,
+      outcome: result.withdrawal.endedEventIds.length ? 'event_withdrawn' : 'assertions_withdrawn'
+    });
+  }
+  await archiveClassification({
+    sourceId: message.sourceId, sourceMessageId: result.sourceMessageId,
+    publishedAt: message.publishedAt, classified,
+    // `redirect` keeps its own decision because it is the only message class that asserts and
+    // withdraws at once; `createdEvent` still records whether the event it asserted was new.
+    decision: classified.intent === 'redirect' ? 'redirect' : result.created ? 'event_created' : 'event_merged',
+    eventId: result.id, createdEvent: result.created, withdrawal: result.withdrawal
+  });
+  return result;
 }
 
 export async function seedDemoData(): Promise<void> {

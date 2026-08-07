@@ -65,7 +65,14 @@ async function enqueueForEvent(event: any) {
     });
     return;
   }
-  if (event.event_type.startsWith('threat.') && event.event_type !== 'threat.expired') {
+  // `threat.withdrawn` is excluded for the same reason as `threat.expired`: both mean the threat is
+  // no longer standing, and the payload this branch builds is the *original* threat text. Fanning
+  // either one out re-sends "Шахед курсом на Полтавщину" to everyone who was already warned, at the
+  // moment the warning stops applying. Nothing is sent instead of a stand-down message on purpose —
+  // a withdrawal here comes from a monitoring source, and a message that reads as an all-clear must
+  // only ever come from an official one.
+  if (event.event_type.startsWith('threat.')
+    && event.event_type !== 'threat.expired' && event.event_type !== 'threat.withdrawn') {
     const entityId = String(event.payload.eventId);
     const threats = await pool.query(
       `SELECT e.*,el.location_id,l.name_uk FROM threat_events e

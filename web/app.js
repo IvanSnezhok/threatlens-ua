@@ -14,11 +14,36 @@ const evidenceNames = { official: 'офіційно', confirmed: 'підтвер
 const occupationLayerIds = ['occupation-fill', 'occupation-hatch', 'occupation-line', 'occupation-contested-line'];
 const occupationColor = ['case', ['==',['get','status'],'occupied'], '#ff7a4d', ['==',['get','status'],'liberated'], '#72d6ca', '#8f9b94'];
 
+// Хороплет тривог. Заливка регіону, а не точка: офіційний канал оголошує тривогу на цілу територію,
+// а в районів у каталозі KATOTTG узагалі немає координат, тож точка для них неможлива в принципі.
+const alertColor = '#ff4747';
+const alertLayerIds = ['alert-oblast-fill','alert-raion-fill','alert-raion-line','alert-oblast-line','alert-oblast-label','alert-raion-label'];
+// 136 районів на оглядовому масштабі зливаються в кашу й перебивають обласну картину, заради якої карту й відкривають.
+// Тому районний шар починає проявлятися з RAION_ZOOM_MIN і набирає повну силу на RAION_ZOOM_FULL —
+// там одна область займає майже весь кадр, а район читається як окрема пляма й лишається клікабельним і на телефоні.
+const RAION_ZOOM_MIN = 6;
+const RAION_ZOOM_FULL = 6.8;
+// alert — тривогу оголошено дослівно на цю територію.
+// unmapped — тривога в її частині, для якої контуру немає взагалі, тож детальнішої картинки не буде;
+//            такий регіон не гасне на великому масштабі, інакше тривога просто зникла б із карти.
+// partial — тривога в її частині, яка має власний контур; тут область поступається районові.
+const alertFlag = ['boolean', ['feature-state', 'alert'], false];
+const unmappedFlag = ['boolean', ['feature-state', 'unmapped'], false];
+const partialFlag = ['boolean', ['feature-state', 'partial'], false];
+const fadingLabel = ['==', ['get', 'tone'], 'partial'];
+const crimeaSovereignty = ['==', ['get', 'sovereignty'], 'crimea-ukraine'];
+
 let snapshot = null;
 let map = null;
 let config = null;
 let locations = [];
 let adminBoundaries = { type: 'FeatureCollection', features: [] };
+let raionBoundaries = null;
+let regionFeatures = new Map();
+let oblastIds = new Set();
+let raionIds = new Set();
+let mapLayersReady = false;
+const regionCentroids = new Map();
 let countryBoundary = { type: 'FeatureCollection', features: [] };
 let occupation = null;
 let occupationVisible = true;
@@ -88,6 +113,135 @@ function cityCollection() {
       properties: { locationId: item.id, nameUk: item.name_uk, sovereignty: item.id === 'ua-85' ? 'crimea-ukraine' : 'ukraine' } })) };
 }
 
+function raionCollection() {
+  return raionBoundaries ?? { type: 'FeatureCollection', features: [] };
+}
+
+// Індекс полігонів за locationId — джерело назв і точок для підписів тривог.
+// Перебудовується лише коли приходить нова геометрія, а не на кожен тік потоку.
+function indexRegionFeatures() {
+  regionFeatures = new Map();
+  regionCentroids.clear();
+  oblastIds = new Set();
+  raionIds = new Set();
+  for (const feature of adminBoundaries.features) {
+    const id = feature.properties?.locationId;
+    if (!id) continue;
+    regionFeatures.set(id, feature);
+    oblastIds.add(id);
+  }
+  for (const feature of raionCollection().features) {
+    const id = feature.properties?.locationId;
+    if (!id || oblastIds.has(id)) continue;
+    regionFeatures.set(id, feature);
+    raionIds.add(id);
+  }
+}
+
+function ringCentroid(ring) {
+  let x = 0, y = 0, area = 0;
+  for (let i = 0, j = ring.length - 1; i < ring.length; j = i++) {
+    const cross = (ring[j][0] * ring[i][1]) - (ring[i][0] * ring[j][1]);
+    area += cross; x += (ring[j][0] + ring[i][0]) * cross; y += (ring[j][1] + ring[i][1]) * cross;
+  }
+  return area ? [x / (3 * area), y / (3 * area)] : ring[0];
+}
+
+// Підпис ставимо в центроїд найбільшого кільця полігона. Координати з каталогу тут не годяться:
+// у районів їх немає взагалі, а в областей вони вказують на адміністративний центр, а не на середину території.
+function regionCentroid(id) {
+  if (regionCentroids.has(id)) return regionCentroids.get(id);
+  const geometry = regionFeatures.get(id)?.geometry;
+  const polygons = geometry?.type === 'MultiPolygon' ? geometry.coordinates
+    : geometry?.type === 'Polygon' ? [geometry.coordinates] : [];
+  let ring = null, largest = 0;
+  for (const polygon of polygons) {
+    const outer = polygon?.[0];
+    if (!Array.isArray(outer) || outer.length < 4) continue;
+    let area = 0;
+    for (let i = 0, j = outer.length - 1; i < outer.length; j = i++) area += (outer[j][0] * outer[i][1]) - (outer[i][0] * outer[j][1]);
+    if (Math.abs(area) > largest) { largest = Math.abs(area); ring = outer; }
+  }
+  const point = ring ? ringCentroid(ring) : null;
+  regionCentroids.set(id, point);
+  return point;
+}
+
+// Офіційний канал оголошує тривогу переважно на рівні району, подекуди — на рівні області чи громади.
+// direct — територія, названа в повідомленні дослівно. covered — її батьківські території: без цього
+// на оглядовому масштабі область виглядала б спокійною, поки в її районі триває тривога.
+// unmapped — найближчий предок із контуром, коли в самої названої території контуру немає
+// (громади, а поки що й кілька районів без геометрії). Він відповідає за тривогу на всіх масштабах,
+// бо детальнішого шару, який його підмінить, просто не існує.
+function alertCoverage() {
+  const parents = new Map(locations.map((item) => [item.id, item.parent_id]));
+  const direct = new Set(), covered = new Set(), unmapped = new Set();
+  for (const alert of snapshot?.alerts ?? []) {
+    if (!alert.location_id) continue;
+    direct.add(alert.location_id);
+    const seen = new Set([alert.location_id]);
+    let anchored = regionFeatures.has(alert.location_id);
+    let parent = parents.get(alert.location_id);
+    while (parent && !seen.has(parent)) {
+      seen.add(parent);
+      covered.add(parent);
+      if (!anchored && regionFeatures.has(parent)) { anchored = true; unmapped.add(parent); }
+      parent = parents.get(parent);
+    }
+  }
+  return { direct, covered, unmapped };
+}
+
+function alertLabelCollection(direct, covered, unmapped) {
+  const names = new Map(locations.map((item) => [item.id, item.name_uk]));
+  const features = [];
+  const add = (id, tone) => {
+    const point = regionCentroid(id);
+    if (!point) return;
+    const name = names.get(id) ?? regionFeatures.get(id)?.properties?.nameUk ?? '';
+    features.push({ type: 'Feature', id: `al-${id}`, geometry: { type: 'Point', coordinates: point }, properties: {
+      locationId: id, tone, level: oblastIds.has(id) ? 'oblast' : 'raion',
+      label: String(name).replace(/\s+(область|район)$/u, '')
+    } });
+  };
+  for (const id of direct) add(id, 'direct');
+  for (const id of covered) if (!direct.has(id)) add(id, unmapped.has(id) ? 'unmapped' : 'partial');
+  return { type: 'FeatureCollection', features };
+}
+
+// Стан тривоги накладається через feature-state: геометрія областей і районів (понад мегабайт)
+// лишається незмінною, на кожен тік потоку змінюються лише кілька десятків прапорців.
+function applyAlertLayers() {
+  if (!mapLayersReady || !map) return;
+  const { direct, covered, unmapped } = alertCoverage();
+  for (const [source, ids] of [['ukraine-admin', oblastIds], ['ukraine-raions', raionIds]]) {
+    if (!map.getSource(source)) continue;
+    map.removeFeatureState({ source });
+    for (const id of covered) {
+      if (!ids.has(id) || direct.has(id)) continue;
+      map.setFeatureState({ source, id }, unmapped.has(id) ? { unmapped: true } : { partial: true });
+    }
+    for (const id of direct) if (ids.has(id)) map.setFeatureState({ source, id }, { alert: true });
+  }
+  map.getSource('alert-labels')?.setData(alertLabelCollection(direct, covered, unmapped));
+}
+
+// Районна геометрія вантажиться окремо й не блокує старт карти. Якщо файлу немає або він зіпсований,
+// карта лишається повністю робочою на рівні областей: районну тривогу все одно видно як приглушену
+// заливку батьківської області, бо стан підіймається вгору ієрархією каталогу.
+async function loadRaionBoundaries() {
+  try {
+    const response = await fetch('/data/ukraine-adm2.geojson', { signal: AbortSignal.timeout(20000) });
+    if (!response.ok) throw new Error('adm2 unavailable');
+    const data = await response.json();
+    if (data?.type !== 'FeatureCollection' || !Array.isArray(data.features) || !data.features.length) throw new Error('adm2 malformed');
+    raionBoundaries = data;
+    indexRegionFeatures();
+    map?.getSource('ukraine-raions')?.setData(raionCollection());
+    applyAlertLayers();
+  } catch { /* без районних контурів карта працює на рівні областей */ }
+}
+
 setInterval(() => { $('#clock strong').textContent = kyivTime(); updateFreshness(); }, 1000);
 
 function updateFreshness() {
@@ -121,7 +275,9 @@ function connectStream() {
     clearTimeout(refreshTimer);
     refreshTimer = setTimeout(() => loadSnapshot().catch(markOffline), 250);
   };
-  ['alert.started','alert.ended','threat.created','threat.updated','threat.corrected','assessment.updated','source.stale','source.recovered'].forEach((name) => source.addEventListener(name, schedule));
+  // 'threat.withdrawn' and 'threat.expired' end a threat. Without them the map keeps drawing it
+  // until some unrelated event happens to arrive, which is the one direction that must not lag.
+  ['alert.started','alert.ended','threat.created','threat.updated','threat.corrected','threat.withdrawn','threat.expired','assessment.updated','source.stale','source.recovered'].forEach((name) => source.addEventListener(name, schedule));
   source.onerror = markOffline;
 }
 
@@ -155,9 +311,11 @@ function eventCard(item, type) {
     <div class="event-foot"><b>${escapeHtml(threatNames[item.threatType] ?? item.threatType)}</b><span>${timeAgo(item.lastObservedAt)}</span></div></article>`;
 }
 
+// Офіційні тривоги тут більше не зʼявляються: їх малює хороплет.
+// Точка в центроїді була доступна лише областям і вдавала локалізацію, якої в повідомленні немає,
+// а район її не отримав би ніколи — координат у каталозі KATOTTG немає.
 function markerCollection() {
   const features = [];
-  for (const alert of snapshot.alerts) if (alert.longitude != null) features.push({ type: 'Feature', id: `a-${alert.id}`, geometry: { type: 'Point', coordinates: [alert.longitude, alert.latitude] }, properties: { kind: 'alert', title: alert.location_name } });
   for (const threat of snapshot.threats) for (const loc of threat.locations) if (loc.longitude != null) features.push({ type: 'Feature', id: `t-${threat.id}-${loc.id}`, geometry: { type: 'Point', coordinates: [loc.longitude, loc.latitude] }, properties: { kind: 'threat', entityId: threat.id, title: threat.title, evidence: threat.evidenceLevel } });
   for (const risk of snapshot.assessments) if (risk.longitude != null) features.push({ type: 'Feature', id: `r-${risk.id}`, geometry: { type: 'Point', coordinates: [risk.longitude, risk.latitude] }, properties: { kind: 'assessment', entityId: risk.id, title: risk.location_name, score: Number(risk.risk_score) } });
   return { type: 'FeatureCollection', features };
@@ -303,7 +461,8 @@ function renderOccupationLegend() {
 }
 
 function initMap() {
-  occupationLayersReady = false; // карту перестворюють на кожному оновленні знімка — шар доводиться додавати наново
+  occupationLayersReady = false; // карту створюють наново лише при поверненні на маршрут карти — шари доводиться додавати з нуля
+  mapLayersReady = false;
   map = new maplibregl.Map({ container: 'map', style: config.mapStyleUrl, center: [31.2, 48.8], zoom: 5.1, attributionControl: false });
   map.on('styleimagemissing', (event) => {
     if (!map.hasImage(event.id)) map.addImage(event.id, { width: 1, height: 1, data: new Uint8Array([0,0,0,0]) });
@@ -316,7 +475,15 @@ function initMap() {
   map.on('style.load', () => {
     map.addSource('ukraine-country', { type: 'geojson', data: countryBoundary });
     map.addSource('ukraine-admin', { type: 'geojson', data: adminBoundaries, promoteId: 'locationId' });
+    // promoteId дослівно збігається з locations.id у базі — саме він робить можливим setFeatureState
+    // замість перегенерації геометрії на кожен тік потоку.
+    // Межі районів — похідна база даних з OpenStreetMap, яку ми самі роздаємо клієнтам за
+    // /data/ukraine-adm2.geojson. ODbL вимагає окремої атрибуції: «© OpenStreetMap contributors»
+    // від підкладки її не покриває, бо це інший продукт із іншим ланцюгом походження.
+    map.addSource('ukraine-raions', { type: 'geojson', data: raionCollection(), promoteId: 'locationId',
+      attribution: 'Межі: © учасники OpenStreetMap, <a href="https://opendatacommons.org/licenses/odbl/1-0/" target="_blank" rel="noreferrer">ODbL 1.0</a>' });
     map.addSource('ukraine-cities', { type: 'geojson', data: cityCollection(), promoteId: 'locationId' });
+    map.addSource('alert-labels', { type: 'geojson', data: { type: 'FeatureCollection', features: [] } });
     map.addSource('sovereignty-labels', { type: 'geojson', data: { type: 'FeatureCollection', features: [
       { type: 'Feature', geometry: { type: 'Point', coordinates: [34.25,45.25] }, properties: { label: 'АР КРИМ · УКРАЇНА' } }
     ] } });
@@ -334,7 +501,42 @@ function initMap() {
     map.addLayer({ id: 'ukraine-state-border', type: 'line', source: 'ukraine-country', paint: {
       'line-color': '#b7ef56', 'line-width': ['interpolate',['linear'],['zoom'],4,1.8,8,3.4], 'line-opacity': .95
     } });
+    // Заливки тривоги йдуть під ukraine-sovereignty-fill і додаються ПЕРЕД addOccupationLayers(),
+    // тож окупаційні шари вставляються поверх них і лишаються читабельними, як і раніше.
+    // Золоте підсвічування суверенітету (ukraine-region-fill) теж лишається зверху — воно важливіше за колір тривоги.
+    // alert — тривога оголошена дослівно на цю територію; partial — тривога лише в її частині,
+    // тому область гасне до ледь помітної, коли районна картина вже читається.
+    map.addLayer({ id: 'alert-oblast-fill', type: 'fill', source: 'ukraine-admin', paint: {
+      'fill-color': alertColor,
+      'fill-opacity': ['interpolate',['linear'],['zoom'],
+        RAION_ZOOM_MIN, ['case', alertFlag, .34, unmappedFlag, .24, partialFlag, .18, 0],
+        RAION_ZOOM_FULL, ['case', alertFlag, .30, unmappedFlag, .24, partialFlag, .06, 0]]
+    } }, 'ukraine-sovereignty-fill');
+    map.addLayer({ id: 'alert-raion-fill', type: 'fill', source: 'ukraine-raions', minzoom: RAION_ZOOM_MIN, paint: {
+      'fill-color': alertColor,
+      'fill-opacity': ['interpolate',['linear'],['zoom'],
+        RAION_ZOOM_MIN, 0,
+        RAION_ZOOM_FULL, ['case', alertFlag, .40, unmappedFlag, .28, partialFlag, .26, 0]]
+    } }, 'ukraine-sovereignty-fill');
     addOccupationLayers();
+    // Обидва контури тривоги лежать ПІД ukraine-region-lines: інакше червона межа перекрила б
+    // золоту лінію суверенітету навколо Криму й Севастополя. Колір тривоги програє суверенітету.
+    map.addLayer({ id: 'alert-raion-line', type: 'line', source: 'ukraine-raions', minzoom: RAION_ZOOM_MIN, paint: {
+      'line-color': ['case', alertFlag, alertColor, unmappedFlag, '#ff7a4d', partialFlag, '#ff7a4d', '#72d6ca'],
+      'line-width': ['interpolate',['linear'],['zoom'], RAION_ZOOM_MIN, .45, 9, 1.3],
+      'line-opacity': ['interpolate',['linear'],['zoom'],
+        RAION_ZOOM_MIN, 0,
+        RAION_ZOOM_FULL, ['case', alertFlag, .9, unmappedFlag, .66, partialFlag, .62, .22]]
+    } }, 'ukraine-region-lines');
+    // Навколо Криму й Севастополя червоний контур не малюємо взагалі: там межа має лишатися золотою,
+    // бо це підсвічування суверенітету. Сама тривога там читається із заливки — так само, як усюди.
+    map.addLayer({ id: 'alert-oblast-line', type: 'line', source: 'ukraine-admin', paint: {
+      'line-color': alertColor,
+      'line-width': ['interpolate',['linear'],['zoom'], 4, 1.3, 8, 2.6],
+      'line-opacity': ['interpolate',['linear'],['zoom'],
+        RAION_ZOOM_MIN, ['case', crimeaSovereignty, 0, alertFlag, .85, unmappedFlag, .58, partialFlag, .45, 0],
+        RAION_ZOOM_FULL, ['case', crimeaSovereignty, 0, alertFlag, .85, unmappedFlag, .58, partialFlag, .16, 0]]
+    } }, 'ukraine-region-lines');
     map.addLayer({ id: 'city-hit', type: 'circle', source: 'ukraine-cities', minzoom: 5.7, paint: {
       'circle-radius': ['interpolate',['linear'],['zoom'],5.7,3,9,6], 'circle-color': '#72d6ca',
       'circle-opacity': .82, 'circle-stroke-color': '#09100f', 'circle-stroke-width': 1.5
@@ -342,14 +544,32 @@ function initMap() {
     map.addLayer({ id: 'city-labels', type: 'symbol', source: 'ukraine-cities', minzoom: 7.2, layout: {
       'text-field': ['get','nameUk'], 'text-size': 10, 'text-offset': [0,1.15], 'text-anchor': 'top', 'text-font': ['Noto Sans Regular']
     }, paint: { 'text-color': '#d8e7df', 'text-halo-color': '#09100f', 'text-halo-width': 1.4 } });
+    // text-allow-overlap гарантує, що підпис суверенітету намалюється завжди, хоч би скільки шарів лягло під ним;
+    // text-ignore-placement лишається вимкненим, тож він, навпаки, відштовхує підписи тривог.
+    // Ореол посилено до 2.6 px: під підписом тепер може лежати ще й заливка тривоги.
     map.addLayer({ id: 'crimea-ukraine-label', type: 'symbol', source: 'sovereignty-labels', minzoom: 4.2, layout: {
       'text-field': ['get','label'], 'text-size': ['interpolate',['linear'],['zoom'],4.2,10,7,14],
-      'text-letter-spacing': .12, 'text-font': ['Noto Sans Regular']
-    }, paint: { 'text-color': '#f3efd9', 'text-halo-color': '#09100f', 'text-halo-width': 2 } });
+      'text-letter-spacing': .12, 'text-font': ['Noto Sans Regular'], 'text-allow-overlap': true, 'text-padding': 12
+    }, paint: { 'text-color': '#f3efd9', 'text-halo-color': '#09100f', 'text-halo-width': 2.6 } });
+    // Підписи тривог лягають під підпис суверенітету; районний — над обласним,
+    // щоб на великому масштабі точніша назва вигравала конкуренцію за місце.
+    map.addLayer({ id: 'alert-oblast-label', type: 'symbol', source: 'alert-labels', filter: ['==',['get','level'],'oblast'], layout: {
+      'text-field': ['get','label'], 'text-size': ['interpolate',['linear'],['zoom'],4.5,11,8,14],
+      'text-transform': 'uppercase', 'text-letter-spacing': .05, 'text-max-width': 7, 'text-padding': 6,
+      'text-offset': [0,-1.4], 'text-font': ['Noto Sans Regular']
+    }, paint: { 'text-color': '#ffe1d8', 'text-halo-color': '#09100f', 'text-halo-width': 1.9,
+      'text-opacity': ['interpolate',['linear'],['zoom'],
+        RAION_ZOOM_MIN, ['case', fadingLabel, .8, 1],
+        RAION_ZOOM_FULL, ['case', fadingLabel, 0, 1]] } }, 'crimea-ukraine-label');
+    map.addLayer({ id: 'alert-raion-label', type: 'symbol', source: 'alert-labels', filter: ['==',['get','level'],'raion'], minzoom: RAION_ZOOM_MIN, layout: {
+      'text-field': ['get','label'], 'text-size': 11, 'text-max-width': 8, 'text-padding': 4, 'text-font': ['Noto Sans Regular']
+    }, paint: { 'text-color': '#ffd2c6', 'text-halo-color': '#09100f', 'text-halo-width': 1.7,
+      'text-opacity': ['interpolate',['linear'],['zoom'],
+        RAION_ZOOM_MIN, 0,
+        RAION_ZOOM_FULL, ['case', fadingLabel, .8, 1]] } }, 'crimea-ukraine-label');
     map.addSource('live-events', { type: 'geojson', data: markerCollection(), promoteId: 'id' });
     map.addLayer({ id: 'assessment-halo', type: 'circle', source: 'live-events', filter: ['==',['get','kind'],'assessment'], paint: { 'circle-radius': ['+', 12, ['*', ['coalesce',['get','score'],0], 2]], 'circle-color': '#e3b341', 'circle-opacity': .10, 'circle-stroke-width': 1, 'circle-stroke-color': '#e3b341', 'circle-stroke-opacity': .6 } });
     map.addLayer({ id: 'threat-pulse', type: 'circle', source: 'live-events', filter: ['==',['get','kind'],'threat'], paint: { 'circle-radius': 13, 'circle-color': '#ff7a4d', 'circle-opacity': .18, 'circle-stroke-width': 2, 'circle-stroke-color': '#ff7a4d' } });
-    map.addLayer({ id: 'alert-pulse', type: 'circle', source: 'live-events', filter: ['==',['get','kind'],'alert'], paint: { 'circle-radius': 20, 'circle-color': '#ff3d3d', 'circle-opacity': .3, 'circle-stroke-width': 4, 'circle-stroke-color': '#ff3d3d' } });
     map.addLayer({ id: 'event-labels', type: 'symbol', source: 'live-events', layout: { 'text-field': ['get','title'], 'text-size': 11, 'text-offset': [0, 2.1], 'text-anchor': 'top', 'text-font': ['Noto Sans Regular'] }, paint: { 'text-color': '#f4f0df', 'text-halo-color': '#09100f', 'text-halo-width': 1.5 } });
     map.addSource('reported-directions', { type: 'geojson', data: directionCollection() });
     map.addLayer({ id: 'direction-lines', type: 'line', source: 'reported-directions', paint: { 'line-color': '#ff7a4d', 'line-width': 3, 'line-dasharray': [2,2], 'line-opacity': .8 } });
@@ -358,28 +578,33 @@ function initMap() {
       const id = feature.properties.entityId;
       if (feature.properties.kind === 'threat' && id) void showThreatDetails(id);
       else if (feature.properties.kind === 'assessment' && id) void showAssessmentDetails(id);
-      else new maplibregl.Popup({ closeButton: false }).setLngLat(event.lngLat).setHTML(`<strong>${escapeHtml(feature.properties.title)}</strong><p>Офіційна тривога активна.</p>`).addTo(map);
     });
+    // Один клік має відкрити одну історію, тож територію вибираємо від найточнішої до найзагальнішої:
+    // місто → район → область. Районний шар нижче RAION_ZOOM_MIN не малюється, тож там клік завжди обласний.
     const openTerritory = (event) => {
       const feature = event.features?.[0];
-      if (feature?.layer?.id === 'ukraine-region-fill'
-        && map.queryRenderedFeatures(event.point, { layers: ['city-hit'] }).length) return;
-      if (feature?.properties?.locationId) void showLocationHistory(feature.properties.locationId);
+      const layerId = feature?.layer?.id;
+      if (!feature?.properties?.locationId) return;
+      if (layerId !== 'city-hit' && map.queryRenderedFeatures(event.point, { layers: ['city-hit'] }).length) return;
+      if (layerId === 'ukraine-region-fill' && map.queryRenderedFeatures(event.point, { layers: ['alert-raion-fill'] }).length) return;
+      void showLocationHistory(feature.properties.locationId);
     };
-    map.on('click', 'ukraine-region-fill', openTerritory);
-    map.on('click', 'city-hit', openTerritory);
-    for (const layer of ['ukraine-region-fill','city-hit']) {
+    for (const layer of ['ukraine-region-fill','alert-raion-fill','city-hit']) {
+      map.on('click', layer, openTerritory);
       map.on('mouseenter', layer, () => { map.getCanvas().style.cursor = 'pointer'; });
       map.on('mouseleave', layer, () => { map.getCanvas().style.cursor = ''; });
     }
+    mapLayersReady = true;
+    applyAlertLayers();
   });
   $('#fit-ukraine').addEventListener('click', () => map.fitBounds([[21.5,43.2],[41.2,52.5]], { padding: 36, duration: 700 }));
 }
 
 function updateMap() {
-  if (!map?.loaded()) return;
+  if (!mapLayersReady) return;
   map.getSource('live-events')?.setData(markerCollection());
   map.getSource('reported-directions')?.setData(directionCollection());
+  applyAlertLayers();
 }
 
 function safeUrl(value) {
@@ -449,12 +674,7 @@ async function showLocationHistory(id) {
   }));
 }
 
-function renderMapPage() {
-  $('#app').replaceChildren($('#map-page').content.cloneNode(true));
-  const telegramLink = document.querySelector('.telegram-cta');
-  if (config.telegramBotUsername) {
-    telegramLink.href = `https://t.me/${config.telegramBotUsername.replace(/^@/, '')}`;
-  } else telegramLink.hidden = true;
+function renderEventRail() {
   const items = [
     ...snapshot.alerts.map((item) => ({ type: 'alert', item })),
     ...snapshot.threats.map((item) => ({ type: 'threat', item })),
@@ -462,6 +682,24 @@ function renderMapPage() {
   ];
   $('#event-count').textContent = items.length;
   $('#event-list').innerHTML = items.length ? items.map(({ item, type }) => eventCard(item, type)).join('') : `<div class="empty-state"><strong>Немає активних офіційних повідомлень</strong><p>Це не означає відсутність загрози. Стежте за офіційними каналами.</p></div>`;
+}
+
+function renderMapPage() {
+  // Карту не перестворюємо на кожен тік потоку: геометрія областей і районів важить понад мегабайт,
+  // а стан тривог накладається через feature-state. Заразом користувач не втрачає масштаб і позицію,
+  // на які щойно перевів карту, — раніше кожна подія SSE скидала вигляд на всю Україну.
+  if (map && document.body.contains(map.getContainer())) {
+    renderEventRail();
+    updateMap();
+    renderOccupationLegend();
+    return;
+  }
+  $('#app').replaceChildren($('#map-page').content.cloneNode(true));
+  const telegramLink = document.querySelector('.telegram-cta');
+  if (config.telegramBotUsername) {
+    telegramLink.href = `https://t.me/${config.telegramBotUsername.replace(/^@/, '')}`;
+  } else telegramLink.hidden = true;
+  renderEventRail();
   initMap();
   $('.event-list').addEventListener('click', (event) => {
     const card = event.target.closest('.event-card'); if (!card) return;
@@ -473,7 +711,7 @@ function renderMapPage() {
     const assessmentId = card.dataset.assessment;
     if (assessmentId) void showAssessmentDetails(assessmentId);
   });
-  const layerGroups = { alerts: ['alert-pulse'], threats: ['threat-pulse','direction-lines'], assessments: ['assessment-halo'] };
+  const layerGroups = { alerts: alertLayerIds, threats: ['threat-pulse','direction-lines'], assessments: ['assessment-halo'] };
   document.querySelectorAll('.layer-toggle').forEach((button) => button.addEventListener('click', () => {
     button.classList.toggle('is-active');
     const active = button.classList.contains('is-active');
@@ -601,7 +839,8 @@ async function renderOps() {
 function renderCurrentRoute() {
   if (!snapshot) return;
   const route = activePage();
-  if (map) { map.remove(); map = null; }
+  // Карту знімаємо лише коли справді йдемо з маршруту карти — на місці вона переживає оновлення знімка.
+  if (map && route !== '/') { map.remove(); map = null; mapLayersReady = false; }
   if (route === '/') renderMapPage();
   else if (route === '/history') void renderHistory();
   else if (route === '/analytics') void renderAnalytics();
@@ -626,9 +865,11 @@ async function boot() {
   ]);
   config = loadedConfig; locations = loadedLocations;
   countryBoundary = loadedCountry; adminBoundaries = enrichBoundaries(loadedAdmin);
+  indexRegionFeatures();
   $('#demo-label').hidden = !config.demoMode;
   if (location.pathname === '/tv') document.body.classList.add('tv-mode');
   window.Telegram?.WebApp?.ready(); window.Telegram?.WebApp?.expand();
+  void loadRaionBoundaries(); // районна геометрія важка й не мусить затримувати першу картинку
   void loadOccupation(); // довідковий шар вантажиться окремо й не блокує старт карти
   await loadSnapshot(); connectStream();
   setInterval(() => void loadOccupation(), 900000);

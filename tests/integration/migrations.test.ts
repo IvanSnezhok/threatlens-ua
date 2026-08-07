@@ -11,7 +11,10 @@ const MIGRATION_FILES = [
   '007_occupation_layer.sql',
   '008_alert_end_debounce.sql',
   '009_raion_tier.sql',
-  '010_alert_channel_source.sql'
+  '010_alert_channel_source.sql',
+  '011_osint_monitor_sources.sql',
+  '012_threat_assertions_and_classification_log.sql',
+  '013_source_catalog_expansion.sql'
 ];
 
 describe.skipIf(!integrationDatabaseAvailable)('migration runner against live PostgreSQL', () => {
@@ -44,7 +47,7 @@ describe.skipIf(!integrationDatabaseAvailable)('migration runner against live Po
 
   it('creates the readiness marker the /health/ready probe queries', async () => {
     // src/api/server.ts gates readiness on this exact filename; a renamed migration must break here.
-    const marker = await sql("SELECT 1 FROM schema_migrations WHERE filename='010_alert_channel_source.sql'");
+    const marker = await sql("SELECT 1 FROM schema_migrations WHERE filename='013_source_catalog_expansion.sql'");
     expect(marker.rowCount).toBe(1);
   });
 

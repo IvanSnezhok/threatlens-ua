@@ -54,7 +54,8 @@ body { overflow-x: hidden; }
 .layer-toggle { background: transparent; border: 0; color: var(--muted); padding: 8px 10px; font: 10px var(--mono); text-transform: uppercase; white-space: nowrap; cursor: pointer; }
 .layer-toggle.is-active { color: var(--paper); background: rgba(255,255,255,.07); }
 .swatch { display: inline-block; width: 7px; height: 7px; border-radius: 50%; margin-right: 7px; }
-.swatch.alert { background: var(--red); }.swatch.threat { background: var(--orange); }.swatch.risk { background: var(--amber); }
+.swatch.alert { width: 11px; height: 9px; border-radius: 0; border: 1px solid rgba(255,71,71,.85); background: rgba(255,71,71,.34); }
+.swatch.threat { background: var(--orange); }.swatch.risk { background: var(--amber); }
 .swatch.occupation { width: 11px; height: 9px; border-radius: 0; border: 1px solid rgba(255,122,77,.5); background: repeating-linear-gradient(45deg, rgba(255,122,77,.8) 0 1.5px, rgba(255,122,77,.14) 1.5px 4.5px); }
 .occupation-legend { width: 300px; max-width: 100%; background: rgba(9,16,15,.9); border: 1px solid var(--line); backdrop-filter: blur(12px); transition: opacity .18s ease; }
 .occupation-legend.is-off { opacity: .48; }

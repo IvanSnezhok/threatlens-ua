@@ -1,13 +1,46 @@
 import { config } from '../config.js';
 import {
-  ALERT_CHANNEL_SOURCE_ID, enableAlertChannelSource, ingestAlertChannelMessages, processMessage,
-  type AlertChannelMessage
+  ALERT_CHANNEL_SOURCE_ID, MONITOR_ADAPTER_TYPE, enableAlertChannelSource,
+  ingestAlertChannelMessages, loadMonitoredTelegramChannels, processMessage,
+  type AlertChannelMessage, type MonitoredTelegramChannel
 } from '../services/ingestion.js';
 import { markSourceError, markSourceSuccess } from '../services/operations.js';
 
+/**
+ * Last-resort definition of the Air Force channel.
+ *
+ * The channel list is read from `sources`, but the Air Force channel is an official Tier A source
+ * that has been collected since the first release and must keep working exactly as it does now. If
+ * the registry query fails, or the row has lost its `telegram_username`, the collector falls back to
+ * this pair rather than starting up subscribed to nothing. The OSINT monitors have no such fallback:
+ * a monitor the database does not list is a monitor that is not read.
+ */
+const AIR_FORCE_SOURCE_ID = 'air-force';
 const AIR_FORCE_CHANNEL = 'kpszsu';
 
 interface CollectorLogger { info: Function; warn?: Function; error: Function }
+
+/**
+ * Resolves the channels the collector subscribes to, keyed by lower-cased username.
+ *
+ * The alert channel is never in this map — `loadMonitoredTelegramChannels` excludes it by adapter
+ * type and by name — so no entry here can reach the alert reconciler.
+ */
+async function resolveChannelRoutes(log: CollectorLogger): Promise<Map<string, MonitoredTelegramChannel>> {
+  const channels = await loadMonitoredTelegramChannels().catch((error) => {
+    log.error({ error }, 'monitored channel registry could not be read; falling back to the Air Force channel');
+    return [] as MonitoredTelegramChannel[];
+  });
+  const routes = new Map<string, MonitoredTelegramChannel>();
+  for (const channel of channels) routes.set(channel.username, channel);
+  if (![...routes.values()].some((channel) => channel.sourceId === AIR_FORCE_SOURCE_ID)) {
+    routes.set(AIR_FORCE_CHANNEL, {
+      sourceId: AIR_FORCE_SOURCE_ID, username: AIR_FORCE_CHANNEL, adapterType: 'mtproto'
+    });
+  }
+  routes.delete(config.ALERT_CHANNEL_USERNAME);
+  return routes;
+}
 
 /**
  * Reads the alert-relevant history the collector missed while it was disconnected.
@@ -63,16 +96,21 @@ export async function startTelegramCollector(log: CollectorLogger): Promise<(() 
       { connectionRetries: 5 }
     );
     await client.connect();
-    await markSourceSuccess('air-force');
+    const routes = await resolveChannelRoutes(log);
+    for (const route of routes.values()) {
+      await markSourceSuccess(route.sourceId)
+        .catch((error) => log.error({ error, sourceId: route.sourceId }, 'source could not be marked connected'));
+    }
 
     const processEvent = async (event: any) => {
       const message = event.message;
       if (!message?.message) return;
       let username: string | undefined;
+      let route: MonitoredTelegramChannel | undefined;
       try {
         const chat = await message.getChat();
         username = chat?.username?.toLowerCase();
-        if (username !== AIR_FORCE_CHANNEL && username !== alertChannel) return;
+        if (!username) return;
         // An edit is re-processed with the *original* publication time, not the edit time. The
         // corrected text is what matters; treating the edit as a fresh event would let a correction
         // to an hours-old message restart an alert, and would break the ordering guard that makes
@@ -80,6 +118,10 @@ export async function startTelegramCollector(log: CollectorLogger): Promise<(() 
         // an all-clear: absence never ends an alert on this path, only an explicit 🟢 does.
         const publishedAt = new Date(Number(message.date) * 1000);
         const editedAt = message.editDate ? new Date(Number(message.editDate) * 1000) : undefined;
+        // The alert channel is matched first and returns unconditionally, so its messages can never
+        // fall through to the classifier — and, because `routes` never contains its username, no
+        // other channel can reach the alert reconciler either. That is the whole routing guarantee:
+        // one username, one destination, decided before anything is parsed.
         if (username === alertChannel) {
           if (!alertChannelEnabled) return;
           await ingestAlertChannelMessages([{
@@ -91,22 +133,25 @@ export async function startTelegramCollector(log: CollectorLogger): Promise<(() 
           }], log as { warn: Function });
           return;
         }
+        route = routes.get(username);
+        if (!route) return;
         await processMessage({
-          sourceId: 'air-force',
+          sourceId: route.sourceId,
           externalId: String(message.id),
           publishedAt,
           editedAt,
           text: message.message,
           rawPayload: { channel: username, id: message.id }
-        });
+        }, { monitor: route.adapterType === MONITOR_ADAPTER_TYPE });
       } catch (error) {
-        const sourceId = username === alertChannel ? ALERT_CHANNEL_SOURCE_ID : 'air-force';
+        const sourceId = username === alertChannel ? ALERT_CHANNEL_SOURCE_ID
+          : route?.sourceId ?? AIR_FORCE_SOURCE_ID;
         await markSourceError(sourceId, error).catch(() => undefined);
         log.error({ error, sourceId }, 'MTProto message processing failed');
       }
     };
 
-    const chats = alertChannelEnabled ? [AIR_FORCE_CHANNEL, alertChannel] : [AIR_FORCE_CHANNEL];
+    const chats = [...routes.keys(), ...(alertChannelEnabled ? [alertChannel] : [])];
     client.addEventHandler(processEvent, new NewMessage({ chats }));
     client.addEventHandler(processEvent, new EditedMessage({ chats }));
 
@@ -119,7 +164,13 @@ export async function startTelegramCollector(log: CollectorLogger): Promise<(() 
         .catch((error) => log.error({ error }, 'alert channel backlog reconciliation failed'));
     }
 
-    const heartbeatSources = alertChannelEnabled ? ['air-force', ALERT_CHANNEL_SOURCE_ID] : ['air-force'];
+    // Every channel the collector is subscribed to, not just the two it started with. A monitoring
+    // source that is never marked successful reports `unknown` health forever and its silence during
+    // a quiet night is indistinguishable from a dead connection.
+    const heartbeatSources = [
+      ...[...routes.values()].map((route) => route.sourceId),
+      ...(alertChannelEnabled ? [ALERT_CHANNEL_SOURCE_ID] : [])
+    ];
     const heartbeat = setInterval(() => {
       for (const sourceId of heartbeatSources) {
         markSourceSuccess(sourceId).catch((error) => log.error({ error, sourceId }, 'MTProto heartbeat failed'));

@@ -5,13 +5,15 @@ This matrix is the release gate for the initial single-node Docker deployment. `
 | Requirement | State | Implementation / verification |
 |---|---|---|
 | One-command Docker start | Implemented | `compose.yaml` starts Caddy, app, PostgreSQL and backup services with health dependencies. |
-| PostgreSQL history and migrations | Implemented | Ten idempotent migrations (`001_init` … `010_alert_channel_source`) applied by an advisory-locked runner; readiness requires `008_alert_end_debounce.sql`. |
+| PostgreSQL history and migrations | Implemented | Idempotent migrations from `001_init` onwards, applied once each by an advisory-locked runner; `/health/ready` gates on a named migration marker in `src/api/server.ts`, and `tests/integration/migrations.test.ts` pins the applied set. |
 | Official alert ingestion | Implemented | Three tier A sources — the Ukraine Alarm and Alerts.in.ua APIs plus the official channel `@air_alert_ua` — feeding per-source state and one aggregate start/end reconciler. For a polled source an alert ends only after every source that held it has been silent for `ALERT_END_DEBOUNCE_SECONDS` (default 60 = four polls), so one missed poll cannot emit a false all-clear. API tokens remain external setup; the channel needs none. |
 | Official alerts without an API token | Implemented | `@air_alert_ua` is read through the MTProto collector, parsed by a pure function (`src/domain/alert-parser.ts`) and reconciled event-by-event: 🔴/🟢 move only the raions a message names, an explicit all-clear skips the polled-source debounce, out-of-order messages are refused via `alert_source_states.last_event_at`, and a missing all-clear is bounded by `ALERT_CHANNEL_MAX_ALERT_SECONDS` (default 24 h) with a warn log and `threatlens_alert_channel_stuck_alerts_total`. |
 | Public-channel monitoring | Implemented | Telegram MTProto collector handles new and edited messages for both the Air Force channel and the official alert channel, and re-reads a bounded, order-folded history window after a reconnect. API credentials/session remain external setup. |
 | Threat normalization | Implemented | UAV, ballistic/cruise missile, KAB, aviation, MLRS, artillery, mortar and combined classifications. |
 | Evidence and provenance | Implemented | Source tier, independence group, raw message, URL, revisions, corroboration and non-downgrading evidence. |
-| Event lifecycle | Implemented | Deduplication, merge, correction, expiry, update history and SSE event versions. |
+| Event lifecycle | Implemented | Deduplication, merge, correction, withdrawal, expiry, update history and SSE event versions. |
+| Threat de-escalation | Implemented | `threat_assertions` holds one row per (event, source, location, threat class), mirroring `alert_source_states`; an event lives while any assertion holds and becomes `withdrawn` with a `threat.withdrawn` event log row when the last one is taken back. A withdrawal is scoped `WHERE source_id = …`, so it never touches another publisher's claim and a source that never asserted changes nothing; `coverage: 'unspecified'` closes every claim of that one source; a redirect withdraws for the place passed and asserts for the place approached. Validity is recomputed as the maximum the survivors support and risk signals decay by expiry, never by a negative contribution. Evidence level is untouched, and no path reaches `alert_source_states` or `alert_periods`. Pinned by `tests/integration/threat-withdrawal.test.ts`. |
+| Classification archive | Implemented | `message_classifications` records one row per classifier decision — created, merged, redirect, de-escalation, ignored, unrecognised, coalesced — with candidate threat classes, indicators, located relations, national scope, the resulting event and, for a withdrawal, what it retracted and what the source last claimed. Every row carries `CLASSIFIER_VERSION`, and `UNIQUE (source_message_id, classifier_version)` lets a new classifier be replayed over stored history beside the old verdict. The write is outside the ingestion transaction; a failure increments `threatlens_classification_log_failures_total` instead of failing ingestion. Pinned by `tests/integration/classification-archive.test.ts`, which executes the three analytical queries in docs/OPERATIONS.md. |
 | City and oblast coverage | Implemented | Weekly official KATOTTG synchronization; verified import of 461 cities plus oblast/special-city hierarchy. |
 | No invented map trajectories | Implemented | Only reported geometry/direction is rendered; details explicitly state that geometry is not a forecast. |
 | Explainable six-hour risk index | Implemented | Time decay, source guardrails, independent-source limits, versioned methodology, factors and supporting signals. |
@@ -41,8 +43,8 @@ This matrix is the release gate for the initial single-node Docker deployment. `
 
 ## Verified release checks
 
-- TypeScript typecheck, ESLint, production build and 201 automated tests pass: 96 unit tests over pure
-  functions and 105 integration tests executed against a live PostgreSQL 18 database.
+- TypeScript typecheck, ESLint, production build and 299 automated tests pass: 129 unit tests over
+  pure functions and 170 integration tests executed against a live PostgreSQL 18 database.
 - The integration suite covers subscription fanout (hierarchy in both directions, evidence threshold,
   threat-type filter, opt-out switches, idempotency), official alert reconciliation across two polled
   sources (including the end-debounce window and the identical-restart collision), event-driven
@@ -50,6 +52,18 @@ This matrix is the release gate for the initial single-node Docker deployment. `
   refusal of a partial all-clear that repeats its own raion, out-of-order rejection, backlog folding
   and the maximum-duration backstop), outbox delivery and stuck-message reclaim, and the migration
   runner.
+- Threat de-escalation is pinned on the isolation guarantee rather than on the happy path: a
+  withdrawal from one monitor leaves another monitor's assertion standing and the event alive; the
+  last withdrawal moves the event to `withdrawn` and appends `threat.withdrawn`; a source that never
+  asserted changes nothing; an unscoped "нічого не летить" closes every claim of its own source and
+  none of anybody else's; a redirect withdraws for the place passed and asserts for the place
+  approached; the withdrawing source's risk signals decay while every other source's stay live; and
+  `alert_source_states` and `alert_periods` are byte-identical before and after, including
+  `updated_at`.
+- The classification archive is verified by executing its three acceptance queries against ingested
+  data: events per threat class per oblast per month by classifier version, the "where are threats
+  lost" join over `threat_assertions`, and the per-source daily breakdown of messages that raised
+  nothing with the reason for each.
 - Integration tests never pass silently: without a database they report as skipped with an explicit
   reason, and CI sets `REQUIRE_INTEGRATION_DB=1` so a missing database fails the run.
 - Production dependency audit reports zero known vulnerabilities.
