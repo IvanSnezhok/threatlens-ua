@@ -10,3 +10,6 @@ data/postgres/
 backups/
 *.log
 .DS_Store
+
+# Agent worktrees created by Claude Code; never part of the repository.
+.claude/worktrees/

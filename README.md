@@ -20,25 +20,95 @@ Evidence-first situational awareness for Ukraine: a Telegram bot, responsive sta
 - Automatic official KATOTTG import covering 461 cities in the 07.07.2026 release.
 - PostgreSQL migrations, monthly materialized summaries, Prometheus metrics, health checks, Caddy, Docker Compose, and verified daily local backups.
 
-## Quick start
+## Running it
+
+Requirements: Docker with Compose, and Node 22 only if you intend to run the tests or generate a
+Telegram session outside the container.
+
+### 1. Demo mode — one command, no credentials
 
 ```bash
 cp .env.example .env
 docker compose up --build -d
 ```
 
-Open `http://localhost:8080`. The backend is also bound to `http://127.0.0.1:13000` for local development. Readiness is available at `/health/ready`.
+Open the port named by `HTTP_PORT` in your `.env` (default `8080`). The backend is also bound
+directly on `127.0.0.1:13000`, and readiness is `/health/ready`.
 
-The default configuration starts in demo mode with two clearly marked synthetic events. Before public deployment:
+This starts four containers — app, PostgreSQL, Caddy, backup — applies every migration and seeds two
+clearly labelled synthetic events. Nothing external is contacted except the map basemap and the
+occupied-territories layer. Use it to see the interface; it carries no real data.
 
-1. Set strong `POSTGRES_PASSWORD` and `OPS_PASSWORD` values.
-2. Configure `PUBLIC_URL`, `PUBLIC_HOST`, and an HTTPS `SITE_ADDRESS`.
-3. Set `DEMO_SOURCE_ENABLED=false`.
-4. Add `TELEGRAM_API_ID`, `TELEGRAM_API_HASH` and `TELEGRAM_SESSION`. This is what turns official alerts on: the MTProto collector reads both the Air Force channel and the official alert channel `@air_alert_ua`. Validate in staging that the raion and hromada names the channel publishes resolve against the local catalog.
-5. Add `TELEGRAM_BOT_TOKEN` and `TELEGRAM_BOT_USERNAME`.
-6. Optionally add `UKRAINE_ALARM_API_TOKEN` or `ALERTS_IN_UA_TOKEN` for a second independent official source, and validate its location mapping against the provider's current schema.
-7. Configure an OpenAI-compatible structured-output endpoint if AI assessments are required.
-8. Point `MAP_STYLE_URL` to a self-hosted style/PMTiles package; see `data/map/README.md`.
+### 2. Live data — Telegram credentials
+
+Everything real arrives over MTProto, so this is the step that turns the product on. It needs a
+**user** account, not a bot: the Bot API cannot read a channel it does not administer, which is what
+official alert channels are.
+
+```bash
+npm install
+node scripts/telegram-session.mjs
+```
+
+The script asks for `api_id` and `api_hash` from [my.telegram.org](https://my.telegram.org) →
+*API development tools*, then your phone, the login code, and your two-step password if you have one.
+It prints a `TELEGRAM_SESSION` line to paste into `.env`. That string is equivalent to being logged in
+as that account — keep it out of git, revoke from *Telegram → Settings → Devices* if it leaks.
+
+```env
+TELEGRAM_API_ID=…
+TELEGRAM_API_HASH=…
+TELEGRAM_SESSION=…
+DEMO_SOURCE_ENABLED=false
+```
+
+Restart with `docker compose up --build -d`. Official alerts and monitored channels now flow.
+
+### 3. The bot
+
+Create one with [@BotFather](https://t.me/BotFather), then:
+
+```env
+TELEGRAM_BOT_TOKEN=…
+TELEGRAM_BOT_USERNAME=…
+```
+
+The bot registers its own command list on start. Without a token it is skipped and everything else
+keeps working.
+
+### 4. The operator panel
+
+`/ops`, HTTP Basic auth, credentials from `OPS_USER` and `OPS_PASSWORD`. No extra service, no
+separate deployment — it is a route of the same app. In production `OPS_PASSWORD` must be at least
+16 characters or the app refuses to start.
+
+### 5. On a server
+
+Beyond the laptop setup:
+
+```env
+SITE_ADDRESS=https://your.domain        # Caddy obtains a certificate for this name
+PUBLIC_HOST=your.domain
+PUBLIC_URL=https://your.domain          # must be https in production
+POSTGRES_PASSWORD=<strong>
+OPS_PASSWORD=<16+ chars>
+METRICS_TOKEN=<16+ chars>
+DEMO_SOURCE_ENABLED=false
+```
+
+Point the domain's DNS at the host and open 80 and 443 — Caddy handles certificates automatically.
+Production startup **fails fast** on weak ops or metrics credentials, a non-HTTPS `PUBLIC_URL`,
+demo mode left on, or development database credentials. That is deliberate: a half-configured
+alerting system is worse than one that refuses to boot.
+
+### Optional
+
+| What | Why |
+|---|---|
+| `UKRAINE_ALARM_API_TOKEN` / `ALERTS_IN_UA_TOKEN` | A second independent official source. Issued on written application; corroboration, not a prerequisite. |
+| `AI_BASE_URL` / `AI_API_KEY` / `AI_MODEL` | Model-written risk explanations. The deterministic engine runs without it. |
+| `MAP_STYLE_URL` | Self-hosted basemap instead of the public one; see `data/map/README.md`. |
+| `OCCUPATION_SOURCE_ENABLED=false` | Turn off the occupied-territories layer. |
 
 ## Telegram commands
 
@@ -193,3 +263,89 @@ in staging; unknown locations are rejected rather than silently shown in the wro
 `docs/EXTERNAL_SETUP.md` for the human-controlled launch checklist.
 
 The location catalog is imported from the [official Ministry KATOTTG publication](https://mindev.gov.ua/diialnist/rozvytok-mistsevoho-samovriaduvannia/kodyfikator-administratyvno-terytorialnykh-odynyts-ta-terytorii-terytorialnykh-hromad), used under the Ukrainian open-data attribution terms. KATOTTG provides names and hierarchy, not map coordinates; cities without verified coordinates remain searchable and subscribable but are not placed at an approximate point.
+
+## Capabilities, and what each one actually does
+
+Every row is either working today or explicitly not. Nothing here is aspirational.
+
+### Alerts — official, authoritative
+
+| | |
+|---|---|
+| **What** | Air raid alert start and all-clear, per oblast and per raion. |
+| **Where from** | `@air_alert_ua` (no token needed), optionally the two alert APIs, plus 21 oblast administration channels registered but **not yet routed**. |
+| **How it ends** | Only an official source ends an alert. A polled source that goes quiet must stay quiet for `ALERT_END_DEBOUNCE_SECONDS` (60s = four missed polls) before the alert drops — one incomplete API response cannot produce a false all-clear. A channel source announces its all-clear explicitly and is not debounced. |
+| **Failure bound** | A missing all-clear on the channel path is capped by `ALERT_CHANNEL_MAX_ALERT_SECONDS` (24h). It fires as a defect report, not as routine expiry — it is set far above any real alert on purpose. |
+| **Not this** | The AI engine and OSINT monitoring **cannot** start or end an official alert, ever. That is enforced by adapter routing, by a database constraint, and by a test. |
+
+### Threats — monitored, corroborated
+
+| | |
+|---|---|
+| **What** | UAV, ballistic, cruise, KAB, aviation, MLRS, artillery, mortar. Classified from message text with locations and reported direction. |
+| **Where from** | Air Force channel plus 37 monitoring channels at tiers B and C. |
+| **Evidence** | `unverified` → `monitoring` → `confirmed` → `official`. Two independent source groups promote to `confirmed`. Reposts share a group, so a copy cannot confirm its original. |
+| **Falling** | A source can stand down what it reported. A stand-down retracts **only that source's** claim; the event ends when nothing holds it. One channel cannot clear a threat two others still report. |
+| **Not this** | No trajectory extrapolation on the public map. Only reported regions, points and directions are drawn. |
+
+### Risk index — explainable, clamped
+
+| | |
+|---|---|
+| **What** | A six-hour relative index per location and threat type, with the signals behind it. |
+| **How** | Time decay with a two-hour half-life, weighted by source reliability. |
+| **Clamps** | Only tier C sources → maximum 3.9. No tier A source → maximum 5.9. Fewer than two independent groups → confidence forced to `low`. The model cannot exceed what the sources support. |
+| **Without a model** | A deterministic engine produces the same shape of output. The model is an improvement, never a dependency. |
+| **Not this** | Not a probability. The indicative percentage is a scale reading. A low score never means safe. |
+
+### Map
+
+| | |
+|---|---|
+| **Alert polygons** | Oblasts and all 136 raions fill by alert state, driven by feature-state rather than regenerated geometry. Raions appear from zoom 6.0 and take over at 6.8. |
+| **Sovereignty** | The internationally recognized border renders above every fill; Crimea and Sevastopol are Ukraine and labelled as such. |
+| **Occupation** | A separate reference layer under the border. Temporary factual condition, never a change of border. |
+| **Boundaries** | Raion geometry built from OpenStreetMap, matched to the catalogue by KATOTTG code, simplified per shared way so neighbours cannot develop gaps. 1.05 MB, 0.31 MB gzipped. |
+
+### Bot
+
+Nine commands, all implemented: `/start`, `/city`, `/status`, `/analytics`, `/settings`, `/channels`,
+`/stop`, `/delete_me`, `/help`. Delivery uses a PostgreSQL outbox with idempotency keys, retry with
+backoff, Telegram `retry_after`, automatic disabling of blocked users, and reclaim of messages stuck
+mid-send. Standing a threat down sends nothing rather than re-sending the original warning text — a
+message that reads as an all-clear must come from an official source.
+
+### Analysis archive
+
+Every classification decision is stored, including the decisions to raise nothing and why, stamped
+with the classifier version. Without that stamp, a change in our own rules is indistinguishable from
+a change in enemy tactics. Three queries ship in `docs/OPERATIONS.md`: events by type and oblast over
+time, **where threats are lost** (last asserted vs. withdrawn, with elapsed time), and what each
+source published that raised nothing.
+
+## Roadmap
+
+### In progress
+
+| | State |
+|---|---|
+| **Routing for 21 official oblast channels** | Registered in the database, inert. Alert routing reads one channel from configuration rather than the catalogue, and the parser does not yet handle their word order (`🔴 <район> - повітряна тривога!` versus `🔴 13:47 Повітряна тривога в <район>`). |
+| **Analytics endpoints** | Archive schema and queries exist; the operator-facing slices do not. |
+| **Threat vectors** | Chains of *reported* movement, public. Extrapolation computed but exposed only under `/ops`, stored separately so it cannot leak into a public response. |
+
+### Next
+
+| | Why it matters |
+|---|---|
+| **Operator panel: source management** | 58 sources exist, 24 deliberately disabled, and the panel cannot show or toggle any of them — it manages the user-facing recommendation list instead. It also has no view of catalogue gaps, stuck alerts, withdrawals, or which source is holding an alert open. |
+| **Conditional forward warning** | The nightly digest is unconditional and fixed at 23:20. A warning issued *because* a threat is building — for the coming evening or day — does not exist yet. |
+| **Model-based classification** | Classification is still regular expressions. The model currently only scores risk. Moving classification to a model needs a labelled corpus and shadow-mode comparison first — the archive above is what makes that possible. |
+| **Russian-language sources** | Three registered channels stay disabled because the classifier and the location catalogue are Ukrainian-only. |
+| **Delivery rate governor** | Burst coalescing is per source. During a mass attack across 46 subscriptions, aggregate fan-out is unreviewed. |
+
+### Known limits
+
+- Single application replica. Schedulers share database cursors; horizontal scaling needs advisory-lock leadership first.
+- `sources.enabled` does not gate the two polled API adapters — they check only for a token.
+- Alerts at hromada level resolve to the parent raion; the catalogue has no hromada tier.
+- Abbreviated administrative forms (`р-н`, `обл.`) resolve to the namesake city rather than the district.
