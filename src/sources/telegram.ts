@@ -55,8 +55,8 @@ export async function startTelegramCollector(log: CollectorLogger): Promise<(() 
   const alertChannelEnabled = config.ALERT_CHANNEL_ENABLED && Boolean(alertChannel);
   try {
     const [{ TelegramClient }, { StringSession }, { NewMessage }, { EditedMessage }] = await Promise.all([
-      import('telegram'), import('telegram/sessions/index.js'), import('telegram/events/index.js'),
-      import('telegram/events/EditedMessage.js')
+      import('teleproto'), import('teleproto/sessions/index.js'), import('teleproto/events/index.js'),
+      import('teleproto/events/EditedMessage.js')
     ]);
     const client = new TelegramClient(
       new StringSession(config.TELEGRAM_SESSION), Number(config.TELEGRAM_API_ID), config.TELEGRAM_API_HASH,
