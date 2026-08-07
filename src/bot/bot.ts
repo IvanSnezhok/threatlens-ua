@@ -1,6 +1,7 @@
 import { Bot, InlineKeyboard } from 'grammy';
 import { config } from '../config.js';
 import { pool } from '../db/pool.js';
+import { LOCATION_HIERARCHY_MAX_DEPTH } from '../repositories/events.js';
 import { listRecommendedChannels } from '../services/recommended-channels.js';
 
 const threatLabels: Record<string, string> = {
@@ -142,17 +143,34 @@ export function createBot() {
 
   bot.command('status', async (ctx) => {
     const rows = await pool.query(
-      `SELECT l.name_uk,
-        EXISTS(SELECT 1 FROM alert_periods ap LEFT JOIN locations child ON child.id=s.location_id
-          WHERE ap.status='active' AND (ap.location_id=s.location_id OR ap.location_id=child.parent_id)) alert_active,
+      `WITH RECURSIVE roots(root) AS (
+         SELECT DISTINCT location_id FROM subscriptions WHERE chat_id=$1 AND enabled=true
+       ), sub_ancestors(root,id,depth,path) AS (
+           SELECT root,root,0,ARRAY[root] FROM roots
+         UNION ALL
+           SELECT a.root,parent.id,a.depth+1,a.path||parent.id
+           FROM sub_ancestors a JOIN locations self ON self.id=a.id
+           JOIN locations parent ON parent.id=self.parent_id
+           WHERE a.depth<${LOCATION_HIERARCHY_MAX_DEPTH} AND NOT (parent.id=ANY(a.path))
+       ), sub_descendants(root,id,depth,path) AS (
+           SELECT root,root,0,ARRAY[root] FROM roots
+         UNION ALL
+           SELECT d.root,child.id,d.depth+1,d.path||child.id
+           FROM sub_descendants d JOIN locations child ON child.parent_id=d.id
+           WHERE d.depth<${LOCATION_HIERARCHY_MAX_DEPTH} AND NOT (child.id=ANY(d.path))
+       ), sub_related(root,id) AS (
+           SELECT root,id FROM sub_ancestors UNION SELECT root,id FROM sub_descendants
+       )
+       SELECT l.name_uk,
+        EXISTS(SELECT 1 FROM alert_periods ap JOIN sub_related r ON r.id=ap.location_id
+          WHERE r.root=s.location_id AND ap.status='active') alert_active,
         t.title threat_title,t.evidence_level,t.valid_until,
         a.threat_type assessment_type,a.risk_score,a.risk_level,a.indicative_percent,a.assessment_confidence
        FROM subscriptions s JOIN locations l ON l.id=s.location_id
        LEFT JOIN LATERAL (
          SELECT e.title,e.evidence_level,e.valid_until FROM threat_events e
-         JOIN threat_event_locations el ON el.event_id=e.id LEFT JOIN locations event_location ON event_location.id=el.location_id
-         LEFT JOIN locations subscribed ON subscribed.id=s.location_id
-         WHERE (el.location_id=s.location_id OR event_location.parent_id=s.location_id OR el.location_id=subscribed.parent_id)
+         JOIN threat_event_locations el ON el.event_id=e.id
+         WHERE EXISTS (SELECT 1 FROM sub_related r WHERE r.root=s.location_id AND r.id=el.location_id)
            AND e.status IN ('observed','confirmed','active')
          ORDER BY e.last_observed_at DESC LIMIT 1
        ) t ON true

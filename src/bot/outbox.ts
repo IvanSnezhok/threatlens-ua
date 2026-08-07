@@ -1,6 +1,7 @@
 import type { Bot } from 'grammy';
 import { config } from '../config.js';
 import { pool } from '../db/pool.js';
+import { relatedLocationsCte } from '../repositories/events.js';
 
 const threatLabels: Record<string, string> = {
   uav: 'ударні БпЛА', ballistic_missile: 'балістичні ракети',
@@ -23,18 +24,21 @@ async function insertForSubscribers(args: {
   locationId: string; type: string; entityId: string; eventVersion: number;
   priority: number; payload: Record<string, unknown>; threatType?: string; evidenceLevel?: string;
 }) {
+  // `related_locations` is the whole ancestor and descendant chain of the event location, so an
+  // oblast subscriber keeps receiving a city event once a raion sits between the two. `DISTINCT`
+  // collapses a chat that holds several matching subscriptions (oblast *and* raion *and* city) into
+  // the single outbox row `idempotency_key` would otherwise have to absorb.
   await pool.query(
-    `INSERT INTO notification_outbox(event_id,alert_period_id,assessment_id,chat_id,notification_type,idempotency_key,priority,payload)
-     SELECT CASE WHEN $2='threat_update' THEN $3::uuid END,
+    `${relatedLocationsCte()}
+     INSERT INTO notification_outbox(event_id,alert_period_id,assessment_id,chat_id,notification_type,idempotency_key,priority,payload)
+     SELECT DISTINCT
+            CASE WHEN $2='threat_update' THEN $3::uuid END,
             CASE WHEN $2 IN ('alert_start','alert_end') THEN $3::uuid END,
             CASE WHEN $2='assessment_update' THEN $3::uuid END,
-            s.chat_id,$2,$3||':'||s.chat_id||':'||$2||':'||$4,$5,$6
+            s.chat_id,$2::text,$3||':'||s.chat_id||':'||$2||':'||$4,$5::integer,$6::jsonb
      FROM subscriptions s JOIN telegram_users u ON u.chat_id=s.chat_id
-     WHERE s.enabled=true AND u.enabled=true AND (
-       s.location_id=$1 OR
-       EXISTS (SELECT 1 FROM locations subscribed WHERE subscribed.id=s.location_id AND subscribed.parent_id=$1) OR
-       EXISTS (SELECT 1 FROM locations event_location WHERE event_location.id=$1 AND event_location.parent_id=s.location_id)
-     )
+     WHERE s.enabled=true AND u.enabled=true
+       AND EXISTS (SELECT 1 FROM related_locations r WHERE r.id=s.location_id)
        AND (
          ($2='alert_start' AND s.notify_alert_start=true) OR
          ($2='alert_end' AND s.notify_alert_end=true) OR

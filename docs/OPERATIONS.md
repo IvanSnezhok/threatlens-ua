@@ -72,6 +72,24 @@ Production backups must additionally be encrypted and copied to independent obje
   Lowering `ALERT_END_DEBOUNCE_SECONDS` does not help in this scenario — with no polls, nothing
   re-evaluates. If *every* official source is down the site is in its documented degraded state and
   the alert layer must be presented as stale, not as current.
+- **Stuck alert on the official channel source (`threatlens_alert_channel_stuck_alerts_total > 0`).**
+  The channel is event-driven: an alert ends only when a 🟢 message names its location. If such a
+  message is never published, is edited away, or arrives in a shape the parser refuses, the location
+  keeps its alert indefinitely. `ALERT_CHANNEL_MAX_ALERT_SECONDS` (default 86400) is the backstop
+  that clears it and increments the counter, and the accompanying `warn` log names the location and
+  its start time.
+
+  A non-zero counter means a 🟢 was genuinely lost — treat it as a parser defect report, not as
+  routine noise. Open `https://t.me/s/air_alert_ua`, find the all-clear for that location and compare
+  it against `src/domain/alert-parser.ts`: the channel publishes partial all-clears (🟡) carrying a
+  "тривога ще триває у:" addendum, threat stand-downs (`Відбій загрози`, `Відбій по КАБах`) that must
+  never end an air raid, and occasional typo headlines. A new wording variant belongs in the parser
+  with a test, not in a lowered threshold.
+
+  **Never lower `ALERT_CHANNEL_MAX_ALERT_SECONDS` toward a realistic alert duration.** The bound sits
+  above the longest plausible real alert on purpose — overnight mass-attack alerts run 8–11 hours and
+  frontline raions hold much of a day. Tuning it down converts a defect detector into a generator of
+  false "Офіційний відбій" messages, which is the failure this system is built to avoid.
 - **Telegram 403:** the user is disabled automatically; queued messages stop.
 - **Telegram 429:** delivery uses the provider `retry_after` value.
 - **AI invalid/timeout:** failure is recorded and deterministic fallback is used.

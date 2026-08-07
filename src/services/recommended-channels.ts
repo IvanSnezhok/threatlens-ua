@@ -1,5 +1,6 @@
 import { z } from 'zod';
 import { pool } from '../db/pool.js';
+import { relatedLocationsCte } from '../repositories/events.js';
 
 const username = z.string().trim().transform((value) => value
   .replace(/^https?:\/\/(?:www\.)?t\.me\//i, '')
@@ -35,14 +36,14 @@ export type UpdateChannelInput = z.infer<typeof updateChannelSchema>;
 
 export async function listRecommendedChannels(locationId?: string | null, includeInactive = false) {
   const result = await pool.query(
-    `SELECT c.id,c.title,c.username,c.description,c.category,c.location_id,l.name_uk AS location_name,
+    `${relatedLocationsCte('$2')}
+     SELECT c.id,c.title,c.username,c.description,c.category,c.location_id,l.name_uk AS location_name,
             c.verified,c.active,c.sort_order,c.created_by,c.created_at,c.updated_at
      FROM recommended_telegram_channels c
      LEFT JOIN locations l ON l.id=c.location_id
      WHERE ($1::boolean OR c.active=true)
-       AND ($2::text IS NULL OR c.location_id IS NULL OR c.location_id=$2
-         OR EXISTS (SELECT 1 FROM locations selected WHERE selected.id=$2 AND selected.parent_id=c.location_id)
-         OR EXISTS (SELECT 1 FROM locations channel_location WHERE channel_location.id=c.location_id AND channel_location.parent_id=$2))
+       AND ($2::text IS NULL OR c.location_id IS NULL
+         OR EXISTS (SELECT 1 FROM related_locations r WHERE r.id=c.location_id))
      ORDER BY c.active DESC,c.verified DESC,c.sort_order,c.title`,
     [includeInactive, locationId ?? null]
   );

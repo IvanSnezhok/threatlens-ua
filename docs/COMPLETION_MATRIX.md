@@ -5,9 +5,10 @@ This matrix is the release gate for the initial single-node Docker deployment. `
 | Requirement | State | Implementation / verification |
 |---|---|---|
 | One-command Docker start | Implemented | `compose.yaml` starts Caddy, app, PostgreSQL and backup services with health dependencies. |
-| PostgreSQL history and migrations | Implemented | Eight idempotent migrations (`001_init` … `008_alert_end_debounce`) applied by an advisory-locked runner; readiness requires `008_alert_end_debounce.sql`. |
-| Official alert ingestion | Implemented | Ukraine Alarm and Alerts.in.ua adapters, per-provider state and aggregate start/end reconciliation. An alert ends only after every source that held it has been silent for `ALERT_END_DEBOUNCE_SECONDS` (default 60 = four polls), so one missed poll cannot emit a false all-clear. Tokens remain external setup. |
-| Public-channel monitoring | Implemented | Telegram MTProto collector handles new and edited messages. API credentials/session remain external setup. |
+| PostgreSQL history and migrations | Implemented | Ten idempotent migrations (`001_init` … `010_alert_channel_source`) applied by an advisory-locked runner; readiness requires `008_alert_end_debounce.sql`. |
+| Official alert ingestion | Implemented | Three tier A sources — the Ukraine Alarm and Alerts.in.ua APIs plus the official channel `@air_alert_ua` — feeding per-source state and one aggregate start/end reconciler. For a polled source an alert ends only after every source that held it has been silent for `ALERT_END_DEBOUNCE_SECONDS` (default 60 = four polls), so one missed poll cannot emit a false all-clear. API tokens remain external setup; the channel needs none. |
+| Official alerts without an API token | Implemented | `@air_alert_ua` is read through the MTProto collector, parsed by a pure function (`src/domain/alert-parser.ts`) and reconciled event-by-event: 🔴/🟢 move only the raions a message names, an explicit all-clear skips the polled-source debounce, out-of-order messages are refused via `alert_source_states.last_event_at`, and a missing all-clear is bounded by `ALERT_CHANNEL_MAX_ALERT_SECONDS` (default 24 h) with a warn log and `threatlens_alert_channel_stuck_alerts_total`. |
+| Public-channel monitoring | Implemented | Telegram MTProto collector handles new and edited messages for both the Air Force channel and the official alert channel, and re-reads a bounded, order-folded history window after a reconnect. API credentials/session remain external setup. |
 | Threat normalization | Implemented | UAV, ballistic/cruise missile, KAB, aviation, MLRS, artillery, mortar and combined classifications. |
 | Evidence and provenance | Implemented | Source tier, independence group, raw message, URL, revisions, corroboration and non-downgrading evidence. |
 | Event lifecycle | Implemented | Deduplication, merge, correction, expiry, update history and SSE event versions. |
@@ -24,7 +25,7 @@ This matrix is the release gate for the initial single-node Docker deployment. `
 | Interactive Ukraine map | Implemented | MapLibre layers, explicit freshness, layer controls, event details and map fit control. |
 | Crimea and Sevastopol sovereignty context | Implemented | Pinned UKR ADM0/ADM1 overlays render above the basemap; Crimea and Sevastopol are explicitly marked as Ukraine. |
 | Temporarily occupied territories layer | Implemented | DeepStateMap sync behind `OCCUPATION_SOURCE_ENABLED`, status-key allowlist, border clipping, revision history in `occupation_snapshots`, cached `/api/v1/occupation` endpoint and rejection metrics. Reference context only: it feeds no alert, threat or risk path. |
-| Occupation data licence | External setup | Attribution is emitted in every response and the source is switchable off, but DeepStateMap data is not under an open licence. Terms of use for a public deployment are unresolved and owned by the product owner. |
+| Occupation data licence | Implemented for personal use | DeepStateMap data is not under an open licence. Attribution is emitted in every response and the source is switchable off with one flag. The product owner runs the project personally, which needs no written permission, so the layer ships enabled. The requirement returns on public distribution and remains owned by the product owner. |
 | Territorial click history | Implemented | Oblast polygons and verified city points open combined alert, threat and analytical timelines with a full-history deep link. |
 | Phone and TV support | Implemented | Browser-verified at 390x844 and 1920x1080; dedicated `/tv` layout. |
 | History and monthly analytics | Implemented | Filterable history; monthly alert duration and threat-message summaries with location filters. |
@@ -34,18 +35,21 @@ This matrix is the release gate for the initial single-node Docker deployment. `
 | Security baseline | Implemented | Production fail-fast configuration, auth, rate limit, CSP and browser security headers, sanitized errors. |
 | Privacy controls | Implemented | Minimal Telegram data, stop and cascade deletion. Controller/legal notice remains external setup. |
 | Backups and restore | Implemented | Scheduled custom dumps, checksum, archive validation and isolated restore test. Off-site encrypted storage remains external setup. |
-| Public deployment | External setup | Domain/DNS, HTTPS host, live source tokens, Telegram registrations, secrets, monitoring receiver and off-site storage. |
+| Public deployment | External setup | Domain/DNS, HTTPS host, Telegram registrations (bot plus the MTProto credentials that enable the official alert channel), secrets, monitoring receiver and off-site storage. Official alert API tokens are optional corroboration, no longer a prerequisite. |
 
 | Continuous verification | Implemented | GitHub Actions runs typecheck, lint, the full test suite against a PostgreSQL service container, and the production build on every push and pull request to `main`. |
 
 ## Verified release checks
 
-- TypeScript typecheck, ESLint, production build and 106 automated tests pass: 54 unit tests over pure
-  functions and 52 integration tests executed against a live PostgreSQL 18 database.
+- TypeScript typecheck, ESLint, production build and 201 automated tests pass: 96 unit tests over pure
+  functions and 105 integration tests executed against a live PostgreSQL 18 database.
 - The integration suite covers subscription fanout (hierarchy in both directions, evidence threshold,
-  threat-type filter, opt-out switches, idempotency), official alert reconciliation across two sources
-  (including the end-debounce window and the identical-restart collision), outbox delivery and
-  stuck-message reclaim, and the migration runner.
+  threat-type filter, opt-out switches, idempotency), official alert reconciliation across two polled
+  sources (including the end-debounce window and the identical-restart collision), event-driven
+  reconciliation of the official alert channel (per-raion isolation of starts and all-clears, the
+  refusal of a partial all-clear that repeats its own raion, out-of-order rejection, backlog folding
+  and the maximum-duration backstop), outbox delivery and stuck-message reclaim, and the migration
+  runner.
 - Integration tests never pass silently: without a database they report as skipped with an explicit
   reason, and CI sets `REQUIRE_INTEGRATION_DB=1` so a missing database fails the run.
 - Production dependency audit reports zero known vulnerabilities.

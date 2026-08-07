@@ -6,7 +6,8 @@ Evidence-first situational awareness for Ukraine: a Telegram bot, responsive sta
 
 ## What is implemented
 
-- Two official alert adapters, per-source state reconciliation, and normalized alert periods.
+- Three official (tier A) alert sources, per-source state reconciliation, and normalized alert periods: the Ukraine Alarm and Alerts.in.ua APIs, plus the official alert channel [@air_alert_ua](https://t.me/air_alert_ua), which needs no API token and works out of the box with the Telegram collector credentials.
+- Two reconciliation models behind one aggregate: snapshot polling for the APIs, and an event-driven path for the channel, which announces raion-level alerts and all-clears one at a time and must never be read as "everything unmentioned is clear".
 - Threat event classifier for UAVs, ballistic and cruise missiles, KABs, aviation, MLRS, artillery, and mortars.
 - Evidence levels: `unverified`, `monitoring`, `confirmed`, and `official`.
 - Corroboration by independent source groups; reposts do not count as independent confirmation.
@@ -33,10 +34,11 @@ The default configuration starts in demo mode with two clearly marked synthetic 
 1. Set strong `POSTGRES_PASSWORD` and `OPS_PASSWORD` values.
 2. Configure `PUBLIC_URL`, `PUBLIC_HOST`, and an HTTPS `SITE_ADDRESS`.
 3. Set `DEMO_SOURCE_ENABLED=false`.
-4. Add the official alert API token and validate its location mapping against the provider's current schema.
-5. Add `TELEGRAM_BOT_TOKEN` and `TELEGRAM_BOT_USERNAME`; configure the MTProto collector for the Air Force channel.
-6. Configure an OpenAI-compatible structured-output endpoint if AI assessments are required.
-7. Point `MAP_STYLE_URL` to a self-hosted style/PMTiles package; see `data/map/README.md`.
+4. Add `TELEGRAM_API_ID`, `TELEGRAM_API_HASH` and `TELEGRAM_SESSION`. This is what turns official alerts on: the MTProto collector reads both the Air Force channel and the official alert channel `@air_alert_ua`. Validate in staging that the raion and hromada names the channel publishes resolve against the local catalog.
+5. Add `TELEGRAM_BOT_TOKEN` and `TELEGRAM_BOT_USERNAME`.
+6. Optionally add `UKRAINE_ALARM_API_TOKEN` or `ALERTS_IN_UA_TOKEN` for a second independent official source, and validate its location mapping against the provider's current schema.
+7. Configure an OpenAI-compatible structured-output endpoint if AI assessments are required.
+8. Point `MAP_STYLE_URL` to a self-hosted style/PMTiles package; see `data/map/README.md`.
 
 ## Telegram commands
 
@@ -56,7 +58,7 @@ The bot does not invent an alert. Official alert state and analytical risk asses
 
 ```mermaid
 flowchart LR
-  Sources[Official APIs and monitored channels] --> Normalize[Normalize and classify]
+  Sources[Official alert sources and monitored channels] --> Normalize[Normalize and classify]
   Normalize --> Evidence[Evidence and independent-source deduplication]
   Evidence --> Events[(PostgreSQL events)]
   Events --> Risk[Six-hour risk assessment]
@@ -160,15 +162,34 @@ drawn on the map. Accepted polygons are then clipped to the recognized ADM0 bord
 Clipping is the second line of defence, not the first. Transnistria's polygon overlaps the Ukrainian border
 closely enough to survive geometric clipping, so the allowlist — not the clip — is what keeps it off the map.
 
-### Data licence — unresolved
+### Data licence
 
 DeepStateMap data is **not** published under an open licence. Attribution is emitted in every
-`/api/v1/occupation` response and the source can be switched off with a single flag, but terms of use for a
-public deployment have not been agreed. The product owner must obtain explicit permission from DeepState
-before a public launch, or deploy with `OCCUPATION_SOURCE_ENABLED=false`.
+`/api/v1/occupation` response and the source can be switched off with a single flag. The product owner runs
+this project personally, and personal use requires no written permission, so the layer ships enabled. The
+requirement returns on public distribution: before a public launch, obtain explicit permission from
+DeepState or deploy with `OCCUPATION_SOURCE_ENABLED=false`.
+
+## Official alerts without an API contract
+
+Both official alert APIs require a token issued on written application. The official alert channel
+[@air_alert_ua](https://t.me/air_alert_ua) carries the same executive-authority and State Emergency
+Service notifications and needs no credential, so it is the source that makes official alerts work out of
+the box. It is registered as a tier A official source in its own independence group — designation and
+tier are what make a source official, not whether the bytes arrive over HTTPS or MTProto.
+
+It is read with an event-driven reconciler rather than the snapshot one, because it publishes
+transitions per raion rather than a national picture per poll. A message about one raion never touches
+another, an explicit all-clear is not delayed by the polled-source debounce, an older message can never
+override a newer one, and a missing all-clear is bounded by `ALERT_CHANNEL_MAX_ALERT_SECONDS` instead of
+leaving an alert up forever. What has not changed: neither the AI engine nor OSINT channel monitoring can
+start or end an official alert. See `docs/ARCHITECTURE.md`.
 
 ## Known integration boundary
 
-Access tokens and contractual schemas for public alert providers are not included. Adapters stay disabled without a token. Validate each provider in staging; unknown locations are rejected rather than silently shown in the wrong region. See `docs/EXTERNAL_SETUP.md` for the human-controlled launch checklist.
+Access tokens and contractual schemas for the two public alert *APIs* are not included; those adapters stay
+disabled without a token and are optional corroboration rather than a prerequisite. Validate each provider
+in staging; unknown locations are rejected rather than silently shown in the wrong region. See
+`docs/EXTERNAL_SETUP.md` for the human-controlled launch checklist.
 
 The location catalog is imported from the [official Ministry KATOTTG publication](https://mindev.gov.ua/diialnist/rozvytok-mistsevoho-samovriaduvannia/kodyfikator-administratyvno-terytorialnykh-odynyts-ta-terytorii-terytorialnykh-hromad), used under the Ukrainian open-data attribution terms. KATOTTG provides names and hierarchy, not map coordinates; cities without verified coordinates remain searchable and subscribable but are not placed at an approximate point.

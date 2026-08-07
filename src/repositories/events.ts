@@ -3,6 +3,68 @@ import type { PoolClient } from 'pg';
 import { pool } from '../db/pool.js';
 import type { ClassifiedMessage, EvidenceLevel, LiveEvent, NormalizedMessage } from '../types.js';
 
+// ------------------------------------------------------------------------------------------------
+// Location hierarchy
+// ------------------------------------------------------------------------------------------------
+
+/**
+ * Hard ceiling on the number of `parent_id` edges any hierarchy walk follows.
+ *
+ * The catalogue is three tiers deep (`oblast` -> `raion` -> `city`) and the schema also permits
+ * `country` and `hromada`, so the longest legal chain is four edges. Eight leaves room for a tier
+ * to be inserted without a code change while still bounding the work a malformed import can cause.
+ */
+export const LOCATION_HIERARCHY_MAX_DEPTH = 8;
+
+/**
+ * `WITH RECURSIVE` prefix that defines `related_locations(id)`.
+ *
+ * The set is every location reachable from `anchor` by following `parent_id` upwards **or**
+ * downwards to any depth, plus the anchor itself. That is what "the same place" means for a
+ * subscriber: somebody watching an oblast wants the events of every raion and every city inside it,
+ * and somebody watching a city wants the oblast-wide alerts that cover them. Matching a single
+ * `parent_id` edge, which is what this replaced, silently drops both directions the moment a raion
+ * tier sits between oblast and city.
+ *
+ * Cycle protection is deliberate rather than incidental. `parent_id` comes from KATOTTG, i.e. from
+ * outside the process, so it is not trusted to be acyclic. Two independent stops are applied:
+ * each branch carries the ids it has already visited and refuses to re-enter one, which cuts a
+ * cycle exactly where it closes, and `depth` caps the walk unconditionally at
+ * {@link LOCATION_HIERARCHY_MAX_DEPTH}. Either alone terminates; together they also keep a cyclic
+ * catalogue from re-expanding a subtree.
+ *
+ * `anchor` is a placeholder expression (a parameter reference such as `$1`), never interpolated
+ * user data — every call site keeps passing the location id as a bind parameter.
+ */
+export function relatedLocationsCte(anchor = '$1'): string {
+  return `WITH RECURSIVE location_ancestors(id,parent_id,depth,path) AS (
+      SELECT anchor.id,anchor.parent_id,0,ARRAY[anchor.id] FROM locations anchor WHERE anchor.id=${anchor}
+    UNION ALL
+      SELECT parent.id,parent.parent_id,child.depth+1,child.path||parent.id
+      FROM location_ancestors child JOIN locations parent ON parent.id=child.parent_id
+      WHERE child.depth<${LOCATION_HIERARCHY_MAX_DEPTH} AND NOT (parent.id=ANY(child.path))
+  ), location_descendants(id,depth,path) AS (
+      SELECT anchor.id,0,ARRAY[anchor.id] FROM locations anchor WHERE anchor.id=${anchor}
+    UNION ALL
+      SELECT child.id,parent.depth+1,parent.path||child.id
+      FROM location_descendants parent JOIN locations child ON child.parent_id=parent.id
+      WHERE parent.depth<${LOCATION_HIERARCHY_MAX_DEPTH} AND NOT (child.id=ANY(parent.path))
+  ), related_locations(id) AS (
+      SELECT id FROM location_ancestors UNION SELECT id FROM location_descendants
+  )`;
+}
+
+/**
+ * Materialises {@link relatedLocationsCte} for callers that fan one location out over several
+ * statements, so the walk is paid for once instead of once per statement.
+ */
+export async function relatedLocationIds(locationId: string): Promise<string[]> {
+  const result = await pool.query<{ id: string }>(
+    `${relatedLocationsCte()} SELECT id FROM related_locations`, [locationId]
+  );
+  return result.rows.map((row) => row.id);
+}
+
 export async function listLocationLexemes() {
   const result = await pool.query<{ id: string; name_uk: string; aliases: string[] }>(
     `SELECT id, name_uk, aliases FROM locations WHERE type <> 'country' ORDER BY length(name_uk) DESC`
@@ -83,9 +145,20 @@ export async function ingestThreat(message: NormalizedMessage, classified: Class
           relevance: location.relationType === 'explicit_threat' ? 1 : location.relationType === 'reported_direction' ? 0.75 : 0.55
         }));
     if (!classified.nationalScope && classified.locations.length) {
+      // The oblast that carries the risk signal for a city is no longer its direct parent once a
+      // raion tier sits in between, so the ancestor chain is walked rather than one edge. Same
+      // cycle guards as `relatedLocationsCte`; `depth>0` keeps a location from being treated as its
+      // own parent when it already is an oblast.
       const parents = await client.query<{ id: string }>(
-        `SELECT DISTINCT parent.id FROM locations child JOIN locations parent ON parent.id=child.parent_id
-         WHERE child.id=ANY($1::text[]) AND parent.type='oblast'`,
+        `WITH RECURSIVE ancestors(id,parent_id,type,depth,path) AS (
+            SELECT child.id,child.parent_id,child.type,0,ARRAY[child.id]
+            FROM locations child WHERE child.id=ANY($1::text[])
+          UNION ALL
+            SELECT parent.id,parent.parent_id,parent.type,child.depth+1,child.path||parent.id
+            FROM ancestors child JOIN locations parent ON parent.id=child.parent_id
+            WHERE child.depth<${LOCATION_HIERARCHY_MAX_DEPTH} AND NOT (parent.id=ANY(child.path))
+         )
+         SELECT DISTINCT id FROM ancestors WHERE depth>0 AND type='oblast'`,
         [classified.locations.map((location) => location.id)]
       );
       for (const parent of parents.rows) {
@@ -326,15 +399,18 @@ export async function locationTimeline(locationId: string, limit = 100) {
     `SELECT id,parent_id,type,name_uk,latitude,longitude FROM locations WHERE id=$1`, [locationId]
   )).rows[0];
   if (!location) return null;
-  const applies = `(target.id=$1 OR target.parent_id=$1 OR
-    target.id=(SELECT parent_id FROM locations WHERE id=$1))`;
+  // Six statements share one hierarchy walk: resolving the ids once and binding them as an array is
+  // cheaper than repeating the recursive CTE in each of them, and keeps the six definitions of
+  // "belongs to this location" identical by construction.
+  const related = await relatedLocationIds(locationId);
+  const applies = `target.id=ANY($1::text[])`;
   const [threats, alerts, assessments, threatCount, alertCount, assessmentCount] = await Promise.all([
     pool.query(
       `SELECT DISTINCT e.id,'threat' AS kind,e.started_at AS happened_at,e.title,e.summary,e.status,
               e.threat_type,e.evidence_level,e.valid_until,NULL::numeric AS risk_score,NULL::text AS risk_level
        FROM threat_events e JOIN threat_event_locations el ON el.event_id=e.id
        JOIN locations target ON target.id=el.location_id WHERE ${applies}
-       ORDER BY e.started_at DESC LIMIT $2`, [locationId, limit]
+       ORDER BY e.started_at DESC LIMIT $2`, [related, limit]
     ),
     pool.query(
       `SELECT a.id,'alert' AS kind,a.started_at AS happened_at,
@@ -343,7 +419,7 @@ export async function locationTimeline(locationId: string, limit = 100) {
               a.status,a.alert_type AS threat_type,'official' AS evidence_level,a.ended_at AS valid_until,
               NULL::numeric AS risk_score,NULL::text AS risk_level
        FROM alert_periods a JOIN locations target ON target.id=a.location_id WHERE ${applies}
-       ORDER BY a.started_at DESC LIMIT $2`, [locationId, limit]
+       ORDER BY a.started_at DESC LIMIT $2`, [related, limit]
     ),
     pool.query(
       `SELECT a.id,'assessment' AS kind,a.generated_at AS happened_at,'Аналітичне попередження' AS title,
@@ -351,14 +427,14 @@ export async function locationTimeline(locationId: string, limit = 100) {
               CASE WHEN a.superseded_by IS NULL AND a.expires_at>now() THEN 'active' ELSE 'expired' END AS status,
               a.threat_type,NULL::text AS evidence_level,a.horizon_end AS valid_until,a.risk_score,a.risk_level
        FROM risk_assessments a JOIN locations target ON target.id=a.location_id WHERE a.published=true AND ${applies}
-       ORDER BY a.generated_at DESC LIMIT $2`, [locationId, limit]
+       ORDER BY a.generated_at DESC LIMIT $2`, [related, limit]
     ),
     pool.query(`SELECT count(DISTINCT e.id)::integer AS count FROM threat_events e
-      JOIN threat_event_locations el ON el.event_id=e.id JOIN locations target ON target.id=el.location_id WHERE ${applies}`, [locationId]),
+      JOIN threat_event_locations el ON el.event_id=e.id JOIN locations target ON target.id=el.location_id WHERE ${applies}`, [related]),
     pool.query(`SELECT count(*)::integer AS count FROM alert_periods a
-      JOIN locations target ON target.id=a.location_id WHERE ${applies}`, [locationId]),
+      JOIN locations target ON target.id=a.location_id WHERE ${applies}`, [related]),
     pool.query(`SELECT count(*)::integer AS count FROM risk_assessments a
-      JOIN locations target ON target.id=a.location_id WHERE a.published=true AND ${applies}`, [locationId])
+      JOIN locations target ON target.id=a.location_id WHERE a.published=true AND ${applies}`, [related])
   ]);
   const items = [...threats.rows, ...alerts.rows, ...assessments.rows]
     .sort((left, right) => new Date(right.happened_at).getTime() - new Date(left.happened_at).getTime())

@@ -5,7 +5,12 @@ import { pool } from '../db/pool.js';
 
 export interface KatottgEntry {
   code: string;
+  /** KATOTTG code of the oblast (level A) the row belongs to. */
   regionCode: string;
+  /** KATOTTG code of the enclosing raion (level B); null for oblast and special-city rows. */
+  raionCode: string | null;
+  /** KATOTTG code of the enclosing hromada (level C); null above that level. */
+  hromadaCode: string | null;
   category: string;
   name: string;
 }
@@ -45,19 +50,128 @@ export function parseKatottgWorkbook(bytes: Uint8Array, minimumEntries = 1000): 
     });
     const code = [...levelColumns].reverse().map((column) => levels[column]).find(Boolean);
     const regionCode = levels.A; const category = values.F; const name = values.G;
-    if (code && regionCode && category && name) entries.push({ code, regionCode, category, name: name.trim() });
+    // The sheet is a depth-first listing, so the surviving level columns spell out the full parent
+    // chain of the current row: B is its raion, C its hromada. Carrying them out of the parser is
+    // what lets the catalogue be three-tier instead of oblast -> city.
+    if (code && regionCode && category && name) {
+      entries.push({
+        code, regionCode, raionCode: levels.B ?? null, hromadaCode: levels.C ?? null,
+        category, name: name.trim()
+      });
+    }
   }
   if (entries.length < minimumEntries) throw new Error(`KATOTTG workbook yielded only ${entries.length} entries`);
   return entries;
 }
 
-async function importEntries(entries: KatottgEntry[], checksum: string): Promise<number> {
-  const regions = entries.filter((entry) => entry.category === 'O');
-  const cities = entries.filter((entry) => entry.category === 'M');
+/** KATOTTG category letters used by the importer. */
+export const KATOTTG_OBLAST = 'O';
+export const KATOTTG_SPECIAL_CITY = 'K';
+export const KATOTTG_RAION = 'P';
+export const KATOTTG_HROMADA = 'H';
+export const KATOTTG_CITY = 'M';
+
+function katottgId(code: string): string {
+  return `katottg-${code.toLocaleLowerCase()}`;
+}
+
+/**
+ * Spellings a raion can appear under in free text.
+ *
+ * KATOTTG stores the bare adjective ("Мелітопольський"); `@air_alert_ua` writes the full form
+ * ("Повітряна тривога в • Мелітопольський район", "Відбій тривоги в Одеський район"), and other
+ * feeds decline it. Only masculine raion forms are emitted as bare adjectives — oblast names are
+ * feminine ("Харківська область"), so a bare "харківський" cannot shadow an oblast the way a bare
+ * "харківська" would.
+ *
+ * Hromadas are folded in here rather than imported as rows of their own: the channel names them
+ * ("м. Харків та Харківська територіальна громада") but the catalogue is deliberately three-tier,
+ * so a hromada mention resolves to the raion that contains it. Where two raions hold hromadas of
+ * the same name the alias is ambiguous and `pickLocationMatch` drops it, which is the safe outcome.
+ */
+export function raionAliases(name: string, hromadaNames: readonly string[] = []): string[] {
+  const base = name.toLocaleLowerCase('uk-UA');
+  const aliases = new Set<string>([base, `${base} район`]);
+  const stem = base.replace(/ий$/u, '');
+  if (stem !== base) { aliases.add(`${stem}ого району`); aliases.add(`${stem}ому районі`); }
+  for (const hromada of hromadaNames) {
+    const lower = hromada.toLocaleLowerCase('uk-UA');
+    aliases.add(`${lower} територіальна громада`); aliases.add(`${lower} громада`);
+  }
+  return [...aliases];
+}
+
+export interface CatalogPlanRow {
+  id: string;
+  nameUk: string;
+  officialCode: string;
+  aliases: string[];
+  /** KATOTTG codes of acceptable parents, most specific first. */
+  parentCodes: string[];
+}
+
+export interface CatalogPlan {
+  raions: CatalogPlanRow[];
+  cities: CatalogPlanRow[];
+}
+
+/**
+ * Turns a parsed workbook into the rows the catalogue should hold, without touching the database.
+ *
+ * Every id is a pure function of the KATOTTG code, which is what makes a re-import idempotent: the
+ * second run addresses exactly the rows the first one wrote.
+ */
+export function planCatalogImport(entries: KatottgEntry[]): CatalogPlan {
+  const hromadaNames = new Map<string, string[]>();
+  for (const entry of entries) {
+    if (entry.category !== KATOTTG_HROMADA || !entry.raionCode) continue;
+    const bucket = hromadaNames.get(entry.raionCode);
+    if (bucket) bucket.push(entry.name); else hromadaNames.set(entry.raionCode, [entry.name]);
+  }
+  const raions = entries.filter((entry) => entry.category === KATOTTG_RAION).map((raion) => ({
+    id: katottgId(raion.code),
+    nameUk: `${raion.name} район`,
+    officialCode: raion.code,
+    aliases: raionAliases(raion.name, hromadaNames.get(raion.code) ?? []),
+    parentCodes: [raion.regionCode]
+  }));
+  const cities = entries.filter((entry) => entry.category === KATOTTG_CITY).map((city) => ({
+    id: katottgId(city.code),
+    nameUk: city.name,
+    officialCode: city.code,
+    aliases: [city.name.toLocaleLowerCase('uk-UA')],
+    // The raion is the real parent; the oblast stays as a fallback so a city whose raion is missing
+    // from the workbook is still attached somewhere rather than silently dropped.
+    parentCodes: [...new Set([city.raionCode, city.regionCode].filter((code): code is string => !!code))]
+  }));
+  return { raions, cities };
+}
+
+export interface CatalogImportSummary {
+  raions: number;
+  cities: number;
+  reparentedCities: number;
+}
+
+/**
+ * Writes a parsed workbook into `locations`.
+ *
+ * Oblasts and the two special cities are matched against the seeded rows by name and only tagged
+ * with their official code; raions are inserted wholesale; cities are re-pointed at their raion.
+ * The city lookup accepts either the raion or the oblast as the current parent, so the first run
+ * after this change migrates the seeded oblast-parented cities and every later run is a no-op.
+ */
+export async function importKatottgEntries(
+  entries: KatottgEntry[], checksum: string
+): Promise<CatalogImportSummary> {
+  const regions = entries.filter(
+    (entry) => entry.category === KATOTTG_OBLAST || entry.category === KATOTTG_SPECIAL_CITY
+  );
+  const plan = planCatalogImport(entries);
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
-    const regionIds = new Map<string, string>();
+    const idsByCode = new Map<string, string>();
     for (const region of regions) {
       const matched = await client.query<{ id: string }>(
         `SELECT id FROM locations WHERE type IN ('oblast','special_city') AND
@@ -66,50 +180,76 @@ async function importEntries(entries: KatottgEntry[], checksum: string): Promise
          ORDER BY type='oblast' DESC LIMIT 1`, [region.name]
       );
       if (!matched.rowCount) continue;
-      const id = matched.rows[0]!.id; regionIds.set(region.code, id);
+      const id = matched.rows[0]!.id; idsByCode.set(region.code, id);
       await client.query(`UPDATE locations SET official_code=COALESCE(official_code,$2) WHERE id=$1`, [id, region.code]);
     }
-    let imported = 0;
-    for (const city of cities) {
-      const parentId = regionIds.get(city.regionCode); if (!parentId) continue;
-      const existing = await client.query<{ id: string }>(
-        `SELECT id FROM locations WHERE type IN ('city','special_city') AND lower(name_uk)=lower($1)
-         AND (parent_id=$2 OR id IN ('ua-80','ua-85')) ORDER BY latitude IS NOT NULL DESC LIMIT 1`,
-        [city.name, parentId]
+    const summary: CatalogImportSummary = { raions: 0, cities: 0, reparentedCities: 0 };
+    for (const raion of plan.raions) {
+      const parentId = raion.parentCodes.map((code) => idsByCode.get(code)).find(Boolean);
+      if (!parentId) continue;
+      await client.query(
+        `INSERT INTO locations(id,parent_id,type,name_uk,official_code,aliases)
+         VALUES ($1,$2,'raion',$3,$4,$5)
+         ON CONFLICT (id) DO UPDATE SET parent_id=$2,name_uk=$3,official_code=$4,aliases=$5`,
+        [raion.id, parentId, raion.nameUk, raion.officialCode, raion.aliases]
+      );
+      idsByCode.set(raion.officialCode, raion.id);
+      summary.raions += 1;
+    }
+    for (const city of plan.cities) {
+      const parents = city.parentCodes.map((code) => idsByCode.get(code)).filter((id): id is string => !!id);
+      const parentId = parents[0]; if (!parentId) continue;
+      // Re-imports find the row by the code the previous run stamped on it; the first run falls back
+      // to a name match under either the new raion parent or the oblast the seed data used.
+      const byCode = await client.query<{ id: string; parent_id: string | null }>(
+        `SELECT id,parent_id FROM locations WHERE official_code=$1 LIMIT 1`, [city.officialCode]
+      );
+      const existing = byCode.rowCount ? byCode : await client.query<{ id: string; parent_id: string | null }>(
+        `SELECT id,parent_id FROM locations WHERE type IN ('city','special_city') AND lower(name_uk)=lower($1)
+           AND (parent_id=ANY($2::text[]) OR id IN ('ua-80','ua-85'))
+         ORDER BY latitude IS NOT NULL DESC LIMIT 1`, [city.nameUk, parents]
       );
       if (existing.rowCount) {
-        await client.query(`UPDATE locations SET official_code=$2 WHERE id=$1`, [existing.rows[0]!.id, city.code]);
+        const row = existing.rows[0]!;
+        if (row.parent_id !== parentId) summary.reparentedCities += 1;
+        // `special_city` rows (Kyiv, Sevastopol) are top-level by design and never get a parent.
+        await client.query(
+          `UPDATE locations SET official_code=$2,
+             parent_id=CASE WHEN type='city' THEN $3 ELSE parent_id END WHERE id=$1`,
+          [row.id, city.officialCode, parentId]
+        );
       } else {
         await client.query(
           `INSERT INTO locations(id,parent_id,type,name_uk,official_code,aliases)
            VALUES ($1,$2,'city',$3,$4,$5) ON CONFLICT (id) DO UPDATE SET name_uk=$3,parent_id=$2,official_code=$4`,
-          [`katottg-${city.code.toLocaleLowerCase()}`, parentId, city.name, city.code, [city.name.toLocaleLowerCase('uk-UA')]]
+          [city.id, parentId, city.nameUk, city.officialCode, city.aliases]
         );
       }
-      imported += 1;
+      summary.cities += 1;
     }
     await client.query(
       `INSERT INTO reference_dataset_syncs(dataset_id,source_url,source_version,source_sha256,imported_rows,status)
        VALUES ('katottg',$1,$2,$3,$4,'success')
        ON CONFLICT (dataset_id) DO UPDATE SET source_url=$1,source_version=$2,source_sha256=$3,
          imported_rows=$4,status='success',error=NULL,synced_at=now()`,
-      [config.KATOTTG_URL, config.KATOTTG_VERSION, checksum, imported]
+      [config.KATOTTG_URL, config.KATOTTG_VERSION, checksum, summary.raions + summary.cities]
     );
     await client.query('COMMIT');
-    return imported;
+    return summary;
   } catch (error) {
     await client.query('ROLLBACK');
     throw error;
   } finally { client.release(); }
 }
 
-export async function syncLocationCatalog(force = false): Promise<number> {
-  if (!config.KATOTTG_SYNC_ENABLED) return 0;
+export async function syncLocationCatalog(force = false): Promise<CatalogImportSummary> {
+  const empty: CatalogImportSummary = { raions: 0, cities: 0, reparentedCities: 0 };
+  if (!config.KATOTTG_SYNC_ENABLED) return empty;
   const current = await pool.query(
     `SELECT 1 FROM reference_dataset_syncs WHERE dataset_id='katottg' AND status='success'
      AND source_version=$1 AND synced_at>now()-interval '6 days'`, [config.KATOTTG_VERSION]
   );
-  if (current.rowCount && !force) return 0;
+  if (current.rowCount && !force) return empty;
   try {
     const response = await fetch(config.KATOTTG_URL, { signal: AbortSignal.timeout(45_000) });
     if (!response.ok) throw new Error(`KATOTTG download ${response.status}`);
@@ -118,7 +258,7 @@ export async function syncLocationCatalog(force = false): Promise<number> {
     const bytes = new Uint8Array(await response.arrayBuffer());
     if (bytes.byteLength > 20 * 1024 * 1024) throw new Error('KATOTTG workbook exceeds 20 MiB limit');
     const checksum = createHash('sha256').update(bytes).digest('hex');
-    return importEntries(parseKatottgWorkbook(bytes), checksum);
+    return importKatottgEntries(parseKatottgWorkbook(bytes), checksum);
   } catch (error) {
     await pool.query(
       `INSERT INTO reference_dataset_syncs(dataset_id,source_url,source_version,source_sha256,imported_rows,status,error)
@@ -132,7 +272,9 @@ export async function syncLocationCatalog(force = false): Promise<number> {
 
 export function startLocationCatalogScheduler(log: { info: Function; error: Function }): () => void {
   const run = () => syncLocationCatalog()
-    .then((imported) => imported && log.info({ imported, version: config.KATOTTG_VERSION }, 'KATOTTG cities imported'))
+    .then((summary) => (summary.raions + summary.cities) && log.info(
+      { ...summary, version: config.KATOTTG_VERSION }, 'KATOTTG raions and cities imported'
+    ))
     .catch((error) => log.error({ error }, 'KATOTTG synchronization failed'));
   const timer = setInterval(run, 24 * 60 * 60_000); timer.unref(); void run();
   return () => clearInterval(timer);

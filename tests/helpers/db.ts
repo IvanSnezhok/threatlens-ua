@@ -74,7 +74,7 @@ export async function ensureMigrated(): Promise<void> {
     `SELECT 1 FROM information_schema.tables WHERE table_schema='public' AND table_name='schema_migrations'`
   );
   if (applied.rowCount) {
-    const current = await sql(`SELECT 1 FROM schema_migrations WHERE filename='008_alert_end_debounce.sql'`);
+    const current = await sql(`SELECT 1 FROM schema_migrations WHERE filename='010_alert_channel_source.sql'`);
     if (current.rowCount) return;
   }
   const { migrate } = await import('../../src/db/migrate.js');

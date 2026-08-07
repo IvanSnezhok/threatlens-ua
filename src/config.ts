@@ -40,7 +40,30 @@ const envSchema = z.object({
   // missed polls and ends the alert on the fourth. The floor is two polls: anything shorter would
   // let a single incomplete response trigger a false "Офіційний відбій" again.
   ALERT_END_DEBOUNCE_SECONDS: z.coerce.number().int()
-    .min(30, 'Alert end debounce must span at least two 15-second polls').default(60)
+    .min(30, 'Alert end debounce must span at least two 15-second polls').default(60),
+
+  // ---- Official alert channel (@air_alert_ua), collected over MTProto -------------------------
+  // This source publishes events, not snapshots, so it has its own reconciliation path and its own
+  // safeguards. See docs/ARCHITECTURE.md, "Event-driven official alert source".
+  ALERT_CHANNEL_ENABLED: z.string().default('true').transform((value) => value === 'true'),
+  ALERT_CHANNEL_USERNAME: z.string().default('air_alert_ua')
+    .transform((value) => value.trim().replace(/^@/, '').toLowerCase()),
+  // Longest an alert from the channel may stay active without an explicit all-clear.
+  //
+  // The event model has exactly one failure mode the snapshot model does not: a 🟢 that is never
+  // delivered, or that arrives in a shape the parser does not recognise, leaves the alert active
+  // forever. This bound is the backstop. It is deliberately far longer than any single air-raid
+  // alert observed on the channel — including overnight mass-attack alerts and frontline raions
+  // that stay under alert most of a day — because ending a *real* alert early would produce the one
+  // failure this system treats as unrecoverable, a false "Офіційний відбій". If it ever fires, a
+  // message was missed: it is logged at warn level and counted, not swallowed. The floor is one
+  // hour so a misconfiguration cannot turn the backstop into a routine all-clear.
+  ALERT_CHANNEL_MAX_ALERT_SECONDS: z.coerce.number().int()
+    .min(3600, 'Alert channel maximum alert duration must be at least one hour').default(86400),
+  // Reconnect backfill. Bounded twice, by count and by age; the window is folded to one terminal
+  // state per location before anything is written, so old events are never replayed as new ones.
+  ALERT_CHANNEL_BACKFILL_MESSAGES: z.coerce.number().int().min(0).max(500).default(300),
+  ALERT_CHANNEL_BACKFILL_SECONDS: z.coerce.number().int().min(0).default(21600)
 }).superRefine((env, ctx) => {
   if (env.NODE_ENV !== 'production') return;
   if (env.OPS_PASSWORD === 'change-me' || env.OPS_PASSWORD.length < 16) {

@@ -6,14 +6,16 @@ import fastifyStatic from '@fastify/static';
 import { Registry, collectDefaultMetrics, Counter, Gauge, Histogram } from 'prom-client';
 import { config } from '../config.js';
 import { pool } from '../db/pool.js';
-import { activeAlerts, assessmentDetails, currentAssessments, liveThreats, locationTimeline, systemVersion, threatDetails } from '../repositories/events.js';
+import { activeAlerts, assessmentDetails, currentAssessments, liveThreats, locationTimeline, relatedLocationsCte, systemVersion, threatDetails } from '../repositories/events.js';
 import { createEventRelay, eventHub, type SystemEvent } from '../services/sse.js';
+import { registerAlertChannelMetrics } from '../services/ingestion.js';
 import occupationRoutes from './occupation-routes.js';
 import { runRiskAssessments } from '../services/risk.js';
 import { createChannelSchema, createRecommendedChannel, listRecommendedChannels, updateChannelSchema, updateRecommendedChannel } from '../services/recommended-channels.js';
 
 const registry = new Registry();
 collectDefaultMetrics({ register: registry, prefix: 'threatlens_' });
+registerAlertChannelMetrics(registry);
 const httpRequests = new Counter({ name: 'threatlens_http_requests_total', help: 'HTTP requests', labelNames: ['method', 'route', 'status'], registers: [registry] });
 const httpDuration = new Histogram({ name: 'threatlens_http_duration_seconds', help: 'HTTP request duration', labelNames: ['route'], registers: [registry] });
 const sseConnections = new Gauge({ name: 'threatlens_sse_connections', help: 'Active SSE clients', registers: [registry] });
@@ -36,6 +38,7 @@ async function sourceHealth() {
     'ukraine-alarm': Boolean(config.UKRAINE_ALARM_API_TOKEN),
     'alerts-in-ua': Boolean(config.ALERTS_IN_UA_TOKEN),
     'air-force': Boolean(config.TELEGRAM_API_ID && config.TELEGRAM_API_HASH && config.TELEGRAM_SESSION),
+    'air-alert-ua': Boolean(config.TELEGRAM_API_ID && config.TELEGRAM_API_HASH && config.TELEGRAM_SESSION),
     demo: config.DEMO_SOURCE_ENABLED
   };
   const rows = (await pool.query(
@@ -71,7 +74,7 @@ export async function buildServer() {
   app.get('/health/live', async () => ({ status: 'ok', version: process.env.npm_package_version ?? 'dev' }));
   app.get('/health/ready', async (_request, reply) => {
     try {
-      const migration = await pool.query(`SELECT 1 FROM schema_migrations WHERE filename='008_alert_end_debounce.sql'`);
+      const migration = await pool.query(`SELECT 1 FROM schema_migrations WHERE filename='010_alert_channel_source.sql'`);
       if (!migration.rowCount) return reply.code(503).send({ status: 'not_ready', reason: 'migrations_pending' });
       return { status: 'ready' };
     }
@@ -163,12 +166,14 @@ export async function buildServer() {
     const evidence = request.query.evidence ?? null;
     const from = request.query.from && !Number.isNaN(Date.parse(request.query.from)) ? request.query.from : null;
     const to = request.query.to && !Number.isNaN(Date.parse(request.query.to)) ? request.query.to : null;
+    // The location filter matches the whole ancestor/descendant chain, so filtering by an oblast
+    // still returns the events of its raions and their cities. With `$1` null the walk starts from
+    // nothing and the empty CTE costs a single index probe.
     const result = await pool.query(
-      `SELECT DISTINCT e.id,e.threat_type,e.status,e.evidence_level,e.title,e.summary,e.started_at,e.last_observed_at,e.ended_at
+      `${relatedLocationsCte()}
+       SELECT DISTINCT e.id,e.threat_type,e.status,e.evidence_level,e.title,e.summary,e.started_at,e.last_observed_at,e.ended_at
        FROM threat_events e LEFT JOIN threat_event_locations el ON el.event_id=e.id
-       WHERE ($1::text IS NULL OR el.location_id=$1
-         OR EXISTS (SELECT 1 FROM locations filtered WHERE filtered.id=$1 AND el.location_id=filtered.parent_id)
-         OR EXISTS (SELECT 1 FROM locations event_location WHERE event_location.id=el.location_id AND event_location.parent_id=$1))
+       WHERE ($1::text IS NULL OR EXISTS (SELECT 1 FROM related_locations r WHERE r.id=el.location_id))
          AND ($2::text IS NULL OR e.threat_type=$2)
          AND ($3::text IS NULL OR e.evidence_level=$3) AND ($4::timestamptz IS NULL OR e.started_at >= $4)
          AND ($5::timestamptz IS NULL OR e.started_at <= $5)

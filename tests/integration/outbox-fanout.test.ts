@@ -24,6 +24,25 @@ async function chatsNotified(): Promise<number[]> {
   return rows.rows.map((row) => Number(row.chat_id));
 }
 
+interface Branch { oblast: string; raion: string; city: string }
+
+/**
+ * A synthetic `oblast -> raion -> city` branch: the shape the catalogue takes once raions are
+ * imported from KATOTTG, where oblast and city are two `parent_id` edges apart.
+ *
+ * Ids are prefixed `test-` because `resetDatabase` clears exactly that prefix from `locations`;
+ * reference rows seeded by the migrations are left alone.
+ */
+async function seedBranch(name: string): Promise<Branch> {
+  const branch: Branch = { oblast: `test-${name}-oblast`, raion: `test-${name}-raion`, city: `test-${name}-city` };
+  await sql(
+    `INSERT INTO locations(id,parent_id,type,name_uk) VALUES
+       ($1,NULL,'oblast',$1),($2,$1,'raion',$2),($3,$2,'city',$3)`,
+    [branch.oblast, branch.raion, branch.city]
+  );
+  return branch;
+}
+
 describe.skipIf(!integrationDatabaseAvailable)('subscription fanout', () => {
   beforeAll(ensureMigrated);
   beforeEach(resetDatabase);
@@ -73,28 +92,129 @@ describe.skipIf(!integrationDatabaseAvailable)('subscription fanout', () => {
       expect(await chatsNotified()).toEqual([]);
     });
 
-    it('matches exactly one level of hierarchy, never a grandparent', async () => {
-      // Pins a real constraint of the query: it compares `parent_id` directly, so it walks one edge
-      // and no further. The shipped catalogue is exactly two levels deep (oblast -> city, KATOTTG
-      // imports attach cities straight to their oblast), so this is sufficient today — but a future
-      // raion or hromada tier inserted between oblast and city would silently break oblast
-      // subscribers, and this test is what would catch it.
-      await sql(
-        `INSERT INTO locations(id,parent_id,type,name_uk) VALUES
-           ('test-oblast',NULL,'oblast','Тест-область'),
-           ('test-raion','test-oblast','raion','Тест-район'),
-           ('test-city','test-raion','city','Тест-місто')`
-      );
-      await seedUser(9005);
-      await seedUser(9006);
-      await seedSubscription({ chatId: 9005, locationId: 'test-oblast' });
-      await seedSubscription({ chatId: 9006, locationId: 'test-raion' });
-      const eventId = await seedThreatEvent({ locationIds: ['test-city'] });
+    it('reaches every tier of an oblast -> raion -> city chain from a city event', async () => {
+      // The regression this guards is silent under-delivery: with `parent_id` compared directly the
+      // query walked one edge, so inserting a raion between oblast and city stopped oblast
+      // subscribers from ever hearing about that city.
+      const branch = await seedBranch('kyiv');
+      for (const chatId of [9005, 9006, 9007]) await seedUser(chatId);
+      await seedSubscription({ chatId: 9005, locationId: branch.oblast });
+      await seedSubscription({ chatId: 9006, locationId: branch.raion });
+      await seedSubscription({ chatId: 9007, locationId: branch.city });
+      const eventId = await seedThreatEvent({ locationIds: [branch.city] });
       await appendSystemEvent('threat.updated', { eventId });
 
       await runFanout();
 
-      expect(await chatsNotified()).toEqual([9006]);
+      expect(await chatsNotifiedFor(eventId)).toEqual([9005, 9006, 9007]);
+    });
+
+    it('reaches every tier of an oblast -> raion -> city chain from an oblast event', async () => {
+      const branch = await seedBranch('kyiv');
+      for (const chatId of [9008, 9009, 9010]) await seedUser(chatId);
+      await seedSubscription({ chatId: 9008, locationId: branch.oblast });
+      await seedSubscription({ chatId: 9009, locationId: branch.raion });
+      await seedSubscription({ chatId: 9010, locationId: branch.city });
+      const eventId = await seedThreatEvent({ locationIds: [branch.oblast] });
+      await appendSystemEvent('threat.updated', { eventId });
+
+      await runFanout();
+
+      expect(await chatsNotifiedFor(eventId)).toEqual([9008, 9009, 9010]);
+    });
+
+    it('delivers a raion event both up to the oblast and down to the city', async () => {
+      const branch = await seedBranch('kyiv');
+      for (const chatId of [9011, 9012]) await seedUser(chatId);
+      await seedSubscription({ chatId: 9011, locationId: branch.oblast });
+      await seedSubscription({ chatId: 9012, locationId: branch.city });
+      const eventId = await seedThreatEvent({ locationIds: [branch.raion] });
+      await appendSystemEvent('threat.updated', { eventId });
+
+      await runFanout();
+
+      expect(await chatsNotifiedFor(eventId)).toEqual([9011, 9012]);
+    });
+
+    it('does not leak into a sibling branch of the same depth', async () => {
+      const subscribed = await seedBranch('kyiv');
+      const other = await seedBranch('lviv');
+      for (const chatId of [9013, 9014, 9015]) await seedUser(chatId);
+      await seedSubscription({ chatId: 9013, locationId: other.oblast });
+      await seedSubscription({ chatId: 9014, locationId: other.raion });
+      await seedSubscription({ chatId: 9015, locationId: other.city });
+      const eventId = await seedThreatEvent({ locationIds: [subscribed.city] });
+      await appendSystemEvent('threat.updated', { eventId });
+
+      await runFanout();
+
+      expect(await chatsNotified()).toEqual([]);
+    });
+
+    it('does not leak sideways between two raions of the same oblast', async () => {
+      const branch = await seedBranch('kyiv');
+      await sql(
+        `INSERT INTO locations(id,parent_id,type,name_uk) VALUES
+           ('test-kyiv-raion-2',$1,'raion','test-kyiv-raion-2'),
+           ('test-kyiv-city-2','test-kyiv-raion-2','city','test-kyiv-city-2')`,
+        [branch.oblast]
+      );
+      await seedUser(9016);
+      await seedSubscription({ chatId: 9016, locationId: 'test-kyiv-raion-2' });
+      const eventId = await seedThreatEvent({ locationIds: [branch.city] });
+      await appendSystemEvent('threat.updated', { eventId });
+
+      await runFanout();
+
+      expect(await chatsNotified()).toEqual([]);
+    });
+
+    it('emits exactly one notification for a chat subscribed to all three tiers of one chain', async () => {
+      // Three matching subscription rows for one chat. `SELECT DISTINCT` collapses them before the
+      // insert and `ON CONFLICT (idempotency_key) DO NOTHING` is the second line of defence, so the
+      // subscriber is told about the raid once rather than three times.
+      const branch = await seedBranch('kyiv');
+      await seedUser(9017);
+      await seedSubscription({ chatId: 9017, locationId: branch.oblast, threatType: '*' });
+      await seedSubscription({ chatId: 9017, locationId: branch.raion, threatType: '*' });
+      await seedSubscription({ chatId: 9017, locationId: branch.city, threatType: '*' });
+      const eventId = await seedThreatEvent({ locationIds: [branch.city] });
+      await appendSystemEvent('threat.updated', { eventId });
+
+      await runFanout();
+
+      expect(await chatsNotifiedFor(eventId)).toEqual([9017]);
+      expect(await count('notification_outbox')).toBe(1);
+    });
+
+    it('emits exactly one notification when the event is attached to all three tiers at once', async () => {
+      const branch = await seedBranch('kyiv');
+      await seedUser(9018);
+      await seedSubscription({ chatId: 9018, locationId: branch.raion });
+      const eventId = await seedThreatEvent({ locationIds: [branch.oblast, branch.raion, branch.city] });
+      await appendSystemEvent('threat.updated', { eventId });
+
+      await runFanout();
+
+      expect(await chatsNotifiedFor(eventId)).toEqual([9018]);
+      expect(await count('notification_outbox')).toBe(1);
+    });
+
+    it('terminates and still delivers when parent_id contains a cycle', async () => {
+      // KATOTTG is an external feed, so `parent_id` is not trusted to be acyclic. The walk carries
+      // its visited path and is depth-capped, so a cycle costs a bounded amount of work instead of
+      // spinning the fanout worker forever.
+      const branch = await seedBranch('kyiv');
+      await sql(`UPDATE locations SET parent_id=$1 WHERE id=$2`, [branch.city, branch.oblast]);
+      for (const chatId of [9019, 9020]) await seedUser(chatId);
+      await seedSubscription({ chatId: 9019, locationId: branch.oblast });
+      await seedSubscription({ chatId: 9020, locationId: branch.city });
+      const eventId = await seedThreatEvent({ locationIds: [branch.raion] });
+      await appendSystemEvent('threat.updated', { eventId });
+
+      await runFanout();
+
+      expect(await chatsNotifiedFor(eventId)).toEqual([9019, 9020]);
     });
 
     it('emits exactly one notification when a chat subscribes to both the oblast and the city', async () => {
@@ -263,6 +383,25 @@ describe.skipIf(!integrationDatabaseAvailable)('subscription fanout', () => {
       );
       expect(rows.rows.map((row) => Number(row.chat_id))).toEqual([9403]);
       expect(rows.rows[0]!.notification_type).toBe('alert_end');
+    });
+
+    it('routes a raion-level air raid up to the oblast and down to the city', async () => {
+      // This is the shape the official alert channel actually publishes in: raion-level periods.
+      // Both neighbouring tiers have to hear about it, which is two `parent_id` edges in one case.
+      const branch = await seedBranch('kyiv');
+      for (const chatId of [9406, 9407, 9408]) await seedUser(chatId);
+      await seedSubscription({ chatId: 9406, locationId: branch.oblast });
+      await seedSubscription({ chatId: 9407, locationId: branch.raion });
+      await seedSubscription({ chatId: 9408, locationId: branch.city });
+      const alertId = await seedAlertPeriod(branch.raion);
+      await appendSystemEvent('alert.started', { alertId, locationId: branch.raion });
+
+      await runFanout();
+
+      const rows = await sql<{ chat_id: string }>(
+        `SELECT chat_id FROM notification_outbox WHERE alert_period_id=$1 ORDER BY chat_id`, [alertId]
+      );
+      expect(rows.rows.map((row) => Number(row.chat_id))).toEqual([9406, 9407, 9408]);
     });
 
     it('ignores the evidence threshold and threat-type filter for official alerts', async () => {
