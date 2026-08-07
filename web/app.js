@@ -11,6 +11,8 @@ const threatNames = {
 };
 const levelNames = { background: 'фоновий', elevated: 'підвищений', significant: 'значний', high: 'високий', very_high: 'дуже високий' };
 const evidenceNames = { official: 'офіційно', confirmed: 'підтверджено', monitoring: 'моніторинг', unverified: 'не перевірено' };
+const occupationLayerIds = ['occupation-fill', 'occupation-hatch', 'occupation-line', 'occupation-contested-line'];
+const occupationColor = ['case', ['==',['get','status'],'occupied'], '#ff7a4d', ['==',['get','status'],'liberated'], '#72d6ca', '#8f9b94'];
 
 let snapshot = null;
 let map = null;
@@ -18,6 +20,11 @@ let config = null;
 let locations = [];
 let adminBoundaries = { type: 'FeatureCollection', features: [] };
 let countryBoundary = { type: 'FeatureCollection', features: [] };
+let occupation = null;
+let occupationVisible = true;
+let occupationLayersReady = false;
+let occupationLegendOpen = null;
+let occupationFetchedAt = null;
 let opsAuthorization = '';
 let lastReceived = null;
 let refreshTimer = null;
@@ -160,14 +167,153 @@ function directionCollection() {
   return { type: 'FeatureCollection', features: snapshot.threats.filter((threat) => threat.geometry?.type === 'LineString').map((threat) => ({ type: 'Feature', id: threat.id, geometry: threat.geometry, properties: { title: threat.title } })) };
 }
 
+// Довідковий шар: тимчасово окуповані території України. Це не тривога і не оцінка ризику —
+// він лягає під усі шари суверенітету, тож державний кордон і підпис Криму завжди зверху.
+function occupationCollection() {
+  return occupation?.geojson ?? { type: 'FeatureCollection', features: [] };
+}
+
+// Порожній шар лишається прихованим — так MapLibre не показує атрибуцію джерела, яке зараз нічого не малює.
+function occupationActive() {
+  return occupationVisible && occupationCollection().features.length > 0;
+}
+
+// Легенда й перемикач зʼявляються лише тоді, коли шар справді лежить на карті.
+// Інакше інтерфейс обіцяв би окупацію, якої карта не малює (наприклад, коли стиль так і не завантажився).
+function occupationOnMap() {
+  return !!occupation && occupationLayersReady;
+}
+
+// Найнебезпечніший режим відмови — застарілий шар, що виглядає актуальним.
+// Тому окрім прапорця сервера перевіряємо ще й те, чи клієнт узагалі зміг оновити дані:
+// поріг збігається з OCCUPATION_STALE_AFTER_SECONDS на бекенді (6 годин).
+function occupationStale() {
+  if (!occupation) return false;
+  if (occupation.stale) return true;
+  return occupationFetchedAt != null && Date.now() - occupationFetchedAt > 21600000;
+}
+
+async function loadOccupation() {
+  try {
+    const response = await fetch('/api/v1/occupation', { signal: AbortSignal.timeout(12000) });
+    if (!response.ok) throw new Error('occupation unavailable');
+    const data = await response.json();
+    if (data?.geojson?.type !== 'FeatureCollection' || !Array.isArray(data.geojson.features)) throw new Error('occupation malformed');
+    occupation = data;
+    occupationFetchedAt = Date.now();
+    applyOccupation();
+  } catch {
+    // Шар довідковий: лишаємо попередній стан, карта працює без нього.
+    // Легенду все одно перемальовуємо — так невдале оновлення з часом проявиться як «дані застаріли».
+    renderOccupationLegend();
+  }
+}
+
+function applyOccupationVisibility() {
+  const visibility = occupationActive() ? 'visible' : 'none';
+  occupationLayerIds.forEach((id) => { if (map?.getLayer(id)) map.setLayoutProperty(id, 'visibility', visibility); });
+}
+
+function applyOccupation() {
+  if (occupationLayersReady && map?.getSource('occupation-areas')) {
+    map.getSource('occupation-areas').setData(occupationCollection());
+    applyOccupationVisibility();
+  }
+  renderOccupationLegend();
+}
+
+function hatchPattern(color, alpha) {
+  const size = 24, canvas = document.createElement('canvas');
+  canvas.width = canvas.height = size;
+  const ctx = canvas.getContext('2d');
+  ctx.globalAlpha = alpha; ctx.strokeStyle = color; ctx.lineWidth = 2;
+  ctx.beginPath();
+  for (let offset = -size; offset < size * 2; offset += size / 2) { ctx.moveTo(offset, 0); ctx.lineTo(offset + size, size); }
+  ctx.stroke();
+  return ctx.getImageData(0, 0, size, size);
+}
+
+function addOccupationLayers() {
+  occupationLayersReady = false;
+  // Якір суверенітету — обовʼязкова умова. Якщо його немає, шар окупації не додається взагалі:
+  // краще не показати окупацію, ніж покласти її поверх державного кордону й підпису Криму.
+  if (!map.getLayer('ukraine-sovereignty-fill')) return;
+  try {
+    map.addSource('occupation-areas', { type: 'geojson', data: occupationCollection(),
+      attribution: 'Окупація: <a href="https://deepstatemap.live" target="_blank" rel="noreferrer">DeepStateMap</a>' });
+    // beforeId тримає весь шар нижче за ukraine-sovereignty-fill, ukraine-region-lines і ukraine-state-border
+    map.addLayer({ id: 'occupation-fill', type: 'fill', source: 'occupation-areas', paint: {
+      'fill-color': occupationColor,
+      'fill-opacity': ['case',['==',['get','status'],'occupied'],.17,['==',['get','status'],'liberated'],.11,.19]
+    } }, 'ukraine-sovereignty-fill');
+    // Штрихування залежить від canvas: якщо візерунок не створився, лишаємо заливку й контури.
+    try {
+      if (!map.hasImage('occupation-hatch-pattern')) map.addImage('occupation-hatch-pattern', hatchPattern('#ff7a4d', .7), { pixelRatio: 2 });
+      map.addLayer({ id: 'occupation-hatch', type: 'fill', source: 'occupation-areas', filter: ['==',['get','status'],'occupied'],
+        paint: { 'fill-pattern': 'occupation-hatch-pattern', 'fill-opacity': .5 } }, 'ukraine-sovereignty-fill');
+    } catch { /* без візерунка окуповані території лишаються позначені заливкою й контуром */ }
+    map.addLayer({ id: 'occupation-line', type: 'line', source: 'occupation-areas', filter: ['!=',['get','status'],'contested'], paint: {
+      'line-color': occupationColor, 'line-width': ['case',['==',['get','status'],'occupied'],1.1,.7], 'line-opacity': .5
+    } }, 'ukraine-sovereignty-fill');
+    map.addLayer({ id: 'occupation-contested-line', type: 'line', source: 'occupation-areas', filter: ['==',['get','status'],'contested'], paint: {
+      'line-color': '#8f9b94', 'line-width': 1.1, 'line-dasharray': [2,2], 'line-opacity': .65
+    } }, 'ukraine-sovereignty-fill');
+    occupationLayersReady = true;
+    applyOccupationVisibility();
+  } catch { /* без цього шару карта лишається повністю робочою */ }
+  renderOccupationLegend();
+}
+
+function renderOccupationLegend() {
+  const onMap = occupationOnMap();
+  const hasAreas = onMap && occupationCollection().features.length > 0;
+  const stale = occupationStale();
+  const toggle = $('.layer-toggle[data-layer="occupation"]');
+  // Перемикати нічого, якщо контурів немає — тоді перемикач лишається схованим.
+  if (toggle) {
+    toggle.hidden = !hasAreas;
+    toggle.classList.toggle('is-active', occupationVisible);
+    toggle.classList.toggle('is-stale', stale);
+  }
+  const legend = $('#occupation-legend');
+  if (!legend) return;
+  legend.hidden = !onMap;
+  if (!onMap) return;
+  legend.classList.toggle('is-off', hasAreas && !occupationVisible);
+  legend.classList.toggle('is-stale', stale);
+  const attributionName = occupation.attribution?.name || 'DeepStateMap';
+  const attributionUrl = safeUrl(occupation.attribution?.url) ?? 'https://deepstatemap.live';
+  const rows = hasAreas
+    ? `<ul class="legend-rows">
+        <li><i class="legend-swatch occupied"></i><span>Тимчасово окупована територія України</span></li>
+        <li><i class="legend-swatch contested"></i><span>Сіра зона — контроль не підтверджено</span></li>
+        <li><i class="legend-swatch liberated"></i><span>Звільнена територія</span></li>
+      </ul>`
+    : '<p class="legend-empty">Контурів для цього зрізу не отримано. Решта карти працює у звичайному режимі.</p>';
+  // Позначку «застаріло» дублюємо в summary: на вузьких екранах легенда згорнута,
+  // і застарілий шар не має жодного шансу виглядати актуальним.
+  legend.innerHTML = `<summary><i class="swatch occupation"></i><span class="legend-title">Тимчасово окуповані території</span>${stale ? '<b class="legend-stale">застаріло</b>' : ''}<span class="legend-caret" aria-hidden="true">▾</span></summary>
+    <div class="legend-body">
+      <p class="legend-meta"><span>${occupation.capturedLabel ? `Станом на ${escapeHtml(occupation.capturedLabel)}` : 'Час зрізу не вказано'}</span></p>
+      ${stale ? '<p class="legend-warning">Шар не оновлювався надто довго. Лінія контролю могла змінитися — не покладайтеся на ці контури як на поточні.</p>' : ''}
+      ${rows}
+      <p class="legend-note">Окупація — тимчасовий фактичний стан на території України, а не зміна кордону. Державний кордон України залишається незмінним; АР Крим і Севастополь — територія України.</p>
+      <p class="legend-source">Джерело шару: <a href="${escapeHtml(attributionUrl)}" target="_blank" rel="noreferrer">${escapeHtml(attributionName)} ↗</a></p>
+    </div>`;
+}
+
 function initMap() {
+  occupationLayersReady = false; // карту перестворюють на кожному оновленні знімка — шар доводиться додавати наново
   map = new maplibregl.Map({ container: 'map', style: config.mapStyleUrl, center: [31.2, 48.8], zoom: 5.1, attributionControl: false });
   map.on('styleimagemissing', (event) => {
     if (!map.hasImage(event.id)) map.addImage(event.id, { width: 1, height: 1, data: new Uint8Array([0,0,0,0]) });
   });
   map.addControl(new maplibregl.NavigationControl({ showCompass: false }), 'top-right');
   map.addControl(new maplibregl.AttributionControl({ compact: true }), 'bottom-left');
-  map.on('load', () => {
+  // Саме 'style.load', а не 'load': 'load' чекає ще й на завантаження тайлів підкладки,
+  // тож при повільному або недоступному tiles.openfreemap.org жоден наш шар не зʼявився б —
+  // ні державний кордон, ні підпис Криму, ні окупація. Стиль розібрано — можна додавати шари.
+  map.on('style.load', () => {
     map.addSource('ukraine-country', { type: 'geojson', data: countryBoundary });
     map.addSource('ukraine-admin', { type: 'geojson', data: adminBoundaries, promoteId: 'locationId' });
     map.addSource('ukraine-cities', { type: 'geojson', data: cityCollection(), promoteId: 'locationId' });
@@ -188,6 +334,7 @@ function initMap() {
     map.addLayer({ id: 'ukraine-state-border', type: 'line', source: 'ukraine-country', paint: {
       'line-color': '#b7ef56', 'line-width': ['interpolate',['linear'],['zoom'],4,1.8,8,3.4], 'line-opacity': .95
     } });
+    addOccupationLayers();
     map.addLayer({ id: 'city-hit', type: 'circle', source: 'ukraine-cities', minzoom: 5.7, paint: {
       'circle-radius': ['interpolate',['linear'],['zoom'],5.7,3,9,6], 'circle-color': '#72d6ca',
       'circle-opacity': .82, 'circle-stroke-color': '#09100f', 'circle-stroke-width': 1.5
@@ -326,12 +473,23 @@ function renderMapPage() {
     const assessmentId = card.dataset.assessment;
     if (assessmentId) void showAssessmentDetails(assessmentId);
   });
+  const layerGroups = { alerts: ['alert-pulse'], threats: ['threat-pulse','direction-lines'], assessments: ['assessment-halo'] };
   document.querySelectorAll('.layer-toggle').forEach((button) => button.addEventListener('click', () => {
     button.classList.toggle('is-active');
-    const visible = button.classList.contains('is-active') ? 'visible' : 'none';
-    const layers = button.dataset.layer === 'alerts' ? ['alert-pulse'] : button.dataset.layer === 'threats' ? ['threat-pulse','direction-lines'] : ['assessment-halo'];
-    layers.forEach((layer) => map.getLayer(layer) && map.setLayoutProperty(layer, 'visibility', visible));
+    const active = button.classList.contains('is-active');
+    if (button.dataset.layer === 'occupation') {
+      occupationVisible = active;
+      applyOccupationVisibility();
+      $('#occupation-legend')?.classList.toggle('is-off', !occupationVisible);
+      return;
+    }
+    (layerGroups[button.dataset.layer] ?? []).forEach((layer) => map.getLayer(layer) && map.setLayoutProperty(layer, 'visibility', active ? 'visible' : 'none'));
   }));
+  const legend = $('#occupation-legend');
+  // Вибір користувача переживає перемальовування сторінки після кожної події потоку.
+  legend.open = occupationLegendOpen ?? window.matchMedia('(min-width: 981px)').matches;
+  legend.addEventListener('toggle', () => { occupationLegendOpen = legend.open; });
+  renderOccupationLegend();
 }
 
 function contentShell(kicker, title, deck) {
@@ -471,6 +629,8 @@ async function boot() {
   $('#demo-label').hidden = !config.demoMode;
   if (location.pathname === '/tv') document.body.classList.add('tv-mode');
   window.Telegram?.WebApp?.ready(); window.Telegram?.WebApp?.expand();
+  void loadOccupation(); // довідковий шар вантажиться окремо й не блокує старт карти
   await loadSnapshot(); connectStream();
+  setInterval(() => void loadOccupation(), 900000);
 }
 boot().catch(markOffline);

@@ -145,7 +145,22 @@ export function formatMessage(row: any): string {
   return `⚠️ <b>${html(p.locationName)}</b>\n${html(threatLabels[p.threatType] ?? p.threatType)}\nРівень доказовості: ${html(p.evidenceLevel)}\n\n${html(p.summary)}\n\nДані дійсні до: ${html(p.validUntil ?? 'не вказано')}\n<a href="${html(p.mapUrl)}">Карта та джерела</a>`;
 }
 
-async function deliverBatch(bot: Bot) {
+const sendingReclaimSeconds = 300;
+const maxAttempts = 8;
+
+async function reclaimStuckSending(): Promise<number> {
+  const reclaimed = await pool.query(
+    `UPDATE notification_outbox
+     SET status=CASE WHEN attempts>=$2 THEN 'failed' ELSE 'retry' END,next_attempt_at=now(),updated_at=now()
+     WHERE status='sending' AND updated_at < now()-($1||' seconds')::interval`,
+    [sendingReclaimSeconds, maxAttempts]
+  );
+  return reclaimed.rowCount ?? 0;
+}
+
+async function deliverBatch(bot: Bot, log: { warn: Function }) {
+  const reclaimed = await reclaimStuckSending();
+  if (reclaimed) log.warn({ reclaimed }, 'reclaimed notifications stuck in sending');
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
@@ -154,7 +169,7 @@ async function deliverBatch(bot: Bot) {
        ORDER BY priority,created_at LIMIT 25 FOR UPDATE SKIP LOCKED`
     );
     for (const row of batch.rows) {
-      await client.query(`UPDATE notification_outbox SET status='sending',attempts=attempts+1 WHERE id=$1`, [row.id]);
+      await client.query(`UPDATE notification_outbox SET status='sending',attempts=attempts+1,updated_at=now() WHERE id=$1`, [row.id]);
     }
     await client.query('COMMIT');
     for (const row of batch.rows) {
@@ -163,7 +178,7 @@ async function deliverBatch(bot: Bot) {
           parse_mode: 'HTML', disable_notification: row.priority >= 3,
           link_preview_options: { is_disabled: true }
         });
-        await pool.query(`UPDATE notification_outbox SET status='sent',sent_at=now() WHERE id=$1`, [row.id]);
+        await pool.query(`UPDATE notification_outbox SET status='sent',sent_at=now(),updated_at=now() WHERE id=$1`, [row.id]);
         await pool.query(
           `INSERT INTO notification_deliveries(outbox_id,telegram_message_id,delivered_status,queued_at,sent_at)
            VALUES ($1,$2,'sent',$3,now())`, [row.id, sent.message_id, row.created_at]
@@ -172,8 +187,8 @@ async function deliverBatch(bot: Bot) {
         const code = String(error?.error?.error_code ?? error?.error_code ?? 'unknown');
         const retryAfter = Number(error?.error?.parameters?.retry_after ?? Math.min(300, 2 ** row.attempts));
         await pool.query(
-          `UPDATE notification_outbox SET status=CASE WHEN attempts>=8 OR $3 IN ('400','403') THEN 'failed' ELSE 'retry' END,
-           next_attempt_at=now()+($2||' seconds')::interval WHERE id=$1`, [row.id, retryAfter, code]
+          `UPDATE notification_outbox SET status=CASE WHEN attempts>=$4 OR $3 IN ('400','403') THEN 'failed' ELSE 'retry' END,
+           next_attempt_at=now()+($2||' seconds')::interval,updated_at=now() WHERE id=$1`, [row.id, retryAfter, code, maxAttempts]
         );
         await pool.query(
           `INSERT INTO notification_deliveries(outbox_id,delivered_status,error_code,queued_at)
@@ -188,10 +203,10 @@ async function deliverBatch(bot: Bot) {
   } finally { client.release(); }
 }
 
-export function startNotificationWorkers(bot: Bot | null, log: { error: Function }) {
+export function startNotificationWorkers(bot: Bot | null, log: { warn: Function; error: Function }) {
   const fanoutRun = () => fanoutNewEvents().catch((error) => log.error({ error }, 'notification fanout failed'));
   const fanout = setInterval(fanoutRun, 1_000); fanout.unref(); void fanoutRun();
-  const deliveryRun = () => bot && deliverBatch(bot).catch((error) => log.error({ error }, 'notification delivery failed'));
+  const deliveryRun = () => bot && deliverBatch(bot, log).catch((error) => log.error({ error }, 'notification delivery failed'));
   const delivery = bot ? setInterval(deliveryRun, 1_000) : undefined; delivery?.unref(); if (bot) void deliveryRun();
   return () => { clearInterval(fanout); if (delivery) clearInterval(delivery); };
 }

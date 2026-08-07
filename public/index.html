@@ -40,12 +40,16 @@
       <div class="map-stage">
         <div id="map" aria-label="Інтерактивна карта України"></div>
         <div class="map-vignette" aria-hidden="true"></div>
-        <div class="map-tools" aria-label="Шари карти">
-          <button class="layer-toggle is-active" data-layer="alerts"><i class="swatch alert"></i>Тривоги</button>
-          <button class="layer-toggle is-active" data-layer="threats"><i class="swatch threat"></i>Загрози</button>
-          <button class="layer-toggle is-active" data-layer="assessments"><i class="swatch risk"></i>Аналітика</button>
+        <div class="map-panels">
+          <div class="map-tools" aria-label="Шари карти">
+            <button class="layer-toggle is-active" data-layer="alerts"><i class="swatch alert"></i>Тривоги</button>
+            <button class="layer-toggle is-active" data-layer="threats"><i class="swatch threat"></i>Загрози</button>
+            <button class="layer-toggle is-active" data-layer="assessments"><i class="swatch risk"></i>Аналітика</button>
+            <button class="layer-toggle is-active" data-layer="occupation" hidden><i class="swatch occupation"></i>Окупація</button>
+          </div>
+          <div class="sovereignty-badge"><strong>Крим — Україна</strong><span>Міжнародно визнані кордони</span></div>
+          <details class="occupation-legend" id="occupation-legend" hidden></details>
         </div>
-        <div class="sovereignty-badge"><strong>Крим — Україна</strong><span>Міжнародно визнані кордони</span></div>
         <div class="map-caption">
           <span>Клікніть область або місто, щоб відкрити історію. Напрямки не є прогнозом траєкторії.</span>
           <button id="fit-ukraine">Показати всю Україну</button>

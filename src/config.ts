@@ -29,7 +29,18 @@ const envSchema = z.object({
   MAP_STYLE_URL: z.string().default('https://tiles.openfreemap.org/styles/dark'),
   KATOTTG_SYNC_ENABLED: z.string().default('true').transform((value) => value === 'true'),
   KATOTTG_URL: z.string().url().default('https://mindev.gov.ua/storage/app/sites/1/uploaded-files/kodifikator-07-07.xlsx'),
-  KATOTTG_VERSION: z.string().default('07.07.2026')
+  KATOTTG_VERSION: z.string().default('07.07.2026'),
+  OCCUPATION_SOURCE_ENABLED: z.string().default('true').transform((value) => value === 'true'),
+  DEEPSTATE_API_URL: z.string().url().default('https://deepstatemap.live/api/history/last'),
+  OCCUPATION_SYNC_INTERVAL_SECONDS: z.coerce.number().int()
+    .min(3600, 'Occupation source must not be polled more than once per hour').default(10800),
+  OCCUPATION_STALE_AFTER_SECONDS: z.coerce.number().int().positive().default(21600),
+  // How long a source may stay silent about an alert it was holding before that alert is allowed to
+  // end. Official providers are polled every 15 seconds, so the default tolerates three consecutive
+  // missed polls and ends the alert on the fourth. The floor is two polls: anything shorter would
+  // let a single incomplete response trigger a false "Офіційний відбій" again.
+  ALERT_END_DEBOUNCE_SECONDS: z.coerce.number().int()
+    .min(30, 'Alert end debounce must span at least two 15-second polls').default(60)
 }).superRefine((env, ctx) => {
   if (env.NODE_ENV !== 'production') return;
   if (env.OPS_PASSWORD === 'change-me' || env.OPS_PASSWORD.length < 16) {

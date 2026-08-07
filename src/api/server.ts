@@ -7,7 +7,8 @@ import { Registry, collectDefaultMetrics, Counter, Gauge, Histogram } from 'prom
 import { config } from '../config.js';
 import { pool } from '../db/pool.js';
 import { activeAlerts, assessmentDetails, currentAssessments, liveThreats, locationTimeline, systemVersion, threatDetails } from '../repositories/events.js';
-import { eventHub, type SystemEvent } from '../services/sse.js';
+import { createEventRelay, eventHub, type SystemEvent } from '../services/sse.js';
+import occupationRoutes from './occupation-routes.js';
 import { runRiskAssessments } from '../services/risk.js';
 import { createChannelSchema, createRecommendedChannel, listRecommendedChannels, updateChannelSchema, updateRecommendedChannel } from '../services/recommended-channels.js';
 
@@ -70,7 +71,7 @@ export async function buildServer() {
   app.get('/health/live', async () => ({ status: 'ok', version: process.env.npm_package_version ?? 'dev' }));
   app.get('/health/ready', async (_request, reply) => {
     try {
-      const migration = await pool.query(`SELECT 1 FROM schema_migrations WHERE filename='005_territory_channels.sql'`);
+      const migration = await pool.query(`SELECT 1 FROM schema_migrations WHERE filename='008_alert_end_debounce.sql'`);
       if (!migration.rowCount) return reply.code(503).send({ status: 'not_ready', reason: 'migrations_pending' });
       return { status: 'ready' };
     }
@@ -84,6 +85,8 @@ export async function buildServer() {
     if (!allowed) return reply.code(401).send({ error: 'unauthorized' });
     return reply.type(registry.contentType).send(await registry.metrics());
   });
+
+  await app.register(occupationRoutes, { metricsRegistry: registry });
 
   app.get('/api/v1/config', async () => ({
     mapStyleUrl: config.MAP_STYLE_URL,
@@ -193,22 +196,31 @@ export async function buildServer() {
       Connection: 'keep-alive', 'X-Accel-Buffering': 'no'
     });
     const lastEventId = Math.max(0, Number(request.headers['last-event-id'] ?? 0) || 0);
-    reply.raw.write(`retry: 3000\nevent: connected\ndata: ${JSON.stringify({ at: new Date().toISOString(), version: await systemVersion() })}\n\n`);
-    const send = (event: SystemEvent) => {
-      reply.raw.write(`id: ${event.version}\nevent: ${event.eventType}\ndata: ${JSON.stringify(event)}\n\n`);
-    };
-    if (lastEventId) {
-      const missed = await pool.query(
-        `SELECT version,event_type,payload,created_at FROM system_event_log
-         WHERE version>$1 ORDER BY version LIMIT 500`, [lastEventId]
-      );
-      for (const row of missed.rows) send({
-        version: Number(row.version), eventType: row.event_type, payload: row.payload, createdAt: row.created_at.toISOString()
-      });
-    }
-    const heartbeat = setInterval(() => reply.raw.write(`: heartbeat ${Date.now()}\n\n`), 15_000);
+    let closed = false;
+    const writeFrame = (frame: string) => { if (!closed) reply.raw.write(frame); };
+    const relay = createEventRelay(lastEventId, (event) => {
+      writeFrame(`id: ${event.version}\nevent: ${event.eventType}\ndata: ${JSON.stringify(event)}\n\n`);
+    });
+    const send = (event: SystemEvent) => relay.buffer(event);
+    const heartbeat = setInterval(() => writeFrame(`: heartbeat ${Date.now()}\n\n`), 15_000);
     eventHub.on('event', send);
-    request.raw.on('close', () => { clearInterval(heartbeat); eventHub.off('event', send); sseConnections.dec(); });
+    request.raw.on('close', () => { closed = true; clearInterval(heartbeat); eventHub.off('event', send); sseConnections.dec(); });
+    writeFrame(`retry: 3000\nevent: connected\ndata: ${JSON.stringify({ at: new Date().toISOString(), version: await systemVersion() })}\n\n`);
+    try {
+      if (lastEventId) {
+        const missed = await pool.query(
+          `SELECT version,event_type,payload,created_at FROM system_event_log
+           WHERE version>$1 ORDER BY version LIMIT 500`, [lastEventId]
+        );
+        for (const row of missed.rows) relay.deliver({
+          version: Number(row.version), eventType: row.event_type, payload: row.payload, createdAt: row.created_at.toISOString()
+        });
+      }
+    } catch (error) {
+      request.log.error({ error }, 'sse backfill failed');
+    } finally {
+      relay.flush();
+    }
   });
 
   app.get('/ops/api', async (request, reply) => {

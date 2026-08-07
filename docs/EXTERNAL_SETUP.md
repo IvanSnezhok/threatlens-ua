@@ -19,6 +19,11 @@ All product code paths exist without these credentials. Complete these human-con
    - `POSTGRES_PASSWORD`, `OPS_PASSWORD`, `METRICS_TOKEN`.
    - Set `DEMO_SOURCE_ENABLED=false`; production startup rejects demo data and known development database credentials.
 
+6. Agree terms of use for the temporarily occupied territories layer with DeepStateMap.
+   - The feed is not published under an open licence; attribution alone is not a licence.
+   - Until permission is confirmed in writing, deploy with `OCCUPATION_SOURCE_ENABLED=false`.
+   - This is a legal decision owned by the product owner, not a configuration step.
+
 ## Optional
 
 - Configure an OpenAI-compatible JSON endpoint through `AI_BASE_URL`, `AI_API_KEY` and `AI_MODEL`. The deterministic engine works without it.

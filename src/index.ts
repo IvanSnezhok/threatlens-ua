@@ -10,6 +10,7 @@ import { startRiskScheduler } from './services/risk.js';
 import { startOperationsScheduler } from './services/operations.js';
 import { startNightlyDigestScheduler } from './services/nightly-digest.js';
 import { startLocationCatalogScheduler } from './services/location-catalog.js';
+import { startOccupationScheduler } from './services/occupation.js';
 import { eventHub } from './services/sse.js';
 import { startTelegramCollector } from './sources/telegram.js';
 
@@ -23,6 +24,7 @@ const stopRisk = startRiskScheduler(app.log);
 const stopOperations = startOperationsScheduler(app.log);
 const stopNightlyDigests = startNightlyDigestScheduler(app.log);
 const stopLocationCatalog = startLocationCatalogScheduler(app.log);
+const stopOccupation = startOccupationScheduler(app.log);
 const bot = createBot();
 const stopNotifications = startNotificationWorkers(bot, app.log);
 const stopCollector = await startTelegramCollector(app.log);
@@ -46,7 +48,7 @@ await app.listen({ port: config.PORT, host: '0.0.0.0' });
 
 async function shutdown(signal: string) {
   app.log.info({ signal }, 'shutting down');
-  stopIngestion(); stopRisk(); stopOperations(); stopNightlyDigests(); stopLocationCatalog(); stopAnalytics(); stopNotifications(); eventHub.stop();
+  stopIngestion(); stopRisk(); stopOperations(); stopNightlyDigests(); stopLocationCatalog(); stopOccupation(); stopAnalytics(); stopNotifications(); eventHub.stop();
   bot?.stop();
   await stopCollector?.();
   await app.close();
