@@ -134,11 +134,17 @@ Production backups must additionally be encrypted and copied to independent obje
   its start time.
 
   A non-zero counter means a 🟢 was genuinely lost — treat it as a parser defect report, not as
-  routine noise. Open `https://t.me/s/air_alert_ua`, find the all-clear for that location and compare
-  it against `src/domain/alert-parser.ts`: the channel publishes partial all-clears (🟡) carrying a
-  "тривога ще триває у:" addendum, threat stand-downs (`Відбій загрози`, `Відбій по КАБах`) that must
-  never end an air raid, and occasional typo headlines. A new wording variant belongs in the parser
-  with a test, not in a lowered threshold.
+  routine noise. The counter and the log carry the `source` label, so start from the channel it names:
+  `SELECT public_url FROM sources WHERE id='…'`, open `https://t.me/s/<handle>`, find the all-clear
+  for that location and compare it against `src/domain/alert-parser.ts`. The channels publish partial
+  all-clears (🟡) carrying a "тривога ще триває у:" / "повітряна тривога досі триває у:" addendum,
+  threat stand-downs (`Відбій загрози`, `Відбій по КАБах`) that must never end an air raid, and
+  occasional typo headlines. A new wording variant belongs in the parser with a fixture from that
+  specific channel, not in a lowered threshold.
+
+  If the channel's whole format has moved rather than one message, the correct response is
+  `UPDATE sources SET enabled=false WHERE id='…'` — the backstop keeps sweeping disabled rows, so
+  switching a channel off releases what it was holding instead of stranding it.
 
   **Never lower `ALERT_CHANNEL_MAX_ALERT_SECONDS` toward a realistic alert duration.** The bound sits
   above the longest plausible real alert on purpose — overnight mass-attack alerts run 8–11 hours and

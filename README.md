@@ -62,7 +62,12 @@ TELEGRAM_SESSION=…
 DEMO_SOURCE_ENABLED=false
 ```
 
-Restart with `docker compose up --build -d`. Official alerts and monitored channels now flow.
+Restart with `docker compose up --build -d`. One session drives everything the collector reads: the
+Air Force channel, every enabled official alert channel, and the OSINT monitors.
+
+Validate in staging that the raion and hromada names those channels publish resolve against the local
+catalogue. An unresolved name is reported as a catalogue gap, not a source failure, so it will not
+break collection — but nothing lands on the map for it either.
 
 ### 3. The bot
 

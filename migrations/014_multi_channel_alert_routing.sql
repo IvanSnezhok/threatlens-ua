@@ -1,0 +1,116 @@
+-- Turns the Tier A alert catalogue registered by migration 013 into something that is actually read,
+-- and corrects the four `enabled` flags that turned out to be wrong once the live feeds were sampled
+-- message by message rather than channel by channel.
+--
+-- Migration 013 registered twenty-one `adapter_type='mtproto_alert_channel'` rows and said in its own
+-- header that two things had to happen outside it before any of them produced anything: multi-channel
+-- routing, and a parser that reads the administrations' word order. Both are in this change. What is
+-- left here is data — which rows the routing is now allowed to read.
+--
+-- ================================================================================================
+-- 1. `enabled` on an alert-channel row now GATES collection instead of recording configuration
+-- ================================================================================================
+--
+-- Migration 010 inserted `air-alert-ua` with `enabled=false` and had the collector flip it to true on
+-- connect, mirroring the Alerts.in.ua adapter. On one hard-coded channel that was harmless
+-- bookkeeping. On a catalogue of twenty-one it is a contradiction: most of those rows are switched
+-- off *deliberately*, because their published wording has never been observed or cannot be read
+-- safely, and a collector that writes the column cannot also obey it.
+--
+-- The flag now belongs to the row. `loadAlertChannels()` reads `enabled=true` and nothing in the
+-- application writes `sources.enabled` for this adapter type any more — `enableAlertChannelSource()`
+-- is deleted. The deployment-level control did not move: `ALERT_CHANNEL_ENABLED=false` still switches
+-- the whole path off without database access, exactly as `OSINT_MONITOR_ENABLED` does for the
+-- monitors. Environment decides whether the path runs; the catalogue decides what it runs over.
+--
+-- The concern migration 010 raised — "an unconfigured deployment would report a permanently healthy
+-- source that never runs" — does not materialise. `sources.health_status` starts at `unknown` and
+-- only `markSourceSuccess` moves it to `current`; `updateSourceFreshness` promotes `current` to
+-- `stale` and never touches `unknown`. A deployment with no MTProto credentials leaves every one of
+-- these rows at `unknown`, and `/api/v1/sources` reports it as such.
+UPDATE sources SET enabled = true WHERE id = 'air-alert-ua';
+
+-- ================================================================================================
+-- 2. Three A1 rows switched OFF: the format claim did not survive contact with the feed
+-- ================================================================================================
+--
+-- Migration 013 grouped seven channels as "confirmed structured alert format". Sampling every one of
+-- them post by post shows that four publish the format the parser now reads and three publish
+-- something else entirely. Alert authority on a channel whose wording the parser cannot read is not
+-- neutral: it is an oblast that looks covered and is not.
+--
+-- `gov-odesa-oda` (@odeskaODA) — locations above the phrase, and an all-clear that names nothing:
+--
+--     ❗️ Болградський район
+--     ❗️ Одеський район
+--
+--     🔴 Повітряна тривога!
+--
+--     🟢 Відбій повітряної тривоги!
+--
+-- The start is readable in principle. The all-clear is not: it carries no location at all, and the
+-- only reading that would make it useful — "everything this source is currently holding" — is a
+-- blanket withdrawal derived from state the parser deliberately does not have. Inventing it would put
+-- the one unrecoverable failure this system recognises, a false "Офіційний відбій", one regex away
+-- from every message on the channel. Left off until that decision is taken explicitly. 187 posts
+-- sampled; the parser reports the all-clear as `unrecognized` rather than acting on it.
+--
+-- `gov-zaporizhzhia-oda` (@zoda_gov_ua) and `gov-zaporizhzhia-head` (@ivan_fedorov_zp) — a prose
+-- format with exclusions:
+--
+--     🚨УВАГА🚨
+--     Оголошена повітряна тривога у місті Запоріжжя!
+--     Бережіть себе і терміново прослідуйте у безпечне місце!
+--
+--     🚨УВАГА🚨
+--     Оголошена повітряна тривога у громадах Запорізької області, крім міста Запоріжжя!
+--
+--     ✅ Відбій повітряної тривоги по Запорізькій області та м. Запоріжжя!
+--     ✅ Відбій повітряної тривоги по м. Запоріжжя, крім Запорізькій області‼️
+--
+-- Neither 🚨 nor ✅ is a status circle, the phrase sits on the second line, and — the part that
+-- settles it — "крім" carries an exclusion the location model has no way to express. Reading
+-- "по всій Запорізькій області, крім міста Запоріжжя" as an oblast-wide alert would declare an alert
+-- over precisely the city the authority just exempted, and the last example above is a mis-declined
+-- sentence whose intended scope is not recoverable from the text at all. This is a parser design
+-- question, not a flag.
+UPDATE sources SET enabled = false
+ WHERE id IN ('gov-odesa-oda', 'gov-zaporizhzhia-oda', 'gov-zaporizhzhia-head');
+
+-- ================================================================================================
+-- 3. Two rows switched ON: their format is the one the parser now reads
+-- ================================================================================================
+--
+-- `gov-rivne-oda` (@oda_rv) was filed under A4, "alert format not confirmed — zero alert posts in the
+-- verified sample", and `gov-sloviansk-mva` (@slv_vca) under A2, "free prose". Sampled again over a
+-- longer window, both publish the administrations' standard format verbatim, including the partial
+-- all-clear with its still-under-alert list:
+--
+--     🔴 Рівненський район - повітряна тривога!
+--     🟡 Сарненський район - відбій повітряної тривоги!
+--
+--        Зверніть увагу, повітряна тривога досі триває у:
+--        - Дубенський район
+--        - Рівненський район
+--
+--     🔴 Краматорський район - повітряна тривога!
+--     🟢 Краматорський район - відбій повітряної тривоги!
+--
+-- Both are pinned as parser fixtures in `src/domain/alert-parser.test.ts`, which is the standard
+-- migration 013 set for enabling a Tier A row: an observed message from that specific channel, in a
+-- test. `slv_vca` speaks only for Kramatorsk raion and can never stand in for Donetsk oblast; the
+-- A2 note that says so still holds.
+UPDATE sources SET enabled = true WHERE id IN ('gov-rivne-oda', 'gov-sloviansk-mva');
+
+-- ================================================================================================
+-- 4. Handles may not be shared between an alert row and a classifier row
+-- ================================================================================================
+--
+-- `loadMonitoredTelegramChannels` now drops any monitoring row whose handle is claimed by an
+-- alert-channel row, and `resolveChannelRoutes` gives the alert route priority when both exist. This
+-- index states the same rule where it cannot drift: one row per channel, across every tier and every
+-- adapter type. Nothing in the catalogue violates it today — `source-catalog.test.ts` already asserts
+-- it as data — and with alert authority now attached to twenty-one handles instead of one, a
+-- duplicate would decide whether an official alert is read as an alert or as an unverified sighting.
+CREATE UNIQUE INDEX IF NOT EXISTS sources_telegram_username_key
+  ON sources (lower(telegram_username)) WHERE telegram_username IS NOT NULL;

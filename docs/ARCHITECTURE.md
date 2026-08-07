@@ -66,10 +66,22 @@ must obtain explicit permission before a public launch, or run with `OCCUPATION_
 
 ### Official sources, and what "official" is not
 
-Three sources are designated official (tier A). Two are APIs — Ukraine Alarm and Alerts.in.ua — and
-both need a token issued on written application. The third is the official alert channel
-[@air_alert_ua](https://t.me/air_alert_ua), which carries the same executive-authority and State
-Emergency Service notifications and needs no credential at all.
+Two of the official (tier A) sources are APIs — Ukraine Alarm and Alerts.in.ua — and both need a
+token issued on written application. The rest are Telegram alert channels, which carry the same
+executive-authority and State Emergency Service notifications and need no credential at all: the
+national [@air_alert_ua](https://t.me/air_alert_ua) plus the oblast and city military
+administrations registered by `migrations/013_source_catalog_expansion.sql`.
+
+Which of those channels is actually read is data, not code. Every row with
+`adapter_type='mtproto_alert_channel'` and `enabled=true` is subscribed to and may start and end
+alert periods; twenty-one bodies are registered and the rest are switched off. `enabled` on these
+rows means one specific thing — **the parser has been shown this channel's published wording, as a
+fixture, in `src/domain/alert-parser.test.ts`** — and not "this body is trustworthy", which is what
+`tier` and `official` say. Three registered administrations publish real alerts and are switched off
+anyway because their format cannot be read safely; `migrations/014_multi_channel_alert_routing.sql`
+carries the verbatim samples and the reasoning. `ALERT_CHANNEL_ENABLED` is the deployment-level kill
+switch above all of them, the same shape as `OSINT_MONITOR_ENABLED`, and nothing in the application
+writes `sources.enabled` for this adapter type.
 
 The distinction that matters is **designation**, not transport. A tier A source designated to publish
 alerts starts and ends official alerts whether its bytes arrive over HTTPS or MTProto. What has not
@@ -81,31 +93,49 @@ changed, and is not negotiable:
   information domain with different wording in the UI and the bot.
 - A source can only move the alert state of the locations it explicitly names.
 
-The alert channel is registered in its own `independence_group` (`official-air-alert-channel`),
-separate from `air-force` and from the API group. Note for anyone reading corroboration counts: it is
-independent of the *Air Force* channel in publisher and mandate, but it shares upstream authorities
-with the civil alert APIs, so two-group agreement between the channel and an API is weaker evidence
-than two-group agreement between the channel and an OSINT group.
+The national channel is registered in its own `independence_group` (`official-air-alert-channel`),
+separate from `air-force` and from the API group, and each administration carries its own. Note for
+anyone reading corroboration counts: the national channel is independent of the *Air Force* channel
+in publisher and mandate, but it shares upstream authorities with the civil alert APIs and with the
+administrations that feed it, so two-group agreement inside the official family is weaker evidence
+than agreement between an official source and an OSINT group. Where two rows are one authority
+speaking twice — an administration and the personal channel of the person who heads it — they share
+a group so a repost cannot corroborate itself.
 
 ### Event-driven official alert source
 
 The APIs return the complete national picture on every poll, so their reconciler is a snapshot: it
 clears everything the source held, re-raises what the response reports, and lets the aggregate decide.
-The channel is not a snapshot. It publishes transitions — "Повітряна тривога в Нікопольський район",
-"Відбій тривоги в Одеський район" — and a message about one raion says nothing whatsoever about any
-other. Running it through the snapshot reconciler would clear the whole country every time one oblast
-was mentioned.
+A channel is not a snapshot. It publishes transitions — "Повітряна тривога в Нікопольський район",
+"Бериславський район - повітряна тривога!" — and a message about one raion says nothing whatsoever
+about any other. Running it through the snapshot reconciler would clear the whole country every time
+one oblast was mentioned.
 
 It therefore has its own path, in the same module and sharing the same aggregate reconciler:
 
 - 🔴 raises exactly the source-state rows it names; 🟢 lowers exactly the rows it names; every other
   row of that source is untouched.
-- Only "Повітряна тривога" and "Відбій тривоги" move alert state. The channel's other traffic — 🟠
+- **Every function on this path takes its source id from the caller.** `alert_source_states` is keyed
+  on `(source_id, location_id, alert_type)`, so several administrations holding an alert over the
+  same raion at once is the storage model working as intended: each owns its own row, `bool_or`
+  decides what the map shows, and one body's all-clear can never end another body's alert.
+- Two published word orders are read, both pinned as verbatim fixtures. The national channel writes
+  the phrase first (`🔴 13:47 Повітряна тривога в <район>`, with an optional `•` list); the
+  administrations write the location first (`🔴 <район> - повітряна тривога!`) with no printed clock.
+- Only "Повітряна тривога" and "Відбій (повітряної) тривоги" move alert state. Other traffic — 🟠
   advisories, 🔴🔴 heightened-danger notices, the "Загроза …"/"Відбій загрози …" family — is recorded
   but never acted on, because "Відбій загрози ударних БпЛА" is a threat standing down inside an alert
-  that is still running.
-- A 🟡 partial all-clear subtracts the locations the same message repeats under "тривога ще триває у".
-  When nothing survives the subtraction, nothing is cleared.
+  that is still running. In the location-first order the literal "повітрян…" before "тривог…" is
+  mandatory: it is what stops "<район> - відбій загрози БпЛА!" from reading as an all-clear now that
+  the phrase no longer has to sit at the start of the headline.
+- A 🟡 partial all-clear subtracts the locations the same message repeats under "тривога ще триває у"
+  (national) or "повітряна тривога досі триває у" (administrations). When nothing survives the
+  subtraction, nothing is cleared.
+- An administration also publishes ordinary news, and about a third of those posts mention
+  "повітряної тривоги" in passing. A message with no status circle **and** no alert phrase in its
+  headline is filed as `ignored: 'unrelated'`; anything carrying a circle, or an alert phrase without
+  a circle, is still `unrecognized` and logged at warn level. That split is what keeps the
+  wording-drift alarm a signal instead of a permanent stream of school-bus announcements.
 - `ALERT_END_DEBOUNCE_SECONDS` is **not** inherited. That window exists for polled sources that go
   quiet about an alert they were holding; it is keyed on `alert_source_states.missing_since`, which
   the event path always leaves NULL. An explicit all-clear is a statement, not a silence.
@@ -116,18 +146,25 @@ It therefore has its own path, in the same module and sharing the same aggregate
 - An edit is re-processed with the **original** publication time. The corrected text is what matters;
   timing it at the edit would let a correction to an hours-old message restart an alert. A location
   dropped by an edit is not cleared — absence never ends an alert on this path.
-- On connect the collector re-reads a bounded window of channel history
+- On connect the collector re-reads a bounded window of each channel's history
   (`ALERT_CHANNEL_BACKFILL_MESSAGES`, `ALERT_CHANNEL_BACKFILL_SECONDS`). The window is folded to one
   terminal state per location before anything is written, so an alert that both started and ended
   while the collector was down produces no notification at all — only what is still true now reaches
-  the reconciler.
+  the reconciler. The message count is a per-channel *ceiling*: history is read a page at a time and
+  the read stops as soon as it runs past the age bound. 300 messages is roughly the six-hour window
+  of the busiest channel (~50 messages an hour); an administration publishes one to three an hour and
+  finishes in one page, so enabling more channels costs round trips proportional to what each one
+  actually published rather than a flat multiple.
 
 The failure mode this model has and the snapshot model does not is a missing all-clear: a 🟢 that is
 never delivered, or that arrives in a shape the parser does not recognise, would leave an alert
 active forever. `ALERT_CHANNEL_MAX_ALERT_SECONDS` bounds it. The bound is deliberately far longer
 than any real alert (default 24 hours, floor 1 hour) because clearing a *live* alert early is the one
 failure this system treats as unrecoverable; when it fires it is a defect signal, logged at warn level
-and counted in `threatlens_alert_channel_stuck_alerts_total`, not routine behaviour.
+and counted in `threatlens_alert_channel_stuck_alerts_total`, not routine behaviour. The sweep covers
+**every** alert-channel row, including the ones `enabled=false` switches off: disabling a channel
+stops it being read, it does not withdraw what it was holding, and those rows would otherwise pin
+their locations on the map with no collector left that could clear them.
 
 Names the channel publishes are raion- and hromada-level and are resolved through the same catalogue
 lookup as the API adapters, with its two guarantees intact: LIKE metacharacters are escaped, and an

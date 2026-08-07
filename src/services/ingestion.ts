@@ -360,30 +360,48 @@ export async function syncAlertsInUa(log?: { warn: Function }): Promise<void> {
 }
 
 // ------------------------------------------------------------------------------------------------
-// Event-driven official alert source: the @air_alert_ua Telegram channel
+// Event-driven official alert sources: the Tier A alert Telegram channels
 // ------------------------------------------------------------------------------------------------
 
 /**
- * The channel is an official Tier A source that happens to publish over MTProto instead of HTTPS.
- * What it is *not* is a snapshot: `persistOfficialAlertSnapshot` clears every state this source
+ * These are official Tier A sources that happen to publish over MTProto instead of HTTPS.
+ * What they are *not* is snapshots: `persistOfficialAlertSnapshot` clears every state a source
  * holds before re-raising the reported ones, which is correct for an API that returns the complete
  * national picture on every poll and catastrophic for a channel that says "an alert started in one
  * raion" — every other raion would be cleared by the next message about a single oblast.
  *
  * So this path is per-location and additive: 🔴 raises exactly the rows it names, 🟢 lowers exactly
  * the rows it names, and every other row of the same source is left untouched.
+ *
+ * Every function below takes the source id from its caller. `alert_source_states` has always been
+ * keyed on `(source_id, location_id, alert_type)` and `reconcileAggregateAlert` has always taken a
+ * source id, so several administrations holding an alert over the same raion at the same time is
+ * the storage model working as designed, not a special case: each one owns its own row, and the
+ * aggregate is what the map shows.
+ */
+
+/** Adapter type of an alert channel: a channel whose messages may start and end alert periods. */
+export const ALERT_CHANNEL_ADAPTER_TYPE = 'mtproto_alert_channel';
+
+/**
+ * The national channel https://t.me/air_alert_ua.
+ *
+ * Named because it is the row `config.ALERT_CHANNEL_USERNAME` falls back to when the registry cannot
+ * be read, and because the operational documentation refers to it by id. It carries no privilege
+ * over the other rows: it is read from the registry like all of them.
  */
 export const ALERT_CHANNEL_SOURCE_ID = 'air-alert-ua';
 
 const alertChannelMessages = new Counter({
   name: 'threatlens_alert_channel_messages_total',
-  help: 'Messages read from the official alert Telegram channel, by parse outcome',
-  labelNames: ['outcome'],
+  help: 'Messages read from the official alert Telegram channels, by source and parse outcome',
+  labelNames: ['source', 'outcome'],
   registers: []
 });
 const alertChannelStuckAlerts = new Counter({
   name: 'threatlens_alert_channel_stuck_alerts_total',
   help: 'Alert-channel states force-cleared because no all-clear arrived within the maximum duration',
+  labelNames: ['source'],
   registers: []
 });
 const monitorMessages = new Counter({
@@ -470,19 +488,21 @@ function compareExternalId(left: string, right: string): number {
  * edited one lands as a second row against the same Telegram id — the revision history comes for
  * free, and an unrecognised format is recorded rather than only logged.
  */
-async function recordAlertChannelMessage(message: AlertChannelMessage, status: string): Promise<void> {
+async function recordAlertChannelMessage(
+  sourceId: string, message: AlertChannelMessage, status: string
+): Promise<void> {
   const hash = createHash('sha256').update(message.text).digest('hex');
   await pool.query(
     `INSERT INTO source_messages(source_id,external_id,published_at,edited_at,raw_text,raw_payload,
        content_hash,processing_status)
      VALUES ($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT (source_id,external_id,content_hash) DO NOTHING`,
-    [ALERT_CHANNEL_SOURCE_ID, message.externalId, message.publishedAt, message.editedAt ?? null,
+    [sourceId, message.externalId, message.publishedAt, message.editedAt ?? null,
       message.text, JSON.stringify(message.rawPayload ?? {}), hash, status]
   );
 }
 
 async function applyAlertChannelStates(
-  states: AlertChannelState[]
+  sourceId: string, states: AlertChannelState[]
 ): Promise<{ applied: number; skippedStale: number }> {
   if (!states.length) return { applied: 0, skippedStale: 0 };
   const client = await pool.connect();
@@ -515,12 +535,12 @@ async function applyAlertChannelStates(
          WHERE alert_source_states.last_event_at IS NULL
             OR alert_source_states.last_event_at <= EXCLUDED.last_event_at
          RETURNING location_id`,
-        [ALERT_CHANNEL_SOURCE_ID, state.locationId, state.alertType, state.active,
+        [sourceId, state.locationId, state.alertType, state.active,
           state.observedAt, state.externalId]
       );
       if (!upsert.rowCount) { skippedStale += 1; continue; }
       applied += 1;
-      await reconcileAggregateAlert(client, state.locationId, state.alertType, ALERT_CHANNEL_SOURCE_ID);
+      await reconcileAggregateAlert(client, state.locationId, state.alertType, sourceId);
     }
     await client.query('COMMIT');
     return { applied, skippedStale };
@@ -533,16 +553,20 @@ async function applyAlertChannelStates(
 }
 
 /**
- * Applies a batch of channel messages.
+ * Applies a batch of messages from one alert channel.
  *
  * The live collector passes one message; the reconnect backfill passes a bounded history window.
  * Both go through the same code because the batch is first **folded to one terminal state per
  * location** — the newest event wins — and only that state is written. Replaying a window therefore
  * converges on the situation as it stands right now instead of re-emitting an hours-old alert and
  * its all-clear as a fresh pair of notifications.
+ *
+ * `sourceId` is the registry row the messages came from, and it is the whole of what keeps two
+ * administrations reporting the same raion apart. Passing the wrong one would attribute one
+ * authority's all-clear to another and end an alert the other body never withdrew.
  */
 export async function ingestAlertChannelMessages(
-  messages: AlertChannelMessage[], log?: { warn: Function }
+  sourceId: string, messages: AlertChannelMessage[], log?: { warn: Function }
 ): Promise<AlertChannelIngestSummary> {
   const summary: AlertChannelIngestSummary = {
     events: 0, ignored: 0, unrecognized: 0, applied: 0, skippedStale: 0, unresolved: []
@@ -558,25 +582,27 @@ export async function ingestAlertChannelMessages(
     const parsed = parseAlertChannelMessage(message.text, message.publishedAt);
     if (parsed.kind === 'unrecognized') {
       summary.unrecognized += 1;
-      alertChannelMessages.inc({ outcome: 'unrecognized' });
-      await recordAlertChannelMessage(message, 'unrecognized');
+      alertChannelMessages.inc({ source: sourceId, outcome: 'unrecognized' });
+      await recordAlertChannelMessage(sourceId, message, 'unrecognized');
       // A channel that changes its wording must make this loud. Silently reporting no alerts is the
-      // one outcome an alert source is never allowed to have.
+      // one outcome an alert source is never allowed to have. Ordinary channel prose does not reach
+      // here — the parser files it as `ignored: 'unrelated'` — so this warning stays a signal on a
+      // channel that publishes news between its alerts.
       log?.warn(
-        { sourceId: ALERT_CHANNEL_SOURCE_ID, externalId: message.externalId, headline: parsed.headline },
+        { sourceId, externalId: message.externalId, headline: parsed.headline },
         'alert channel message matched no known format and was not applied'
       );
       continue;
     }
     if (parsed.kind === 'ignored') {
       summary.ignored += 1;
-      alertChannelMessages.inc({ outcome: `ignored:${parsed.reason}` });
-      await recordAlertChannelMessage(message, 'ignored');
+      alertChannelMessages.inc({ source: sourceId, outcome: `ignored:${parsed.reason}` });
+      await recordAlertChannelMessage(sourceId, message, 'ignored');
       continue;
     }
     summary.events += 1;
-    alertChannelMessages.inc({ outcome: parsed.event.action });
-    await recordAlertChannelMessage(message, 'alert');
+    alertChannelMessages.inc({ source: sourceId, outcome: parsed.event.action });
+    await recordAlertChannelMessage(sourceId, message, 'alert');
     for (const name of parsed.event.locationNames) {
       const locationId = await resolveLocationId({ locationName: name });
       if (!locationId) { unresolved.push(name); continue; }
@@ -585,18 +611,18 @@ export async function ingestAlertChannelMessages(
         alertType: parsed.event.alertType,
         active: parsed.event.action === 'start',
         observedAt: parsed.event.observedAt,
-        externalId: `${ALERT_CHANNEL_SOURCE_ID}:${message.externalId}`
+        externalId: `${sourceId}:${message.externalId}`
       });
     }
   }
 
-  const outcome = await applyAlertChannelStates([...desired.values()]);
+  const outcome = await applyAlertChannelStates(sourceId, [...desired.values()]);
   summary.applied = outcome.applied;
   summary.skippedStale = outcome.skippedStale;
   summary.unresolved = unresolved;
   // Reported only when there is something to report: unlike a poll, a single message is not a
   // statement about every location, so a resolvable message must not erase the standing gap report.
-  if (unresolved.length) recordUnresolvedLocations(ALERT_CHANNEL_SOURCE_ID, unresolved, log);
+  if (unresolved.length) recordUnresolvedLocations(sourceId, unresolved, log);
   return summary;
 }
 
@@ -608,27 +634,34 @@ export async function ingestAlertChannelMessages(
  * channel state that has been active for longer than `ALERT_CHANNEL_MAX_ALERT_SECONDS`, logs it and
  * counts it. The bound is set far above any real alert precisely so that firing is a defect signal,
  * not routine behaviour: if it fires, an all-clear was missed and the operator needs to know.
+ *
+ * It sweeps **every** row whose adapter type is an alert channel, deliberately including the ones
+ * `enabled=false` currently switches off. Disabling a channel stops it being read; it does not
+ * withdraw the alerts it was holding when it was switched off, and without this those rows would
+ * hold their locations on the map with no collector left that could ever clear them.
  */
 export async function expireStuckAlertChannelAlerts(log?: { warn: Function }): Promise<number> {
   if (!config.ALERT_CHANNEL_ENABLED) return 0;
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
-    const stuck = await client.query<{ location_id: string; alert_type: string; started_at: string }>(
+    const stuck = await client.query<{
+      source_id: string; location_id: string; alert_type: string; started_at: string;
+    }>(
       `UPDATE alert_source_states
           SET active=false,missing_since=NULL,last_seen_at=now(),updated_at=now()
-        WHERE source_id=$1 AND active=true
+        WHERE source_id IN (SELECT id FROM sources WHERE adapter_type=$1) AND active=true
           AND COALESCE(provider_started_at,last_event_at,updated_at)
               < now()-($2::int * interval '1 second')
-        RETURNING location_id,alert_type,
+        RETURNING source_id,location_id,alert_type,
                   COALESCE(provider_started_at,last_event_at,updated_at)::text AS started_at`,
-      [ALERT_CHANNEL_SOURCE_ID, config.ALERT_CHANNEL_MAX_ALERT_SECONDS]
+      [ALERT_CHANNEL_ADAPTER_TYPE, config.ALERT_CHANNEL_MAX_ALERT_SECONDS]
     );
     for (const row of stuck.rows) {
-      await reconcileAggregateAlert(client, row.location_id, row.alert_type, ALERT_CHANNEL_SOURCE_ID);
-      alertChannelStuckAlerts.inc();
+      await reconcileAggregateAlert(client, row.location_id, row.alert_type, row.source_id);
+      alertChannelStuckAlerts.inc({ source: row.source_id });
       log?.warn({
-        sourceId: ALERT_CHANNEL_SOURCE_ID, locationId: row.location_id, alertType: row.alert_type,
+        sourceId: row.source_id, locationId: row.location_id, alertType: row.alert_type,
         startedAt: row.started_at, maximumSeconds: config.ALERT_CHANNEL_MAX_ALERT_SECONDS
       }, 'alert channel state cleared by the maximum alert duration guard: an all-clear was missed');
     }
@@ -642,9 +675,39 @@ export async function expireStuckAlertChannelAlerts(log?: { warn: Function }): P
   }
 }
 
-/** Marks the channel source as configured once its collector is actually connected. */
-export async function enableAlertChannelSource(): Promise<void> {
-  await pool.query(`UPDATE sources SET enabled=true WHERE id=$1`, [ALERT_CHANNEL_SOURCE_ID]);
+export interface AlertTelegramChannel {
+  sourceId: string;
+  /** Lower-cased, without the leading `@`. */
+  username: string;
+}
+
+/**
+ * The Telegram channels allowed to start and end official alerts, read from `sources`.
+ *
+ * `enabled` is a real gate here, exactly as it is for the OSINT monitors: fifteen of the twenty-one
+ * registered Tier A rows are switched off because their published wording has never been observed or
+ * cannot be read safely, and the flag is the only thing that keeps alert-declaring authority away
+ * from those channels. Nothing in the code writes this column — see
+ * `migrations/014_multi_channel_alert_routing.sql` for why the collector no longer flips it on.
+ *
+ * `config.ALERT_CHANNEL_ENABLED` sits above it as the deployment-level kill switch, mirroring
+ * `OSINT_MONITOR_ENABLED`: the environment decides whether this path runs at all, and the catalogue
+ * decides which channels it runs over.
+ */
+export async function loadAlertChannels(): Promise<AlertTelegramChannel[]> {
+  if (!config.ALERT_CHANNEL_ENABLED) return [];
+  const result = await pool.query<{ id: string; telegram_username: string }>(
+    `SELECT id,lower(telegram_username) AS telegram_username FROM sources
+     WHERE adapter_type=$1 AND enabled=true AND telegram_username IS NOT NULL
+     ORDER BY id`,
+    [ALERT_CHANNEL_ADAPTER_TYPE]
+  );
+  return result.rows
+    .map((row) => ({
+      sourceId: row.id,
+      username: (row.telegram_username ?? '').trim().replace(/^@/, '').toLowerCase()
+    }))
+    .filter((channel) => channel.username);
 }
 
 // ------------------------------------------------------------------------------------------------
@@ -656,6 +719,16 @@ export const MONITOR_ADAPTER_TYPE = 'mtproto_monitor';
 
 /** Adapter type of the Air Force channel: the same classifier path, but an official Tier A source. */
 const CLASSIFIER_ADAPTER_TYPES = ['mtproto', MONITOR_ADAPTER_TYPE] as const;
+
+/**
+ * Every handle claimed by an alert-channel row, `enabled` or not.
+ *
+ * Disabled is included on purpose: a switched-off Tier A row must not become collectable through
+ * the classifier by having its handle duplicated onto a monitoring row. Interpolated into the two
+ * queries below, where `$1` is the alert-channel adapter type.
+ */
+const ALERT_CHANNEL_HANDLES_SQL =
+  `SELECT lower(telegram_username) FROM sources WHERE adapter_type=$1 AND telegram_username IS NOT NULL`;
 
 export interface MonitoredTelegramChannel {
   sourceId: string;
@@ -673,33 +746,39 @@ export interface MonitoredTelegramChannel {
  *
  * Two things this deliberately does *not* return:
  *
- *  * **The official alert channel.** Its adapter type is `mtproto_alert_channel` and is not in
- *    {@link CLASSIFIER_ADAPTER_TYPES}, and any row that claims the configured alert-channel username
- *    is dropped outright. A monitoring row can therefore never be routed to the alert reconciler,
- *    and cannot shadow the alert channel by claiming its name.
- *  * **Disabled monitors.** `enabled=false` really stops collection here. It does not for the
- *    official adapters — `syncOfficialAlerts` gates on a token and `syncAlertsInUa` sets the flag to
- *    true itself, so for those rows the column reports configuration rather than controlling it.
- *    That known defect is not carried into this path. The Air Force row is left on its existing
- *    behaviour on purpose: it is an official source that must keep working exactly as it does now,
- *    so it is not gated on a flag nothing currently sets.
+ *  * **Any alert channel.** Their adapter type is `mtproto_alert_channel` and is not in
+ *    {@link CLASSIFIER_ADAPTER_TYPES}; on top of that, a row claiming a username that *any*
+ *    alert-channel row also claims is dropped outright, as is a row claiming the configured
+ *    fallback username. A monitoring row can therefore never be routed to the alert reconciler,
+ *    and cannot shadow an official channel by claiming its name — which matters far more now that
+ *    twenty-one handles carry alert authority instead of one.
+ *  * **Disabled monitors.** `enabled=false` really stops collection here. It does not for the two
+ *    HTTP official adapters — `syncOfficialAlerts` gates on a token and `syncAlertsInUa` sets the
+ *    flag to true itself, so for those rows the column reports configuration rather than
+ *    controlling it. That known defect is not carried into this path. The Air Force row is left on
+ *    its existing behaviour on purpose: it is an official source that must keep working exactly as
+ *    it does now, so it is not gated on a flag nothing currently sets.
  */
 export async function loadMonitoredTelegramChannels(): Promise<MonitoredTelegramChannel[]> {
   if (!config.OSINT_MONITOR_ENABLED) {
     // The kill switch stops the OSINT monitors only; the Air Force channel is not OSINT.
     const airForce = await pool.query<{ id: string; telegram_username: string; adapter_type: string }>(
       `SELECT id,lower(telegram_username) AS telegram_username,adapter_type FROM sources
-       WHERE telegram_username IS NOT NULL AND adapter_type='mtproto' ORDER BY id`
+       WHERE telegram_username IS NOT NULL AND adapter_type='mtproto'
+         AND lower(telegram_username) NOT IN (${ALERT_CHANNEL_HANDLES_SQL})
+       ORDER BY id`,
+      [ALERT_CHANNEL_ADAPTER_TYPE]
     );
     return toMonitoredChannels(airForce.rows);
   }
   const result = await pool.query<{ id: string; telegram_username: string; adapter_type: string }>(
     `SELECT id,lower(telegram_username) AS telegram_username,adapter_type FROM sources
      WHERE telegram_username IS NOT NULL
-       AND adapter_type = ANY($1::text[])
-       AND (adapter_type <> $2 OR enabled = true)
+       AND adapter_type = ANY($2::text[])
+       AND (adapter_type <> $3 OR enabled = true)
+       AND lower(telegram_username) NOT IN (${ALERT_CHANNEL_HANDLES_SQL})
      ORDER BY id`,
-    [[...CLASSIFIER_ADAPTER_TYPES], MONITOR_ADAPTER_TYPE]
+    [ALERT_CHANNEL_ADAPTER_TYPE, [...CLASSIFIER_ADAPTER_TYPES], MONITOR_ADAPTER_TYPE]
   );
   return toMonitoredChannels(result.rows);
 }

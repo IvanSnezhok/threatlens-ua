@@ -2,9 +2,11 @@ import { describe, expect, it } from 'vitest';
 import { parseAlertChannelMessage, locationKey, type AlertChannelParse } from './alert-parser.js';
 
 /**
- * Every fixture below is a verbatim message from https://t.me/s/air_alert_ua, captured from the live
- * channel while this parser was written. Nothing here reaches the network: the channel's wording is
- * the contract under test, so it is pinned as data.
+ * Every fixture below is a verbatim message captured from a live channel while this parser was
+ * written — https://t.me/s/air_alert_ua for the phrase-first order, and the oblast and city military
+ * administrations (khersonskaODA, kyivoda, VinnytsiaODA, oda_rv, slv_vca, kherson_miskrada) for the
+ * location-first one. Nothing here reaches the network: the channels' wording is the contract under
+ * test, so it is pinned as data.
  */
 const OBSERVED_AT = new Date('2026-08-07T11:47:00.000Z');
 
@@ -131,6 +133,82 @@ describe('alert channel parser — partial all-clears (🟡)', () => {
   });
 });
 
+/**
+ * The oblast and city military administrations publish the same three transitions in the opposite
+ * word order, with no printed clock and one location per message. Fixtures below are verbatim from
+ * https://t.me/s/khersonskaODA, kyivoda, VinnytsiaODA, oda_rv, slv_vca and kherson_miskrada.
+ */
+describe('alert channel parser — the administrations\' location-first word order', () => {
+  it('reads a start whose location comes before the phrase', () => {
+    expect(action('🔴 Бериславський район - повітряна тривога!')).toBe('start');
+    expect(names('🔴 Бериславський район - повітряна тривога!')).toEqual(['Бериславський район']);
+  });
+
+  it('reads an all-clear whose location comes before the phrase', () => {
+    expect(action('🟢 Каховський район - відбій повітряної тривоги!')).toBe('end');
+    expect(names('🟢 Каховський район - відбій повітряної тривоги!')).toEqual(['Каховський район']);
+  });
+
+  it('keeps a hyphenated raion name intact', () => {
+    // `Могилів-Подільський` carries an unspaced hyphen inside the name; the separator is a spaced
+    // dash. Splitting on the wrong one would leave "Могилів" and never resolve against the catalogue.
+    expect(names('🔴 Могилів-Подільський район - повітряна тривога!'))
+      .toEqual(['Могилів-Подільський район']);
+  });
+
+  it('clears the raion a 🟡 names and leaves the ones it lists as still under alert', () => {
+    const text = '🟡 Скадовський район - відбій повітряної тривоги!\n\n'
+      + 'Зверніть увагу, повітряна тривога досі триває у:\n'
+      + '- Бериславський район\n- Генічеський район\n- Каховський район\n- Херсонський район';
+    expect(action(text)).toBe('end');
+    // The administrations list the *other* raions, never the one they are clearing, so the
+    // subtraction is a no-op here — and stays in place so that the day one of them does repeat it,
+    // the all-clear is refused exactly as it is on the national channel.
+    expect(names(text)).toEqual(['Скадовський район']);
+    const result = parse(text);
+    if (result.kind !== 'event') throw new Error('expected an event');
+    expect(result.event.stillActiveNames).toEqual([
+      'Бериславський район', 'Генічеський район', 'Каховський район', 'Херсонський район'
+    ]);
+  });
+
+  it('reads "досі триває" the same way as the national channel\'s "ще триває"', () => {
+    // Same trap, the administrations' wording: the cleared raion repeated under the still-active
+    // list must not produce an "Офіційний відбій" for a raion that is still under alert.
+    const text = '🟡 Херсонський район - відбій повітряної тривоги!\n\n'
+      + 'Зверніть увагу, повітряна тривога досі триває у:\n- Херсонський район\n- Каховський район';
+    expect(parse(text)).toMatchObject({ kind: 'ignored', reason: 'partial_all_clear_still_active' });
+  });
+
+  it('carries no printed clock', () => {
+    const result = parse('🔴 Краматорський район - повітряна тривога!');
+    expect(result).toMatchObject({ kind: 'event', event: { channelClock: null } });
+  });
+
+  it('refuses a threat stand-down dressed in the same word order', () => {
+    // The whole reason "повітрян…" is mandatory in front of "тривог…" in the location-first
+    // patterns: without it these would end a running air-raid alert.
+    expect(parse('🟢 Херсонський район - відбій загрози ударних БпЛА!'))
+      .toMatchObject({ kind: 'ignored', reason: 'threat_notice' });
+    expect(parse('🔴 Херсонський район - загроза застосування КАБів!'))
+      .toMatchObject({ kind: 'ignored', reason: 'threat_notice' });
+  });
+
+  it('refuses a circle that disagrees with the location-first wording', () => {
+    expect(parse('🟢 Бериславський район - повітряна тривога!').kind).toBe('unrecognized');
+    expect(parse('🔴 Бериславський район - відбій повітряної тривоги!').kind).toBe('unrecognized');
+  });
+
+  it('reports an all-clear that names no location instead of clearing everything', () => {
+    // Verbatim from https://t.me/s/odeskaODA, which publishes its locations *above* the phrase and
+    // then gives the all-clear with no location at all. "Everything this source holds" is not a
+    // reading this parser is allowed to invent, so the shape is surfaced rather than acted on.
+    expect(parse('🟢 Відбій повітряної тривоги!').kind).toBe('unrecognized');
+    expect(parse('❗️ Одеський район\n\n🔴 Повітряна тривога!'))
+      .toMatchObject({ kind: 'ignored', reason: 'unrelated' });
+  });
+});
+
 describe('alert channel parser — messages that must never move alert state', () => {
   const notAlerts: Array<[string, string]> = [
     ['🟠 evacuation notice', '🟠 13:59 БЕЗКОШТОВНА ЕВАКУАЦІЯ\n'
@@ -154,7 +232,11 @@ describe('alert channel parser — messages that must never move alert state', (
     ['🟡 KAB stand-down', '🟡 22:02 Відбій по КАБах\nЗверніть увагу, тривога ще триває у:\n'
       + '- Кальміуський район\n- Краматорський район'],
     ['🟢 KAB stand-down under an Увага headline', '🟢 17:49 Увага\n'
-      + 'Відбій загрози застосування керованих авіаційних бомб (КАБів).']
+      + 'Відбій загрози застосування керованих авіаційних бомб (КАБів).'],
+    // Verbatim, and the reason "загроз" is no longer anchored to the start of the headline: the
+    // national channel writes the noun second here, and the shape was reported as unknown until it.
+    ['🔴🔴 missile threat with the noun second', '🔴🔴 17:46 Ракетна загроза в м. Запоріжжя та '
+      + 'Запорізька територіальна громада!']
   ];
 
   it.each(notAlerts)('ignores %s', (_label, text) => {
@@ -177,8 +259,24 @@ describe('alert channel parser — shapes it does not know', () => {
     expect(result).toEqual({ kind: 'unrecognized', headline: 'Нова невідома фраза каналу' });
   });
 
-  it('reports a message with no status circle', () => {
-    expect(parse('Технічне повідомлення каналу без кружечка').kind).toBe('unrecognized');
+  it('reports an alert phrase published without a status circle', () => {
+    // The wording-drift alarm the `unrelated` bucket must never swallow: the vocabulary is there,
+    // the circle is not, so which half moved is unknown and guessing is the wrong answer.
+    expect(parse('Повітряна тривога в Одеський район').kind).toBe('unrecognized');
+    expect(parse('Бериславський район - повітряна тривога!').kind).toBe('unrecognized');
+  });
+
+  it('files an ordinary post with neither a circle nor the alert vocabulary as unrelated', () => {
+    // An administration channel publishes news between its alerts, and about a third of those posts
+    // mention "повітряної тривоги" in passing. Reporting them as unknown *shapes* would bury a real
+    // wording change under a permanent stream of school-bus announcements.
+    expect(parse('Технічне повідомлення каналу без кружечка'))
+      .toMatchObject({ kind: 'ignored', reason: 'unrelated' });
+    // Verbatim, https://t.me/s/VinnytsiaODA.
+    expect(parse('⏳З 00:00 розпочалася комендантська година. Вона триватиме до 5:00.\n\n'
+      + 'Нагадуємо, що перебування на вулиці в цей час заборонено 🚫\n\n'
+      + '☝️Виходити можна лише для того, щоб дійти до найближчого укриття у разі сигналу '
+      + 'повітряної тривоги.')).toMatchObject({ kind: 'ignored', reason: 'unrelated' });
   });
 
   it('reports an alert phrase that names no location', () => {

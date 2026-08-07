@@ -42,10 +42,19 @@ const envSchema = z.object({
   ALERT_END_DEBOUNCE_SECONDS: z.coerce.number().int()
     .min(30, 'Alert end debounce must span at least two 15-second polls').default(60),
 
-  // ---- Official alert channel (@air_alert_ua), collected over MTProto -------------------------
-  // This source publishes events, not snapshots, so it has its own reconciliation path and its own
-  // safeguards. See docs/ARCHITECTURE.md, "Event-driven official alert source".
+  // ---- Official alert channels, collected over MTProto -----------------------------------------
+  // These sources publish events, not snapshots, so they have their own reconciliation path and
+  // their own safeguards. See docs/ARCHITECTURE.md, "Event-driven official alert source".
+  //
+  // *Which* channels are read is data, not configuration: every `sources` row with
+  // adapter_type='mtproto_alert_channel' and enabled=true is subscribed to and may start and end
+  // alert periods. This flag is the deployment-level kill switch above that registry, exactly as
+  // OSINT_MONITOR_ENABLED is for the monitors — it must work without database access.
   ALERT_CHANNEL_ENABLED: z.string().default('true').transform((value) => value === 'true'),
+  // Fallback only. If the registry query fails, the collector subscribes to this one channel rather
+  // than starting up with no official alert source at all; when the query succeeds, the table
+  // decides and this value is not consulted. It is also still the handle no monitoring row may
+  // claim, which is why it stays normalised here rather than being read straight from the row.
   ALERT_CHANNEL_USERNAME: z.string().default('air_alert_ua')
     .transform((value) => value.trim().replace(/^@/, '').toLowerCase()),
   // Longest an alert from the channel may stay active without an explicit all-clear.
@@ -62,6 +71,12 @@ const envSchema = z.object({
     .min(3600, 'Alert channel maximum alert duration must be at least one hour').default(86400),
   // Reconnect backfill. Bounded twice, by count and by age; the window is folded to one terminal
   // state per location before anything is written, so old events are never replayed as new ones.
+  //
+  // The count is a per-channel *ceiling*, not a target: history is read a page at a time and the
+  // read stops as soon as it runs past the age bound. 300 is calibrated to the busiest channel —
+  // @air_alert_ua publishes about fifty messages an hour, so ~300 fill the six-hour window — while
+  // an oblast administration publishes one to three an hour and finishes in a single page. That is
+  // what keeps the cost of enabling another channel proportional to what it actually publishes.
   ALERT_CHANNEL_BACKFILL_MESSAGES: z.coerce.number().int().min(0).max(500).default(300),
   ALERT_CHANNEL_BACKFILL_SECONDS: z.coerce.number().int().min(0).default(21600),
 
