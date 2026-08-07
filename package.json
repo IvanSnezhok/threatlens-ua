@@ -1,0 +1,40 @@
+{
+  "name": "threatlens-ua",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Evidence-first alerts, threats and risk assessments for Ukraine",
+  "scripts": {
+    "dev": "tsx watch src/index.ts",
+    "dev:web": "esbuild web/app.js --bundle --sourcemap --outfile=public/assets/app.js --loader:.css=css --watch",
+    "build:web": "esbuild web/app.js --bundle --minify --outfile=public/assets/app.js --loader:.css=css",
+    "build": "npm run build:web && tsc -p tsconfig.json",
+    "start": "node dist/index.js",
+    "migrate": "tsx src/db/migrate.ts",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "@fastify/rate-limit": "^10.3.0",
+    "@fastify/static": "^10.1.3",
+    "drizzle-orm": "^0.45.2",
+    "fastify": "^5.6.0",
+    "fflate": "^0.8.3",
+    "grammy": "^1.38.3",
+    "maplibre-gl": "^5.7.1",
+    "pg": "^8.16.3",
+    "pino": "^9.9.4",
+    "prom-client": "^15.1.3",
+    "telegram": "^2.26.22",
+    "zod": "^4.1.11"
+  },
+  "devDependencies": {
+    "@types/node": "^22.18.8",
+    "@types/pg": "^8.15.5",
+    "esbuild": "^0.25.10",
+    "tsx": "^4.20.6",
+    "typescript": "^5.9.3",
+    "vitest": "^3.2.4"
+  }
+}

@@ -1,0 +1,12 @@
+node_modules/
+dist/
+.env
+public/assets/app.js
+public/assets/app.css
+public/assets/*.map
+coverage/
+data/*.session
+data/postgres/
+backups/
+*.log
+.DS_Store

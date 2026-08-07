@@ -1,0 +1,106 @@
+import { pool } from '../db/pool.js';
+
+export async function markSourceSuccess(sourceId: string): Promise<void> {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const current = await client.query<{ health_status: string }>(
+      `SELECT health_status FROM sources WHERE id=$1 FOR UPDATE`, [sourceId]
+    );
+    if (!current.rowCount) throw new Error(`Unknown source: ${sourceId}`);
+    await client.query(
+      `UPDATE sources SET last_success_at=now(),last_error=NULL,health_status='current' WHERE id=$1`,
+      [sourceId]
+    );
+    if (current.rows[0]!.health_status === 'stale' || current.rows[0]!.health_status === 'error') {
+      await client.query(
+        `INSERT INTO system_event_log(event_type,payload) VALUES ('source.recovered',$1)`,
+        [JSON.stringify({ sourceId })]
+      );
+    }
+    await client.query('COMMIT');
+  } catch (error) {
+    await client.query('ROLLBACK');
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
+export async function markSourceError(sourceId: string, error: unknown): Promise<void> {
+  const message = error instanceof Error ? error.message : String(error);
+  await pool.query(
+    `UPDATE sources SET last_error_at=now(),last_error=$2,health_status='error' WHERE id=$1`,
+    [sourceId, message.slice(0, 800)]
+  );
+}
+
+export async function expireThreatEvents(): Promise<number> {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const candidates = await client.query<{ id: string; evidence_level: string; status: string }>(
+      `SELECT id,evidence_level,status FROM threat_events
+       WHERE status IN ('observed','confirmed','active') AND valid_until IS NOT NULL AND valid_until<=now()
+       FOR UPDATE`
+    );
+    for (const event of candidates.rows) {
+      await client.query(
+        `UPDATE threat_events SET status='expired',ended_at=COALESCE(ended_at,valid_until,now()),updated_at=now() WHERE id=$1`,
+        [event.id]
+      );
+      await client.query(
+        `INSERT INTO event_updates(event_id,previous_status,new_status,previous_evidence_level,new_evidence_level,reason)
+         VALUES ($1,$2,'expired',$3,$3,'validity_window_elapsed')`,
+        [event.id, event.status, event.evidence_level]
+      );
+      await client.query(
+        `INSERT INTO system_event_log(event_type,payload) VALUES ('threat.expired',$1)`,
+        [JSON.stringify({ eventId: event.id })]
+      );
+    }
+    await client.query('COMMIT');
+    return candidates.rowCount ?? 0;
+  } catch (error) {
+    await client.query('ROLLBACK');
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
+export async function updateSourceFreshness(): Promise<number> {
+  const stale = await pool.query<{ id: string }>(
+    `UPDATE sources SET health_status='stale'
+     WHERE enabled=true AND health_status='current' AND last_success_at IS NOT NULL
+       AND last_success_at < now()-(stale_after_seconds||' seconds')::interval
+     RETURNING id`
+  );
+  for (const source of stale.rows) {
+    await pool.query(
+      `INSERT INTO system_event_log(event_type,payload) VALUES ('source.stale',$1)`,
+      [JSON.stringify({ sourceId: source.id })]
+    );
+  }
+  return stale.rowCount ?? 0;
+}
+
+export function startOperationsScheduler(log: { info: Function; error: Function }): () => void {
+  let running = false;
+  const run = async () => {
+    if (running) return;
+    running = true;
+    try {
+      const [expired, stale] = await Promise.all([expireThreatEvents(), updateSourceFreshness()]);
+      if (expired || stale) log.info({ expired, stale }, 'operational state updated');
+    } catch (error) {
+      log.error({ error }, 'operational state update failed');
+    } finally {
+      running = false;
+    }
+  };
+  const timer = setInterval(run, 30_000);
+  timer.unref();
+  void run();
+  return () => clearInterval(timer);
+}
