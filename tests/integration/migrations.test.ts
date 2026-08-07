@@ -50,7 +50,7 @@ describe.skipIf(!integrationDatabaseAvailable)('migration runner against live Po
 
   it('creates the readiness marker the /health/ready probe queries', async () => {
     // src/api/server.ts gates readiness on this exact filename; a renamed migration must break here.
-    const marker = await sql("SELECT 1 FROM schema_migrations WHERE filename='013_source_catalog_expansion.sql'");
+    const marker = await sql("SELECT 1 FROM schema_migrations WHERE filename='016_threat_vectors.sql'");
     expect(marker.rowCount).toBe(1);
   });
 

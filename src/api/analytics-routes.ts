@@ -1,6 +1,5 @@
-import { timingSafeEqual } from 'node:crypto';
 import type { FastifyPluginAsync, FastifyReply, FastifyRequest } from 'fastify';
-import { config } from '../config.js';
+import { hasValidOpsAuth } from './ops-auth.js';
 import {
   AnalyticsInputError,
   archiveCoverage,
@@ -31,29 +30,10 @@ import { narrateOverview } from '../services/analytics-narrative.js';
  * await app.register(analyticsRoutes);
  * ```
  *
- * ## Why the auth check is duplicated
- *
- * `hasValidOpsAuth` in `src/api/server.ts` is module-private and this plugin must not be the reason
- * that file changes. The check below is the same one, character for character: constant-time
- * comparison of both halves of the Basic credential against `OPS_USER`/`OPS_PASSWORD`. If the
- * server-side helper is ever exported, delete this copy and import it — there should be exactly one
- * definition of who an operator is, and today there are two.
- *
- * Everything here is behind that check without exception. The archive contains the raw decisions of
- * the classifier over every message from every monitored channel, including the ones it got wrong;
- * that is an internal diagnostic surface, not a public dataset.
+ * Everything here is behind the shared operator check in `./ops-auth.js`, without exception. The
+ * archive holds the classifier's raw decisions over every message from every monitored channel,
+ * including the ones it got wrong; that is an internal diagnostic surface, not a public dataset.
  */
-
-function safeEqual(a: string, b: string) {
-  const left = Buffer.from(a); const right = Buffer.from(b);
-  return left.length === right.length && timingSafeEqual(left, right);
-}
-
-function hasValidOpsAuth(authorization?: string) {
-  if (!authorization?.startsWith('Basic ')) return false;
-  const [user, password] = Buffer.from(authorization.slice(6), 'base64').toString().split(':');
-  return safeEqual(user ?? '', config.OPS_USER) && safeEqual(password ?? '', config.OPS_PASSWORD);
-}
 
 interface AnalyticsQuery {
   from?: string;

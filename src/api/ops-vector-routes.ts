@@ -1,30 +1,9 @@
-import { timingSafeEqual } from 'node:crypto';
 import type { FastifyPluginAsync, FastifyReply, FastifyRequest } from 'fastify';
-import { config } from '../config.js';
 import { pool } from '../db/pool.js';
+import { hasValidOpsAuth } from './ops-auth.js';
 import { latestStoredProjection, projectEventVector, recentProjections } from '../services/vector-projection.js';
 
 const uuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
-
-function safeEqual(left: string, right: string): boolean {
-  const a = Buffer.from(left), b = Buffer.from(right);
-  return a.length === b.length && timingSafeEqual(a, b);
-}
-
-/**
- * Same rule as `hasValidOpsAuth` in `./server.ts`, restated here.
- *
- * The original is module-private and `server.ts` is owned by other work in flight, so it cannot be
- * exported right now. Nine duplicated lines are the cheaper mistake: the alternative is loosening the
- * ops boundary — exporting the check, or registering the extrapolation route inside the public
- * plugin — to save them. When `server.ts` is next touched, exporting `hasValidOpsAuth` and deleting
- * this copy is a mechanical change.
- */
-function hasValidOpsAuth(authorization?: string): boolean {
-  if (!authorization?.startsWith('Basic ')) return false;
-  const [user, password] = Buffer.from(authorization.slice(6), 'base64').toString().split(':');
-  return safeEqual(user ?? '', config.OPS_USER) && safeEqual(password ?? '', config.OPS_PASSWORD);
-}
 
 function authorised(request: FastifyRequest): boolean {
   return hasValidOpsAuth(request.headers.authorization);

@@ -181,11 +181,12 @@ describe.skipIf(!integrationDatabaseAvailable)('threat vectors', () => {
     let baseUrl = '';
 
     beforeAll(async () => {
+      // buildServer() registers both vector plugins itself. Registering them again here — which this
+      // test did while server.ts was off-limits — throws FST_ERR_DUPLICATED_ROUTE in beforeAll, and
+      // Vitest reports the suite as skipped rather than failed. That silently disarmed the two
+      // assertions that matter most in this file, so the server is taken exactly as it ships.
       const { buildServer } = await import('../../src/api/server.js');
       app = await buildServer();
-      // The two registration lines `src/api/server.ts` needs, exercised here rather than assumed.
-      await app.register((await import('../../src/api/vector-routes.js')).default);
-      await app.register((await import('../../src/api/ops-vector-routes.js')).default);
       baseUrl = await app.listen({ port: 0, host: '127.0.0.1' });
     });
 

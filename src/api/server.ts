@@ -1,4 +1,3 @@
-import { timingSafeEqual } from 'node:crypto';
 import { resolve } from 'node:path';
 import Fastify from 'fastify';
 import rateLimit from '@fastify/rate-limit';
@@ -9,7 +8,11 @@ import { pool } from '../db/pool.js';
 import { activeAlerts, assessmentDetails, currentAssessments, liveThreats, locationTimeline, relatedLocationsCte, systemVersion, threatDetails } from '../repositories/events.js';
 import { createEventRelay, eventHub, type SystemEvent } from '../services/sse.js';
 import { registerAlertChannelMetrics } from '../services/ingestion.js';
+import { hasValidOpsAuth, safeEqual } from './ops-auth.js';
+import analyticsRoutes from './analytics-routes.js';
 import occupationRoutes from './occupation-routes.js';
+import opsVectorRoutes from './ops-vector-routes.js';
+import vectorRoutes from './vector-routes.js';
 import { runRiskAssessments } from '../services/risk.js';
 import { createChannelSchema, createRecommendedChannel, listRecommendedChannels, updateChannelSchema, updateRecommendedChannel } from '../services/recommended-channels.js';
 
@@ -21,17 +24,6 @@ const httpDuration = new Histogram({ name: 'threatlens_http_duration_seconds', h
 const sseConnections = new Gauge({ name: 'threatlens_sse_connections', help: 'Active SSE clients', registers: [registry] });
 const uuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const locationIdPattern = /^[a-z0-9-]{1,64}$/i;
-
-function safeEqual(a: string, b: string) {
-  const left = Buffer.from(a); const right = Buffer.from(b);
-  return left.length === right.length && timingSafeEqual(left, right);
-}
-
-function hasValidOpsAuth(authorization?: string) {
-  if (!authorization?.startsWith('Basic ')) return false;
-  const [user, password] = Buffer.from(authorization.slice(6), 'base64').toString().split(':');
-  return safeEqual(user ?? '', config.OPS_USER) && safeEqual(password ?? '', config.OPS_PASSWORD);
-}
 
 /**
  * Whether a source can actually collect, decided per adapter rather than per id.
@@ -89,7 +81,7 @@ export async function buildServer() {
   app.get('/health/live', async () => ({ status: 'ok', version: process.env.npm_package_version ?? 'dev' }));
   app.get('/health/ready', async (_request, reply) => {
     try {
-      const migration = await pool.query(`SELECT 1 FROM schema_migrations WHERE filename='013_source_catalog_expansion.sql'`);
+      const migration = await pool.query(`SELECT 1 FROM schema_migrations WHERE filename='016_threat_vectors.sql'`);
       if (!migration.rowCount) return reply.code(503).send({ status: 'not_ready', reason: 'migrations_pending' });
       return { status: 'ready' };
     }
@@ -104,7 +96,13 @@ export async function buildServer() {
     return reply.type(registry.contentType).send(await registry.metrics());
   });
 
+  // Each of these is registered WITHOUT fastify-plugin on purpose. The encapsulation is what keeps
+  // their hooks — the occupation cache headers, the ops auth guards — scoped to their own routes
+  // instead of leaking onto every response the server sends.
   await app.register(occupationRoutes, { metricsRegistry: registry });
+  await app.register(analyticsRoutes);
+  await app.register(vectorRoutes);
+  await app.register(opsVectorRoutes);
 
   app.get('/api/v1/config', async () => ({
     mapStyleUrl: config.MAP_STYLE_URL,

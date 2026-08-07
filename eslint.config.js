@@ -16,7 +16,10 @@ import tseslint from 'typescript-eslint';
  */
 export default tseslint.config(
   {
-    ignores: ['dist/**', 'node_modules/**', 'public/**', 'web/**', 'data/**', 'coverage/**', 'scripts/**']
+    // `.claude/worktrees/**` holds full checkouts of this same repository. Without it, every
+    // TypeScript file exists several times over and the parser cannot decide which tsconfig root
+    // it belongs to, which fails the whole run rather than any one file.
+    ignores: ['dist/**', 'node_modules/**', 'public/**', 'web/**', 'data/**', 'coverage/**', 'scripts/**', '.claude/**']
   },
   js.configs.recommended,
   ...tseslint.configs.recommended,
