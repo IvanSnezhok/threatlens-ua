@@ -20,6 +20,43 @@ docker compose exec -T app curl -fsS http://localhost:3000/health/ready
 docker compose exec -T postgres psql -U threatlens -d threatlens -c 'TABLE schema_migrations'
 ```
 
+## Threat vector extrapolation (operator only)
+
+The public product publishes the chain of *reported* observations behind a threat and stops where the
+reporting stops. Continuing the last leg is an internal tool. It lives behind the same Basic auth as
+the rest of `/ops`, in its own tables, and **must not be quoted publicly, forwarded to a channel or
+pasted into a message to the public** — it is a calculation about the future, and the product's
+standing commitment is that it does not predict targets or trajectories.
+
+```bash
+# Live events that have a chain worth extrapolating, plus the last 20 projections.
+curl -fsS -u "$OPS_USER:$OPS_PASSWORD" http://localhost:3000/ops/vectors
+
+# Compute, record and read one projection. horizonMinutes is 1..60, default 15.
+curl -fsS -u "$OPS_USER:$OPS_PASSWORD" -X POST \
+  "http://localhost:3000/ops/threats/<event-id>/vector-projection?horizonMinutes=15"
+```
+
+The same panel is rendered inside `/ops` in the browser. Reading it:
+
+- **`dataNature: "calculated"`** is on the row, not on the caption. It is a CHECK constraint, so no
+  row in these tables can claim to be an observation.
+- **`uncertainty`** is mandatory. `lateralHalfAngleDegrees` widens for every admission the computation
+  has to make — one leg only, an approximate raion centroid on either end, sub-minute spacing between
+  the two reports, a stale last report — and `reasons` names each one in Ukrainian.
+  `confidence` is only ever `low` or `medium`; `high` is not a value the schema accepts.
+- **`candidates`** are locations that fall in or near the cone. They are a *calculation about places*,
+  never a report that anything is heading there. `withinUncertainty: false` means "near the cone, not
+  in it" and is kept deliberately rather than dropped.
+- **`narrativeOrigin`** is `deterministic` unless a model was configured *and* its rewording passed
+  validation. The numbers are never the model's: a reply containing any number the computation did not
+  produce is discarded and the generated wording is used.
+
+A `422 projection_unavailable` is a normal answer, not a fault. `no_drawable_leg` means no leg has a
+coordinate at both ends (hromadas, and raions missing from the ADM2 file); `no_elapsed_time` means one
+message stated both ends, which gives a heading but no speed; `implausible_speed` means two reports
+landed close enough together that the ratio is an artefact.
+
 ## Analytical queries
 
 The classification archive and the assertion table are shaped so each of these is one statement.

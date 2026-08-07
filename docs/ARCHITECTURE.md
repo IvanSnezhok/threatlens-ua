@@ -198,6 +198,61 @@ The archive write happens outside the ingestion transaction and its failure is a
 (`threatlens_classification_log_failures_total`), never an exception. During a mass attack the thing
 that must keep working is the map; an analytics row is not worth a dropped threat event.
 
+### Threat vectors: a reported chain in public, an extrapolation for operators only
+
+The commitment stated at the top of this document and on the map itself — the system shows an
+explicitly reported region, point or direction and never a predicted target, impact or trajectory —
+is unchanged. Threat vectors are two different things wearing one name, and the whole design is about
+keeping them apart.
+
+**The public chain** is a sequence of *reported observations*: "three sources led this target from
+Sumy through Poltava to Kharkiv over eight minutes". It is derived, never stored: every fact it is
+made of already lives in `message_classifications` and `message_classification_locations`, so the
+chain cannot disagree with the messages it summarises and a classifier fix retroactively corrects
+every chain it touched. Each leg is graded by what was actually said, and the payload never flattens
+the three rungs into one line:
+
+| Basis | What a single message stated | Where it comes from |
+| --- | --- | --- |
+| `reported_transit` | the movement itself — "Балістика повз Полтаву на Харків" | a `redirect`: one message retracts the place being passed and asserts the place being approached |
+| `reported_direction` | a heading out of a named place, not an arrival | `relation_type='reported_direction'` beside an anchor location |
+| `observation_sequence` | **nothing** — two separate messages named two places at two times | consecutive classifications on the same event |
+
+The weakest rung is the one that could be mistaken for a trajectory, so it is labelled as such in the
+payload (`basis`, `basisLabel`), drawn as a dotted line rather than a solid one, and described in the
+map legend as "порядок наш; рух не стверджувало жодне джерело". Legs whose ends have no coordinate
+stay in the payload as stated facts with `drawable: false` — raions carry no KATOTTG coordinate, so
+the chain falls back to the centroid of their ADM2 polygon and publishes that as
+`coordinateSource: 'raion_centroid'`, `coordinatePrecision: 'approximate'`, rendered as a hollow node.
+
+**The extrapolation** — continue the last leg, name the locations inside the resulting cone, state the
+uncertainty — is an operator tool and is isolated the way the occupation layer is isolated, only more
+strictly, because this one would be actively harmful if published:
+
+- separate storage: `ops_threat_vector_projections` and `ops_threat_vector_projection_candidates`,
+  never a column on `threat_events`, so no `SELECT e.*` in a public query can pick it up;
+- separate service (`src/services/vector-projection.ts`) and separate plugin
+  (`src/api/ops-vector-routes.ts`) behind the same Basic auth as the rest of `/ops`;
+- the import arrow points one way: the ops service imports the public chain builder, and no module
+  that builds a public response imports the ops service, at any depth;
+- `data_nature` is `CHECK (data_nature = 'calculated')` on the projection row *and* on every candidate
+  row, so "this is arithmetic, not an observation" is a property of the data rather than of a caption;
+- `confidence` is `CHECK (confidence IN ('low','medium'))`. High confidence in an extrapolation of two
+  reported points is not a value this schema can hold.
+
+`src/api/vector-isolation.test.ts` walks the real module graph from every public entry point and
+fails the build if any of them reaches the ops modules, and separately fails if the `ops_`-prefixed
+table names appear in a public module or in the browser bundle.
+`tests/integration/threat-vector.test.ts` plants a marker inside a stored projection and then reads
+the snapshot, the threat list and detail, the history, the location timeline, both public vector
+endpoints and a live SSE connection including its replay backfill, asserting none of them contains it.
+
+The vector itself is computed deterministically — bearing, ground speed, horizon, cone half-angle,
+uncertainty radius and candidate ranking involve no network call. A configured model is offered the
+finished numbers and may only return a better Ukrainian phrasing; the reply is schema-validated and
+rejected outright if it contains a single number the computation did not produce, and
+`narrative_origin` records whether an operator is reading the model's wording or the generated one.
+
 ## Event flow
 
 ```mermaid
@@ -278,6 +333,11 @@ flowchart LR
   a raion or hromada tier between them would require widening the query.
 - The occupation layer is reference context only. It never starts, ends or weights an alert, a threat event
   or a risk assessment.
+- A public threat vector contains only reported observations, and every leg names the source, the time
+  and how strongly the movement itself was attested. Nothing is continued past the last message.
+- The extrapolation of a vector is operator-only and structurally unreachable from public code: its own
+  tables, its own service, its own plugin, and no import path from any module that builds a public
+  response. Every stored projection row is `data_nature = 'calculated'` by constraint.
 
 ## Scale boundary
 

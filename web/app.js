@@ -14,6 +14,21 @@ const evidenceNames = { official: 'офіційно', confirmed: 'підтвер
 const occupationLayerIds = ['occupation-fill', 'occupation-hatch', 'occupation-line', 'occupation-contested-line'];
 const occupationColor = ['case', ['==',['get','status'],'occupied'], '#ff7a4d', ['==',['get','status'],'liberated'], '#72d6ca', '#8f9b94'];
 
+// Вектор загрози — це ланцюг ПОВІДОМЛЕНЬ, а не траєкторія. Один відрізок = один перехід, у якого є
+// джерело, час і рівень доказовості. Три різні шари ліній, бо MapLibre не вміє керувати
+// line-dasharray за даними, а різниця між рівнями доказовості мусить бути видима, а не описана:
+//   transit   — одне повідомлення ствердило сам рух («повз Бровари на Бориспіль»): суцільна лінія;
+//   direction — повідомлено напрямок, але не прибуття: штрихова;
+//   sequence  — два різні повідомлення в різний час; порядок наш, рух не стверджував ніхто: крапкова.
+// Порядок у масиві збігається з порядком додавання шарів і, отже, з їхнім z-порядком.
+const vectorLayerIds = ['threat-vector-sequence','threat-vector-direction','threat-vector-transit','threat-vector-nodes','threat-vector-order'];
+const vectorColor = '#ff7a4d';
+const vectorBasisLabels = {
+  reported_transit: 'джерело повідомило сам рух',
+  reported_direction: 'джерело повідомило напрямок',
+  observation_sequence: 'послідовність окремих повідомлень'
+};
+
 // Хороплет тривог. Заливка регіону, а не точка: офіційний канал оголошує тривогу на цілу територію,
 // а в районів у каталозі KATOTTG узагалі немає координат, тож точка для них неможлива в принципі.
 const alertColor = '#ff4747';
@@ -50,6 +65,8 @@ let occupationVisible = true;
 let occupationLayersReady = false;
 let occupationLegendOpen = null;
 let occupationFetchedAt = null;
+let vectors = [];
+let vectorLegendOpen = null;
 let opsAuthorization = '';
 let lastReceived = null;
 let refreshTimer = null;
@@ -265,6 +282,8 @@ async function loadSnapshot() {
   lastReceived = new Date();
   renderCurrentRoute();
   updateFreshness();
+  // Ланцюги — окремий запит: він важчий за знімок і не має права затримати першу картинку.
+  void loadVectors();
 }
 
 function connectStream() {
@@ -323,6 +342,170 @@ function markerCollection() {
 
 function directionCollection() {
   return { type: 'FeatureCollection', features: snapshot.threats.filter((threat) => threat.geometry?.type === 'LineString').map((threat) => ({ type: 'Feature', id: threat.id, geometry: threat.geometry, properties: { title: threat.title } })) };
+}
+
+// ------------------------------------------------------------------------------------------------
+// Вектори загроз — ланцюги повідомлень
+// ------------------------------------------------------------------------------------------------
+//
+// Наявний шар direction-lines лишається недоторканим. Він малює threat_events.geometry — одну лінію
+// на подію, з однаковим пунктиром і без розбору, звідки вона взялася. Ланцюг — інша річ: у нього
+// власне джерело даних (/api/v1/vectors), власна одиниця (відрізок, а не подія) і, головне, кожен
+// відрізок має різний рівень доказовості, який мусить читатися з карти. Розширити direction-lines
+// означало б звалити дві семантики в одне джерело й втратити саме ту різницю, заради якої ланцюг і
+// будується. Тому — окремі шари; порядок наявних не змінюється.
+
+function vectorSegmentCollection() {
+  const features = [];
+  for (const vector of vectors) {
+    for (const [order, segment] of (vector.segments ?? []).entries()) {
+      // Відрізок без координат лишається у відповіді й у діалозі як факт, але не малюється:
+      // у районів KATOTTG координат немає взагалі, і вигадана точка була б гіршою за її відсутність.
+      if (!segment.drawable) continue;
+      const from = vector.nodes[segment.from];
+      const to = vector.nodes[segment.to];
+      if (!from?.coordinates || !to?.coordinates) continue;
+      features.push({ type: 'Feature', id: `vs-${vector.eventId}-${order}`,
+        geometry: { type: 'LineString', coordinates: [from.coordinates, to.coordinates] },
+        properties: { eventId: vector.eventId, basis: segment.basis, evidence: segment.evidenceLevel,
+          approximate: from.coordinatePrecision === 'approximate' || to.coordinatePrecision === 'approximate',
+          label: `${from.name} → ${to.name}` } });
+    }
+  }
+  return { type: 'FeatureCollection', features };
+}
+
+function vectorNodeCollection() {
+  const features = [];
+  for (const vector of vectors) {
+    if (!(vector.segments ?? []).some((segment) => segment.drawable)) continue;
+    for (const node of vector.nodes ?? []) {
+      if (!node.coordinates) continue;
+      features.push({ type: 'Feature', id: `vn-${vector.eventId}-${node.index}`,
+        geometry: { type: 'Point', coordinates: node.coordinates },
+        properties: { eventId: vector.eventId, order: String(node.index + 1), name: node.name,
+          approximate: node.coordinatePrecision === 'approximate' } });
+    }
+  }
+  return { type: 'FeatureCollection', features };
+}
+
+async function loadVectors() {
+  try {
+    const response = await fetch('/api/v1/vectors', { cache: 'no-store', signal: AbortSignal.timeout(12000) });
+    if (!response.ok) throw new Error('vectors unavailable');
+    const data = await response.json();
+    if (!Array.isArray(data?.items)) throw new Error('vectors malformed');
+    vectors = data.items;
+  } catch {
+    // Пояснювальний шар поверх маркерів, які карта вже малює: лишаємо попередній стан.
+  }
+  applyVectors();
+}
+
+function applyVectors() {
+  if (mapLayersReady && map?.getSource('threat-vector-segments')) {
+    map.getSource('threat-vector-segments').setData(vectorSegmentCollection());
+    map.getSource('threat-vector-points')?.setData(vectorNodeCollection());
+  }
+  renderVectorLegend();
+}
+
+function addVectorLayers() {
+  // Якір: alert-oblast-label. Геометрія ланцюга лягає НАД заливками й контурами тривог, але ПІД усіма
+  // підписами — обласними, районними, підписом суверенітету Криму й підписами міст. Жоден наявний шар
+  // при цьому не зміщується: вставка «перед» існуючим шаром не переставляє нічого іншого.
+  // Маркери подій (threat-pulse, event-labels) додано без beforeId, тож вони лишаються зверху — лінія
+  // не перекриває крапку, на яку клікають.
+  const anchor = map.getLayer('alert-oblast-label') ? 'alert-oblast-label' : undefined;
+  const basis = ['get','basis'];
+  map.addSource('threat-vector-segments', { type: 'geojson', data: vectorSegmentCollection() });
+  map.addSource('threat-vector-points', { type: 'geojson', data: vectorNodeCollection() });
+  map.addLayer({ id: 'threat-vector-sequence', type: 'line', source: 'threat-vector-segments',
+    filter: ['==', basis, 'observation_sequence'], layout: { 'line-cap': 'round', 'line-join': 'round' },
+    paint: { 'line-color': vectorColor, 'line-width': ['interpolate',['linear'],['zoom'],5,1.5,9,3],
+      'line-opacity': .4, 'line-dasharray': [0.5,2.4] } }, anchor);
+  map.addLayer({ id: 'threat-vector-direction', type: 'line', source: 'threat-vector-segments',
+    filter: ['==', basis, 'reported_direction'], layout: { 'line-cap': 'butt', 'line-join': 'round' },
+    paint: { 'line-color': vectorColor, 'line-width': ['interpolate',['linear'],['zoom'],5,2,9,3.6],
+      'line-opacity': .7, 'line-dasharray': [3,1.6] } }, anchor);
+  map.addLayer({ id: 'threat-vector-transit', type: 'line', source: 'threat-vector-segments',
+    filter: ['==', basis, 'reported_transit'], layout: { 'line-cap': 'round', 'line-join': 'round' },
+    paint: { 'line-color': vectorColor, 'line-width': ['interpolate',['linear'],['zoom'],5,2.4,9,4.4],
+      'line-opacity': .92 } }, anchor);
+  // Порожнє коло = координати немає в каталозі й узято центроїд полігона району. Це наближення,
+  // і воно позначене формою, а не лише в тексті легенди.
+  map.addLayer({ id: 'threat-vector-nodes', type: 'circle', source: 'threat-vector-points', paint: {
+    'circle-radius': ['interpolate',['linear'],['zoom'],5,3.2,9,6],
+    'circle-color': ['case',['get','approximate'],'rgba(255,122,77,.10)',vectorColor],
+    'circle-opacity': .9, 'circle-stroke-width': 1.6, 'circle-stroke-color': vectorColor, 'circle-stroke-opacity': .85
+  } }, anchor);
+  map.addLayer({ id: 'threat-vector-order', type: 'symbol', source: 'threat-vector-points', minzoom: 5.6, layout: {
+    'text-field': ['get','order'], 'text-size': 10, 'text-offset': [0,-1.3], 'text-anchor': 'bottom',
+    'text-font': ['Noto Sans Regular'], 'text-allow-overlap': true
+  }, paint: { 'text-color': '#ffd9c9', 'text-halo-color': '#09100f', 'text-halo-width': 1.5 } }, anchor);
+}
+
+function vectorLegendElement() {
+  const panels = $('.map-panels');
+  if (!panels) return null;
+  let legend = $('#vector-legend');
+  if (!legend) {
+    // Легенду створює скрипт, а не розмітка: підпис має існувати рівно тоді, коли на карті справді
+    // лежить хоч один ланцюг, і жодного разу раніше.
+    legend = document.createElement('details');
+    legend.id = 'vector-legend';
+    legend.className = 'occupation-legend';
+    legend.hidden = true;
+    legend.addEventListener('toggle', () => { vectorLegendOpen = legend.open; });
+    panels.append(legend);
+  }
+  return legend;
+}
+
+function renderVectorLegend() {
+  const legend = vectorLegendElement();
+  if (!legend) return;
+  const drawn = vectorSegmentCollection().features.length;
+  const chains = vectors.filter((vector) => (vector.segments ?? []).some((segment) => segment.drawable)).length;
+  const hidden = vectors.reduce((sum, vector) => sum + (vector.segments ?? []).filter((segment) => !segment.drawable).length, 0);
+  legend.hidden = !drawn;
+  if (!drawn) return;
+  legend.open = vectorLegendOpen ?? window.matchMedia('(min-width: 981px)').matches;
+  const swatch = (style) => `<i class="legend-swatch" style="height:0;border:0;border-top:2px solid ${vectorColor};${style}"></i>`;
+  legend.innerHTML = `<summary><i class="swatch threat"></i><span class="legend-title">Ланцюги повідомлень</span><span class="legend-caret" aria-hidden="true">▾</span></summary>
+    <div class="legend-body">
+      <p class="legend-meta"><span>${chains} ланцюг${chains === 1 ? '' : 'ів'} · ${drawn} відрізк${drawn === 1 ? '' : 'ів'}</span></p>
+      <p class="legend-warning">Це послідовність <b>повідомлень</b> із часом і джерелом, а не траєкторія польоту. Лінія показує, що і коли повідомили, а не куди прямує ціль. Система не прогнозує ціль, влучання або маршрут.</p>
+      <ul class="legend-rows">
+        <li>${swatch('opacity:.95')}<span>Суцільна — одне повідомлення ствердило сам рух («повз А на Б»).</span></li>
+        <li>${swatch('border-top-style:dashed;opacity:.75')}<span>Штрихова — джерело повідомило напрямок, але не прибуття.</span></li>
+        <li>${swatch('border-top-style:dotted;opacity:.5')}<span>Крапкова — різні повідомлення в різний час. Порядок наш; рух не стверджувало жодне джерело.</span></li>
+      </ul>
+      <p class="legend-note">Порожнє коло — район без координат у каталозі KATOTTG: точку взято з центроїда полігона, це наближення до району, а не місце.${hidden ? ` ${hidden} відрізк${hidden === 1 ? '' : 'ів'} не намальовано взагалі — для цих територій контуру немає; вони лишаються в картці події текстом.` : ''}</p>
+    </div>`;
+}
+
+function vectorChainHtml(vector) {
+  if (!vector?.segments?.length) return '';
+  const rows = vector.segments.map((segment) => {
+    const from = vector.nodes[segment.from];
+    const to = vector.nodes[segment.to];
+    const gap = segment.elapsedSeconds ? `${Math.round(segment.elapsedSeconds / 60) || '<1'} хв` : 'те саме повідомлення';
+    const corroboration = segment.independentEnds ? ' · незалежні джерела' : '';
+    const approximate = [from, to].some((node) => node?.coordinatePrecision === 'approximate')
+      ? '<small>Координата району наближена — центроїд полігона.</small>' : '';
+    const undrawn = segment.drawable ? '' : '<small>Немає координат — на карті не показано.</small>';
+    return `<li><time>${shortTime(segment.reportedAt)}</time> <b>${escapeHtml(from?.name ?? '?')} → ${escapeHtml(to?.name ?? '?')}</b>
+      <span class="evidence ${escapeHtml(segment.evidenceLevel)}">${escapeHtml(evidenceNames[segment.evidenceLevel] ?? segment.evidenceLevel)}</span>
+      <br><small>${escapeHtml(vectorBasisLabels[segment.basis] ?? segment.basis)} · ${escapeHtml(segment.source?.name ?? 'джерело не вказано')} · ${escapeHtml(gap)}${corroboration}</small>
+      ${segment.statement ? `<br><small>«${escapeHtml(segment.statement)}»</small>` : ''}${approximate}${undrawn}</li>`;
+  }).join('');
+  const span = vector.span ?? {};
+  return `<h3>Ланцюг повідомлень</h3>
+    <p class="detail-summary">${span.sourceCount ?? 0} джерел${span.sourceCount === 1 ? 'о' : ''} за ${Math.max(1, Math.round((span.elapsedSeconds ?? 0) / 60))} хв · ${vector.nodes.length} точ${vector.nodes.length === 1 ? 'ка' : 'ок'} · ${vector.segments.length} перехід${vector.segments.length === 1 ? '' : 'ів'}</p>
+    <ol class="update-list">${rows}</ol>
+    <div class="safety-note"><strong>Це не траєкторія</strong><p>${escapeHtml(vector.disclaimer ?? '')}</p></div>`;
 }
 
 // Довідковий шар: тимчасово окуповані території України. Це не тривога і не оцінка ризику —
@@ -573,6 +756,7 @@ function initMap() {
     map.addLayer({ id: 'event-labels', type: 'symbol', source: 'live-events', layout: { 'text-field': ['get','title'], 'text-size': 11, 'text-offset': [0, 2.1], 'text-anchor': 'top', 'text-font': ['Noto Sans Regular'] }, paint: { 'text-color': '#f4f0df', 'text-halo-color': '#09100f', 'text-halo-width': 1.5 } });
     map.addSource('reported-directions', { type: 'geojson', data: directionCollection() });
     map.addLayer({ id: 'direction-lines', type: 'line', source: 'reported-directions', paint: { 'line-color': '#ff7a4d', 'line-width': 3, 'line-dasharray': [2,2], 'line-opacity': .8 } });
+    addVectorLayers();
     map.on('click', 'event-labels', (event) => {
       const feature = event.features?.[0]; if (!feature) return;
       const id = feature.properties.entityId;
@@ -596,6 +780,7 @@ function initMap() {
     }
     mapLayersReady = true;
     applyAlertLayers();
+    applyVectors();
   });
   $('#fit-ukraine').addEventListener('click', () => map.fitBounds([[21.5,43.2],[41.2,52.5]], { padding: 36, duration: 700 }));
 }
@@ -605,6 +790,7 @@ function updateMap() {
   map.getSource('live-events')?.setData(markerCollection());
   map.getSource('reported-directions')?.setData(directionCollection());
   applyAlertLayers();
+  applyVectors();
 }
 
 function safeUrl(value) {
@@ -626,7 +812,12 @@ function openDetail(title, kicker, body) {
 }
 
 async function showThreatDetails(id) {
-  const response = await fetch(`/api/v1/threats/${encodeURIComponent(id)}`);
+  // Ланцюг тягнемо паралельно й ніколи не даємо йому зламати картку: без нього подія читається так
+  // само, як читалася до появи векторів.
+  const [response, vector] = await Promise.all([
+    fetch(`/api/v1/threats/${encodeURIComponent(id)}`),
+    fetch(`/api/v1/threats/${encodeURIComponent(id)}/vector`).then((r) => r.ok ? r.json() : null).catch(() => null)
+  ]);
   if (!response.ok) return openDetail('Подію не знайдено', 'Помилка', '<p>Дані могли бути архівовані або виправлені.</p>');
   const item = await response.json();
   const sources = item.evidence.map((source) => {
@@ -635,7 +826,7 @@ async function showThreatDetails(id) {
   }).join('') || '<p>Публічних доказів ще немає.</p>';
   const updates = item.updates.map((update) => `<li><time>${new Date(update.created_at).toLocaleString('uk-UA')}</time> ${escapeHtml(update.reason)}: ${escapeHtml(update.new_status)} / ${escapeHtml(update.new_evidence_level)}</li>`).join('');
   openDetail(item.title, evidenceNames[item.evidence_level] ?? item.evidence_level,
-    `<p class="detail-summary">${escapeHtml(item.summary)}</p><dl><div><dt>Остання згадка</dt><dd>${new Date(item.last_observed_at).toLocaleString('uk-UA')}</dd></div><div><dt>Дійсна до</dt><dd>${item.valid_until ? new Date(item.valid_until).toLocaleString('uk-UA') : 'не визначено'}</dd></div><div><dt>Напрямок</dt><dd>${escapeHtml(item.direction_text || 'не повідомлявся')}</dd></div></dl><h3>Джерела</h3>${sources}${updates ? `<h3>Історія змін</h3><ol class="update-list">${updates}</ol>` : ''}<div class="safety-note"><strong>Геометрія не є прогнозом</strong><p>Система показує лише дослівно повідомлену територію або напрямок і не екстраполює маршрут.</p></div>`);
+    `<p class="detail-summary">${escapeHtml(item.summary)}</p><dl><div><dt>Остання згадка</dt><dd>${new Date(item.last_observed_at).toLocaleString('uk-UA')}</dd></div><div><dt>Дійсна до</dt><dd>${item.valid_until ? new Date(item.valid_until).toLocaleString('uk-UA') : 'не визначено'}</dd></div><div><dt>Напрямок</dt><dd>${escapeHtml(item.direction_text || 'не повідомлявся')}</dd></div></dl>${vectorChainHtml(vector)}<h3>Джерела</h3>${sources}${updates ? `<h3>Історія змін</h3><ol class="update-list">${updates}</ol>` : ''}<div class="safety-note"><strong>Геометрія не є прогнозом</strong><p>Система показує лише дослівно повідомлену територію або напрямок і не екстраполює маршрут.</p></div>`);
 }
 
 async function showAssessmentDetails(id) {
@@ -711,7 +902,9 @@ function renderMapPage() {
     const assessmentId = card.dataset.assessment;
     if (assessmentId) void showAssessmentDetails(assessmentId);
   });
-  const layerGroups = { alerts: alertLayerIds, threats: ['threat-pulse','direction-lines'], assessments: ['assessment-halo'] };
+  // Ланцюги йдуть у групу «Загрози»: вони пояснюють ті самі події й не заслуговують окремого
+  // перемикача, який довелося б додавати в public/index.html — файл, який зараз правлять інші гілки.
+  const layerGroups = { alerts: alertLayerIds, threats: ['threat-pulse','direction-lines',...vectorLayerIds], assessments: ['assessment-halo'] };
   document.querySelectorAll('.layer-toggle').forEach((button) => button.addEventListener('click', () => {
     button.classList.toggle('is-active');
     const active = button.classList.contains('is-active');
@@ -783,6 +976,42 @@ async function renderAbout() {
   root.innerHTML = `<div class="method-grid"><article><span>01</span><h2>Тривога</h2><p>Лише агрегований стан офіційних API. AI не може оголосити або завершити тривогу.</p></article><article><span>02</span><h2>Загроза</h2><p>Нормалізована подія з першоджерелом, часом, строком дії та рівнем доказовості.</p></article><article><span>03</span><h2>Оцінка v${escapeHtml(methodology.version)}</h2><p>Відносний індекс для офіційного попередження на ${methodology.horizonHours} годин. Старі сигнали втрачають половину ваги кожні ${methodology.guardrails.signalHalfLifeHours} години.</p></article><article><span>04</span><h2>Захисні межі</h2><p>Лише Tier C: максимум ${methodology.guardrails.onlyTierCMaximum}/10. Без Tier A: максимум ${methodology.guardrails.withoutTierAMaximum}/10. Висока впевненість потребує офіційного джерела.</p></article><article><span>05</span><h2>Напрямок</h2><p>Лише дослівно повідомлений напрямок із часом. Жодної екстраполяції маршруту або цілі.</p></article></div><div class="safety-note"><strong>У разі офіційної тривоги</strong><p>Прямуйте до визначеного укриття та дотримуйтеся вказівок ДСНС і місцевої влади. Низький індекс не означає безпеку.</p></div>`;
 }
 
+// ------------------------------------------------------------------------------------------------
+// Закритий контур: екстраполяція вектора
+// ------------------------------------------------------------------------------------------------
+//
+// Усе нижче рендериться ЛИШЕ всередині renderOps(), тобто після успішної Basic-автентифікації, і
+// звертається лише до /ops/*. На карту, у знімок, у потік подій і в бота ці дані не потрапляють —
+// не тому, що клієнт цього не робить, а тому, що публічні ендпоінти їх не віддають.
+function opsProjectionHtml(projection) {
+  if (!projection) return '';
+  const candidates = (projection.candidates ?? []).map((candidate) =>
+    `<li>${escapeHtml(candidate.name)} — ${candidate.distanceKm} км, відхилення ${candidate.angularDeviationDegrees}°, ~${candidate.minutesToReach} хв${candidate.withinUncertainty ? '' : ' (поза сектором)'}${candidate.coordinatePrecision === 'approximate' ? ' · координата наближена' : ''}</li>`).join('');
+  const reasons = (projection.uncertainty?.reasons ?? []).map((reason) => `<li>${escapeHtml(reason)}</li>`).join('');
+  return `<div class="safety-note"><strong>${escapeHtml(String(projection.dataNature ?? 'calculated')).toUpperCase()} — розрахунок, не спостереження</strong>
+      <p>${escapeHtml(projection.narrative ?? '')}</p></div>
+    <dl><div><dt>Основа</dt><dd>${escapeHtml(projection.basis?.fromName ?? '')} → ${escapeHtml(projection.basis?.toName ?? '')} (${escapeHtml(vectorBasisLabels[projection.basis?.segmentBasis] ?? '')})</dd></div>
+      <div><dt>Курс і швидкість</dt><dd>${projection.bearingDegrees}° · ${projection.groundSpeedKmh} км/год</dd></div>
+      <div><dt>Горизонт</dt><dd>${projection.horizonMinutes} хв · ${projection.horizonDistanceKm} км</dd></div>
+      <div><dt>Невизначеність</dt><dd>сектор ±${projection.uncertainty?.lateralHalfAngleDegrees}° · радіус ${projection.uncertainty?.radiusKmAtHorizon} км · впевненість ${escapeHtml(projection.uncertainty?.confidence ?? '')}</dd></div>
+      <div><dt>Формулювання</dt><dd>${projection.narrativeOrigin === 'model' ? `модель ${escapeHtml(projection.modelVersion ?? '')}` : 'детерміноване (модель не застосовано або відхилено)'}</dd></div></dl>
+    ${reasons ? `<h3>Чому оцінка невпевнена</h3><ul>${reasons}</ul>` : ''}
+    ${candidates ? `<h3>Локації в секторі — розрахунок</h3><ul>${candidates}</ul>` : '<p class="legend-note">У секторі немає жодної локації з каталогу.</p>'}`;
+}
+
+function opsVectorSection(payload) {
+  if (!payload) return '';
+  const events = (payload.events ?? []).map((event) => `<article>
+      <div><span>${escapeHtml(event.threat_type)} · ${escapeHtml(event.evidence_level)} · ${event.classifications} повідомл.</span>
+        <h3>${escapeHtml(event.title)}</h3><p>остання згадка ${timeAgo(event.last_observed_at)}</p></div>
+      <div class="ops-channel-actions"><button data-project-vector="${escapeHtml(event.id)}">Порахувати екстраполяцію</button></div>
+      <div id="projection-${escapeHtml(event.id)}" class="ops-projection"></div>
+    </article>`).join('') || '<p>Немає активних подій із ланцюгом повідомлень.</p>';
+  return `<section class="ops-section"><header class="ops-section-head"><div><p>Тільки для оператора</p><h2>Вектори загроз: екстраполяція</h2></div></header>
+    <div class="safety-note"><strong>Не для публікації</strong><p>${escapeHtml(payload.notice ?? '')}</p></div>
+    <div class="ops-channel-list">${events}</div></section>`;
+}
+
 async function renderOps() {
   const root = contentShell('Закритий контур', 'Операційна консоль', 'Стан системи та керування каталогом рекомендованих Telegram-каналів.');
   const response = await opsFetch('/ops/api');
@@ -800,6 +1029,9 @@ async function renderOps() {
   }
   if (!response.ok) { root.innerHTML = '<p>Операційна консоль тимчасово недоступна.</p>'; return; }
   const data = await response.json();
+  // Екстраполяція живе тільки тут. Запит іде на окремий ендпоінт за тим самим Basic-логіном; жоден
+  // публічний маршрут її не віддає, і жоден інший екран цієї функції не викликає.
+  const vectorOps = await opsFetch('/ops/vectors').then((result) => result.ok ? result.json() : null).catch(() => null);
   const queued = data.outbox.reduce((sum, item) => sum + Number(item.count), 0);
   root.innerHTML = `<div class="ops-metrics"><article><span>Джерела</span><strong>${data.sources.length}</strong></article><article><span>Черга</span><strong>${queued}</strong></article><article><span>Канали</span><strong>${data.channels.filter((item) => item.active).length}</strong></article><article><span>PostgreSQL</span><strong>${escapeHtml(data.database.size)}</strong></article></div>
     <section class="ops-section"><header class="ops-section-head"><div><p>Каталог для користувачів</p><h2>Додати Telegram-канал</h2></div><button id="ops-logout">Вийти</button></header>
@@ -815,7 +1047,19 @@ async function renderOps() {
       </form>
       <div class="ops-channel-list">${data.channels.map((channel) => `<article class="${channel.active ? '' : 'is-disabled'}"><div><span>${channel.verified ? '✓ перевірено' : escapeHtml(channel.category)}</span><h3>${escapeHtml(channel.title)}</h3><p>@${escapeHtml(channel.username)}${channel.location_name ? ` · ${escapeHtml(channel.location_name)}` : ''}</p></div><div class="ops-channel-actions"><a href="${escapeHtml(channel.url)}" target="_blank" rel="noreferrer">Відкрити ↗</a><button data-channel-toggle="verified" data-id="${channel.id}" data-value="${channel.verified}">${channel.verified ? 'Зняти перевірку' : 'Перевірити'}</button><button data-channel-toggle="active" data-id="${channel.id}" data-value="${channel.active}">${channel.active ? 'Приховати' : 'Активувати'}</button></div></article>`).join('')}</div>
     </section>
+    ${opsVectorSection(vectorOps)}
     <details class="ops-raw"><summary>Технічний стан і журнали</summary><pre class="ops-json">${escapeHtml(JSON.stringify({ sources: data.sources, outbox: data.outbox, aiRuns: data.aiRuns, database: data.database }, null, 2))}</pre></details>`;
+  root.querySelectorAll('[data-project-vector]').forEach((button) => button.addEventListener('click', async () => {
+    const output = $(`#projection-${button.dataset.projectVector}`, root);
+    output.textContent = 'Рахуємо…';
+    const result = await opsFetch(`/ops/threats/${encodeURIComponent(button.dataset.projectVector)}/vector-projection?horizonMinutes=15`, { method: 'POST' });
+    const payload = await result.json().catch(() => null);
+    if (!result.ok) {
+      output.innerHTML = `<p class="legend-note">Розрахунок неможливий: ${escapeHtml(payload?.reason ?? 'невідома причина')}. Це нормальний стан — ланцюг може не мати жодного відрізка з двома координатами й виміряним часом.</p>`;
+      return;
+    }
+    output.innerHTML = opsProjectionHtml(payload);
+  }));
   $('#channel-form', root).addEventListener('submit', async (event) => {
     event.preventDefault(); const form = event.currentTarget; const values = Object.fromEntries(new FormData(form));
     const result = await opsFetch('/ops/channels', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({
