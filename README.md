@@ -52,6 +52,7 @@ node scripts/telegram-session.mjs
 
 The script asks for `api_id` and `api_hash` from [my.telegram.org](https://my.telegram.org) →
 *API development tools*, then your phone, the login code, and your two-step password if you have one.
+Step-by-step for this and every other credential: [`docs/EXTERNAL_SETUP.md`](docs/EXTERNAL_SETUP.md).
 It prints a `TELEGRAM_SESSION` line to paste into `.env`. That string is equivalent to being logged in
 as that account — keep it out of git, revoke from *Telegram → Settings → Devices* if it leaks.
 
