@@ -190,6 +190,7 @@ Useful endpoints:
 - `/api/v1/stream` — real-time SSE events.
 - `/api/v1/history` — normalized event history.
 - `/api/v1/locations/:id/timeline` — alerts, threats and assessments for a clicked oblast or city.
+- `/api/v1/vectors` and `/api/v1/threats/:id/vector` — the chain of **reported** observations behind a threat: which source named which place, when, and how strongly the movement between two places was attested. Not a trajectory and not a forecast; the extrapolation of a chain is operator-only and is served by neither of these endpoints.
 - `/api/v1/channels` — active administrator-curated Telegram channels.
 - `/api/v1/occupation` — temporarily occupied territories as GeoJSON, with source attribution, upstream revision id, per-status counts and a `stale` flag. Cached (`ETag`, `Last-Modified`, `Cache-Control: public, max-age=120`); returns an empty layer rather than an error when the source is off or unavailable.
 - `/api/v1/analytics/monthly` — monthly summaries.
@@ -197,6 +198,7 @@ Useful endpoints:
 - `/api/v1/methodology` — machine-readable v2 methodology and hard limits.
 - `/metrics` — Prometheus metrics.
 - `/ops/api` and `/ops/run-assessment` — Basic-auth protected operations API.
+- `/ops/vectors` and `/ops/threats/:id/vector-projection` — Basic-auth protected extrapolation of a reported chain, with an explicit uncertainty cone. Stored in its own tables, marked `data_nature = 'calculated'` by constraint, and unreachable from any module that builds a public response.
 - `/ops` — operator login and channel catalog management; channel mutations remain Basic-auth protected.
 
 ## Backups

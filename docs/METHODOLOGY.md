@@ -14,6 +14,8 @@ It does not estimate a target, impact, exact route, number of weapons or persona
 
 National posture signals are propagated to regions with low geographic relevance. A city signal may also contribute to its parent oblast, but the original event geography remains unchanged.
 
+Threat vectors are **not** an input. The public chain is a presentation of messages this engine has already weighed one by one; feeding it back in would count the same reports twice. The operator-only extrapolation of a chain (`docs/ARCHITECTURE.md`, "Threat vectors") never reaches this engine either — it is a calculation about the future, and the index is only ever a function of what has already been reported.
+
 ## Weighting
 
 Each signal has a configured base contribution and reliability. Its effective contribution has a two-hour half-life:
