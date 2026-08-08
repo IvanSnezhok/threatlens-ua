@@ -1,18 +1,9 @@
 import type { Bot } from 'grammy';
-import { config } from '../config.js';
 import { pool } from '../db/pool.js';
 import { relatedLocationsCte } from '../repositories/events.js';
-
-const threatLabels: Record<string, string> = {
-  uav: 'ударні БпЛА', ballistic_missile: 'балістичні ракети',
-  cruise_missile: 'крилаті ракети', guided_air_bomb: 'керовані авіаційні бомби',
-  aviation: 'активність авіації', mlrs: 'РСЗВ', artillery: 'артилерія',
-  mortar: 'мінометний обстріл', combined: 'комбінована загроза', unknown: 'невизначена загроза'
-};
-const levelLabels: Record<string, string> = {
-  background: 'фоновий', elevated: 'підвищений', significant: 'значний',
-  high: 'високий', very_high: 'дуже високий'
-};
+import {
+  cleanSummary, confidenceLabel, evidenceStatement, humanMoment, levelLabel, threatLabel, validUntilLine
+} from './humanize.js';
 
 function html(value: unknown): string {
   return String(value ?? '').replace(/[&<>'"]/g, (char) => ({
@@ -53,15 +44,71 @@ async function insertForSubscribers(args: {
   );
 }
 
+/**
+ * Turns a source row into the link a reader can actually open to check us.
+ *
+ * Telegram sources keep the channel handle in `sources.telegram_username` and the message id in
+ * `source_messages.external_id`, which together address the exact post the classification was built
+ * from — that is the citation worth showing. When the id is not a plain message number (the polled
+ * alert APIs synthesise their own ids) the channel front page is still honest, and a source with no
+ * public address at all yields nothing rather than a link that goes nowhere.
+ */
+function sourceUrlFor(row: any): string | null {
+  const username = String(row?.telegram_username ?? '').trim().replace(/^@/, '');
+  const externalId = String(row?.external_id ?? '').trim();
+  if (username && /^\d+$/.test(externalId)) return `https://t.me/${username}/${externalId}`;
+  if (username) return `https://t.me/${username}`;
+  const publicUrl = String(row?.public_url ?? '').trim();
+  return /^https?:\/\//i.test(publicUrl) ? publicUrl : null;
+}
+
+/** Spread into a payload: contributes the two source fields, or nothing when there is no citation. */
+function sourceFields(row: any): Record<string, string> {
+  const url = sourceUrlFor(row);
+  if (!url) return {};
+  const name = String(row?.source_name ?? '').trim();
+  return name ? { sourceUrl: url, sourceName: name } : { sourceUrl: url };
+}
+
+const sourceColumns = `s.name AS source_name,s.public_url,s.telegram_username,sm.external_id`;
+
+/** The newest piece of evidence behind an event — the message a reader is most likely to recognise. */
+async function latestEventSource(eventId: string): Promise<Record<string, string>> {
+  const result = await pool.query(
+    `SELECT ${sourceColumns}
+     FROM event_evidence ee JOIN source_messages sm ON sm.id=ee.source_message_id
+     JOIN sources s ON s.id=sm.source_id
+     WHERE ee.event_id=$1 ORDER BY sm.published_at DESC LIMIT 1`, [eventId]
+  );
+  return sourceFields(result.rows[0]);
+}
+
+async function messageSource(sourceMessageId: string | null): Promise<Record<string, string>> {
+  if (!sourceMessageId) return {};
+  const result = await pool.query(
+    `SELECT ${sourceColumns} FROM source_messages sm JOIN sources s ON s.id=sm.source_id WHERE sm.id=$1`,
+    [sourceMessageId]
+  );
+  return sourceFields(result.rows[0]);
+}
+
 async function enqueueForEvent(event: any) {
   if (event.event_type.startsWith('alert.')) {
     const locationId = String(event.payload.locationId);
     const entityId = String(event.payload.alertId);
     const type = event.event_type === 'alert.started' ? 'alert_start' : 'alert_end';
     const location = (await pool.query(`SELECT name_uk FROM locations WHERE id=$1`, [locationId])).rows[0];
+    // The alert row carries the times a reader asks about first ("since when?", "when did it end?")
+    // and the message that announced it, which is the only citation an alert notification can have.
+    const alert = (await pool.query(
+      `SELECT started_at,ended_at,source_message_id FROM alert_periods WHERE id=$1`, [entityId]
+    )).rows[0];
     await insertForSubscribers({
       locationId, type, entityId, eventVersion: Number(event.version), priority: type === 'alert_start' ? 0 : 2,
-      payload: { locationName: location?.name_uk, mapUrl: `${config.PUBLIC_URL}/?location=${locationId}` }
+      payload: {
+        locationName: location?.name_uk, startedAt: alert?.started_at, endedAt: alert?.ended_at,
+        ...(await messageSource(alert?.source_message_id ?? null))
+      }
     });
     return;
   }
@@ -79,6 +126,7 @@ async function enqueueForEvent(event: any) {
        JOIN threat_event_locations el ON el.event_id=e.id JOIN locations l ON l.id=el.location_id
        WHERE e.id=$1`, [entityId]
     );
+    const threatSource = await latestEventSource(entityId);
     for (const threat of threats.rows) {
       await insertForSubscribers({
         locationId: threat.location_id, type: 'threat_update', entityId,
@@ -87,7 +135,7 @@ async function enqueueForEvent(event: any) {
         payload: {
           locationName: threat.name_uk, threatType: threat.threat_type, summary: threat.summary,
           evidenceLevel: threat.evidence_level, lastObservedAt: threat.last_observed_at,
-          validUntil: threat.valid_until, mapUrl: `${config.PUBLIC_URL}/?event=${entityId}`
+          validUntil: threat.valid_until, ...threatSource
         }
       });
     }
@@ -99,6 +147,14 @@ async function enqueueForEvent(event: any) {
       `SELECT a.*,l.name_uk FROM risk_assessments a JOIN locations l ON l.id=a.location_id WHERE a.id=$1`, [entityId]
     )).rows[0];
     if (!assessment) return;
+    // The strongest contributing signal is the closest thing an assessment has to a first source:
+    // the score is ours, but the observation that moved it belongs to whoever published it.
+    const topSignal = (await pool.query(
+      `SELECT ${sourceColumns}
+       FROM risk_assessment_signals ras JOIN risk_signals rs ON rs.id=ras.signal_id
+       JOIN source_messages sm ON sm.id=rs.source_message_id JOIN sources s ON s.id=sm.source_id
+       WHERE ras.assessment_id=$1 ORDER BY ras.contribution DESC LIMIT 1`, [entityId]
+    )).rows[0];
     await insertForSubscribers({
       locationId: assessment.location_id, type: 'assessment_update', entityId,
       eventVersion: Number(event.version), priority: 4, threatType: assessment.threat_type,
@@ -107,7 +163,7 @@ async function enqueueForEvent(event: any) {
         score: assessment.risk_score, level: assessment.risk_level,
         indicativePercent: assessment.indicative_percent, confidence: assessment.assessment_confidence,
         explanation: assessment.explanation, horizonEnd: assessment.horizon_end,
-        mapUrl: `${config.PUBLIC_URL}/?assessment=${entityId}`
+        ...sourceFields(topSignal)
       }
     });
   }
@@ -133,27 +189,103 @@ async function fanoutNewEvents() {
   } finally { client.release(); }
 }
 
-export function formatMessage(row: any): string {
+/**
+ * The link back to the first source, or nothing at all.
+ *
+ * There is deliberately no fallback link. The map view these messages used to point at does not
+ * exist yet, and a dead "Карта та джерела" costs more trust than a missing line: a reader who taps a
+ * broken link during an alert learns that the bot's claims are not checkable.
+ */
+function sourceLine(payload: any): string | null {
+  const url = typeof payload.sourceUrl === 'string' && /^https?:\/\//i.test(payload.sourceUrl)
+    ? payload.sourceUrl : null;
+  if (!url) return null;
+  const name = String(payload.sourceName ?? '').trim();
+  return `<a href="${html(url)}">Першоджерело${name ? `: ${html(name)}` : ''}</a>`;
+}
+
+/** Joins the detail block, dropping the lines whose data was missing. */
+function details(...lines: (string | null)[]): string {
+  const present = lines.filter((line): line is string => Boolean(line));
+  return present.length ? `\n\n${present.join('\n')}` : '';
+}
+
+/**
+ * Every message follows the same three beats: what happened and where, what the reader should do,
+ * then the details that let them judge it (evidence, validity, source). The order is the point — a
+ * person reading one notification on a lock screen at 03:00 sees the action before the metadata.
+ *
+ * `now` is injectable so the relative wording ("ще ~25 хв") is testable without freezing the clock.
+ */
+export function formatMessage(row: any, now: Date = new Date()): string {
   const p = row.payload;
   if (row.notification_type === 'alert_start') {
-    return `🔴 <b>Повітряна тривога — ${html(p.locationName)}</b>\n\nОфіційне сповіщення. Перейдіть до визначеного укриття та дотримуйтеся вказівок офіційних служб.\n\n<a href="${html(p.mapUrl)}">Відкрити карту</a>`;
+    const started = humanMoment(p.startedAt, now);
+    return `🔴 <b>Повітряна тривога — ${html(p.locationName)}</b>\n\n`
+      + 'Прямуйте до визначеного укриття й дотримуйтеся вказівок офіційних служб.'
+      + details(
+        started && `Оголошено о ${html(started)}`,
+        'Офіційне сповіщення про тривогу',
+        sourceLine(p)
+      );
   }
   if (row.notification_type === 'alert_end') {
-    return `⚪ <b>Офіційний відбій — ${html(p.locationName)}</b>\n\nЗавершено конкретну офіційну тривогу. Перевірте локальні вказівки перед виходом з укриття.\n\n<a href="${html(p.mapUrl)}">Хронологія</a>`;
+    const ended = humanMoment(p.endedAt, now);
+    return `⚪ <b>Відбій тривоги — ${html(p.locationName)}</b>\n\n`
+      + 'Перед виходом з укриття перевірте місцеві вказівки: відбій стосується лише цієї тривоги.'
+      + details(
+        ended && `Відбій о ${html(ended)}`,
+        'Офіційне сповіщення про відбій',
+        sourceLine(p)
+      );
   }
   if (row.notification_type === 'assessment_update') {
     const factors = Array.isArray(p.explanation?.raisingFactors) ? p.explanation.raisingFactors.slice(0, 3) : [];
-    return `📊 <b>Оновлення аналітики — ${html(p.locationName)}</b>\n\n${html(threatLabels[p.threatType] ?? p.threatType)}: <b>${html(levelLabels[p.level] ?? p.level)}</b> · ${html(p.score)}/10\nІндикативний рівень: ${html(p.indicativePercent)}% · впевненість: ${html(p.confidence)}${factors.length ? `\n\nЧинники:\n${factors.map((factor: string) => `• ${html(factor)}`).join('\n')}` : ''}\n\nЦе індекс публічних сигналів, не статистична ймовірність і не офіційна тривога.\n<a href="${html(p.mapUrl)}">Пояснення</a>`;
+    const horizon = humanMoment(p.horizonEnd, now);
+    const confidence = confidenceLabel(p.confidence);
+    return `📊 <b>Оновлення аналітики — ${html(p.locationName)}</b>\n`
+      + `${html(threatLabel(p.threatType))}: <b>${html(levelLabel(p.level))}</b> · ${html(p.score)}/10\n\n`
+      + 'Це орієнтир для планування, а не сигнал тривоги. Окремих дій зараз не потрібно — '
+      + 'реагуйте на офіційні сповіщення.'
+      + (factors.length ? `\n\nЩо підвищує рівень:\n${factors.map((factor: string) => `• ${html(factor)}`).join('\n')}` : '')
+      + details(
+        p.indicativePercent != null ? `Індикативний рівень: ${html(p.indicativePercent)}%` : null,
+        confidence ? `Впевненість оцінки: ${html(confidence)}` : null,
+        horizon && `Оцінка чинна до ${html(horizon)}`,
+        'Це індекс публічних сигналів, не статистична ймовірність і не офіційна тривога.',
+        sourceLine(p)
+      );
   }
   if (row.notification_type === 'nightly_digest') {
     const lines = (p.assessments as any[]).map((assessment) => {
       const factor = assessment.explanation?.raisingFactors?.[0];
-      return `<b>${html(assessment.locationName)}</b> — ${html(threatLabels[assessment.threatType] ?? assessment.threatType)}\n${html(levelLabels[assessment.level] ?? assessment.level)} · ${html(assessment.indicativePercent)}% індикативного рівня · ${html(assessment.score)}/10${factor ? `\n↳ ${html(factor)}` : ''}`;
+      return `<b>${html(assessment.locationName)}</b> — ${html(threatLabel(assessment.threatType))}\n`
+        + `${html(levelLabel(assessment.level))} · ${html(assessment.indicativePercent)}% індикативного рівня · ${html(assessment.score)}/10`
+        + (factor ? `\n↳ ${html(factor)}` : '');
     });
+    // `generatedTime` is already a Kyiv HH:MM produced by the digest scheduler; anything else that
+    // reaches this field still goes through the formatter rather than being printed raw.
+    const generated = /^\d{1,2}:\d{2}$/.test(String(p.generatedTime ?? ''))
+      ? String(p.generatedTime) : humanMoment(p.generatedTime, now);
+    const horizon = humanMoment((p.assessments as any[])[0]?.horizonEnd, now);
     const omitted = p.omitted ? `\n\nЩе оцінок: ${html(p.omitted)} — перегляньте на сайті.` : '';
-    return `🌙 <b>Оновлення аналітики станом на ${html(p.generatedTime)}</b>\n\n${lines.join('\n\n')}${omitted}\n\nРівень сформовано з публічних сигналів на горизонт до 6 годин. Це не статистична ймовірність, не прогноз цілі та не офіційна тривога. У разі тривоги перейдіть до визначеного укриття.\n\n<a href="${html(p.mapUrl)}">Карта й пояснення</a>`;
+    return `🌙 <b>Аналітика${generated ? ` станом на ${html(generated)}` : ''}</b>\n\n${lines.join('\n\n')}${omitted}`
+      + details(
+        horizon && `Горизонт оцінки — до ${html(horizon)}`,
+        'Рівень сформовано з публічних сигналів. Це не статистична ймовірність, не прогноз цілі та не офіційна тривога.',
+        'У разі тривоги прямуйте до визначеного укриття.'
+      );
   }
-  return `⚠️ <b>${html(p.locationName)}</b>\n${html(threatLabels[p.threatType] ?? p.threatType)}\nРівень доказовості: ${html(p.evidenceLevel)}\n\n${html(p.summary)}\n\nДані дійсні до: ${html(p.validUntil ?? 'не вказано')}\n<a href="${html(p.mapUrl)}">Карта та джерела</a>`;
+  const summary = cleanSummary(p.summary);
+  return `⚠️ <b>${html(p.locationName)} — ${html(threatLabel(p.threatType))}</b>`
+    + (summary ? `\n\n${html(summary)}` : '')
+    + '\n\nЯкщо ви в цьому районі — перейдіть до укриття або до приміщення без вікон '
+    + 'і дочекайтеся офіційного сповіщення.'
+    + details(
+      evidenceStatement(p.evidenceLevel),
+      validUntilLine(p.validUntil, now),
+      sourceLine(p)
+    );
 }
 
 const sendingReclaimSeconds = 300;

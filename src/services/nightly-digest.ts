@@ -73,8 +73,7 @@ export async function enqueueNightlyDigests(now = new Date()): Promise<number> {
             confidence: row.assessment_confidence, explanation: row.explanation,
             horizonEnd: row.horizon_end
           })),
-          omitted: Math.max(0, rows.length - selected.length),
-          mapUrl: `${config.PUBLIC_URL}/analytics`
+          omitted: Math.max(0, rows.length - selected.length)
         })]
       );
       await client.query(
