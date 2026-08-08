@@ -11,6 +11,34 @@ const threatNames = {
 };
 const levelNames = { background: 'фоновий', elevated: 'підвищений', significant: 'значний', high: 'високий', very_high: 'дуже високий' };
 const evidenceNames = { official: 'офіційно', confirmed: 'підтверджено', monitoring: 'моніторинг', unverified: 'не перевірено' };
+const confidenceNames = { low: 'низька', medium: 'середня', high: 'висока' };
+// Рівень джерела людині нічого не каже літерою. Назва каже все, а літера лишається в дужках для тих,
+// хто читав методологію.
+const tierNames = { A: 'офіційне джерело', B: 'моніторинговий канал', C: 'допоміжний канал' };
+// Дзеркало signalTypeLabels із src/services/risk.ts — фронтенд збирається окремим бандлом і не
+// імпортує з src/. Назви індикаторів («зліт стратегічної авіації») мапа пропускає без змін:
+// класифікатор уже пише їх українською.
+const signalTypeNames = {
+  explicit_threat: 'пряма загроза цій території',
+  reported_direction: 'ціль рухається в цьому напрямку',
+  mentioned: 'територію згадано в повідомленні',
+  official_alert: 'офіційна тривога',
+  aftermath: 'повідомлення про наслідки на місці',
+  national_posture: 'загальнонаціональне попередження',
+  child_location_signal: 'сигнал із населеного пункту всередині території'
+};
+// Причини зміни статусу події зберігаються ідентифікаторами — у хронології їх читає людина.
+const updateReasonNames = {
+  stronger_evidence_received: 'надійшло вагоміше підтвердження',
+  two_independent_tier_a_or_b_sources: 'підтвердили два незалежні джерела',
+  source_message_edited: 'джерело відредагувало повідомлення',
+  last_source_assertion_withdrawn: 'джерело відкликало повідомлення',
+  validity_window_elapsed: 'минув строк дії повідомлення'
+};
+const statusNames = {
+  active: 'триває', observed: 'спостерігається', confirmed: 'підтверджено',
+  withdrawn: 'відкликано', corrected: 'виправлено', expired: 'втратила чинність'
+};
 const occupationLayerIds = ['occupation-fill', 'occupation-hatch', 'occupation-line', 'occupation-contested-line'];
 const occupationColor = ['case', ['==',['get','status'],'occupied'], '#ff7a4d', ['==',['get','status'],'liberated'], '#72d6ca', '#8f9b94'];
 
@@ -812,6 +840,87 @@ function openDetail(title, kicker, body) {
   return dialog;
 }
 
+function signalTypeName(type) {
+  return signalTypeNames[type] ?? type ?? 'тип сигналу не вказано';
+}
+
+// `observed_at` теоретично може не розпарситися, а «55 років тому» на картці загрози виглядає як
+// зламана система, а не як відсутнє поле.
+function agoOrUnknown(timestamp) {
+  return timestamp ? timeAgo(timestamp) : 'час не вказано';
+}
+
+function tierName(tier) {
+  return tierNames[tier] ? `${tierNames[tier]} (${tier})` : `джерело рівня ${tier ?? '—'}`;
+}
+
+// Речення, а не фрагмент: чинники приходять і від моделі, і від сталого правила, і жоден із двох
+// не гарантує ні великої літери, ні крапки.
+function sentence(value) {
+  const text = String(value ?? '').trim();
+  if (!text) return '';
+  const capitalised = text[0].toUpperCase() + text.slice(1);
+  return /[.!?…»]$/.test(capitalised) ? capitalised : `${capitalised}.`;
+}
+
+function pluralUk(count, one, few, many) {
+  const mod100 = count % 100;
+  if (mod100 >= 11 && mod100 <= 14) return many;
+  const mod10 = count % 10;
+  if (mod10 === 1) return one;
+  if (mod10 >= 2 && mod10 <= 4) return few;
+  return many;
+}
+
+// «внесок 0.35» — це число з внутрішньої шкали, у якої немає одиниці виміру й немає стелі, зрозумілої
+// ззовні. Людині потрібне порівняння, а не значення: сильніше чи слабше за решту. Пороги взято з
+// того, як внесок формується насправді (базові 2.5 / 1.5 / 0.6 за рівнем джерела, помножені на
+// релевантність, надійність і згасання за давністю).
+function influenceWord(contribution) {
+  const value = Number(contribution);
+  if (!Number.isFinite(value)) return 'вплив не визначено';
+  if (value >= 1.2) return 'значний вплив';
+  if (value >= 0.5) return 'помірний вплив';
+  return 'слабкий вплив';
+}
+
+// Три повідомлення про той самий напрямок — це один аргумент, повторений тричі, а не три аргументи.
+// Групування прибирає з картки саме ту «плутанину з факторів», через яку її неможливо було читати.
+function groupAssessmentSignals(signals = []) {
+  const groups = new Map();
+  for (const signal of signals) {
+    const key = signal.signal_type ?? 'unknown';
+    const group = groups.get(key) ?? {
+      key, label: signalTypeName(key), count: 0, weight: 0, latest: 0, sources: new Set(), tiers: new Set()
+    };
+    group.count += 1;
+    group.weight += Number(signal.contribution) || 0;
+    group.latest = Math.max(group.latest, new Date(signal.observed_at).getTime() || 0);
+    if (signal.source_name) group.sources.add(signal.source_name);
+    if (signal.source_tier) group.tiers.add(signal.source_tier);
+    groups.set(key, group);
+  }
+  return [...groups.values()].sort((a, b) => b.weight - a.weight);
+}
+
+// Звідки береться впевненість — питання, на яке картка мусить відповідати сама. Слово «низька» без
+// причини читається як дефект системи, хоча насправді це чесний опис доказової бази.
+function confidenceExplanation(item, groups) {
+  const tiers = new Set(groups.flatMap((group) => [...group.tiers]));
+  const sources = new Set(groups.flatMap((group) => [...group.sources]));
+  const reasons = [];
+  if (tiers.size && !tiers.has('A')) reasons.push('офіційного повідомлення серед джерел поки немає');
+  if (tiers.size === 1 && tiers.has('C')) reasons.push('усі повідомлення надійшли з допоміжних каналів');
+  if (sources.size === 1) reasons.push('усе спирається на одне джерело');
+  if (!reasons.length) {
+    reasons.push(tiers.has('A')
+      ? 'серед джерел є офіційне повідомлення'
+      : 'повідомлення надійшли з кількох незалежних каналів');
+  }
+  const level = confidenceNames[item.assessment_confidence] ?? item.assessment_confidence ?? 'не визначена';
+  return `Впевненість системи — ${level}: ${reasons.join('; ')}.`;
+}
+
 async function showThreatDetails(id) {
   // Ланцюг тягнемо паралельно й ніколи не даємо йому зламати картку: без нього подія читається так
   // само, як читалася до появи векторів.
@@ -823,22 +932,70 @@ async function showThreatDetails(id) {
   const item = await response.json();
   const sources = item.evidence.map((source) => {
     const url = safeUrl(source.public_url);
-    return `<article class="evidence-row"><div><span>TIER ${escapeHtml(source.tier)} · ${source.official ? 'офіційне' : 'допоміжне'}</span><strong>${escapeHtml(source.name)}</strong></div><time>${new Date(source.published_at).toLocaleString('uk-UA')}</time><p>${escapeHtml(source.raw_text)}</p>${url ? `<a href="${escapeHtml(url)}" target="_blank" rel="noreferrer">Першоджерело ↗</a>` : ''}</article>`;
+    return `<article class="evidence-row"><div><span>${escapeHtml(tierName(source.tier))} · ${source.official ? 'офіційне' : 'неофіційне'}</span><strong>${escapeHtml(source.name)}</strong></div><time>${escapeHtml(agoOrUnknown(new Date(source.published_at).getTime()))} · ${escapeHtml(new Date(source.published_at).toLocaleString('uk-UA'))}</time><p>${escapeHtml(source.raw_text)}</p>${url ? `<a href="${escapeHtml(url)}" target="_blank" rel="noreferrer">Першоджерело ↗</a>` : ''}</article>`;
   }).join('') || '<p>Публічних доказів ще немає.</p>';
-  const updates = item.updates.map((update) => `<li><time>${new Date(update.created_at).toLocaleString('uk-UA')}</time> ${escapeHtml(update.reason)}: ${escapeHtml(update.new_status)} / ${escapeHtml(update.new_evidence_level)}</li>`).join('');
+  // Причина зміни й новий статус зберігаються ідентифікаторами; у хронології події їх читає людина,
+  // тож ідентифікатор лишається лише тоді, коли назви для нього ще немає.
+  const updates = item.updates.map((update) => `<li><time>${escapeHtml(agoOrUnknown(new Date(update.created_at).getTime()))}</time> <b>${escapeHtml(sentence(updateReasonNames[update.reason] ?? update.reason))}</b><br><small>стан: ${escapeHtml(statusNames[update.new_status] ?? update.new_status)} · доказовість: ${escapeHtml(evidenceNames[update.new_evidence_level] ?? update.new_evidence_level)}</small></li>`).join('');
   openDetail(item.title, evidenceNames[item.evidence_level] ?? item.evidence_level,
-    `<p class="detail-summary">${escapeHtml(item.summary)}</p><dl><div><dt>Остання згадка</dt><dd>${new Date(item.last_observed_at).toLocaleString('uk-UA')}</dd></div><div><dt>Дійсна до</dt><dd>${item.valid_until ? new Date(item.valid_until).toLocaleString('uk-UA') : 'не визначено'}</dd></div><div><dt>Напрямок</dt><dd>${escapeHtml(item.direction_text || 'не повідомлявся')}</dd></div></dl>${vectorChainHtml(vector)}<h3>Джерела</h3>${sources}${updates ? `<h3>Історія змін</h3><ol class="update-list">${updates}</ol>` : ''}<div class="safety-note"><strong>Геометрія не є прогнозом</strong><p>Система показує лише дослівно повідомлену територію або напрямок і не екстраполює маршрут.</p></div>`);
+    `<p class="detail-summary">${escapeHtml(item.summary)}</p><dl><div><dt>Остання згадка</dt><dd>${escapeHtml(agoOrUnknown(new Date(item.last_observed_at).getTime()))}</dd></div><div><dt>Дійсна до</dt><dd>${item.valid_until ? escapeHtml(shortTime(item.valid_until)) : 'не визначено'}</dd></div><div><dt>Напрямок</dt><dd>${escapeHtml(item.direction_text || 'не повідомлявся')}</dd></div></dl>${vectorChainHtml(vector)}<h3>Джерела</h3>${sources}${updates ? `<h3>Історія змін</h3><ol class="update-list">${updates}</ol>` : ''}<div class="safety-note"><strong>Геометрія не є прогнозом</strong><p>Система показує лише дослівно повідомлену територію або напрямок і не екстраполює маршрут.</p></div>`);
 }
 
 async function showAssessmentDetails(id) {
   const response = await fetch(`/api/v1/assessments/${encodeURIComponent(id)}`);
   if (!response.ok) return openDetail('Оцінку не знайдено', 'Помилка', '<p>Оцінка могла втратити актуальність.</p>');
-  const item = await response.json(); const explanation = item.explanation ?? {};
-  const factors = (explanation.raisingFactors ?? []).map((factor) => `<li>${escapeHtml(factor)}</li>`).join('');
-  const limits = (explanation.limitingFactors ?? []).map((factor) => `<li>${escapeHtml(factor)}</li>`).join('');
-  const signals = item.signals.map((signal) => `<article class="signal-row"><strong>${escapeHtml(signal.signal_type)}</strong><span>TIER ${escapeHtml(signal.source_tier)} · внесок ${Number(signal.contribution).toFixed(2)}</span><small>${escapeHtml(signal.source_name || 'джерело не вказано')} · ${new Date(signal.observed_at).toLocaleString('uk-UA')}</small></article>`).join('');
-  openDetail(`${item.location_name}: ${threatNames[item.threat_type] ?? item.threat_type}`, 'Аналітична оцінка, не тривога',
-    `<div class="detail-score"><strong>${item.risk_score}<small>/10</small></strong><span>${escapeHtml(levelNames[item.risk_level])}<br>${item.indicative_percent ?? Math.round(item.risk_score * 10)}% індикативно · впевненість ${escapeHtml(item.assessment_confidence)}</span></div><p class="detail-summary">${escapeHtml(explanation.summary || '')}</p><dl><div><dt>Горизонт</dt><dd>${new Date(item.horizon_start).toLocaleString('uk-UA')} — ${new Date(item.horizon_end).toLocaleString('uk-UA')}</dd></div><div><dt>Методологія</dt><dd>${escapeHtml(item.methodology_version)} · ${escapeHtml(item.model_version)}</dd></div></dl>${factors ? `<h3>Що підвищує індекс</h3><ul>${factors}</ul>` : ''}${limits ? `<h3>Що обмежує оцінку</h3><ul>${limits}</ul>` : ''}<h3>Сигнали</h3>${signals}<div class="safety-note"><strong>Не статистична ймовірність</strong><p>${escapeHtml(explanation.caveat || 'Це відносний індекс публічних сигналів. Низький рівень не означає безпеку.')}</p></div>`);
+  const item = await response.json();
+  const explanation = item.explanation ?? {};
+  const groups = groupAssessmentSignals(item.signals);
+  const threat = threatNames[item.threat_type] ?? item.threat_type;
+  const level = levelNames[item.risk_level] ?? item.risk_level;
+
+  // Три абзаци відповідають на три питання поспіль: що і де, з чого це зроблено, наскільки система
+  // впевнена. Далі йде компактний блок причин — він повторює головне списком, бо під час тривоги
+  // картку читають по діагоналі.
+  const opening = `Це аналітична оцінка, а не тривога. Для території «${item.location_name}» система оцінює загрозу «${threat}» на найближчі шість годин як ${level} — ${item.risk_score} з 10.`;
+  const reasonSource = (explanation.raisingFactors ?? []).filter(Boolean);
+  const reasons = (reasonSource.length
+    ? reasonSource
+    : groups.map((group) => `${group.label} — ${group.count} ${pluralUk(group.count, 'повідомлення', 'повідомлення', 'повідомлень')}, найсвіжіше ${agoOrUnknown(group.latest)}`)
+  ).slice(0, 3).map((reason) => `<li>${escapeHtml(sentence(reason))}</li>`).join('');
+  const changes = (explanation.limitingFactors ?? []).filter(Boolean).slice(0, 4)
+    .map((factor) => `<li>${escapeHtml(sentence(factor))}</li>`).join('');
+
+  const signalGroups = groups.map((group) => {
+    const sources = [...group.sources];
+    const sourceLine = sources.length
+      ? `${sources.slice(0, 3).map((name) => escapeHtml(name)).join(', ')}${sources.length > 3 ? ` та ще ${sources.length - 3}` : ''}`
+      : 'джерело не вказано';
+    return `<li class="signal-group"><strong>${escapeHtml(group.label)}</strong>
+      <span>${group.count} ${pluralUk(group.count, 'повідомлення', 'повідомлення', 'повідомлень')} · ${escapeHtml(influenceWord(group.weight))}</span>
+      <small>найсвіжіше ${escapeHtml(agoOrUnknown(group.latest))} · ${sourceLine}</small></li>`;
+  }).join('') || '<li class="signal-group"><strong>Сигналів не залишилося</strong><small>Повідомлення, з яких зроблено оцінку, втратили чинність.</small></li>';
+
+  // Сирі числа нікуди не зникають — вони переїжджають під <details>. Тут вони перевіряються, а не
+  // читаються: людині під час тривоги не потрібні ні версія методології, ні георелевантність 0.65.
+  const technical = item.signals.map((signal) => `<li><span>${escapeHtml(signal.signal_type)}</span>
+    <span>${escapeHtml(tierName(signal.source_tier))} · внесок ${Number(signal.contribution).toFixed(2)} · надійність ${Number(signal.reliability).toFixed(2)} · георелевантність ${Number(signal.geographic_relevance).toFixed(2)}</span>
+    <time>${escapeHtml(new Date(signal.observed_at).toLocaleString('uk-UA'))}</time></li>`).join('');
+
+  openDetail(`${item.location_name}: ${threat}`, 'Аналітична оцінка, не тривога',
+    `<div class="detail-score"><strong>${escapeHtml(item.risk_score)}<small>/10</small></strong><span>${escapeHtml(level)} рівень<br>впевненість ${escapeHtml(confidenceNames[item.assessment_confidence] ?? item.assessment_confidence)}</span></div>
+     <div class="assessment-story">
+       <p>${escapeHtml(opening)}</p>
+       ${explanation.summary ? `<p>${escapeHtml(sentence(explanation.summary))}</p>` : ''}
+       <p>${escapeHtml(confidenceExplanation(item, groups))}</p>
+     </div>
+     ${reasons ? `<h3>З чого зроблено висновок</h3><ul class="reason-list">${reasons}</ul>` : ''}
+     ${changes ? `<h3>Що може змінити оцінку</h3><ul class="reason-list is-muted">${changes}</ul>` : ''}
+     <h3>Повідомлення, на яких тримається оцінка</h3>
+     <ul class="signal-groups">${signalGroups}</ul>
+     <details class="tech-details"><summary>Технічні деталі</summary>
+       <dl><div><dt>Горизонт</dt><dd>${escapeHtml(new Date(item.horizon_start).toLocaleString('uk-UA'))} — ${escapeHtml(new Date(item.horizon_end).toLocaleString('uk-UA'))}</dd></div>
+       <div><dt>Індикативний рівень</dt><dd>${escapeHtml(String(item.indicative_percent ?? Math.round(item.risk_score * 10)))}% за шкалою індексу</dd></div>
+       <div><dt>Методологія · модель</dt><dd>${escapeHtml(item.methodology_version)} · ${escapeHtml(item.model_version)}</dd></div></dl>
+       ${technical ? `<ul class="tech-signals">${technical}</ul>` : ''}
+     </details>
+     <div class="safety-note"><strong>Не статистична ймовірність</strong><p>${escapeHtml(explanation.caveat || 'Це відносний індекс публічних повідомлень, а не ймовірність удару. Низький рівень не означає безпеку.')}</p></div>`);
 }
 
 async function showLocationHistory(id) {

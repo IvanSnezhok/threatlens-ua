@@ -34,31 +34,120 @@ function unique<T>(values: T[]): T[] {
   return [...new Set(values)];
 }
 
+/**
+ * Людські назви типів сигналу.
+ *
+ * `risk_signals.signal_type` — це або назва індикатора з класифікатора (вона вже написана
+ * українською: «зліт стратегічної авіації»), або технічна назва зв'язку повідомлення з територією
+ * (`explicit_threat`, `child_location_signal`). Друге ніколи не писалося для людини, і саме воно
+ * протікало в інтерфейс сирим ідентифікатором. Мапа перекладає лише технічні значення, а назви
+ * індикаторів проходять крізь неї без змін — вони вже кращі за будь-який переклад.
+ *
+ * Дзеркальна копія цієї мапи живе у web/app.js: фронтенд — окремий бандл і не імпортує з src/,
+ * тож єдиний спосіб не показати сире значення там — повторити відповідності. Змінюєш тут — зміни й там.
+ */
+const signalTypeLabels: Record<string, string> = {
+  explicit_threat: 'пряма загроза цій території',
+  reported_direction: 'ціль рухається в цьому напрямку',
+  mentioned: 'територію згадано в повідомленні',
+  official_alert: 'офіційна тривога',
+  aftermath: 'повідомлення про наслідки на місці',
+  national_posture: 'загальнонаціональне попередження',
+  child_location_signal: 'сигнал із населеного пункту всередині території'
+};
+
+export function signalTypeLabel(signalType: string): string {
+  return signalTypeLabels[signalType] ?? signalType;
+}
+
+function plural(count: number, one: string, few: string, many: string): string {
+  const mod100 = count % 100;
+  if (mod100 >= 11 && mod100 <= 14) return many;
+  const mod10 = count % 10;
+  if (mod10 === 1) return one;
+  if (mod10 >= 2 && mod10 <= 4) return few;
+  return many;
+}
+
+interface SignalGroup {
+  signalType: string;
+  count: number;
+  weight: number;
+}
+
+/**
+ * Однотипні повідомлення — це один аргумент, а не п'ять.
+ *
+ * Раніше кожен сигнал ставав окремим рядком «чинників», і три повідомлення про той самий напрямок
+ * читалися як три різні причини. Групування за типом лишає рівно стільки причин, скільки їх є
+ * насправді, а вага групи — сума внесків, бо саме сума й формує індекс.
+ */
+function groupSignals(signals: RiskSignalRow[]): SignalGroup[] {
+  const groups = new Map<string, SignalGroup>();
+  for (const signal of signals) {
+    const group = groups.get(signal.signal_type)
+      ?? { signalType: signal.signal_type, count: 0, weight: 0 };
+    group.count += 1;
+    group.weight += signal.effective_contribution ?? effectiveContribution(signal);
+    groups.set(signal.signal_type, group);
+  }
+  return [...groups.values()].sort((a, b) => b.weight - a.weight);
+}
+
 export function effectiveContribution(signal: RiskSignalRow, now = Date.now()): number {
   const ageHours = Math.max(0, (now - new Date(signal.observed_at).getTime()) / 3_600_000);
   const freshnessDecay = 2 ** (-ageHours / 2);
   return Number(signal.contribution) * Number(signal.reliability) * freshnessDecay;
 }
 
-function fallbackAssessment(locationId: string, threatType: string, signals: RiskSignalRow[]): ModelAssessment {
+const threatLabels: Record<string, string> = {
+  uav: 'ударних БпЛА', ballistic_missile: 'балістичних ракет',
+  cruise_missile: 'крилатих ракет', guided_air_bomb: 'керованих авіаційних бомб',
+  aviation: 'активності авіації', mlrs: 'РСЗВ', artillery: 'артилерійського обстрілу',
+  mortar: 'мінометного обстрілу', combined: 'комбінованої загрози', unknown: 'невизначеної загрози'
+};
+
+/**
+ * Пояснення, яке читає людина, а не список технічних полів.
+ *
+ * Раніше «чинниками» тут ставали самі значення `signal_type`, і в картку оцінки потрапляв рядок
+ * штибу `child_location_signal`. Тепер кожен чинник — завершене речення про те, що саме повідомили
+ * джерела й скільки разів; це той самий текст, який іде і в Telegram-дайджест, тож він мусить
+ * читатися без жодного контексту інтерфейсу.
+ */
+export function fallbackAssessment(
+  location: { id: string; name_uk: string },
+  threatType: string,
+  signals: RiskSignalRow[]
+): ModelAssessment {
   const score = Math.min(10, signals.reduce((sum, signal) => sum + (signal.effective_contribution ?? effectiveContribution(signal)), 0));
   const independent = new Set(signals.map((signal) => signal.independence_group)).size;
-  const raisingFactors = unique(signals
-    .sort((a, b) => (b.effective_contribution ?? 0) - (a.effective_contribution ?? 0))
-    .map((signal) => signal.signal_type)).slice(0, 5);
+  const tiers = new Set(signals.map((signal) => signal.source_tier));
+  const groups = groupSignals(signals);
+  const raisingFactors = groups.slice(0, 3).map((group) => {
+    const messages = `${group.count} ${plural(group.count, 'повідомлення', 'повідомлення', 'повідомлень')}`;
+    return `Джерела повідомляють про це: ${signalTypeLabel(group.signalType)} — ${messages} за останні години.`;
+  });
+  if (tiers.has('A')) raisingFactors.push('Серед джерел є офіційне повідомлення.');
+  if (independent >= 2) raisingFactors.push('Повідомлення надійшли щонайменше з двох незалежних груп джерел.');
+
+  const threatLabel = threatLabels[threatType] ?? threatType;
+  const messageCount = `${signals.length} ${plural(signals.length, 'публічного повідомлення', 'публічних повідомлень', 'публічних повідомлень')}`;
   return {
-    locationId,
+    locationId: location.id,
     threatType,
     horizonHours: 6,
     score,
     confidence: independent >= 2 ? 'medium' : 'low',
     supportingSignalIds: signals.map((signal) => signal.id),
-    raisingFactors,
+    raisingFactors: unique(raisingFactors).slice(0, 5),
     limitingFactors: [
-      'Використано детерміновану модель без зовнішнього AI',
-      independent < 2 ? 'Менше двох незалежних груп джерел' : 'Оцінка обмежена шестигодинним горизонтом'
+      'Оцінку зроблено за сталим правилом без зовнішньої моделі: воно враховує лише кількість повідомлень, їхню давність, надійність джерела та те, наскільки повідомлення стосується саме цієї території.',
+      independent < 2
+        ? 'Усе тримається на одній групі джерел — помилка в ній зсуне весь індекс.'
+        : 'Система дивиться лише на шість годин уперед і не бачить, що буде далі.'
     ],
-    summary: 'Індекс сформовано з актуальних публічних сигналів з урахуванням давності, надійності та географічної релевантності.'
+    summary: `Оцінка загрози ${threatLabel} для території «${location.name_uk}» на найближчі шість годин. Індекс зібрано з ${messageCount} за останні години з поправкою на давність, надійність джерела та те, наскільки повідомлення стосується саме цієї території.`
   };
 }
 
@@ -73,14 +162,14 @@ export function clampAssessment(candidate: ModelAssessment, signals: RiskSignalR
   if (tiers.size === 1 && tiers.has('C')) {
     maximum = 3.9;
     confidence = 'low';
-    limitingFactors.push('Лише допоміжні джерела рівня C: індекс обмежено');
+    limitingFactors.push('Усі повідомлення — з допоміжних каналів, тож індекс навмисно обмежено зверху.');
   } else if (!tiers.has('A')) {
     maximum = 5.9;
-    limitingFactors.push('Немає офіційного джерела рівня A: індекс обмежено');
+    limitingFactors.push('Офіційного повідомлення поки немає, тож індекс навмисно обмежено зверху.');
   }
   if (independent < 2) {
     confidence = 'low';
-    limitingFactors.push('Немає підтвердження другою незалежною групою джерел');
+    limitingFactors.push('Другої незалежної групи джерел, яка підтвердила б те саме, поки немає.');
   } else if (confidence === 'high' && !tiers.has('A')) confidence = 'medium';
 
   return {
@@ -105,7 +194,7 @@ async function recordFailedRun(input: unknown, error: unknown): Promise<void> {
 
 async function callModel(location: { id: string; name_uk: string }, threatType: string, signals: RiskSignalRow[]): Promise<ModelAssessment> {
   if (!config.AI_BASE_URL || !config.AI_API_KEY || !config.AI_MODEL) {
-    return fallbackAssessment(location.id, threatType, signals);
+    return fallbackAssessment(location, threatType, signals);
   }
   const input = {
     location: { id: location.id, name: location.name_uk },
@@ -131,7 +220,11 @@ async function callModel(location: { id: string; name_uk: string }, threatType: 
         temperature: 0,
         response_format: { type: 'json_object' },
         messages: [
-          { role: 'system', content: 'Return only JSON. Assess the relative risk that an official warning of the specified type will appear for this location within six hours. This is an index, not a statistical probability. Never infer an impact, target, exact route, or safety. Required fields: locationId, threatType, horizonHours=6, score 0-10, confidence low|medium|high, supportingSignalIds, raisingFactors, limitingFactors, summary.' },
+          // Текст із цієї відповіді потрапляє людині в очі без редагування — і в картку на карті, і в
+          // Telegram. Тому від моделі вимагається не перелік полів, а завершені українські речення:
+          // «reported_direction» у списку чинників було б таким самим витоком технічної назви, як і
+          // раніше в інтерфейсі.
+          { role: 'system', content: 'Return only JSON. Assess the relative risk that an official warning of the specified type will appear for this location within six hours. This is an index, not a statistical probability. Never infer an impact, target, exact route, or safety. Required fields: locationId, threatType, horizonHours=6, score 0-10, confidence low|medium|high, supportingSignalIds, raisingFactors, limitingFactors, summary. Write summary, raisingFactors and limitingFactors in Ukrainian, as complete calm sentences a civilian can read aloud; never emit raw field names, signal type identifiers, English terms or numeric weights in them.' },
           { role: 'user', content: JSON.stringify(input) }
         ]
       }),
@@ -149,7 +242,7 @@ async function callModel(location: { id: string; name_uk: string }, threatType: 
     return parsed;
   } catch (error) {
     await recordFailedRun(input, error);
-    return fallbackAssessment(location.id, threatType, signals);
+    return fallbackAssessment(location, threatType, signals);
   }
 }
 
@@ -204,7 +297,7 @@ export async function runRiskAssessments(): Promise<number> {
               summary: assessment.summary,
               raisingFactors: assessment.raisingFactors,
               limitingFactors: assessment.limitingFactors,
-              caveat: 'Індикативний відсоток є шкалою індексу, а не статистичною ймовірністю.'
+              caveat: 'Індикативний відсоток — це позначка на шкалі індексу, а не статистична ймовірність удару. Низький рівень не означає безпеку: офіційна тривога може бути оголошена без жодного попереднього сигналу.'
             }), material]
         );
         const assessmentId = result.rows[0]!.id;
