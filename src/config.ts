@@ -130,8 +130,9 @@ const envSchema = z.object({
   //
   // The client id and issuer below are the ones the public Codex CLI uses. They are not ours.
   // The sign-in they drive was exercised end to end against the live service on 2026-08-07 and
-  // returned a session with a refresh token; the *transport* to the model remains the unverified
-  // part, as `docs/EXTERNAL_SETUP.md` records. Override both if the values move.
+  // returned a session with a refresh token; the Responses transport was exercised with that
+  // session on 2026-08-08 and returned model text, as `docs/EXTERNAL_SETUP.md` records. Override
+  // both if the values move.
   //
   // The redirect is loopback by necessity, not by preference: that client only accepts
   // `http://localhost:<port>/auth/callback`, so the browser completing the sign-in and the server

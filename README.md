@@ -17,10 +17,26 @@ Evidence-first situational awareness for Ukraine: a Telegram bot, responsive sta
 - Explicit internationally recognized Ukraine boundary overlay including the Autonomous Republic of Crimea and Sevastopol; oblast/city clicks open territorial history.
 - Temporarily occupied territories layer sourced from DeepStateMap, filtered by a fail-safe status allowlist and clipped to the recognized border of Ukraine. Reference context only — it never affects alerts or risk scores.
 - Operator-managed catalog of recommended Telegram channels, exposed on the site and through the bot.
-- Codex sign-in from the operations console: an OAuth (PKCE) button instead of a token pasted into
-  `.env`, with the session stored in PostgreSQL and refreshed automatically. The callback is
-  loopback-only, so it works where the browser and the app share one `localhost`; the manual
-  `CODEX_API_KEY` remains as a fallback and the narrative still degrades to deterministic text.
+- Codex analytics on a ChatGPT plan, managed entirely from the operations console: an OAuth (PKCE)
+  sign-in button instead of a token pasted into `.env` (session stored in PostgreSQL, refreshed
+  automatically, loopback-only callback), a model picker and three per-surface switches — narrative,
+  nightly digest, vector extrapolation — stored in `codex_settings`. The client speaks the streamed
+  Responses API against `chatgpt.com/backend-api/codex` (or `chat/completions` against a compatible
+  proxy), audits every call in `ai_runs`, and every surface keeps its deterministic fallback: a
+  refused or expired model never breaks the flow, and model-written text is always labelled as such.
+- Humanised Telegram notifications: Kyiv-time wording with a remaining-time hint instead of ISO
+  timestamps, evidence levels spelled out in Ukrainian instead of database enums, a link to the
+  originating channel message instead of a dead map link, and channel-text clean-up (duplicate
+  punctuation, leading decorations) — with the what/where → what-to-do → details order kept
+  consistent across every notification type.
+- Readable threat analysis in the map's assessment details: a connected narrative of what the threat
+  is, what the conclusion rests on and what would change it, signals grouped and named in Ukrainian
+  with worded influence instead of raw contributions, and the raw numbers folded into a collapsed
+  technical block.
+- Attack analytics page: day/week/month aggregates over the classification archive — means, targets
+  by territory, hours of the day, wave clustering with real message-time boundaries, repeated
+  combinations and period-over-period trends — topped by a deterministic "patterns and probable
+  strategy" narrative that states its open-source limits plainly.
 - Automatic official KATOTTG import covering 461 cities in the 07.07.2026 release.
 - PostgreSQL migrations, monthly materialized summaries, Prometheus metrics, health checks, Caddy, Docker Compose, and verified daily local backups.
 
@@ -343,7 +359,7 @@ source published that raised nothing.
 | | State |
 |---|---|
 | **Routing for 21 official oblast channels** | Registered in the database, inert. Alert routing reads one channel from configuration rather than the catalogue, and the parser does not yet handle their word order (`🔴 <район> - повітряна тривога!` versus `🔴 13:47 Повітряна тривога в <район>`). |
-| **Analytics endpoints** | Archive schema and queries exist; the operator-facing slices do not. |
+| **Analytics endpoints** | Archive schema and queries exist, and the public attack-analytics page now reads them (`/api/v1/analytics/attacks`, day/week/month, waves and trends). Remaining: operator-facing slices beyond the coverage view. |
 | **Threat vectors** | Chains of *reported* movement, public. Extrapolation computed but exposed only under `/ops`, stored separately so it cannot leak into a public response. |
 
 ### Next

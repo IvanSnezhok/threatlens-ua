@@ -235,7 +235,29 @@ The archive write happens outside the ingestion transaction and its failure is a
 (`threatlens_classification_log_failures_total`), never an exception. During a mass attack the thing
 that must keep working is the map; an analytics row is not worth a dropped threat event.
 
-### Threat vectors: a reported chain in public, an extrapolation for operators only
+### Attack analytics over the archive
+
+`src/services/attack-analytics.ts` reads the classification archive back out as a public page: for
+a day, a week or a month it aggregates means, territories, hours of the day and period-over-period
+trends in SQL, clusters messages into waves — with the gap measured between actual message times,
+not bucket edges, so the wave count cannot depend on the resolution the reader picked — and writes
+a deterministic "patterns and probable strategy" conclusion in the same voice as the narrative
+service. `GET /api/v1/analytics/attacks` is public, cached, and validates its period against a
+whitelist; the page states plainly that it reads open sources and is neither a forecast nor an
+official record. When the previous period is empty the prose says there is no baseline instead of
+claiming a comparison it does not have.
+
+### One model client, one audit trail
+
+Everything that reaches a language model goes through `src/services/codex-client.ts`. The client
+holds the only copy of the transport decision — the streamed Responses API against
+`chatgpt.com/backend-api/codex`, `chat/completions` against anything else, `CODEX_API_STYLE` to
+overrule the URL — and the only copy of the audit write: every call, including the pre-flight
+refusals that never left the process, lands in `ai_runs` with its prompt, output, duration and
+failure reason. The token goes into one `Authorization` header and nowhere else. Which surfaces may
+call at all — narrative, nightly digest, vector extrapolation — is stored in `codex_settings` and
+switched from `/ops`; every surface is complete without a model, so a dead session degrades to the
+deterministic text rather than to an error, and model-written prose is always labelled.
 
 The commitment stated at the top of this document and on the map itself — the system shows an
 explicitly reported region, point or direction and never a predicted target, impact or trajectory —

@@ -180,8 +180,10 @@ Three caveats, all of them real:
    `CODEX_OAUTH_ISSUER` carry the values that client publishes. Both are overridable. The sign-in
    itself *has* been exercised against the live service (2026-08-07): the authorisation, the
    loopback callback and the code-for-token exchange all completed and stored a session with a
-   refresh token. That says nothing about caveat 1 — obtaining a credential and being able to spend
-   it at an endpoint are separate questions.
+   refresh token. The Responses transport was then exercised end to end with that session
+   (2026-08-08): a live call against `chatgpt.com/backend-api/codex` returned model text and its
+   audit row landed in `ai_runs`, so both halves — the credential and the spending of it — have
+   now been seen working.
 3. **It is outside what that authorisation is for.** Codex sign-in is meant for the Codex client, not
    for a third-party server running around the clock. The risk is account action.
 
@@ -194,7 +196,7 @@ PostgreSQL and refreshed from then on. Nothing is written to `.env` and no resta
 One thing still has to be set by hand, because signing in supplies a credential and not an endpoint:
 
 ```env
-CODEX_BASE_URL=
+CODEX_BASE_URL=https://chatgpt.com/backend-api/codex
 ```
 
 `CODEX_MODEL` and `ANALYTICS_NARRATIVE_ENABLED` remain valid and still work exactly as before, but

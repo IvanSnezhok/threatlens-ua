@@ -57,6 +57,40 @@ coordinate at both ends (hromadas, and raions missing from the ADM2 file); `no_e
 message stated both ends, which gives a heading but no speed; `implausible_speed` means two reports
 landed close enough together that the ratio is an artefact.
 
+## Codex analytics (operator only)
+
+The whole lifecycle lives in one `/ops` group — «Codex-аналітика»: session status, the sign-in
+button, the model dropdown, the three surface switches and the `ai_runs` audit viewer. Nothing about
+it requires editing `.env` or restarting, except `CODEX_BASE_URL` itself.
+
+```bash
+# Session: is there one, whose is it, when does it die. Never returns a token.
+curl -fsS -u "$OPS_USER:$OPS_PASSWORD" http://localhost:3000/ops/codex
+
+# Current settings, the model catalogue and its provenance.
+curl -fsS -u "$OPS_USER:$OPS_PASSWORD" http://localhost:3000/ops/codex/settings
+
+# Pick a model and switch surfaces. Any subset of fields; omitted ones keep their value.
+curl -fsS -u "$OPS_USER:$OPS_PASSWORD" -X PUT -H 'Content-Type: application/json' \
+  -d '{"model":"gpt-5.6-luna","features":{"narrative":true,"digest":true,"attacks":true}}' \
+  http://localhost:3000/ops/codex/settings
+
+# The audit log: every call, including the ones that never left the process.
+curl -fsS -u "$OPS_USER:$OPS_PASSWORD" 'http://localhost:3000/ops/ai-runs?limit=20'
+```
+
+Reading it:
+
+- **The switches are off by default.** An installation that never opens the console never calls a
+  model, and every surface produces its complete deterministic output either way.
+- **`modelsSource: "fallback"` against the ChatGPT backend is by design**, not a degradation — that
+  backend publishes no `/models`, so the dropdown is the static list plus whatever is already
+  selected. Against an OpenAI-compatible proxy the list comes from the service.
+- **The prose stopping is answered by `ai_runs`, not by guesswork.** Pre-flight refusals are recorded
+  under the model that would have been used (`no_session`, `model_not_selected`, `not_configured`),
+  endpoint refusals keep the status code and never the response body, and a `session_expired` streak
+  means someone needs to press the sign-in button again.
+
 ## Analytical queries
 
 The classification archive and the assertion table are shaped so each of these is one statement.
