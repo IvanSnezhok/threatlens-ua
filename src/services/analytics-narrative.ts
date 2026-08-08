@@ -408,16 +408,21 @@ const SYSTEM_PROMPT = [
 ].join(' ');
 
 async function audit(
-  status: 'success' | 'failed', model: string, input: unknown, output: unknown, durationMs: number, error?: unknown
+  status: 'success' | 'failed', validation: 'passed' | 'rejected' | 'skipped',
+  model: string, input: unknown, output: unknown, durationMs: number, error?: unknown
 ): Promise<void> {
   // A failed audit write must never cost the caller its analytics: the numbers were already
   // computed and are correct whether or not this row lands.
   //
-  // `validation_status` is the point of this row. `codexChat` has already written the *transport*
-  // row and marked it `'skipped'`, because a transport knows nothing about grounding; this row is
-  // written only when the model answered and the answer was refused, which is a fact the transport
-  // log alone cannot express. That is also why any counting keyed on `ai_runs` double-counts Codex
-  // narratives, and why the Codex cooldown is keyed on an in-memory timestamp instead.
+  // `validation_status` is the point of this row, and it is an ARGUMENT rather than a function of
+  // `status` because the two are not the same axis. Migration 022 defines `'rejected'` as "the model
+  // text did not survive the number-grounding check", and `codexChat` writes `'skipped'` on every
+  // transport row it produces precisely so a filter over the column means one thing whoever wrote
+  // it. Deriving the verdict from `status` filed a legacy-provider fetch timeout — no model text, no
+  // check run — under the same label as a hallucinated number, so an hour of network failures read
+  // as an hour of hallucinations in `SELECT count(*) … WHERE surface='narrative' AND
+  // validation_status='rejected'`, the one query the column was added for. `'rejected'` is now
+  // written only where the model answered and this module refused the answer.
   await pool.query(
     `INSERT INTO ai_runs(model,prompt_version,input,output,status,error,duration_ms,
                          surface,classifier_version,validation_status,fallback_reason)
@@ -425,7 +430,7 @@ async function audit(
     [
       model, JSON.stringify(input), output == null ? null : JSON.stringify(output), status,
       error == null ? null : String(error).slice(0, 800), durationMs,
-      CLASSIFIER_VERSION, status === 'failed' ? 'rejected' : 'passed'
+      CLASSIFIER_VERSION, validation
     ]
   ).catch(() => undefined);
 }
@@ -477,16 +482,23 @@ export async function narrateOverview(
       const parsed = narrativeSchema.parse(JSON.parse(content));
       const rejection = verifyNarrative(parsed, facts);
       if (rejection) {
-        await audit('failed', provider.model, facts, parsed, Date.now() - started, rejection);
+        // The grounding rejection itself: the one row `validation_status='rejected'` is defined for.
+        await audit('failed', 'rejected', provider.model, facts, parsed, Date.now() - started, rejection);
         return deterministic(rejection);
       }
-      if (provider.kind === 'ai') await audit('success', provider.model, facts, parsed, Date.now() - started);
+      if (provider.kind === 'ai') {
+        await audit('success', 'passed', provider.model, facts, parsed, Date.now() - started);
+      }
       return {
         ...parsed, caveats: withAiMarker(parsed.caveats), generatedBy: 'model', aiGenerated: true,
         model: provider.model, rejectionReason: null, facts
       };
     } catch (error) {
-      await audit('failed', provider.model, facts, null, Date.now() - started, error);
+      // Malformed JSON or a reply the schema refuses. Still `'rejected'`: the model answered and
+      // this module declined to publish the answer, which is exactly what the label claims and what
+      // an operator counting model-quality failures wants to see. Only the transport catch below is
+      // outside that meaning.
+      await audit('failed', 'rejected', provider.model, facts, null, Date.now() - started, error);
       return deterministic(String(error));
     }
   };
@@ -533,7 +545,12 @@ export async function narrateOverview(
     if (!content) throw new Error('narrative endpoint returned empty content');
     return conclude(content);
   } catch (error) {
-    await audit('failed', provider.model, facts, null, Date.now() - started, error);
+    // The legacy provider's transport: a fetch throw, an `AbortSignal.timeout`, a non-2xx or an
+    // empty body. No model text exists, so no grounding check ran and this row makes no grounding
+    // claim — `'skipped'`, exactly as `codexChat` records the identical event on the Codex wire.
+    // Labelling it `'rejected'` made the same physical failure mean two different things depending
+    // on which provider was configured.
+    await audit('failed', 'skipped', provider.model, facts, null, Date.now() - started, error);
     return deterministic(String(error));
   }
 }

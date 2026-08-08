@@ -35,6 +35,25 @@ export async function markSourceError(sourceId: string, error: unknown): Promise
   );
 }
 
+/**
+ * Retires the events whose validity window has elapsed.
+ *
+ * `ended_at=now()`, deliberately NOT `COALESCE(ended_at,valid_until,now())`. `ended_at` is what the
+ * publication cutoff reads to decide how long a terminated event stays on the delayed public map:
+ * `liveThreats` (src/repositories/events.ts) keeps a terminal row while `ended_at > cutoff`, which
+ * is exactly as long as the `threat.expired` frame written below is held by the hub. Back-dating
+ * `ended_at` to `valid_until` broke that handoff — the WHERE above guarantees `valid_until <=
+ * now()`, so it is the deadline, older than this sweep by however late the thirty-second timer
+ * caught the row. Whenever that lateness reached `PUBLICATION_DELAY_SECONDS` the row left the public
+ * snapshot at the instant this transaction committed, fifteen seconds BEFORE the frame that explains
+ * it — an early all-clear, the direction `docs/ARCHITECTURE.md` §Consistency rules calls
+ * unrecoverable. The withdrawal (events.ts `applyRetraction`) and correction paths already write
+ * `now()`; expiry is now symmetric with them.
+ *
+ * Nothing is lost by it: the validity deadline stays on the row as `valid_until`, which is the
+ * column every reader that wants "until when was this true" already reads. In `live` mode the cutoff
+ * is `now()`, `ended_at > now()` is false either way, and the row leaves the map exactly as before.
+ */
 export async function expireThreatEvents(): Promise<number> {
   const client = await pool.connect();
   try {
@@ -46,7 +65,7 @@ export async function expireThreatEvents(): Promise<number> {
     );
     for (const event of candidates.rows) {
       await client.query(
-        `UPDATE threat_events SET status='expired',ended_at=COALESCE(ended_at,valid_until,now()),updated_at=now() WHERE id=$1`,
+        `UPDATE threat_events SET status='expired',ended_at=now(),updated_at=now() WHERE id=$1`,
         [event.id]
       );
       await client.query(

@@ -721,9 +721,15 @@ export async function liveThreats(cutoff: Date): Promise<LiveEvent[]> {
         'id',l.id,'name',l.name_uk,'relationType',el.relation_type,
         'latitude',l.latitude,'longitude',l.longitude
       )) FILTER (WHERE l.id IS NOT NULL AND el.created_at <= $1),'[]') AS locations,
+      -- Bounded on attached_at (when WE attached the evidence) for the same reason the district
+      -- above is, and never on sm.published_at, which is the publisher's declared time and would
+      -- walk past any hold on a back-dated post. threatDetails() gates its evidence list the same
+      -- way, so the marker and the dialog opened from it can never name different sources. An event
+      -- inside the slice always keeps at least its first source: that row is attached in the same
+      -- transaction that created the event, so their timestamps are equal.
       COALESCE(jsonb_agg(DISTINCT jsonb_build_object(
         'name',s.name,'url',s.public_url,'publishedAt',sm.published_at
-      )) FILTER (WHERE s.id IS NOT NULL),'[]') AS sources
+      )) FILTER (WHERE s.id IS NOT NULL AND ee.attached_at <= $1),'[]') AS sources
      FROM threat_events e
      LEFT JOIN threat_event_locations el ON el.event_id=e.id
      LEFT JOIN locations l ON l.id=el.location_id
@@ -756,16 +762,45 @@ export async function liveThreats(cutoff: Date): Promise<LiveEvent[]> {
   }));
 }
 
+/**
+ * The dialog behind one marker — the same event {@link liveThreats} is drawing, and therefore the
+ * same slice.
+ *
+ * All FOUR reads carry the cutoff, not just the event's own existence. The event row gets the
+ * identical as-of-cutoff projection `liveThreats` applies, because otherwise the map draws an
+ * «активна загроза» polygon while the dialog opened from it reports `status: 'withdrawn'` and an
+ * `ended_at` — an early all-clear read straight off a public endpoint, and two public endpoints
+ * contradicting each other about one event inside one slice. `event_updates` is the same leak in
+ * prose: web/app.js renders it as «Історія змін … стан: відкликано». Evidence and district
+ * membership are held for the reason `migrations/022_publication_runtime.sql` states — a district is
+ * a polygon and an icon stack, and a source message is the verbatim text of a report that has not
+ * been published yet.
+ *
+ * The evidence bound is `ee.attached_at`, i.e. when WE attached it, never `sm.published_at`, which
+ * is the publisher's own declared time and would walk straight past any hold on a back-dated post —
+ * the same reasoning `/api/v1/history` gives for gating `created_at` and never `started_at`.
+ *
+ * In `live` mode the cutoff is `now()`, every added predicate is true for every visible row, the
+ * CASE is a no-op, and the four statements are the ones that were here before.
+ */
 export async function threatDetails(id: string, cutoff: Date) {
   const event = await pool.query(
     // An event created after the cutoff does not exist yet as far as a public reader is concerned;
     // the `null` return is already the route's 404, so the hold and "no such event" are answered
     // identically and a probe cannot distinguish them.
+    //
+    // `e.*` expands first and the projected columns are selected AFTER it, so node-pg's field-by-
+    // field row build leaves the later duplicate in place — the same trick, and the same reason, as
+    // in `liveThreats`. `actual_status` carries the raw value for /ops and for tests.
     `SELECT e.*,
+      CASE WHEN e.status IN ('expired','withdrawn','corrected') AND e.ended_at > $2
+           THEN 'active' ELSE e.status END                                  AS status,
+      e.status                                                              AS actual_status,
+      CASE WHEN e.ended_at > $2 THEN NULL ELSE e.ended_at END               AS ended_at,
       COALESCE(jsonb_agg(DISTINCT jsonb_build_object(
         'id',l.id,'name',l.name_uk,'relationType',el.relation_type,
         'latitude',l.latitude,'longitude',l.longitude
-      )) FILTER (WHERE l.id IS NOT NULL),'[]') AS locations
+      )) FILTER (WHERE l.id IS NOT NULL AND el.created_at <= $2),'[]') AS locations
      FROM threat_events e
      LEFT JOIN threat_event_locations el ON el.event_id=e.id
      LEFT JOIN locations l ON l.id=el.location_id
@@ -777,11 +812,12 @@ export async function threatDetails(id: string, cutoff: Date) {
       `SELECT s.id AS source_id,s.name,s.tier,s.official,s.public_url,sm.external_id,
               sm.published_at,sm.edited_at,sm.raw_text,ee.confidence,ee.evidence_role
        FROM event_evidence ee JOIN source_messages sm ON sm.id=ee.source_message_id
-       JOIN sources s ON s.id=sm.source_id WHERE ee.event_id=$1 ORDER BY sm.published_at`, [id]
+       JOIN sources s ON s.id=sm.source_id WHERE ee.event_id=$1 AND ee.attached_at <= $2
+       ORDER BY sm.published_at`, [id, cutoff]
     ),
     pool.query(
       `SELECT previous_status,new_status,previous_evidence_level,new_evidence_level,reason,created_at
-       FROM event_updates WHERE event_id=$1 ORDER BY created_at`, [id]
+       FROM event_updates WHERE event_id=$1 AND created_at <= $2 ORDER BY created_at`, [id, cutoff]
     )
   ]);
   return { ...event.rows[0], evidence: evidence.rows, updates: updates.rows };
@@ -916,6 +952,13 @@ export async function territoryAncestry(locationIds: string[]): Promise<Territor
  *
  * The three item queries and the three matching count queries all carry the predicate, so the counts
  * can never disagree with the items a reader is shown.
+ *
+ * The timeline is the THIRD query bound by the module header's «status is reported as of the cutoff»
+ * rule, and the one it is easiest to miss, because here the status is not just a field — it picks
+ * the title and the summary, and the terminal strings are literal all-clear prose («Офіційна тривога
+ * завершена», «Зафіксовано офіційний відбій.»). Rendered verbatim in the territory panel's «Історія»
+ * tab, they would announce the відбій while the sibling «Стан зараз» tab, fed by the same slice's
+ * snapshot, still shows the alert running and the map still paints the polygon.
  */
 export async function locationTimeline(locationId: string, cutoff: Date, limit = 100) {
   const location = (await pool.query(
@@ -929,20 +972,37 @@ export async function locationTimeline(locationId: string, cutoff: Date, limit =
   const applies = `target.id=ANY($1::text[])`;
   const [threats, alerts, assessments, threatCount, alertCount, assessmentCount] = await Promise.all([
     pool.query(
-      `SELECT DISTINCT e.id,'threat' AS kind,e.started_at AS happened_at,e.title,e.summary,e.status,
-              e.threat_type,e.evidence_level,e.valid_until,NULL::numeric AS risk_score,NULL::text AS risk_level
+      `SELECT DISTINCT e.id,'threat' AS kind,e.started_at AS happened_at,e.title,e.summary,
+              CASE WHEN e.status IN ('expired','withdrawn','corrected') AND e.ended_at > $3
+                   THEN 'active' ELSE e.status END AS status,
+              e.status AS actual_status,
+              -- valid_until is left alone: it is the declared validity deadline the event carried
+              -- from the moment it was published, not a terminal-transition timestamp, so it reveals
+              -- nothing the reader was not already shown.
+              e.threat_type,e.evidence_level,e.valid_until,
+              NULL::numeric AS risk_score,NULL::text AS risk_level
        FROM threat_events e JOIN threat_event_locations el ON el.event_id=e.id
        JOIN locations target ON target.id=el.location_id WHERE ${applies}
          AND e.created_at <= $3
        ORDER BY e.started_at DESC LIMIT $2`, [related, limit, cutoff]
     ),
     pool.query(
+      // The status as of the cutoff is written ONCE and read four times: the title, the summary, the
+      // status and the end instant must never disagree about whether the відбій has been published,
+      // and repeating the condition four times is how they drift apart. This row's `valid_until`
+      // carries `ended_at`, so it is nulled while the period is still running as of the cutoff —
+      // otherwise the payload leaks the very timestamp the prose is being held back from announcing.
       `SELECT a.id,'alert' AS kind,a.started_at AS happened_at,
-              CASE WHEN a.status='active' THEN 'Офіційна тривога' ELSE 'Офіційна тривога завершена' END AS title,
-              CASE WHEN a.status='active' THEN 'Офіційне попередження активне.' ELSE 'Зафіксовано офіційний відбій.' END AS summary,
-              a.status,a.alert_type AS threat_type,'official' AS evidence_level,a.ended_at AS valid_until,
+              CASE WHEN c.active_at_cutoff THEN 'Офіційна тривога' ELSE 'Офіційна тривога завершена' END AS title,
+              CASE WHEN c.active_at_cutoff THEN 'Офіційне попередження активне.' ELSE 'Зафіксовано офіційний відбій.' END AS summary,
+              CASE WHEN c.active_at_cutoff THEN 'active' ELSE a.status END AS status,
+              a.status AS actual_status,
+              a.alert_type AS threat_type,'official' AS evidence_level,
+              CASE WHEN c.active_at_cutoff THEN NULL ELSE a.ended_at END AS valid_until,
               NULL::numeric AS risk_score,NULL::text AS risk_level
-       FROM alert_periods a JOIN locations target ON target.id=a.location_id WHERE ${applies}
+       FROM alert_periods a JOIN locations target ON target.id=a.location_id
+       CROSS JOIN LATERAL (SELECT a.status='active' OR (a.status='ended' AND a.ended_at > $3) AS active_at_cutoff) c
+       WHERE ${applies}
          AND a.published_at <= $3
        ORDER BY a.started_at DESC LIMIT $2`, [related, limit, cutoff]
     ),

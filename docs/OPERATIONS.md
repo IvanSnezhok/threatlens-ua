@@ -55,6 +55,19 @@ Reading it:
   `GREATEST(now() - delay, mode_changed_at)`, so switching to `delayed_15s` holds *new* rows and
   never retracts what was already published. An alert that was open three seconds before the flip is
   still returned; one that ended before it stays ended.
+- **A provider flap does not blank an alert either.** When a source drops a region for one poll and
+  re-lists it with the same declared start, the reconciler reopens the same period. It refreshes
+  `alert_periods.published_at` only when the period had already been publicly cleared — a gap longer
+  than `PUBLICATION_DELAY_SECONDS`. A shorter flap keeps the original value, because the delayed view
+  was still drawing that alert one millisecond earlier and re-stamping it would take the red polygon
+  off the public map for the rest of the hold. If you ever see an oblast blink in `delayed_15s`, this
+  is the first thing to check: `SELECT status, published_at, ended_at, updated_at FROM alert_periods
+  WHERE location_id = …`.
+- **The public attack analytics hold on receipt time, not on the post's own timestamp.**
+  `message_classifications.published_at` is the Telegram post's time and is what the window
+  («за добу») is measured on; the hold is applied to `classified_at`, the instant we recorded the
+  classification. So a message an hour old that we only just ingested still waits out the full hold
+  before it appears in the aggregate — that is the intended behaviour, not a lagging query.
 - **A 400 with `issues` is the API refusing an impossible pair, not a fault.**
   `analyticsMaxDelayMs` below `analyticsDebounceMs` is rejected inside the row lock, so two
   concurrent PUTs both get a 400 naming the field rather than one getting a 500.
@@ -118,9 +131,22 @@ Reading it:
   then never subscribes at all. It exists because the reason to stop event-driven recomputation is
   usually that it is amplifying a database problem, which is the worst moment to need the database
   to read a flag.
-- **A recompute never calls a model for its numbers.** The Codex leg writes prose over already
-  computed aggregates behind `codexCooldownMs`, and a skipped call is counted in
-  `threatlens_codex_cooldown_skips_total` and reported as `codex: 'cooldown'`.
+- **The Codex leg never touches the numbers.** It writes prose over already computed aggregates
+  behind `codexCooldownMs`, and a skipped call is counted in `threatlens_codex_cooldown_skips_total`
+  and reported as `codex: 'cooldown'`.
+- **The risk leg does call a model, and it is bounded separately.** On a deployment where
+  `AI_BASE_URL`, `AI_API_KEY` and `AI_MODEL` are set, `runRiskAssessments` calls that model **once
+  per `(location, threat_type)` group**, and one nationwide message fans a group out over every
+  oblast for six hours. A recompute is therefore allowed to spend it **at most once per
+  `ANALYTICS_RECOMPUTE_FLOOR_MS` (15 min), plus every press of «Оновити зараз»**; the passes in
+  between still re-score every group, through the deterministic scorer that is the default wherever
+  `AI_*` is unset. Model spend on this path is otherwise governed by the same three levers as
+  database load — `analyticsDebounceMs`, `analyticsMaxDelayMs`, `analyticsEventDriven` — plus the
+  legacy fifteen-minute `startRiskScheduler` timer, which is unaffected by any of them.
+- **A failing materialised-view refresh costs the pass its views and nothing else.** It is counted as
+  `outcome="view_refresh_failed"`, logged with the pg error, and the risk leg, the Codex leg and the
+  `analytics.updated` row still run. The refresh is then retried at floor cadence, not on the next
+  pass.
 
 ## Threat vector extrapolation (operator only)
 
@@ -477,7 +503,12 @@ Production backups must additionally be encrypted and copied to independent obje
   climbing steeply, `threatlens_analytics_recompute_duration_seconds` widening, and the pool visibly
   contended — the 15-second ingestion tick, the one-second event poll and every snapshot share twelve
   connections under a 15-second `statement_timeout`, and a `REFRESH MATERIALIZED VIEW CONCURRENTLY`
-  that exceeds the timeout dies, counts as `failed`, and is retried by the next pass.
+  that exceeds the timeout dies, counts as `view_refresh_failed`, and is retried at floor cadence.
+
+  A recompute storm is also the case in which model spend rises, on a deployment where `AI_*` is
+  configured: the risk leg calls that model once per `(location, threat_type)` group. It is bounded
+  to one pass per fifteen minutes plus the manual button, so cadence alone cannot run it away — but
+  the levers below are the ones that govern it, and there is no separate knob.
 
   Read the outcome label before changing anything — the counter is split for exactly this:
 
@@ -493,7 +524,15 @@ Production backups must additionally be encrypted and copied to independent obje
     faster than one completed pass per minute and the surplus is being refused. Rising
     `skipped_interval` with a healthy `ok` series is a busy night, and the correct response is none.
   - `outcome="failed"` rising means the passes themselves are dying — look at the `statement_timeout`
-    and at `refreshMonthlyAnalytics` before touching cadence.
+    and at the risk leg before touching cadence. A pass counted here wrote no `analytics.updated`
+    row, so the map's аналітична оцінка is standing still on this path and only the legacy
+    fifteen-minute `startRiskScheduler` is still moving it.
+  - `outcome="view_refresh_failed"` rising is **narrower than `failed` and much less serious**: the
+    monthly materialised views did not refresh, and the rest of the pass — the risk leg, the Codex
+    leg, the `analytics.updated` row — completed. Both views aggregate by month, so the visible cost
+    is a stale month bucket in the archive, not a stale map. Look at the `statement_timeout` and at
+    `refreshMonthlyAnalytics`; the pg error is on the log line beside the counter. The retry is at
+    floor cadence, so this can rise at most four times an hour per trigger.
   - `outcome="skipped_overlap"` rising means passes are taking longer than the window they are armed
     in; raise `analyticsDebounceMs`, do not lower it.
 

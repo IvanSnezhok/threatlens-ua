@@ -49,7 +49,10 @@ const vectorRoutes: FastifyPluginAsync = async (app) => {
     if (!(await threatEventExists(request.params.id, slice.cutoffAt))) {
       return reply.code(404).send({ error: 'not_found' });
     }
-    const vector = await reportedVectorForEvent(request.params.id);
+    // The SAME slice the visibility check above used, threaded into the chain: `threatEventExists`
+    // only decides whether the event may be seen at all, and without this the chain of a published
+    // event still grows nodes and segments out of classifications recorded after the cutoff.
+    const vector = await reportedVectorForEvent(request.params.id, slice.cutoffAt);
     if (vector) return vector;
     // "This event has no chain" and "this event does not exist" are different answers, and the
     // client renders them differently: the first is an ordinary single-message threat.

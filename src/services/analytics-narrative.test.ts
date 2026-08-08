@@ -6,11 +6,19 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
  * counted rather than discarded: "one model call leaves one transport row" is one of the properties
  * under test, and a mock that swallowed the write could not show it.
  */
-const db = vi.hoisted(() => ({ statements: [] as string[] }));
+const db = vi.hoisted(() => ({
+  statements: [] as string[],
+  /** The same writes with their parameters, for the assertions about what a row actually says. */
+  calls: [] as Array<{ text: string; params: unknown[] }>
+}));
 
 vi.mock('../db/pool.js', () => ({
   pool: {
-    query: async (text: string) => { db.statements.push(text); return { rows: [], rowCount: 0 }; }
+    query: async (text: string, params: unknown[] = []) => {
+      db.statements.push(text);
+      db.calls.push({ text, params });
+      return { rows: [], rowCount: 0 };
+    }
   }
 }));
 
@@ -278,10 +286,22 @@ function modelSaying(headline: string) {
 beforeEach(() => {
   resetAnalyticsNarrativeMemo();
   db.statements = [];
+  db.calls = [];
   archive.overview = overviewWith(4);
 });
 
 const aiRunInserts = () => db.statements.filter((text) => text.includes('INSERT INTO ai_runs')).length;
+
+/**
+ * Every `ai_runs` row this module wrote, as `[status, validation_status, fallback_reason]`.
+ *
+ * The insert is positional (`$4` status, `$8` validation_status, and `fallback_reason` reuses `$5`
+ * alongside `error`), which is exactly why the labels are worth asserting from the parameters rather
+ * than trusting the statement text.
+ */
+const auditRows = () => db.calls
+  .filter((call) => call.text.includes('INSERT INTO ai_runs'))
+  .map((call) => [call.params[3], call.params[7], call.params[4]]);
 
 describe('the narrative memo', () => {
   it('serves the memo for the same window and the same facts', async () => {
@@ -434,6 +454,70 @@ describe('one question, one model call', () => {
     const outcome = await warmNarrative({ provider: null, fetchImpl: model.fetchImpl, now: 1_000, cooldownMs: 0 });
     expect(outcome).toEqual({ codex: 'disabled', fallback: false, narrative: null });
     expect(model.calls).toBe(0);
+  });
+});
+
+// ------------------------------------------------------------------------------------------------
+// What an `ai_runs` row from this surface claims
+// ------------------------------------------------------------------------------------------------
+
+describe('the validation_status a narrative row writes', () => {
+  /**
+   * `rejected` is defined by migration 022 as "the model text did not survive the number-grounding
+   * check", and `codexChat` writes `skipped` on every transport row it produces so that a filter
+   * over the column means one thing whoever wrote it. Deriving the verdict from `status` filed a
+   * legacy-provider timeout under the same label as a hallucinated number, and
+   * `SELECT count(*) … WHERE surface='narrative' AND validation_status='rejected'` — the one query
+   * the column was added for — counted an hour of network failures as an hour of hallucinations.
+   */
+  const overview = overviewWith(4);
+
+  it('calls a transport failure skipped, not a grounding rejection', async () => {
+    const fetchImpl = (async () => { throw new Error('fetch failed'); }) as unknown as typeof fetch;
+
+    const value = await narrateOverview(overview, { provider, fetchImpl });
+
+    expect(value).toMatchObject({ generatedBy: 'deterministic', aiGenerated: false });
+    expect(auditRows()).toEqual([['failed', 'skipped', 'Error: fetch failed']]);
+  });
+
+  it('calls a non-2xx endpoint skipped as well', async () => {
+    // Same physical event as the throw above, one layer further in; an empty body is the third.
+    const fetchImpl = (async () => new Response('', { status: 503 })) as unknown as typeof fetch;
+
+    await narrateOverview(overview, { provider, fetchImpl });
+
+    expect(auditRows()).toEqual([['failed', 'skipped', 'Error: narrative endpoint 503']]);
+  });
+
+  it('still calls an ungrounded number rejected', async () => {
+    const model = modelSaying('Зафіксовано 47 подій.');
+
+    const value = await narrateOverview(overview, { provider, fetchImpl: model.fetchImpl });
+
+    expect(value.rejectionReason).toBe('ungrounded_number:47');
+    expect(auditRows()).toEqual([['failed', 'rejected', 'ungrounded_number:47']]);
+  });
+
+  it('calls a reply the schema refuses rejected, because the model did answer', async () => {
+    const fetchImpl = (async () => new Response(
+      JSON.stringify({ choices: [{ message: { content: 'не JSON' } }] }),
+      { status: 200, headers: { 'Content-Type': 'application/json' } }
+    )) as unknown as typeof fetch;
+
+    await narrateOverview(overview, { provider, fetchImpl });
+
+    const [row] = auditRows();
+    expect([row![0], row![1]]).toEqual(['failed', 'rejected']);
+  });
+
+  it('calls an accepted narrative passed, with no fallback reason', async () => {
+    const model = modelSaying('Огляд періоду.');
+
+    const value = await narrateOverview(overview, { provider, fetchImpl: model.fetchImpl });
+
+    expect(value.aiGenerated).toBe(true);
+    expect(auditRows()).toEqual([['success', 'passed', null]]);
   });
 });
 

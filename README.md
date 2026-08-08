@@ -367,7 +367,7 @@ Every row is either working today or explicitly not. Nothing here is aspirationa
 | **Sovereignty** | The internationally recognized border renders above every fill; Crimea and Sevastopol are Ukraine and labelled as such. |
 | **Occupation** | A separate reference layer under the border. Temporary factual condition, never a change of border. |
 | **Boundaries** | Raion geometry built from OpenStreetMap, matched to the catalogue by KATOTTG code, simplified per shared way so neighbours cannot develop gaps. 1.05 MB, 0.31 MB gzipped. |
-| **Screen readers** | A polite live region beside the map names up to eight territories with their icon stacks in Ukrainian, and says «Показано 8 територій із N» when there are more. With no icons anywhere on the map it falls back to naming the territories under an official alert. The map is a summary, not the record: the «Активні події» rail beside it lists every alert, threat and assessment as ordinary focusable text and is the canonical surface. |
+| **Screen readers** | A polite live region beside the map names up to eight territories in Ukrainian — official alerts first, then icon stacks — and says «Показано 8 територій із N» when there are more. An alert is a polygon fill and never an icon, so a territory whose only state is an alert is named from the territory list rather than from the stacks; the region is also written when the raster icon pipeline fails outright, since the map's textual equivalent must not depend on whether bitmaps could be drawn. A payload with no `territories[]` falls back to the raw alert list. The map is a summary, not the record: the «Активні події» rail beside it lists every alert, threat and assessment as ordinary focusable text and is the canonical surface. |
 
 ### Bot
 
@@ -436,11 +436,10 @@ state. And the nightly trust run reads the same archive to score every source's 
 - `sources.enabled` does not gate the two polled API adapters — they check only for a token.
 - Alerts at hromada level resolve to the parent raion; the catalogue has no hromada tier.
 - Abbreviated administrative forms (`р-н`, `обл.`) resolve to the namesake city rather than the district.
-- The map's live region is built from the icon stacks, and an official alert on its own produces no
-  icon. A territory whose only state is an alert therefore contributes no sentence to it while any
-  icon exists elsewhere on the map; the alert-only fallback applies when the map carries no icons at
-  all. Nothing is lost — the «Активні події» rail lists every alert as text and is the canonical
-  screen-reader surface — but the live region is a summary of the map, not of the situation.
+- The map's live region names at most eight territories and follows the map's own zoom tier: at
+  overview zoom a raion is summarised through its oblast rather than named in its own right. It is a
+  summary of the map, not of the situation — the «Активні події» rail lists every alert, threat and
+  assessment as text and remains the canonical screen-reader surface.
 - A threat reported only for a raion carries no icon below zoom 6.8. The raion stack appears only
   once the raion layer is readable, and the oblast above it is `partial` coverage, which is
   deliberately never given an icon. Below that zoom the threat is a muted oblast fill, an event card

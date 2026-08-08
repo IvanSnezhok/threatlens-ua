@@ -104,7 +104,15 @@ Two limits of the hold are documented rather than latent:
   The cutoff bounds when a row became visible, not every later revision of it, so a threat can be
   promoted to `confirmed` in the public view before the delay has elapsed. A district *added* to an
   already-published event is a different case and **is** held for the full cutoff, because under the
-  territory model a district is a polygon and an icon stack.
+  territory model a district is a polygon and an icon stack — and it is held on every surface that
+  can draw it, including the observation-chain overlay, whose nodes and segments are bounded by when
+  the classification behind them was recorded. A source message attached to a published event, and
+  the change-log entry recording a status transition, are held on the same terms in the event dialog.
+- The delayed public attack analytics measure **two different clocks**. The window («за добу», «за
+  тиждень») is measured on the source's own publication time, so a backfilled or edited post lands in
+  the night it describes; the hold is applied to the instant the classification was *recorded*. A
+  message published an hour ago but ingested a second ago therefore waits out the full delay before
+  it is counted, exactly as the same message does on the map and in the event stream.
 - The consequence family rests on a message-wide regular expression. The classifier assigns the
   `aftermath` relation when the message text anywhere contains наслідк / влучан / пошкоджен / вибух,
   without tying the word to the location alias it is labelling. That is deliberately generous, and it

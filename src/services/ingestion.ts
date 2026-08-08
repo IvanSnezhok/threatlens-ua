@@ -245,18 +245,37 @@ async function reconcileAggregateAlert(
     // only when the period is already active, which happens when the two adapters reconcile the
     // same location concurrently; the transaction that reopened it emits the event.
     //
-    // `published_at` is refreshed here and nowhere else on this branch: a period that ends and
-    // reappears became publicly true a second time, and the delayed view must treat it as new.
-    // Leaving the original value would make a reopened alert instantly older than the cutoff — i.e.
-    // visible before it happened.
+    // `published_at` is refreshed here and nowhere else on this branch — but ONLY when the period
+    // had genuinely stopped being public first. A period whose `ended_at` is younger than the
+    // longest possible hold was still being served a millisecond ago by branch 2 of
+    // `activeAlerts()` (`status='ended' AND published_at <= cutoff AND ended_at > cutoff`), so
+    // stamping a fresh `published_at` on it satisfies NEITHER branch — the row is `'active'` with a
+    // `published_at` newer than the cutoff — and the red oblast polygon disappears from the public
+    // map for the rest of the hold. That is a retraction of an already-published official alert
+    // caused by nothing but a provider flap, and `docs/ARCHITECTURE.md` §Consistency rules calls
+    // that direction unrecoverable.
+    //
+    // Keeping the old value in that case cannot publish anything early: the row was already public
+    // at that instant, which is exactly the condition being tested. A gap LONGER than the hold is a
+    // genuinely new public fact — the all-clear had already been released — and still gets a fresh
+    // timestamp, so a reopened alert can never look older than the cutoff it should be held behind.
+    //
+    // `config.PUBLICATION_DELAY_SECONDS` and not the mode in force: the bound is the widest window
+    // in which `activeAlerts` could still have been serving the row, and in `live` mode the cutoff
+    // is `now()` so `published_at <= cutoff` holds either way and the branch is unobservable.
     const created = await client.query<{ id: string }>(
       `INSERT INTO alert_periods(location_id,alert_type,status,started_at,external_id)
        VALUES ($1,$2,'active',COALESCE($3,now()),$4)
        ON CONFLICT (location_id,alert_type,started_at) DO UPDATE
-         SET status='active',ended_at=NULL,updated_at=now(),published_at=now()
+         SET status='active',ended_at=NULL,updated_at=now(),
+             published_at = CASE
+               WHEN alert_periods.ended_at > now() - make_interval(secs => $5::int)
+                 THEN alert_periods.published_at
+               ELSE now() END
          WHERE alert_periods.status<>'active'
        RETURNING id`,
-      [locationId, alertType, aggregate.rows[0].started_at, `aggregate:${locationId}:${alertType}:${Date.now()}`]
+      [locationId, alertType, aggregate.rows[0].started_at, `aggregate:${locationId}:${alertType}:${Date.now()}`,
+        config.PUBLICATION_DELAY_SECONDS]
     );
     if (created.rowCount) {
       await client.query(`INSERT INTO system_event_log(event_type,payload) VALUES ('alert.started',$1)`,

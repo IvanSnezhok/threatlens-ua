@@ -1,5 +1,44 @@
-import { describe, expect, it } from 'vitest';
-import { clampAssessment, effectiveContribution, fallbackAssessment, signalTypeLabel, type ModelAssessment, type RiskSignalRow } from './risk.js';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+
+/**
+ * One group, one location, one signal — the smallest shape a pass can have.
+ *
+ * The budget assertion below is about how many times the pass reaches the network, so the database
+ * it walks through on the way there is a dispatching fake rather than a container. Every branch
+ * `runRiskAssessmentsPass` takes is represented: the group query, the location, the signals, the
+ * absent previous assessment, and the transaction that publishes the new one.
+ */
+const db = vi.hoisted(() => ({ statements: [] as string[] }));
+
+vi.mock('../db/pool.js', () => {
+  const signal = {
+    id: 'one', signal_type: 'explicit_threat', source_tier: 'A', independence_group: 'a',
+    reliability: 1, freshness: 1, geographic_relevance: 1, contribution: 2,
+    observed_at: new Date(), source_id: null, source_trust: null
+  };
+  const answer = (text: string) => {
+    db.statements.push(text);
+    if (text.includes('FROM risk_signals rs')) return { rows: [signal], rowCount: 1 };
+    if (text.includes('FROM risk_signals')) {
+      return { rows: [{ location_id: 'ua-80', threat_type: 'uav', signal_ids: ['one'] }], rowCount: 1 };
+    }
+    if (text.includes('FROM locations')) return { rows: [{ id: 'ua-80', name_uk: 'Київ' }], rowCount: 1 };
+    if (text.includes('INSERT INTO risk_assessments(')) return { rows: [{ id: 'assessment-1' }], rowCount: 1 };
+    return { rows: [], rowCount: 0 };
+  };
+  return {
+    pool: {
+      query: async (text: string) => answer(text),
+      connect: async () => ({ query: async (text: string) => answer(text), release: () => undefined })
+    }
+  };
+});
+
+import { config } from '../config.js';
+import {
+  clampAssessment, effectiveContribution, fallbackAssessment, resetRiskRunGuard,
+  runRiskAssessmentsGuarded, signalTypeLabel, type ModelAssessment, type RiskSignalRow
+} from './risk.js';
 
 const candidate: ModelAssessment = {
   locationId: 'wrong', threatType: 'wrong', horizonHours: 6, score: 9,
@@ -96,5 +135,68 @@ describe('пояснення оцінки читається людиною', ()
     const result = clampAssessment(candidate, [signal()], 'ua-80', 'uav');
     expect(result.limitingFactors.some((factor) => factor.includes('допоміжних каналів'))).toBe(true);
     expect(result.limitingFactors.join(' ')).not.toMatch(/tier|рівня C/i);
+  });
+});
+
+// ------------------------------------------------------------------------------------------------
+// The model budget one pass is given
+// ------------------------------------------------------------------------------------------------
+
+/** `src/config.ts` freezes nothing and every consumer reads the live object. */
+function withAiConfigured<T>(body: () => Promise<T>): Promise<T> {
+  const mutable = config as unknown as Record<string, unknown>;
+  const saved = { AI_BASE_URL: mutable.AI_BASE_URL, AI_API_KEY: mutable.AI_API_KEY, AI_MODEL: mutable.AI_MODEL };
+  Object.assign(mutable, {
+    AI_BASE_URL: 'https://model.test/v1', AI_API_KEY: 'token', AI_MODEL: 'test-model'
+  });
+  return body().finally(() => Object.assign(mutable, saved));
+}
+
+describe('the model budget a risk pass is given', () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    resetRiskRunGuard();
+    db.statements = [];
+  });
+
+  it('spends one model call per group when the pass is allowed to', async () => {
+    let calls = 0;
+    vi.stubGlobal('fetch', async () => {
+      calls += 1;
+      return new Response(JSON.stringify({ choices: [{ message: { content: '{}' } }] }), { status: 200 });
+    });
+
+    const outcome = await withAiConfigured(() => runRiskAssessmentsGuarded());
+
+    expect(calls).toBe(1);
+    expect(outcome.skipped).toBe(false);
+  });
+
+  it('makes no model call at all when it is not, and still publishes an assessment', async () => {
+    // The bound the event-driven recompute uses on its intermediate passes: the model is called once
+    // per `(location_id, threat_type)` group and one nationwide message fans out to every oblast for
+    // six hours, so a caller running up to once a minute has to be able to say "re-score everything,
+    // but not with the model". Declining it is not a degradation — `fallbackAssessment` is the
+    // deployed default wherever `AI_*` is unset, and the row it writes is a complete one.
+    let calls = 0;
+    vi.stubGlobal('fetch', async () => { calls += 1; return new Response('{}', { status: 200 }); });
+
+    const outcome = await withAiConfigured(() => runRiskAssessmentsGuarded({ allowModel: false }));
+
+    expect(calls).toBe(0);
+    expect(outcome).toEqual({ published: 1, skipped: false });
+    expect(db.statements.some((text) => text.includes('INSERT INTO risk_assessments('))).toBe(true);
+  });
+
+  it('defaults to allowing the model, so the fifteen-minute scheduler is unchanged', async () => {
+    let calls = 0;
+    vi.stubGlobal('fetch', async () => {
+      calls += 1;
+      return new Response(JSON.stringify({ choices: [{ message: { content: '{}' } }] }), { status: 200 });
+    });
+
+    await withAiConfigured(() => runRiskAssessmentsGuarded({}));
+
+    expect(calls).toBe(1);
   });
 });

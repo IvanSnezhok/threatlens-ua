@@ -175,6 +175,7 @@ let rearm = false;
 let running = false;                    // OWNED BY execute(); recomputeAnalytics re-checks it
 let lastCompletedAt = 0;
 let lastViewRefreshAt = 0;              // the materialised views run at floor cadence, not per pass
+let lastRiskModelAt = 0;                // and so does the risk leg's MODEL call — see the pass below
 let lastSettings: RuntimeSettings = RUNTIME_SETTINGS_DEFAULTS;
 let lastResult: RecomputeResult | null = null;
 
@@ -257,6 +258,7 @@ export function resetAnalyticsScheduler(): void {
   executeGrant = false;
   lastCompletedAt = 0;
   lastViewRefreshAt = 0;
+  lastRiskModelAt = 0;
   lastSettings = RUNTIME_SETTINGS_DEFAULTS;
   lastResult = null;
   generation += 1;
@@ -491,6 +493,17 @@ export async function recomputeAnalytics(
     return { ...skeleton, durationMs: 0, codex: 'not_attempted', fallback: false, skipped: 'cooldown' };
   }
   running = true;                                   // set before the first await
+  /**
+   * Whether this pass got past every refusal and started spending the database.
+   *
+   * The two guards above return before `running = true` and so never reach the `finally`, but the
+   * `disabled` refusal below is inside the `try` — and stamping `lastCompletedAt` for it would arm
+   * the minimum-interval guard on a pass that read one settings row and did nothing. An operator who
+   * switches `analyticsEventDriven` back on, or presses «Оновити зараз», within a minute of a
+   * fifteen-minute floor tick would then be refused with `skipped: 'cooldown'` and told «попередній
+   * перерахунок був щойно» about a pass that never happened.
+   */
+  let attempted = false;
   try {
     const settings = await (deps.settings ?? readSettings)();
     // A manual «Оновити зараз» always runs: an operator who pressed the button has already
@@ -499,6 +512,7 @@ export async function recomputeAnalytics(
       recomputeTotal.inc({ trigger, outcome: 'skipped_disabled' });
       return { ...skeleton, durationMs: 0, codex: 'not_attempted', fallback: false, skipped: 'disabled' };
     }
+    attempted = true;                               // past every refusal; the pass now spends the DB
 
     // 1. The public attack-analytics memo. Its 120 s TTL is a floor on staleness, not an
     //    invalidation; this is the invalidation, and the existing test seam is the seam.
@@ -510,12 +524,36 @@ export async function recomputeAnalytics(
     //    hub poll, the 15 s ingestion tick and every client's snapshot on a pool of twelve.
     //    `refreshMonthlyAnalytics` owns its own overlap guard because it has two callers.
     if (startedAt - lastViewRefreshAt >= ANALYTICS_RECOMPUTE_FLOOR_MS) {
-      if (await refreshMonthlyAnalytics()) lastViewRefreshAt = startedAt;
+      try {
+        if (await refreshMonthlyAnalytics()) lastViewRefreshAt = startedAt;
+      } catch (error) {
+        // `refreshMonthlyAnalytics` has a `finally` and no `catch`, so a refresh that exceeds the
+        // 15 s `statement_timeout` — the failure this module's header and the runbook both name as
+        // the expected one — rejects into the caller. Without this guard that rejection unwinds
+        // straight past the risk leg, the Codex leg and the `analytics.updated` row: a stale month
+        // bucket would cost the map its аналітична оцінка, which is the thing this worker exists to
+        // move. The clock is stamped on failure too, so the retry stays at floor cadence instead of
+        // re-satisfying the floor test on every pass and burning a connection every minute for ever.
+        lastViewRefreshAt = startedAt;
+        recomputeTotal.inc({ trigger, outcome: 'view_refresh_failed' });
+        log.error({ error }, 'monthly analytics refresh failed; the pass continues');
+      }
     }
 
     // 3. The risk engine — the expensive leg and the one that writes what the map draws.
-    const risk = await runRiskAssessmentsGuarded();
+    //    Every pass re-scores every group; only one pass per floor interval, plus the operator's
+    //    button, may spend the configured model doing it. `runRiskAssessmentsPass` calls the model
+    //    once per `(location_id, threat_type)` group, and one national air-raid message fans out to
+    //    every oblast for six hours — so without this bound the delivery would turn a leg that used
+    //    to run on a fifteen-minute timer into one that runs up to once a minute, at up to
+    //    `AI_TIMEOUT_MS` per group, with no operator knob covering it. The intermediate passes still
+    //    re-score everything through the deterministic scorer, which is the default deployment path
+    //    and already produces complete, clamped, Ukrainian assessments.
+    const allowModel = trigger === 'manual'
+      || startedAt - lastRiskModelAt >= ANALYTICS_RECOMPUTE_FLOOR_MS;
+    const risk = await runRiskAssessmentsGuarded({ allowModel });
     if (risk.skipped) recomputeTotal.inc({ trigger, outcome: 'skipped_overlap' });
+    else if (allowModel) lastRiskModelAt = startedAt;
 
     // 4. Codex leg: the cooldown is checked first, so a mass attack cannot turn a debounce into a
     //    model-call storm.
@@ -536,6 +574,9 @@ export async function recomputeAnalytics(
       published: risk.published, skipped: null
     };
   } catch (error) {
+    // A pass that threw still spent the database, so the minimum interval applies to it — otherwise
+    // a leg that fails fast would be retried as fast as the events arrive.
+    attempted = true;
     recomputeTotal.inc({ trigger, outcome: 'failed' });
     log.error({ error }, 'analytics recompute pass failed');
     return {
@@ -543,7 +584,7 @@ export async function recomputeAnalytics(
     };
   } finally {
     running = false;
-    lastCompletedAt = clock();
+    if (attempted) lastCompletedAt = clock();
     // NOTE: `rearm` and `firstPendingAt` are drained by `execute()`'s finally, not here — one place,
     // and every pass goes through it.
   }

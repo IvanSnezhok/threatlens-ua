@@ -144,9 +144,10 @@ class EventHub extends EventEmitter {
           // next tick retries, which is exactly what the comment in the catch below promises.
           if (degraded) return;
           const head = await pool.query<{ version: string }>(
-            `SELECT COALESCE((SELECT version FROM system_event_log
-                               WHERE created_at <= GREATEST(now() - make_interval(secs => $1::int), $2::timestamptz)
-                               ORDER BY version DESC LIMIT 1), 0) AS version`,
+            `SELECT COALESCE((SELECT version - 1 FROM system_event_log
+                               WHERE created_at > GREATEST(now() - make_interval(secs => $1::int), $2::timestamptz)
+                               ORDER BY version LIMIT 1),
+                             (SELECT version FROM system_event_log ORDER BY version DESC LIMIT 1), 0) AS version`,
             [delaySeconds, modeChangedAt]
           );
           this.lastVersion = Number(head.rows[0]?.version ?? 0);
@@ -159,6 +160,19 @@ class EventHub extends EventEmitter {
         // dropped forever. Bounding the head instead means the cursor can only ever stop *before* a
         // held row.
         //
+        // The head is the version just BELOW the OLDEST row still held, not the newest row already
+        // releasable. `max(version) WHERE created_at <= cutoff` looks equivalent and is not: version
+        // order and created_at order diverge, because `version` is taken at INSERT while `created_at`
+        // defaults to `now()` = transaction START. A long write transaction that appends its log rows
+        // last (`persistOfficialAlertSnapshot`'s reconcile loop) produces HIGH versions carrying an
+        // OLD created_at; the instant they become visible they lift a `max`-shaped head above every
+        // short-transaction row that committed in between with a LOWER version and a NEWER created_at,
+        // and the loop below emits those with no time check of their own — the hold silently degrades
+        // to `delaySeconds − (write transaction duration)`, i.e. to nothing during a nationwide alert.
+        // Stopping strictly before the first held row makes that unrepresentable: every emitted
+        // version is below every row whose created_at is past the cutoff, so its own created_at is
+        // necessarily at or before the cutoff.
+        //
         // Five properties this shape buys:
         //  1. Nothing is skipped. The cursor only ever takes a value that was selected and emitted,
         //     in ascending `version`, and for a fixed hold `head(t)` is non-decreasing in `t` and
@@ -168,21 +182,25 @@ class EventHub extends EventEmitter {
         //     head(t₀⁺) >= head(t₀⁻), so emission does not even pause across a live→delayed_15s
         //     flip; the hold ramps in over `delaySeconds`.
         //  4. The internal feed below is never gated. Two cursors, one tick, one extra statement.
-        //  5. The commit-order gap is narrowed, not closed. `version` is taken at INSERT while
-        //     `created_at` is transaction-START time, so a transaction whose TOTAL duration exceeds
-        //     the hold can still have its row skipped — exactly as it can today in live mode.
-        //     `idle_in_transaction_session_timeout: 10_000` in `src/db/pool.ts` is what makes that
-        //     duration bounded at all; see the comment there for the escalation path.
+        //  5. The commit-order gap is narrowed, not closed. A row that is still INVISIBLE when the
+        //     head is computed cannot be seen by any bound: a transaction that takes a low version
+        //     early and commits after a higher-versioned one was already emitted still loses its row,
+        //     exactly as it can today in live mode. That residual gap is bounded by transaction
+        //     duration, and nothing in this process caps transaction duration — see the comment in
+        //     `src/db/pool.ts` for why `idle_in_transaction_session_timeout` does not, and for the
+        //     escalation path if a real bound is ever wanted.
         //
-        // In `live` mode `delaySeconds = 0`, `now() - make_interval(secs => 0)` is `now()`, every
-        // committed row satisfies `created_at <= now()`, `head.v = max(version)`, and this is
-        // today's statement with an extra CTE Postgres flattens. That equivalence is the whole
-        // safety argument for shipping this with the switch off.
+        // In `live` mode `delaySeconds = 0`, `now() - make_interval(secs => 0)` is `now()`, no
+        // VISIBLE row can carry a created_at newer than this transaction's own start, the first
+        // subselect is NULL, `head.v = max(version)`, and this is today's statement with an extra CTE
+        // Postgres flattens. That equivalence is the whole safety argument for shipping this with the
+        // switch off.
         const result = await pool.query(
           `WITH head AS (
-             SELECT COALESCE((SELECT version FROM system_event_log
-                               WHERE created_at <= GREATEST(now() - make_interval(secs => $2::int), $3::timestamptz)
-                               ORDER BY version DESC LIMIT 1), 0) AS v
+             SELECT COALESCE((SELECT version - 1 FROM system_event_log
+                               WHERE created_at > GREATEST(now() - make_interval(secs => $2::int), $3::timestamptz)
+                               ORDER BY version LIMIT 1),
+                             (SELECT version FROM system_event_log ORDER BY version DESC LIMIT 1), 0) AS v
            )
            SELECT l.version, l.event_type, l.payload, l.created_at
            FROM system_event_log l, head

@@ -57,7 +57,14 @@ const attackAnalyticsRoutes: FastifyPluginAsync = async (app) => {
     // the configuration. `resolveAttackWindow` already takes `to = now`, so this moves the window
     // end AND the payload's own `generatedAt` to the cutoff in one step.
     const asOf = new Date(Math.min(Date.now(), slice.cutoffAt.getTime()));
-    const payload = await attackAnalytics(period, asOf, slice.mode);
+    // `slice.cutoffAt` is passed SEPARATELY from `asOf`, and the two are not redundant. `asOf` moves
+    // the analytical window end and `generatedAt`, both of which are statements about
+    // `message_classifications.published_at` — the SOURCE's own timestamp. The hold has to be applied
+    // to the receipt column instead (`classified_at`), or a message published sixty seconds before we
+    // ingested it is already older than a `now()-15s` window end and is counted the instant it is
+    // classified — the same mistake `/api/v1/history` avoids by gating `created_at` and never
+    // `started_at`.
+    const payload = await attackAnalytics(period, asOf, slice.mode, slice.cutoffAt);
     // The memo key fixes only the server side. A body produced in `live` mode sits in browser and
     // CDN caches and is replayed for 120 s fresh and up to an hour stale AFTER the operator flips —
     // on this surface the hold would simply not take effect, which fails «у delayed_15s — не раніше

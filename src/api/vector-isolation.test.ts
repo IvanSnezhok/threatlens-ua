@@ -368,12 +368,18 @@ describe('map layer order', () => {
     for (const rule of rules) expect(rule).not.toMatch(/box-shadow|filter:\s*blur/);
   });
 
-  it('keeps the style.load block free of straight apostrophes in Ukrainian words', () => {
+  it('keeps web/app.js free of straight apostrophes in Ukrainian words', () => {
     // balanced() treats ' as a string delimiter and does not skip comments, so one «обʼєкт» written
-    // with U+0027 desynchronises the parser for the rest of the block and every layer assertion in
-    // this file starts testing a nonsense list. The file's convention is the modifier letter ʼ.
+    // with U+0027 desynchronises the parser for the rest of the slice and every assertion built on
+    // it starts testing a nonsense list — or the parser runs off the end of the file and throws.
+    // The file's convention is the modifier letter ʼ.
+    //
+    // The whole file, not only the style.load block: the suites at the bottom of this file slice
+    // `renderCurrentRoute`, `writeMapAria`, `updateTerritoryIcons` and `territoryIconCollection`
+    // out of the source too, and each of those is one stray apostrophe away from unparseable.
     const block = styleLoadBlock();                    // the raw slice, before the .replace() calls
     expect(block).not.toMatch(/[а-яіїєґА-ЯІЇЄҐ]'[а-яіїєґА-ЯІЇЄҐ]/u);
+    expect(APP_SOURCE).not.toMatch(/[а-яіїєґА-ЯІЇЄҐ]'[а-яіїєґА-ЯІЇЄҐ]/u);
   });
 
   it('never gives the analytic state a fill', () => {
@@ -426,5 +432,451 @@ describe('map layer order', () => {
     // Єдиний обробник масштабу у файлі: MapLibre забороняє ['zoom'] усередині filter, тож рівень
     // деталізації іконок перемикається перевипуском джерела, а не виразом у стилі.
     expect(source).toContain(`map.on('zoomend'`);
+  });
+});
+
+// ------------------------------------------------------------------------------------------------
+// Browser-bundle behaviour
+// ------------------------------------------------------------------------------------------------
+
+/**
+ * `web/app.js` is a browser bundle: it opens with `import maplibregl from 'maplibre-gl'`, touches
+ * `document` at module scope and ends by calling `boot()`, so it cannot be imported into a node
+ * test. The scans above therefore only ever asserted on its *text*, which is why a wrong decision
+ * inside a function body — as opposed to a wrong layer id — went green.
+ *
+ * The three suites below close that gap without a bundler and without jsdom: they slice the exact
+ * source of one declaration out of the file, evaluate it with its free variables injected, and then
+ * assert on what it *does*. Everything under test is the shipped text, not a copy of it — rewrite
+ * the function and these tests run the rewrite.
+ */
+
+/**
+ * The full `const NAME = …;` declaration, however many lines its literal spans.
+ *
+ * A trailing line comment is dropped before the terminator is looked for (`const ICON_CHIP_PX = 30;
+ * // CSS px …`). That is safe for the declarations used here, all of which hold numbers, arrays or
+ * object literals; a value containing `//` inside a string would need a real tokenizer.
+ */
+function constDeclaration(name: string): string {
+  const start = APP_SOURCE.search(new RegExp(`const ${name}\\s*=`));
+  if (start === -1) throw new Error(`const ${name} not found in web/app.js`);
+  const code = APP_SOURCE.slice(start, APP_SOURCE.indexOf('\n', start)).replace(/\s*\/\/.*$/, '');
+  if (code.trimEnd().endsWith(';')) return code;
+  return `${APP_SOURCE.slice(start, balanced(APP_SOURCE, APP_SOURCE.indexOf('{', start), '{', '}') + 1)};`;
+}
+
+/** Compiles a slice of the bundle once and returns the factory that binds its free variables. */
+function compileSlice<T>(source: string, exported: string, parameters: string[]): (...args: unknown[]) => T {
+  return new Function(...parameters, `${source}\nreturn ${exported};`) as unknown as (...args: unknown[]) => T;
+}
+
+/** One-shot form of {@link compileSlice}. */
+function evaluateSlice<T>(source: string, exported: string, bindings: Record<string, unknown> = {}): T {
+  const names = Object.keys(bindings);
+  return compileSlice<T>(source, exported, names)(...names.map((name) => bindings[name]));
+}
+
+/**
+ * Defers a slice to the first test that needs it, and memoises the result.
+ *
+ * Slicing at `describe` body time would be tidier to read, but `balanced()` throws on a source it
+ * cannot parse — and a thrown collection error takes down all of this file's assertions at once,
+ * including the apostrophe check that would have named the cause. Lazily, that check still runs and
+ * still reports.
+ */
+function lazy<T>(build: () => T): () => T {
+  let value: T;
+  let built = false;
+  return () => {
+    if (!built) { value = build(); built = true; }
+    return value;
+  };
+}
+
+function* permutations<T>(items: T[]): Generator<T[]> {
+  if (items.length <= 1) { yield [...items]; return; }
+  for (let index = 0; index < items.length; index += 1) {
+    const rest = [...items.slice(0, index), ...items.slice(index + 1)];
+    for (const tail of permutations(rest)) yield [items[index]!, ...tail];
+  }
+}
+
+/**
+ * `liveLayers`, the per-DOM-click flag and `openTerritory`, sliced contiguously out of the raw
+ * `style.load` block. They are adjacent and comment-free in the source, which is what lets one
+ * slice carry the whole mechanism.
+ */
+function clickResolutionSource(): string {
+  const block = styleLoadBlock();
+  const start = block.indexOf('const liveLayers =');
+  const arrow = block.indexOf('const openTerritory =', start);
+  if (start === -1 || arrow === -1) throw new Error('the click resolution left the style.load block');
+  return `${block.slice(start, balanced(block, block.indexOf('{', block.indexOf('=>', arrow)), '{', '}') + 1)};`;
+}
+
+describe('territory click resolution', () => {
+  const iconLayerIds = evaluateSlice<string[]>(constDeclaration('iconLayerIds'), 'iconLayerIds');
+  const raionFillLayerIds = evaluateSlice<string[]>(constDeclaration('raionFillLayerIds'), 'raionFillLayerIds');
+  const everyLayer = [...iconLayerIds, 'ukraine-region-fill', ...raionFillLayerIds, 'city-hit'];
+  const factory = lazy(() => compileSlice<(event: unknown) => void>(
+    clickResolutionSource(), 'openTerritory',
+    ['map', 'iconLayerIds', 'raionFillLayerIds', 'showTerritoryPanel']
+  ));
+
+  /**
+   * One DOM click, dispatched the way MapLibre dispatches it: `Map.on(type, layerId, listener)`
+   * wraps every call in its own delegate, `Evented.fire` walks them in registration order, and each
+   * delegate that finds a feature under the point is invoked with the *same* `originalEvent`.
+   *
+   * `order` is that dispatch order, `present` maps a layer id to the `locationId` its feature would
+   * carry under the click, and `existing` is the set of layers that are in the style at all — a
+   * canvas failure leaves the four icon layers out of it entirely.
+   */
+  function dispatch(order: string[], present: Map<string, string>, existing: Set<string>): string[] {
+    const opened: string[] = [];
+    const map = {
+      getLayer: (id: string) => (existing.has(id) ? { id } : undefined),
+      queryRenderedFeatures: (_point: unknown, options: { layers: string[] }) => options.layers
+        .filter((id) => present.has(id))
+        .map((id) => ({ layer: { id }, properties: { locationId: present.get(id) } }))
+    };
+    const openTerritory = factory()(map, iconLayerIds, raionFillLayerIds, (id: string) => { opened.push(id); });
+    const originalEvent = { type: 'click' };
+    for (const layerId of order) {
+      if (!present.has(layerId)) continue;
+      openTerritory({
+        originalEvent,
+        point: { x: 10, y: 10 },
+        features: [{ layer: { id: layerId }, properties: { locationId: present.get(layerId) } }]
+      });
+    }
+    return opened;
+  }
+
+  /**
+   * The documented precedence is **icon → city → raion → oblast**, and it must hold whatever order
+   * MapLibre happens to call the delegates in — that order is an undocumented implementation
+   * detail, and in 5.24 it is registration order, which runs the *coarsest* layer
+   * (`ukraine-region-fill`, covering the whole country) ahead of both the raion fills and
+   * `city-hit`. So every case below is replayed for every permutation of the delegates that fire.
+   *
+   * Exactly one panel per DOM click is asserted by the same expectation: the arrays are compared
+   * whole, so a second `showTerritoryPanel` call fails just as loudly as none.
+   */
+  const cases = [
+    {
+      name: 'an icon stack beats the city, the raion and the oblast under it',
+      present: new Map([
+        ['territory-icon-slot-0', 'icon'], ['territory-icon-badge', 'icon'],
+        ['ukraine-region-fill', 'oblast'], ['alert-raion-fill', 'raion'], ['threat-raion-fill', 'raion'],
+        ['city-hit', 'city']
+      ]),
+      hidden: [] as string[],
+      opens: ['icon']
+    },
+    {
+      name: 'a city dot beats the raion and the oblast under it',
+      present: new Map([
+        ['ukraine-region-fill', 'oblast'], ['alert-raion-fill', 'raion'], ['threat-raion-fill', 'raion'],
+        ['consequence-raion-fill', 'raion'], ['city-hit', 'city']
+      ]),
+      hidden: [] as string[],
+      opens: ['city']
+    },
+    {
+      name: 'three raion fills over one polygon open the raion once, not the oblast and not thrice',
+      present: new Map([
+        ['ukraine-region-fill', 'oblast'], ['alert-raion-fill', 'raion'], ['threat-raion-fill', 'raion'],
+        ['consequence-raion-fill', 'raion']
+      ]),
+      hidden: [] as string[],
+      opens: ['raion']
+    },
+    {
+      // Нижче RAION_ZOOM_MIN районних заливок під точкою немає взагалі, тож клік завжди обласний.
+      name: 'below the raion zoom the oblast wins because nothing finer is drawn',
+      present: new Map([['ukraine-region-fill', 'oblast']]),
+      hidden: [] as string[],
+      opens: ['oblast']
+    },
+    {
+      // Деградація: canvas недоступний, чотирьох шарів іконок немає в стилі. queryRenderedFeatures
+      // кинув би на неіснуючому шарі — liveLayers() мусить відфільтрувати їх до запиту.
+      name: 'a missing icon layer degrades the precision instead of throwing',
+      present: new Map([
+        ['ukraine-region-fill', 'oblast'], ['alert-raion-fill', 'raion'], ['threat-raion-fill', 'raion']
+      ]),
+      hidden: iconLayerIds,
+      opens: ['raion']
+    }
+  ];
+
+  it.each(cases)('$name, in every listener order', ({ present, hidden, opens }) => {
+    const existing = new Set(everyLayer.filter((id) => !hidden.includes(id)));
+    const firing = [...present.keys()];
+    let orders = 0;
+    for (const order of permutations(firing)) {
+      orders += 1;
+      expect(dispatch(order, present, existing), `listener order ${order.join(' > ')}`).toEqual(opens);
+    }
+    expect(orders).toBeGreaterThan(0);
+  });
+
+  it('claims the DOM click on the listener that opens the panel, not on the first one to run', () => {
+    // Це і є механізм, який робить попередній тест правдою за будь-якого порядку. Прапорець,
+    // поставлений на вході, віддавав би клік найгрубішому шару, і той виходив би по перевірці
+    // точності, не відкривши нічого й не давши відкрити нікому.
+    const body = clickResolutionSource();
+    const claim = body.indexOf('lastTerritoryClick = event.originalEvent');
+    const open = body.indexOf('showTerritoryPanel(');
+    expect(claim).toBeGreaterThan(-1);
+    for (const guard of ['liveLayers(iconLayerIds)', `liveLayers(['city-hit'])`, 'liveLayers(raionFillLayerIds)']) {
+      expect(body.indexOf(guard), `guard ${guard} runs after the click is claimed`).toBeLessThan(claim);
+    }
+    expect(claim).toBeLessThan(open);
+  });
+});
+
+describe('territory icon stacks', () => {
+  const chip = evaluateSlice<number>(constDeclaration('ICON_CHIP_PX'), 'ICON_CHIP_PX');
+  const lift = evaluateSlice<number>(constDeclaration('ICON_TIER_LIFT'), 'ICON_TIER_LIFT');
+  const badgeTextSize = evaluateSlice<number>(constDeclaration('ICON_BADGE_TEXT_SIZE'), 'ICON_BADGE_TEXT_SIZE');
+
+  const source = lazy(() => [
+    constDeclaration('ICON_SLOT_OFFSETS'),
+    constDeclaration('ICON_BADGE_OFFSET'),
+    constDeclaration('ICON_BADGE_TEXT_SIZE'),
+    constDeclaration('ICON_TIER_LIFT'),
+    constDeclaration('MAX_ICON_SLOTS'),
+    `function territoryIconCollection() ${bodyOf('territoryIconCollection')}`
+  ].join('\n'));
+
+  interface Stack { properties: Record<string, [number, number] | string | number> }
+
+  function collect(territories: unknown[], centroids: Record<string, [number, number]>, tier = 'oblast'): Stack[] {
+    const collection = evaluateSlice<() => { features: Stack[] }>(source(), 'territoryIconCollection', {
+      snapshotTerritories: () => territories,
+      iconTier: tier,
+      regionCentroid: (id: string) => centroids[id] ?? null,
+      iconFamilyVisible: () => true,
+      territoryAriaSentence: (territory: { name: string }) => `${territory.name}.`,
+      iconImageId: (threatType: string, tone: string) => `ti-${threatType}-${tone}`
+    });
+    return collection().features;
+  }
+
+  /**
+   * Kyiv city (`ua-80`, a `special_city`) sits inside the hole of Kyiv oblast (`ua-32`), and the two
+   * centroids are 17.4 km apart — 6 px at the map's own opening zoom of 5.1. Both stacks carry
+   * `icon-allow-overlap: true`, so MapLibre is explicitly forbidden from resolving the collision;
+   * the anchors have to be separated here or the two stacks and their two `+N` badges overprint,
+   * which is precisely the Kyiv-raid case the icons exist for. The same superposition happens at
+   * raion zoom for every oblast whose centroid falls inside one of its own raions.
+   */
+  it('lifts a stack that is not an oblast clear of the oblast stack enclosing it', () => {
+    const [oblast, city] = collect([
+      { locationId: 'ua-32', tier: 'oblast', name: 'Київська область', iconOverflow: 0,
+        icons: [{ threatType: 'uav', tone: 'confirmed' }] },
+      { locationId: 'ua-80', tier: 'special_city', name: 'м. Київ', iconOverflow: 0,
+        icons: [{ threatType: 'ballistic_missile', tone: 'confirmed' }, { threatType: 'uav', tone: 'confirmed' },
+          { threatType: 'cruise_missile', tone: 'reported' }, { threatType: 'aviation', tone: 'analytic' }] }
+    ], { 'ua-32': [30.458128, 50.302764], 'ua-80': [30.547518, 50.448691] });
+
+    expect(oblast!.properties.off0).toEqual([0, 0]);
+    // icon-offset is in pixels × icon-size, so the gap does not melt away as the map zooms out.
+    expect((city!.properties.off0 as [number, number])[1]).toBe(lift);
+    expect((city!.properties.off1 as [number, number])[1]).toBe(lift);
+    expect((city!.properties.off2 as [number, number])[1]).toBe(lift);
+    const gap = Math.abs((city!.properties.off0 as [number, number])[1] - (oblast!.properties.off0 as [number, number])[1]);
+    expect(gap, 'the two stacks still overlap vertically').toBeGreaterThan(chip);
+    // text-offset is in ems of the badge's own text-size, so the «+N» stays glued to its own stack.
+    expect((city!.properties.badgeOffset as [number, number])[1]).toBeCloseTo(lift / badgeTextSize, 10);
+    expect((oblast!.properties.badgeOffset as [number, number])[1]).toBe(0);
+  });
+
+  it('leaves the horizontal slot layout of both tiers untouched', () => {
+    const slots = evaluateSlice<Record<number, [number, number][]>>(
+      constDeclaration('ICON_SLOT_OFFSETS'), 'ICON_SLOT_OFFSETS');
+    const [oblast, city] = collect([
+      { locationId: 'ua-32', tier: 'oblast', name: 'Київська область', iconOverflow: 0,
+        icons: [{ threatType: 'uav', tone: 'confirmed' }, { threatType: 'mlrs', tone: 'reported' }] },
+      { locationId: 'ua-80', tier: 'special_city', name: 'м. Київ', iconOverflow: 0,
+        icons: [{ threatType: 'uav', tone: 'confirmed' }, { threatType: 'mlrs', tone: 'reported' }] }
+    ], { 'ua-32': [30.458128, 50.302764], 'ua-80': [30.547518, 50.448691] });
+    for (const stack of [oblast!, city!]) {
+      expect((stack.properties.off0 as [number, number])[0]).toBe(slots[2]![0]![0]);
+      expect((stack.properties.off1 as [number, number])[0]).toBe(slots[2]![1]![0]);
+    }
+  });
+});
+
+describe('map live region', () => {
+  const ariaSource = lazy(() => `function writeMapAria() ${bodyOf('writeMapAria')}`);
+
+  function write(options: {
+    territories: unknown[];
+    stacks?: { properties: { locationId: string; aria: string } }[];
+    alerts?: { location_name: string }[];
+    tier?: string;
+  }): string {
+    const node = { textContent: '' };
+    evaluateSlice<() => void>(ariaSource(), 'writeMapAria', {
+      $: () => node,
+      territoryIconCollection: () => ({ features: options.stacks ?? [] }),
+      iconTier: options.tier ?? 'oblast',
+      snapshotTerritories: () => options.territories,
+      territoryAriaSentence: (territory: { name: string }) => `${territory.name}: офіційна тривога.`,
+      snapshot: options.alerts ? { alerts: options.alerts } : null
+    })();
+    return node.textContent;
+  }
+
+  /**
+   * An official alert is a polygon fill, never an icon — `iconCandidatesFor` builds candidates from
+   * asserted threats and assessments alone — so a territory whose only state is an alert produces
+   * no feature in `territory-icons` at all. Built from the icon stacks, the live region therefore
+   * announced one UAV over Odesa and stayed silent about fifteen alerted oblasts: the single most
+   * important thing the map was showing.
+   */
+  it('names an alerted territory that carries no icon, and names it first', () => {
+    const text = write({
+      territories: [
+        { locationId: 'ua-51', tier: 'oblast', name: 'Одеська область', alertActive: false },
+        { locationId: 'ua-32', tier: 'oblast', name: 'Київська область', alertActive: true },
+        { locationId: 'ua-63', tier: 'oblast', name: 'Харківська область', alertActive: true }
+      ],
+      stacks: [{ properties: { locationId: 'ua-51', aria: 'Одеська область: ударні БпЛА.' } }]
+    });
+    expect(text).toContain('Київська область: офіційна тривога.');
+    expect(text).toContain('Харківська область: офіційна тривога.');
+    expect(text).toContain('Одеська область: ударні БпЛА.');
+    expect(text.indexOf('Київська'), 'alerts must lead').toBeLessThan(text.indexOf('Одеська'));
+  });
+
+  it('says nothing about a territory that is neither alerted nor stacked', () => {
+    const text = write({
+      territories: [{ locationId: 'ua-32', tier: 'oblast', name: 'Київська область', alertActive: false }]
+    });
+    expect(text).toBe('Активних позначок на карті немає.');
+  });
+
+  it('counts every announced territory in the honesty suffix, not only the stacked ones', () => {
+    const territories = Array.from({ length: 11 }, (_, index) => ({
+      locationId: `ua-${index}`, tier: 'oblast', name: `Область ${index}`, alertActive: true
+    }));
+    const text = write({ territories });
+    expect(text).toContain('Показано 8 територій із 11.');
+    expect(text).toContain('Область 7: офіційна тривога.');
+    expect(text).not.toContain('Область 8:');
+  });
+
+  it('keeps the oblast-zoom tier boundary of the stacks', () => {
+    const text = write({
+      territories: [
+        { locationId: 'ua-3222', tier: 'raion', name: 'Бориспільський район', alertActive: true },
+        { locationId: 'ua-32', tier: 'oblast', name: 'Київська область', alertActive: true }
+      ]
+    });
+    expect(text).toBe('Київська область: офіційна тривога.');
+  });
+
+  it('still falls back to the raw alert list for a payload with no territories', () => {
+    const text = write({ territories: [], alerts: [{ location_name: 'Львівська область' }] });
+    expect(text).toBe('Львівська область: офіційна тривога.');
+  });
+});
+
+describe('map text survives a failed icon pipeline', () => {
+  const source = lazy(() => `function updateTerritoryIcons() ${bodyOf('updateTerritoryIcons')}`);
+
+  function run(mapLayersReady: boolean, iconLayersReady: boolean): string[] {
+    const calls: string[] = [];
+    evaluateSlice<() => void>(source(), 'updateTerritoryIcons', {
+      mapLayersReady,
+      iconLayersReady,
+      map: { getSource: () => ({ setData: () => calls.push('setData') }) },
+      territoryIconCollection: () => ({ type: 'FeatureCollection', features: [] }),
+      writeMapAria: () => calls.push('aria')
+    })();
+    return calls;
+  }
+
+  /**
+   * `addThreatIconImages` swallows a missing canvas 2D context, a missing `Path2D` and a throwing
+   * `addImage`, which leaves `iconLayersReady` false forever. Gating the live region on that flag
+   * made the map's only textual equivalent a dependent of the raster pipeline: the polygons still
+   * rendered and `#map-aria` stayed permanently empty.
+   */
+  it('writes the live region even when the raster icon layers never came up', () => {
+    expect(run(true, false)).toEqual(['aria']);
+    expect(run(true, true)).toEqual(['setData', 'aria']);
+  });
+
+  it('still writes nothing before the map layers exist', () => {
+    expect(run(false, true)).toEqual([]);
+  });
+});
+
+describe('snapshot refresh and the operations console', () => {
+  const source = lazy(() => `function renderCurrentRoute(options = {}) ${bodyOf('renderCurrentRoute')}`);
+  const parameters = ['snapshot', 'activePage', 'map', 'mapLayersReady', 'codexPollTimer', 'renderedRoute',
+    'renderMapPage', 'renderHistory', 'renderAttacks', 'renderAnalytics', 'renderSources', 'renderOps', 'renderAbout'];
+
+  /**
+   * `renderedRoute`, `map` and `mapLayersReady` are module-level `let`s that the function assigns
+   * to. Injected as parameters they become closure variables of one compiled instance, so the
+   * assignments survive between calls exactly as they do in the bundle — which is the whole point:
+   * the first render and the hundredth have to behave differently.
+   */
+  function router(route: string): { render: (options?: unknown) => void; calls: string[] } {
+    const calls: string[] = [];
+    const stub = (name: string) => () => { calls.push(name); };
+    const render = compileSlice<(options?: unknown) => void>(source(), 'renderCurrentRoute', parameters)(
+      { version: 1 }, () => route, null, false, null, null,
+      stub('map'), stub('history'), stub('attacks'), stub('analytics'), stub('sources'), stub('ops'), stub('about')
+    );
+    return { render, calls };
+  }
+
+  /**
+   * `renderOps()` opens with `contentShell(…)`, which is `#app.replaceChildren(…)` — a full DOM
+   * wipe. Driving that from the snapshot meant the 60 s belt and every SSE frame reverted the
+   * runtime form to its stored values mid-edit, and discarded a half-typed Basic-auth password. The
+   * console reads nothing from `snapshot`; it fetches all of its own data and refreshes itself.
+   */
+  it('renders the console once on a direct load and then leaves the operator alone', () => {
+    const { render, calls } = router('/ops');
+    render({ fromSnapshot: true });         // boot() -> loadSnapshot(), the only render /ops ever gets
+    expect(calls).toEqual(['ops']);
+    render({ fromSnapshot: true });         // the 60 s belt
+    render({ fromSnapshot: true });         // an SSE frame, debounced 250 ms
+    expect(calls).toEqual(['ops']);
+  });
+
+  it('still renders the console when the operator navigates to it', () => {
+    const { render, calls } = router('/ops');
+    render({ fromSnapshot: true });
+    render();                                // a[data-route] click handler calls it bare
+    expect(calls).toEqual(['ops', 'ops']);
+  });
+
+  it('reads the popstate Event as a navigation, not as a snapshot tick', () => {
+    // window.addEventListener('popstate', renderCurrentRoute) passes the Event as `options`, and an
+    // Event has no `fromSnapshot` — which is why the flag is compared against true, not truthiness.
+    const { render, calls } = router('/ops');
+    render({ fromSnapshot: true });
+    render({ type: 'popstate' });
+    expect(calls).toEqual(['ops', 'ops']);
+  });
+
+  it('leaves every other route repainting on every snapshot', () => {
+    for (const [route, rendered] of [['/', 'map'], ['/history', 'history'], ['/attacks', 'attacks'],
+      ['/analytics', 'analytics'], ['/sources', 'sources'], ['/about', 'about']]) {
+      const { render, calls } = router(route!);
+      render({ fromSnapshot: true });
+      render({ fromSnapshot: true });
+      expect(calls, `route ${route}`).toEqual([rendered, rendered]);
+    }
   });
 });

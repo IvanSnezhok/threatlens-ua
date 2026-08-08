@@ -496,6 +496,21 @@ export function buildReportedVector(eventId: string, rows: VectorChainRow[]): Re
 // Queries
 // ------------------------------------------------------------------------------------------------
 
+/**
+ * `$2` is the publication cutoff, or NULL for the operator paths that are exempt from the hold.
+ *
+ * Bounded on `classified_at` (when the classification was RECORDED), never on `published_at`, which
+ * migration 012 documents as «Publication time, not receipt time» — the Telegram post's own
+ * timestamp, which a back-dated or edited message carries hours into the past and which would
+ * therefore walk straight past any hold. `classified_at` is written within milliseconds of the
+ * `threat_event_locations.created_at` that `liveThreats` already bounds, which is what keeps the two
+ * surfaces in step: without this predicate a message naming a NEW raion for an ALREADY-PUBLISHED
+ * event draws a chain node, a transit segment and a legend entry into a district the map is
+ * simultaneously refusing to fill or icon, because `liveThreats` is holding it for the full cutoff.
+ *
+ * `message_classifications_event_idx` already narrows to the event's handful of rows, so the extra
+ * predicate is a residual filter and needs no index of its own.
+ */
 const CHAIN_QUERY = `
   SELECT mc.id AS classification_id, mc.event_id, mc.published_at, mc.decision, mc.intent,
          mc.direction_text, mc.source_message_id,
@@ -509,11 +524,19 @@ const CHAIN_QUERY = `
     JOIN message_classification_locations mcl ON mcl.classification_id = mc.id
     JOIN locations l ON l.id = mcl.location_id
    WHERE mc.event_id = ANY($1::uuid[])
+     AND ($2::timestamptz IS NULL OR mc.classified_at <= $2)
    ORDER BY mc.event_id, mc.published_at, mc.id, mcl.role, mcl.location_id`;
 
-export async function reportedVectorsForEvents(eventIds: string[]): Promise<ReportedVector[]> {
+/**
+ * `cutoff` defaults to `null` — UNBOUNDED — so `src/services/vector-projection.ts` keeps the whole
+ * chain for the operator extrapolation, which is exempt from the hold by design. Every PUBLIC caller
+ * passes `slice.cutoffAt`.
+ */
+export async function reportedVectorsForEvents(
+  eventIds: string[], cutoff: Date | null = null
+): Promise<ReportedVector[]> {
   if (!eventIds.length) return [];
-  const result = await pool.query<VectorChainRow>(CHAIN_QUERY, [eventIds]);
+  const result = await pool.query<VectorChainRow>(CHAIN_QUERY, [eventIds, cutoff]);
   const vectors: ReportedVector[] = [];
   for (const eventId of eventIds) {
     const vector = buildReportedVector(eventId, result.rows);
@@ -524,8 +547,10 @@ export async function reportedVectorsForEvents(eventIds: string[]): Promise<Repo
   return vectors;
 }
 
-export async function reportedVectorForEvent(eventId: string): Promise<ReportedVector | null> {
-  const [vector] = await reportedVectorsForEvents([eventId]);
+export async function reportedVectorForEvent(
+  eventId: string, cutoff: Date | null = null
+): Promise<ReportedVector | null> {
+  const [vector] = await reportedVectorsForEvents([eventId], cutoff);
   return vector ?? null;
 }
 
@@ -535,6 +560,11 @@ export async function reportedVectorForEvent(eventId: string): Promise<ReportedV
  * The window must mirror `liveThreats(cutoff)` exactly — the same statuses, the same twelve hours
  * AND the same publication cutoff — or the map draws an observation chain for a threat it is not
  * showing, which is the one way this overlay can assert something no marker backs.
+ *
+ * The cutoff is applied TWICE and both applications are load-bearing: once when choosing which
+ * events to expand (an event created after the cutoff does not exist yet) and once inside the chain
+ * itself (a classification recorded after the cutoff has not been published yet, even for an event
+ * that has). Only the first gate existed, so a chain grew into held geography.
  */
 export async function reportedVectorsForLiveEvents(cutoff: Date): Promise<ReportedVector[]> {
   const live = await pool.query<{ id: string }>(
@@ -546,7 +576,7 @@ export async function reportedVectorsForLiveEvents(cutoff: Date): Promise<Report
                 AND ended_at > $1 AND updated_at > now() - interval '1 hour' ) )
       ORDER BY last_observed_at DESC LIMIT 200`, [cutoff]
   );
-  return reportedVectorsForEvents(live.rows.map((row) => row.id));
+  return reportedVectorsForEvents(live.rows.map((row) => row.id), cutoff);
 }
 
 /** Visibility, not existence: an event created after the cutoff is not yet a fact a public reader

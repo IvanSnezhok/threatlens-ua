@@ -27,6 +27,30 @@
 -- deployment publishes. Event-driven recomputation defaults ON because its alternative is the
 -- existing fifteen-minute timer, which is strictly worse and still runs as the floor.
 
+-- ------------------------------------------------------------------------------------------------
+-- Why this file lifts the statement timeout for its own transaction
+-- ------------------------------------------------------------------------------------------------
+-- `src/db/migrate.ts` runs each migration inside a transaction it opened itself, on the ordinary
+-- application connection — whose session GUC is `statement_timeout = 15s` (`src/db/pool.ts`, sent as
+-- a startup parameter by node-pg, so it applies to DDL too). This is the first migration in the repo
+-- to rewrite whole tables that have no retention policy: the `alert_periods.published_at` backfill
+-- below matches every row, the `threat_event_locations.created_at` backfill matches every
+-- pre-existing row (PG11+ takes the fast-default path for `DEFAULT now()`, stamping them all with
+-- transaction-start time, so the `>` guard is true for all of them), and `SET NOT NULL` adds a full
+-- verification scan under ACCESS EXCLUSIVE. `src/index.ts` awaits `migrate()` BEFORE `buildServer()`,
+-- so a timeout here is not a slow deploy — it is a container that never reaches listen(), retried
+-- forever by `restart: unless-stopped`, each attempt slower than the last because the rolled-back
+-- UPDATE left its dead tuples behind. Migration 015 already reasons about this timeout for reads;
+-- this is the same argument for a write.
+--
+-- `SET LOCAL` reverts at COMMIT, so its scope is this migration's transaction: no other migration
+-- and no runtime statement loses the 15 s bound. `lock_timeout` is the companion the lift makes
+-- necessary — without a statement timeout the `SET NOT NULL` below could otherwise queue on an
+-- ACCESS EXCLUSIVE lock indefinitely, and failing fast on the lock is strictly better than hanging
+-- the boot on it.
+SET LOCAL statement_timeout = 0;
+SET LOCAL lock_timeout = '10s';
+
 CREATE TABLE IF NOT EXISTS runtime_settings (
   singleton              boolean PRIMARY KEY DEFAULT true CHECK (singleton),
   publication_mode       text        NOT NULL DEFAULT 'live'
@@ -111,7 +135,12 @@ COMMENT ON TABLE runtime_settings_audit IS
 -- the reopen branch (`ON CONFLICT (location_id,alert_type,started_at) DO UPDATE SET status='active'`,
 -- src/services/ingestion.ts), so a reopened alert would look old the moment it reappears. This
 -- column is the one honest answer to "when did this become publicly true", and the reopen branch
--- writes it (`src/services/ingestion.ts` `reconcileAggregateAlert`, agent A, wave 1 — §12).
+-- writes it (`src/services/ingestion.ts` `reconcileAggregateAlert`, agent A, wave 1 — §12) — but
+-- CONDITIONALLY, and only when the period had genuinely stopped being public. A flap shorter than
+-- `PUBLICATION_DELAY_SECONDS` never stopped being publicly true: the delayed view was still serving
+-- the ended row (`status='ended' AND ended_at > cutoff`) a millisecond earlier, so a fresh
+-- `published_at` there would satisfy neither branch of `activeAlerts()` and RETRACT an air-raid alert
+-- from the public map for the rest of the hold. See the comment on that branch.
 --
 -- The backfill is BEST-EFFORT for history and says so out loud. `created_at` alone would stamp every
 -- period that was reopened before this migration with its first appearance — knowingly wrong in
@@ -128,7 +157,7 @@ ALTER TABLE alert_periods ALTER COLUMN published_at SET DEFAULT now();
 ALTER TABLE alert_periods ALTER COLUMN published_at SET NOT NULL;
 
 COMMENT ON COLUMN alert_periods.published_at IS
-  'When this period became publicly true. Set on insert and refreshed by the reopen branch. Not the provider''s declared start (started_at) and not the row''s first insert (created_at). Values older than migration 022 are a best-effort backfill.';
+  'When this period became publicly true. Set on insert and refreshed by the reopen branch only when the period had already been publicly cleared (a gap longer than PUBLICATION_DELAY_SECONDS); refreshing it after a shorter flap would retract an alert the delayed view was still showing. Not the provider''s declared start (started_at) and not the row''s first insert (created_at). Values older than migration 022 are a best-effort backfill.';
 
 -- ================================================================================================
 -- threat_event_locations.created_at — the cutoff has to be able to hold a NEW DISTRICT too

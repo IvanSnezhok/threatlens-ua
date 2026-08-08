@@ -8,13 +8,27 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
  * consists of" is stated once, and threading four more injection points through it to test the
  * cadence of one of them would move that statement into the callers.
  */
-const legs = vi.hoisted(() => ({ refresh: 0, risk: 0, warm: 0, eventRows: [] as unknown[][] }));
+const legs = vi.hoisted(() => ({
+  refresh: 0, risk: 0, warm: 0, eventRows: [] as unknown[][],
+  /** Set to make the materialised-view refresh reject, the way a 15 s `statement_timeout` does. */
+  refreshError: null as Error | null,
+  /** One entry per risk leg: whether that pass was allowed to spend the model. */
+  riskModel: [] as boolean[]
+}));
 
 vi.mock('./analytics.js', () => ({
-  refreshMonthlyAnalytics: async () => { legs.refresh += 1; return true; }
+  refreshMonthlyAnalytics: async () => {
+    legs.refresh += 1;
+    if (legs.refreshError) throw legs.refreshError;
+    return true;
+  }
 }));
 vi.mock('./risk.js', () => ({
-  runRiskAssessmentsGuarded: async () => { legs.risk += 1; return { published: 3, skipped: false }; }
+  runRiskAssessmentsGuarded: async (options: { allowModel?: boolean } = {}) => {
+    legs.risk += 1;
+    legs.riskModel.push(options.allowModel ?? true);
+    return { published: 3, skipped: false };
+  }
 }));
 vi.mock('./attack-analytics.js', () => ({ resetAttackAnalyticsCache: () => undefined }));
 vi.mock('../db/pool.js', () => ({
@@ -155,6 +169,7 @@ async function emit(h: ReturnType<typeof harness>, eventType: string, version = 
 beforeEach(() => {
   resetAnalyticsScheduler();
   legs.refresh = 0; legs.risk = 0; legs.warm = 0; legs.eventRows = [];
+  legs.refreshError = null; legs.riskModel = [];
 });
 afterEach(() => { resetAnalyticsScheduler(); });
 
@@ -490,6 +505,24 @@ describe('the guards inside one pass', () => {
     expect(legs.risk).toBe(1);
   });
 
+  it('a pass refused by the switch does not arm the minimum-interval guard', async () => {
+    // The case the ten-fake-minute gap in the test above steps over. The `disabled` refusal returns
+    // from INSIDE the try, so its `finally` used to stamp `lastCompletedAt` for a pass that read one
+    // settings row and did nothing — and the fifteen-minute floor keeps firing those while the
+    // switch is off. The operator who then flips the switch back, or presses «Оновити зараз», is
+    // told «попередній перерахунок був щойно» about a pass that never happened.
+    const disabled = { ...RUNTIME_SETTINGS_DEFAULTS, analyticsEventDriven: false };
+    const at = ANALYTICS_MIN_PASS_INTERVAL_MS * 10;
+
+    const floorPass = await recomputeAnalytics('schedule', { now: () => at, settings: async () => disabled });
+    expect(floorPass).toMatchObject({ skipped: 'disabled' });
+
+    // The SAME instant, not ten fake minutes later.
+    const manual = await recomputeAnalytics('manual', { now: () => at, settings: async () => disabled });
+    expect(manual).toMatchObject({ skipped: null, published: 3 });
+    expect(legs.risk).toBe(1);
+  });
+
   it('refreshes the materialised views at floor cadence, not per pass', async () => {
     let clock = ANALYTICS_MIN_PASS_INTERVAL_MS * 100;
     for (let index = 0; index < 3; index += 1) {
@@ -505,6 +538,73 @@ describe('the guards inside one pass', () => {
     expect(legs.refresh).toBe(1);
     expect(legs.risk).toBe(3);
     expect(legs.warm).toBe(3);
+  });
+
+  it('a failing view refresh costs the pass its views and nothing else', async () => {
+    // `refreshMonthlyAnalytics` has a `finally` and no `catch`, and the failure the module header
+    // and the runbook both name — a `REFRESH MATERIALIZED VIEW CONCURRENTLY` past the 15 s
+    // `statement_timeout` — rejects into this pass. Unguarded it unwound past the risk leg, the
+    // Codex leg and the `analytics.updated` row, so a stale month bucket silently reverted the map's
+    // аналітична оцінка to the fifteen-minute timer this worker exists to replace.
+    legs.refreshError = new Error('canceling statement due to statement timeout');
+
+    const result = await recomputeAnalytics('event', {
+      now: () => ANALYTICS_MIN_PASS_INTERVAL_MS * 300, settings: async () => RUNTIME_SETTINGS_DEFAULTS
+    });
+
+    expect(result).toMatchObject({ skipped: null, published: 3, codex: 'disabled', fallback: false });
+    expect([legs.refresh, legs.risk, legs.warm]).toEqual([1, 1, 1]);
+    expect(legs.eventRows).toHaveLength(1);
+  });
+
+  it('a failing view refresh retries at floor cadence, not on every pass', async () => {
+    // The floor test is `startedAt - lastViewRefreshAt`, and the clock was advanced only on success —
+    // so a refresh that keeps timing out re-satisfied the test on every single pass and burned a
+    // connection and up to fifteen seconds of `statement_timeout` every minute, for ever.
+    legs.refreshError = new Error('canceling statement due to statement timeout');
+    let clock = ANALYTICS_MIN_PASS_INTERVAL_MS * 400;
+    for (let index = 0; index < 3; index += 1) {
+      const result = await recomputeAnalytics('event', {
+        now: () => clock, settings: async () => RUNTIME_SETTINGS_DEFAULTS
+      });
+      expect(result.skipped).toBeNull();
+      clock += ANALYTICS_MIN_PASS_INTERVAL_MS + 1_000;
+    }
+    expect(legs.refresh).toBe(1);
+    expect(legs.risk).toBe(3);
+  });
+
+  it('spends the risk engine\'s model at floor cadence while re-scoring on every pass', async () => {
+    // `runRiskAssessmentsPass` calls the model once per `(location_id, threat_type)` group, and one
+    // nationwide message fans out to every oblast for six hours. Before the bound, moving that leg
+    // from a fifteen-minute timer onto a once-a-minute recompute multiplied model spend with no ops
+    // knob covering it. Every pass still re-scores every group — through the deterministic scorer,
+    // which is the default deployment path — so nothing the map draws goes stale in between.
+    let clock = ANALYTICS_MIN_PASS_INTERVAL_MS * 500;
+    const base = clock;
+    for (let index = 0; index < 3; index += 1) {
+      await recomputeAnalytics('event', { now: () => clock, settings: async () => RUNTIME_SETTINGS_DEFAULTS });
+      clock += ANALYTICS_MIN_PASS_INTERVAL_MS + 1_000;
+    }
+    expect(legs.risk).toBe(3);
+    expect(legs.riskModel).toEqual([true, false, false]);
+
+    // Past the floor the next pass may spend it again.
+    await recomputeAnalytics('event', {
+      now: () => base + ANALYTICS_RECOMPUTE_FLOOR_MS, settings: async () => RUNTIME_SETTINGS_DEFAULTS
+    });
+    expect(legs.riskModel).toEqual([true, false, false, true]);
+  });
+
+  it('the operator button always spends the model', async () => {
+    // «Оновити зараз» is a person asking for the best answer available, and it is rate-limited by a
+    // human pressing it plus the minimum-interval guard.
+    const base = ANALYTICS_MIN_PASS_INTERVAL_MS * 600;
+    await recomputeAnalytics('event', { now: () => base, settings: async () => RUNTIME_SETTINGS_DEFAULTS });
+    await recomputeAnalytics('manual', {
+      now: () => base + ANALYTICS_MIN_PASS_INTERVAL_MS + 1_000, settings: async () => RUNTIME_SETTINGS_DEFAULTS
+    });
+    expect(legs.riskModel).toEqual([true, true]);
   });
 
   it('writes one analytics.updated row per completed pass and nothing on a skip', async () => {

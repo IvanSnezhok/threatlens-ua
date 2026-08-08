@@ -179,16 +179,36 @@ async function seedAlert(fields: {
 
 async function seedThreat(fields: {
   createdAgoSeconds?: number; status?: string; endedAgoSeconds?: number | null;
+  /** Positive puts `valid_until` in the PAST, which is what the expiry sweep selects on. */
+  validUntilAgoSeconds?: number | null;
 }): Promise<string> {
   const row = await sql<{ id: string }>(
     `INSERT INTO threat_events(threat_type,status,evidence_level,title,summary,started_at,
        last_observed_at,valid_until,created_at,updated_at,ended_at)
      VALUES ('uav',$1,'monitoring','Публікаційна перевірка','Публікаційна перевірка',
-             now() - interval '10 minutes', now(), now() + interval '2 hours',
+             now() - interval '10 minutes', now(),
+             CASE WHEN $4::int IS NULL THEN now() + interval '2 hours'
+                  ELSE now() - make_interval(secs => $4::int) END,
              now() - make_interval(secs => $2::int), now(),
              CASE WHEN $3::int IS NULL THEN NULL ELSE now() - make_interval(secs => $3::int) END)
      RETURNING id`,
-    [fields.status ?? 'observed', fields.createdAgoSeconds ?? 0, fields.endedAgoSeconds ?? null]
+    [fields.status ?? 'observed', fields.createdAgoSeconds ?? 0, fields.endedAgoSeconds ?? null,
+      fields.validUntilAgoSeconds ?? null]
+  );
+  return row.rows[0]!.id;
+}
+
+/** One stored source message, so `event_evidence` and `message_classifications` have something to
+ *  point at. `content_hash` only has to be unique per (source, external id). */
+async function seedSourceMessage(fields: {
+  externalId: string; publishedAgoSeconds: number; text?: string; sourceId?: string;
+}): Promise<string> {
+  const row = await sql<{ id: string }>(
+    `INSERT INTO source_messages(source_id,external_id,published_at,raw_text,content_hash)
+     VALUES ($1,$2, now() - make_interval(secs => $3::int), $4, md5($2))
+     RETURNING id`,
+    [fields.sourceId ?? WAR_MONITOR, fields.externalId, fields.publishedAgoSeconds,
+      fields.text ?? 'Повідомлення для перевірки публікації.']
   );
   return row.rows[0]!.id;
 }
@@ -420,6 +440,13 @@ describe.skipIf(!integrationDatabaseAvailable)('publication mode', () => {
 
     it('replays nothing across a live→delayed flip until the hold expires, then each version once', async () => {
       const consumed = await appendSystemEvent('threat.created', { eventId: 'flip-3' });
+      // Aged FIRST and by MORE than the two rows below it. `consumed` was published in live mode
+      // before the flip, so in any reachable state its `created_at` is older than theirs — and the
+      // head bound now stops strictly before the OLDEST held row, so leaving a low version sitting
+      // above the cutoff would (correctly) hold everything numbered after it. Ageing only the newer
+      // versions builds a state Postgres cannot produce: version order and created_at order
+      // inverted, with the inversion visible. See the sibling case below, which asserts exactly that.
+      await backdate(consumed, 40);
       await setMode('delayed_15s');
       const afterFlipA = await appendSystemEvent('threat.created', { eventId: 'flip-4' });
       const afterFlipB = await appendSystemEvent('threat.created', { eventId: 'flip-5' });
@@ -431,6 +458,41 @@ describe.skipIf(!integrationDatabaseAvailable)('publication mode', () => {
 
       const released = await readStream(500, { 'Last-Event-ID': String(consumed) });
       expect(deliveredIds(released)).toEqual([afterFlipA, afterFlipB]);
+    });
+
+    it('never releases a row past a lower-versioned one whose created_at is still held', async () => {
+      // `version` is a sequence value taken at INSERT while `created_at` defaults to `now()` =
+      // transaction START, so a long write transaction that appends its log rows last produces HIGH
+      // versions carrying an OLD created_at, and a short transaction that commits in between gets a
+      // LOWER version and a NEWER one. Ageing only the higher version reproduces that interleaving
+      // deterministically, with no second connection.
+      //
+      // Under a `max(version) WHERE created_at <= cutoff` head, `newer` lifts the bound to `older`
+      // and `older` goes out on the public stream seconds after it was recorded instead of fifteen —
+      // the hold silently degrading to `15 s − (write transaction duration)`, i.e. to nothing during
+      // the nationwide alert the long transaction exists for.
+      await setMode('delayed_15s');
+      // A released anchor to resume from: `?since=0` is falsy at the route and skips the backfill
+      // entirely, which would make the assertion below pass for the wrong reason.
+      const anchor = await appendSystemEvent('threat.created', { eventId: 'interleave-anchor' });
+      await backdate(anchor, 40);
+      const held = await appendSystemEvent('alert.started', { alertId: 'interleave-low' });
+      const newer = await appendSystemEvent('threat.created', { eventId: 'interleave-high' });
+      await backdate(newer, 20);
+
+      const snapshot = await getJson('/api/v1/snapshot');
+      const backfill = await readStream(500, {}, `/api/v1/stream?since=${anchor}`);
+
+      expect(snapshot.publication.cutoffVersion).toBe(anchor);
+      expect(deliveredIds(backfill)).toEqual([]);
+      expect(connectedFrame(backfill)!.data.version).toBe(anchor);
+
+      // And nothing is DROPPED by the stricter bound: once the low version clears the cutoff too,
+      // both are released, in version order, exactly once.
+      await backdate(held, 25);
+
+      const released = await readStream(500, {}, `/api/v1/stream?since=${anchor}`);
+      expect(deliveredIds(released)).toEqual([held, newer]);
     });
 
     it('resumes from ?since= exactly as it does from Last-Event-ID', async () => {
@@ -500,7 +562,15 @@ describe.skipIf(!integrationDatabaseAvailable)('publication mode', () => {
       expect(await getJson('/api/v1/alerts')).toEqual([]);
     });
 
-    it('treats a reopened alert as new for the cutoff', async () => {
+    /**
+     * Drives the real reconciler through open → end → reopen on one oblast and returns the
+     * `published_at` the period carried while it was public.
+     *
+     * `gapSeconds` is how long the period had been ended when the provider re-listed it, which is
+     * the ONLY thing that distinguishes the two cases below: a flap shorter than the hold and a
+     * genuinely new appearance take the same `ON CONFLICT` branch on the same row.
+     */
+    async function openEndAndReopen(gapSeconds: number): Promise<string> {
       stubFetch();
       const { syncOfficialAlerts } = await import('../../src/services/ingestion.js');
       const kyiv = alarmBody([{ regionId: OBLAST, regionName: 'Київська область', types: ['AIR'] }]);
@@ -519,10 +589,56 @@ describe.skipIf(!integrationDatabaseAvailable)('publication mode', () => {
       await sql(`UPDATE alert_source_states SET missing_since = now() - interval '1 hour' WHERE missing_since IS NOT NULL`);
       await syncOfficialAlerts();
       expect((await sql<{ status: string }>(`SELECT status FROM alert_periods`)).rows[0]!.status).toBe('ended');
+      if (gapSeconds > 0) {
+        await sql(
+          `UPDATE alert_periods SET ended_at = now() - make_interval(secs => $1::int),
+                                    updated_at = now() - make_interval(secs => $1::int)`,
+          [gapSeconds]
+        );
+      }
 
       // The same provider start, so the unique index takes the ON CONFLICT reopen branch.
       stubbedResponses.set(UKRAINE_ALARM_URL, kyiv);
       await syncOfficialAlerts();
+      return before;
+    }
+
+    it('keeps a reopened alert on the public map when the flap is shorter than the hold', async () => {
+      // The provider drops a region for one poll and re-lists it with the identical declared start.
+      // One millisecond before the reopen the delayed view was still serving the period through
+      // branch 2 of `activeAlerts` (`status='ended' AND published_at <= cutoff AND ended_at >
+      // cutoff`), so the alert is on the public map right now. Refreshing `published_at` here would
+      // satisfy NEITHER branch — active, with a published_at newer than the cutoff — and the red
+      // oblast polygon, the «Офіційна тривога» card and the label would disappear for the rest of the
+      // hold, during a live air-raid alert, because of a provider flap and nothing else. That is the
+      // retraction `docs/ARCHITECTURE.md` §Consistency rules calls unrecoverable.
+      const before = await openEndAndReopen(0);
+
+      const rows = await sql<{ status: string; at: string }>(
+        `SELECT status, published_at::text AS at FROM alert_periods`
+      );
+      expect(rows.rowCount).toBe(1);
+      expect(rows.rows[0]!.status).toBe('active');
+      // The period never stopped being publicly true, so it keeps the instant at which it became so.
+      expect(Date.parse(rows.rows[0]!.at)).toBe(Date.parse(before));
+
+      await setMode('delayed_15s');
+      const alerts = await getJson('/api/v1/alerts');
+      expect(alerts).toHaveLength(1);
+      expect(alerts[0].status).toBe('active');
+      expect(alerts[0].actual_status).toBe('active');
+
+      // And the same in live, where the cutoff is now() and this branch is unobservable either way.
+      await setMode('live');
+      expect(await getJson('/api/v1/alerts')).toHaveLength(1);
+    });
+
+    it('treats an alert reopened after a gap longer than the hold as new for the cutoff', async () => {
+      // Here the all-clear had already been released: the period ended a minute ago, longer than any
+      // configured hold, so the public map is not showing it and its reappearance is a genuinely new
+      // fact. Keeping the old `published_at` would make it instantly older than the cutoff — visible
+      // before it happened.
+      const before = await openEndAndReopen(60);
 
       const rows = await sql<{ status: string; at: string }>(
         `SELECT status, published_at::text AS at FROM alert_periods`
@@ -532,8 +648,6 @@ describe.skipIf(!integrationDatabaseAvailable)('publication mode', () => {
       expect(Date.parse(rows.rows[0]!.at)).toBeGreaterThan(Date.parse(before));
 
       await setMode('delayed_15s');
-      // Without `published_at=now()` on the reopen branch the alert would be instantly older than
-      // the cutoff — visible before it happened.
       expect(await getJson('/api/v1/alerts')).toEqual([]);
       await setMode('live');
       expect(await getJson('/api/v1/alerts')).toHaveLength(1);
@@ -570,6 +684,37 @@ describe.skipIf(!integrationDatabaseAvailable)('publication mode', () => {
       expect(stored.rows[0]!.status).toBe('withdrawn');
     });
 
+    it('holds an expired threat for the same fifteen seconds as the threat.expired frame', async () => {
+      // The sweep runs on a thirty-second timer and selects on `valid_until <= now()`, so it catches
+      // a row up to thirty seconds after its validity elapsed. Back-dating `ended_at` to
+      // `valid_until` — which is what it used to do — made `ended_at > cutoff` already false at the
+      // instant the sweep committed, so the polygon and the icon stack left the public map with ZERO
+      // hold while the `threat.expired` row written in the very same transaction was correctly held
+      // for fifteen seconds. Withdrawal and correction never had that gap because they write
+      // `ended_at = now()`; this pins expiry to the same rule.
+      const eventId = await seedThreat({ createdAgoSeconds: 300, validUntilAgoSeconds: 26 });
+      await attachLocation(eventId, OBLAST, 300);
+      await setMode('delayed_15s');
+
+      const { expireThreatEvents } = await import('../../src/services/operations.js');
+      expect(await expireThreatEvents()).toBe(1);
+
+      const threats = await getJson('/api/v1/threats');
+      expect(threats.map((row: any) => row.id)).toEqual([eventId]);
+      expect(threats[0].status).toBe('active');
+      // `liveThreats` maps its rows into the public `LiveEvent` shape, which carries no
+      // `actual_status`; the raw value is read from the table, as the sibling withdrawal case does.
+      const stored = await sql<{ status: string }>(`SELECT status FROM threat_events WHERE id=$1`, [eventId]);
+      expect(stored.rows[0]!.status).toBe('expired');
+      // The territory fold is fed the same rows, so the oblast keeps its polygon with it.
+      const snapshot = await getJson('/api/v1/snapshot');
+      expect(snapshot.threats.map((row: any) => row.id)).toEqual([eventId]);
+
+      // The row leaves when the hold expires, not before — the same instant the frame is released.
+      await sql(`UPDATE threat_events SET ended_at = now() - interval '20 seconds' WHERE id=$1`, [eventId]);
+      expect(await getJson('/api/v1/threats')).toEqual([]);
+    });
+
     it('withholds a threat created inside the cutoff, and its vector chain with it', async () => {
       const eventId = await seedThreat({ createdAgoSeconds: 0 });
       await attachLocation(eventId, OBLAST, 0);
@@ -592,6 +737,104 @@ describe.skipIf(!integrationDatabaseAvailable)('publication mode', () => {
       await setMode('live');
 
       expect((await getResponse(`/api/v1/threats/${eventId}`)).status).toBe(200);
+    });
+
+    it('answers /threats/:id with the same as-of-cutoff world the map is drawing', async () => {
+      // The dialog is opened FROM the polygon the map is drawing, so the two are read in the same
+      // slice by the same person, seconds apart. Serving the raw row here put «стан: відкликано» and
+      // an `ended_at` next to an orange «активна загроза» polygon, published the withdrawal reason
+      // and the verbatim text of a source message the hold was still withholding everywhere else,
+      // and made two public endpoints disagree about one event inside one slice.
+      const eventId = await seedThreat({ createdAgoSeconds: 300, status: 'withdrawn', endedAgoSeconds: 0 });
+      await attachLocation(eventId, OBLAST, 300);
+      await attachLocation(eventId, 'ua-53', 0);
+      await sql(
+        `INSERT INTO event_updates(event_id,previous_status,new_status,previous_evidence_level,
+           new_evidence_level,reason,created_at)
+         VALUES ($1,'active','withdrawn','monitoring','monitoring','last_source_assertion_withdrawn',now())`,
+        [eventId]
+      );
+      const oldMessage = await seedSourceMessage({ externalId: 'detail-old', publishedAgoSeconds: 300 });
+      const newMessage = await seedSourceMessage({
+        externalId: 'detail-new', publishedAgoSeconds: 0, text: 'Свіже повідомлення, ще під витримкою.'
+      });
+      await sql(
+        `INSERT INTO event_evidence(event_id,source_message_id,evidence_role,attached_at) VALUES
+           ($1,$2,'initial', now() - interval '300 seconds'),
+           ($1,$3,'corroboration', now())`,
+        [eventId, oldMessage, newMessage]
+      );
+
+      await setMode('delayed_15s');
+      const held = await getJson(`/api/v1/threats/${eventId}`);
+
+      expect(held.status).toBe('active');
+      expect(held.actual_status).toBe('withdrawn');
+      expect(held.ended_at).toBeNull();
+      expect(held.updates).toEqual([]);
+      expect(held.evidence.map((row: any) => row.external_id)).toEqual(['detail-old']);
+      expect(JSON.stringify(held)).not.toContain('ще під витримкою');
+      expect(held.locations.map((location: any) => location.id)).toEqual([OBLAST]);
+      // And the list endpoint agrees with the dialog opened from it, on the same slice.
+      const list = await getJson('/api/v1/threats');
+      expect(list[0].sources).toHaveLength(1);
+      expect(list[0].locations.map((location: any) => location.id)).toEqual([OBLAST]);
+
+      await setMode('live');
+      const now = await getJson(`/api/v1/threats/${eventId}`);
+
+      expect(now.status).toBe('withdrawn');
+      expect(now.ended_at).not.toBeNull();
+      expect(now.updates.map((row: any) => row.new_status)).toEqual(['withdrawn']);
+      expect(now.evidence.map((row: any) => row.external_id).sort()).toEqual(['detail-new', 'detail-old']);
+      expect(now.locations.map((location: any) => location.id).sort()).toEqual([OBLAST, 'ua-53'].sort());
+    });
+
+    it('projects the threat status as of the cutoff in /history too', async () => {
+      // Same leak, different surface: `/api/v1/history` gates `created_at` and then shipped the raw
+      // `status`/`ended_at`, so the archive announced the withdrawal while the map still drew it.
+      const eventId = await seedThreat({ createdAgoSeconds: 300, status: 'withdrawn', endedAgoSeconds: 0 });
+      await attachLocation(eventId, OBLAST, 300);
+
+      await setMode('delayed_15s');
+      const held = await getJson('/api/v1/history');
+
+      expect(held.items).toHaveLength(1);
+      expect(held.items[0].status).toBe('active');
+      expect(held.items[0].actual_status).toBe('withdrawn');
+      expect(held.items[0].ended_at).toBeNull();
+
+      await setMode('live');
+      expect((await getJson('/api/v1/history')).items[0].status).toBe('withdrawn');
+    });
+
+    it('keeps the territory timeline on the as-of-cutoff status, prose included', async () => {
+      // «Історія» renders `title` and `summary` verbatim, and the terminal strings are literal
+      // all-clear prose. Deriving them from `a.status` published «Зафіксовано офіційний відбій.» in
+      // one tab of the territory dialog while the sibling «Стан зараз» tab, fed by the same slice,
+      // still showed the alert running and the map still painted the polygon.
+      await seedAlert({ publishedAgoSeconds: 300, status: 'ended', endedAgoSeconds: 0 });
+
+      await setMode('delayed_15s');
+      const timeline = await getJson(`/api/v1/locations/${OBLAST}/timeline`);
+      const alert = timeline.items.find((item: any) => item.kind === 'alert');
+
+      expect(alert).toBeDefined();
+      expect(alert.status).toBe('active');
+      expect(alert.actual_status).toBe('ended');
+      expect(alert.title).toBe('Офіційна тривога');
+      expect(alert.summary).not.toContain('відбій');
+      // The end instant itself rides in `valid_until` on this row and is held with the prose.
+      expect(alert.valid_until).toBeNull();
+
+      await setMode('live');
+      const live = await getJson(`/api/v1/locations/${OBLAST}/timeline`);
+      const cleared = live.items.find((item: any) => item.kind === 'alert');
+
+      expect(cleared.status).toBe('ended');
+      expect(cleared.title).toBe('Офіційна тривога завершена');
+      expect(cleared.summary).toContain('відбій');
+      expect(cleared.valid_until).not.toBeNull();
     });
 
     it('keeps an assessment superseded after the cutoff as the current one', async () => {
@@ -619,6 +862,79 @@ describe.skipIf(!integrationDatabaseAvailable)('publication mode', () => {
       await setMode('live');
       const live = await getJson('/api/v1/threats');
       expect(live[0].locations.map((location: any) => location.id).sort()).toEqual([OBLAST, 'ua-53'].sort());
+    });
+
+    it('holds a district a later message added to an already-published chain', async () => {
+      // `liveThreats` holds a district attached to a published event, and the chain overlay used to
+      // draw straight into it: `reportedVectorsForLiveEvents` gated the EVENT and then expanded the
+      // whole classification archive for it. The result was a node, a transit line and a legend entry
+      // naming a place the map was simultaneously refusing to fill or icon.
+      const { processMessage, resetMonitorCoalescing } = await import('../../src/services/ingestion.js');
+      resetMonitorCoalescing();
+      const now = Date.now();
+      await processMessage({
+        sourceId: 'osint-aeris-rimor', externalId: 'chain-1', publishedAt: new Date(now - 8 * 60_000),
+        text: 'Балістика повз Суми на Полтаву.', rawPayload: { test: true }
+      }, { monitor: true });
+      await processMessage({
+        sourceId: WAR_MONITOR, externalId: 'chain-2', publishedAt: new Date(now - 4 * 60_000),
+        text: 'Балістика повз Полтаву на Харків.', rawPayload: { test: true }
+      }, { monitor: true });
+      const events = await sql<{ id: string }>(`SELECT id FROM threat_events`);
+      expect(events.rowCount, 'both messages must land on one event').toBe(1);
+
+      // Age everything past the hold, then put the SECOND message's receipt instant — and the
+      // district it brought — back to now. That is a chain extension of an event the map is already
+      // drawing, which is the case the event-level gate cannot see.
+      await sql(`UPDATE threat_events SET created_at = now() - interval '120 seconds'`);
+      await sql(`UPDATE threat_event_locations SET created_at = now() - interval '120 seconds'`);
+      await sql(`UPDATE message_classifications SET classified_at = now() - interval '120 seconds'`);
+      await sql(`UPDATE message_classifications SET classified_at = now() WHERE source_id=$1`, [WAR_MONITOR]);
+      await sql(`UPDATE threat_event_locations SET created_at = now() WHERE location_id='ua-city-kharkiv'`);
+
+      await setMode('delayed_15s');
+      const held = await getJson('/api/v1/vectors');
+      const heldDetail = await getJson(`/api/v1/threats/${events.rows[0]!.id}/vector`);
+
+      expect(held.items).toHaveLength(1);
+      expect(held.items[0].nodes.map((node: any) => node.locationId)).toEqual(['ua-city-sumy', 'ua-city-poltava']);
+      expect(JSON.stringify(held.items)).not.toContain('Харків');
+      // `/threats/:id/vector` gates the EVENT and then returned the unbounded chain — the same leak
+      // through a route that had the slice in its hand already.
+      expect(heldDetail.nodes.map((node: any) => node.locationId)).toEqual(['ua-city-sumy', 'ua-city-poltava']);
+      expect((await getJson('/api/v1/threats'))[0].locations.map((l: any) => l.id))
+        .not.toContain('ua-city-kharkiv');
+
+      await setMode('live');
+      const live = await getJson('/api/v1/vectors');
+      expect(live.items[0].nodes.map((node: any) => node.locationId))
+        .toEqual(['ua-city-sumy', 'ua-city-poltava', 'ua-city-kharkiv']);
+      expect((await getJson('/api/v1/threats'))[0].locations.map((l: any) => l.id))
+        .toContain('ua-city-kharkiv');
+    }, 60_000);
+
+    it('holds a freshly classified message out of the public attack analytics', async () => {
+      // The window end is a bound on `published_at`, which is the SOURCE's own timestamp. A message
+      // published sixty seconds before we received it is already older than a `now()-15s` window end,
+      // so gating the hold on that column held nothing at all — a side channel around the fifteen
+      // seconds `/threats`, `/vectors` and the SSE frame were applying to the very same message.
+      const { resetAttackAnalyticsCache } = await import('../../src/services/attack-analytics.js');
+      resetAttackAnalyticsCache();
+      const messageId = await seedSourceMessage({ externalId: 'analytics-late', publishedAgoSeconds: 60 });
+      await sql(
+        `INSERT INTO message_classifications(source_message_id,source_id,classifier_version,published_at,
+           classified_at,decision,intent,created_event,threat_type)
+         VALUES ($1,$2,'test', now() - interval '60 seconds', now(),'event_created','threat',true,'uav')`,
+        [messageId, WAR_MONITOR]
+      );
+
+      await setMode('delayed_15s');
+      const held = await getJson('/api/v1/analytics/attacks?period=day');
+      expect(held.totals.messages).toBe(0);
+
+      await setMode('live');
+      const live = await getJson('/api/v1/analytics/attacks?period=day');
+      expect(live.totals.messages).toBe(1);
     });
 
     it('ends the attack-analytics window at the cutoff and re-keys the memo on a flip', async () => {
@@ -654,6 +970,7 @@ describe.skipIf(!integrationDatabaseAvailable)('publication mode', () => {
     });
 
     it('states the mode in /methodology and appends the fourth caveat only when delayed', async () => {
+      const { config } = await import('../../src/config.js');
       const live = await getJson('/api/v1/methodology');
       expect(live.publication).toEqual({ mode: 'live', delaySeconds: 0 });
       expect(live.caveats).toHaveLength(3);
@@ -661,11 +978,38 @@ describe.skipIf(!integrationDatabaseAvailable)('publication mode', () => {
       await setMode('delayed_15s');
       const delayed = await getJson('/api/v1/methodology');
 
-      expect(delayed.publication).toEqual({ mode: 'delayed_15s', delaySeconds: 15 });
+      expect(delayed.publication).toEqual({ mode: 'delayed_15s', delaySeconds: config.PUBLICATION_DELAY_SECONDS });
       expect(delayed.caveats).toHaveLength(4);
       // APPENDED, never inserted: a client rendering `caveats[2]` keeps rendering the same sentence.
       expect(delayed.caveats.slice(0, 3)).toEqual(live.caveats);
       expect(delayed.caveats[3]).toContain('Публічний показ затримано');
+      // The number in the prose is the number in the payload. `PUBLICATION_DELAY_SECONDS` is a
+      // supported 5..60 knob, so a hardcoded «15 секунд» is a document that its own response
+      // disproves on any deployment that tunes the hold.
+      expect(delayed.caveats[3]).toContain(String(config.PUBLICATION_DELAY_SECONDS));
+      // Read from the SOURCE as well, because the default hold is 15 and a hardcoded literal would
+      // satisfy the assertion above by coincidence on this deployment and on no other — which is
+      // exactly how the hardcoded sentence survived the suite in the first place.
+      const source = await readFile(resolve(process.cwd(), 'src/api/server.ts'), 'utf8');
+      expect(source).toContain('Публічний показ затримано на ${delaySeconds} с');
+      expect(source).not.toContain('Публічний показ затримано на 15');
+    });
+
+    it('lets migration 022 run its whole-table backfills without the runtime statement timeout', async () => {
+      // The migration runner hands each file to the ordinary application connection, whose session
+      // GUC is `statement_timeout = 15s`, inside a transaction it opened itself — and `src/index.ts`
+      // awaits `migrate()` before `buildServer()`. 022 is the first migration to rewrite whole tables
+      // that have no retention policy, so on a grown installation a timeout here is not a slow deploy
+      // but a container that never reaches listen(), retried forever into an ever more bloated table.
+      // `SET LOCAL` reverts at COMMIT, so no other migration and no runtime statement is affected.
+      const source = await readFile(resolve(process.cwd(), 'migrations/022_publication_runtime.sql'), 'utf8');
+      const lift = source.indexOf('SET LOCAL statement_timeout = 0;');
+      expect(lift, 'migration 022 must lift the statement timeout for its own transaction').toBeGreaterThan(-1);
+      expect(source).toContain("SET LOCAL lock_timeout = '10s';");
+      // Before the first statement that rewrites a table, not merely somewhere in the file.
+      expect(lift).toBeLessThan(source.indexOf('UPDATE alert_periods'));
+      expect(lift).toBeLessThan(source.indexOf('UPDATE threat_event_locations'));
+      expect(lift).toBeLessThan(source.indexOf('ALTER COLUMN published_at SET NOT NULL'));
     });
   });
 

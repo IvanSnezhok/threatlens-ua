@@ -35,7 +35,7 @@ export interface PublicationSlice {
   delaySeconds: number;
   /** Postgres `now()` − delaySeconds, clamped to `mode_changed_at`. */
   cutoffAt: Date;
-  /** max(version) among rows with `created_at <= cutoffAt`. */
+  /** The highest version below the OLDEST row still being held — see {@link publicationSlice}. */
   cutoffVersion: number;
   /** max(created_at) among rows with `created_at <= cutoffAt`. */
   lastPublishedEventAt: Date | null;
@@ -204,15 +204,34 @@ export async function publicationSlice(): Promise<PublicationSlice> {
   // air-raid alert opened five seconds before the flip fails `published_at <= cutoff` and vanishes
   // from the public map for the length of the hold. That is the one thing this system may never do.
   //
-  // NO `max(...) FILTER (...)`. PostgreSQL's MIN/MAX→index rewrite (preprocess_minmax_aggregates /
-  // can_minmax_aggs) bails out for any aggregate carrying an aggfilter, and it is all-or-nothing for
-  // the whole query — so the FILTER form plans as a Seq Scan + Aggregate over the WHOLE
-  // `system_event_log`, a table with no retention that grows one row per event forever, on every
-  // snapshot, every stream connection and every GET /ops/api/runtime, against `max: 12` connections
-  // under a 15 s statement_timeout. Each subselect below is one index probe: the primary key on
-  // `version` and `system_event_log_created_idx (created_at DESC)` from migration 003. If this ever
-  // needs changing, run EXPLAIN first — `tests/integration/publication-mode.test.ts` asserts the
-  // plan contains no Seq Scan on system_event_log.
+  // `cutoff_version` is the version just BELOW the OLDEST row still being held, not the newest row
+  // already releasable. The two differ because `version` is a sequence value taken at INSERT while
+  // `created_at` defaults to `now()` = transaction START: a long write transaction that appends its
+  // log rows at the end of its life produces HIGH versions carrying an OLD created_at, and the
+  // moment they become visible `max(version) WHERE created_at <= cutoff` jumps above every
+  // short-transaction row that committed in between with a LOWER version and a NEWER created_at.
+  // Those rows are then released by `version <= cutoff_version` with no time check of their own —
+  // published before their own hold elapsed, which is the whole thing this module exists to prevent.
+  // Stopping strictly before the first held row makes that impossible by construction: every version
+  // at or below the bound is below every row whose created_at is past the cutoff, so its own
+  // created_at is necessarily at or before the cutoff.
+  //
+  // Drop-free as well as leak-free: `src/services/sse.ts` only ever advances its cursor to a version
+  // it actually emitted, and the bound is monotone as the cutoff advances, so it stops before a held
+  // row instead of straddling it. In `live` mode the cutoff is `now()`, no VISIBLE row can carry a
+  // created_at newer than the reading transaction's own start, the first subselect is NULL and the
+  // expression degenerates to `max(version)` — today's value, byte for byte.
+  //
+  // NO `max(...) FILTER (...)` and no `min(...)`. PostgreSQL's MIN/MAX→index rewrite
+  // (preprocess_minmax_aggregates / can_minmax_aggs) bails out for any aggregate carrying an
+  // aggfilter, and it is all-or-nothing for the whole query — so the FILTER form plans as a Seq Scan
+  // + Aggregate over the WHOLE `system_event_log`, a table with no retention that grows one row per
+  // event forever, on every snapshot, every stream connection and every GET /ops/api/runtime,
+  // against `max: 12` connections under a 15 s statement_timeout. Each subselect below is one index
+  // probe: the primary key on `version` and `system_event_log_created_idx (created_at DESC)` from
+  // migration 003. If this ever needs changing, run EXPLAIN first —
+  // `tests/integration/publication-mode.test.ts` asserts the plan contains no Seq Scan on
+  // system_event_log.
   const result = await pool.query<{
     cutoff_at: Date; cutoff_version: string; last_published_at: Date | null; head_version: string;
   }>(
@@ -220,8 +239,10 @@ export async function publicationSlice(): Promise<PublicationSlice> {
        SELECT GREATEST(now() - make_interval(secs => $1::int), $2::timestamptz) AS cutoff_at
      )
      SELECT b.cutoff_at,
-            COALESCE((SELECT l.version FROM system_event_log l
-                       WHERE l.created_at <= b.cutoff_at
+            COALESCE((SELECT l.version - 1 FROM system_event_log l
+                       WHERE l.created_at > b.cutoff_at
+                       ORDER BY l.version LIMIT 1),
+                     (SELECT l.version FROM system_event_log l
                        ORDER BY l.version DESC LIMIT 1), 0)::bigint    AS cutoff_version,
             (SELECT l.created_at FROM system_event_log l
               WHERE l.created_at <= b.cutoff_at

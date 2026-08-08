@@ -223,8 +223,21 @@ async function recordFailedRun(input: unknown, error: unknown): Promise<void> {
   );
 }
 
-async function callModel(location: { id: string; name_uk: string }, threatType: string, signals: RiskSignalRow[]): Promise<ModelAssessment> {
-  if (!config.AI_BASE_URL || !config.AI_API_KEY || !config.AI_MODEL) {
+/**
+ * One group's assessment, from the configured model when this pass is allowed to spend it.
+ *
+ * `allowModel` is a *budget*, not a feature switch. The model is called once per
+ * `(location_id, threat_type)` group and one nationwide message fans out to every oblast for six
+ * hours, so a caller that runs far more often than the fifteen-minute scheduler has to be able to
+ * say "re-score everything, but not with the model this time". Declining it is not a degradation of
+ * the contract: {@link fallbackAssessment} is the deployed default wherever `AI_*` is unset and
+ * already produces a complete, clamped, Ukrainian assessment.
+ */
+async function callModel(
+  location: { id: string; name_uk: string }, threatType: string, signals: RiskSignalRow[],
+  allowModel: boolean
+): Promise<ModelAssessment> {
+  if (!allowModel || !config.AI_BASE_URL || !config.AI_API_KEY || !config.AI_MODEL) {
     return fallbackAssessment(location, threatType, signals);
   }
   const input = {
@@ -307,6 +320,18 @@ export interface RiskRunOutcome {
   skipped: boolean;
 }
 
+export interface RiskRunOptions {
+  /**
+   * Whether this pass may spend the configured `AI_*` model, one call per group.
+   *
+   * Defaults to **true**, so `startRiskScheduler` and `POST /ops/run-assessment` — both of which run
+   * at most every fifteen minutes — are unchanged. The event-driven recompute passes `false` on the
+   * intermediate passes it runs in between, because it can run up to once a minute and the model leg
+   * has no other bound. See the risk leg of `recomputeAnalytics` for the cadence this implements.
+   */
+  allowModel?: boolean;
+}
+
 /**
  * The guarded entry point. It exists separately from {@link runRiskAssessments} because the
  * analytics scheduler has to count a blocked leg
@@ -314,11 +339,11 @@ export interface RiskRunOutcome {
  * `Promise<number>` cannot express "blocked" — while changing that signature would move
  * `POST /ops/run-assessment`, and importing the scheduler's counter here would close a cycle.
  */
-export async function runRiskAssessmentsGuarded(): Promise<RiskRunOutcome> {
+export async function runRiskAssessmentsGuarded(options: RiskRunOptions = {}): Promise<RiskRunOutcome> {
   if (riskRunInFlight) return { published: 0, skipped: true };
   riskRunInFlight = true;
   try {
-    return { published: await runRiskAssessmentsPass(), skipped: false };
+    return { published: await runRiskAssessmentsPass(options.allowModel ?? true), skipped: false };
   } finally {
     riskRunInFlight = false;
   }
@@ -334,7 +359,7 @@ export function resetRiskRunGuard(): void {
   riskRunInFlight = false;
 }
 
-async function runRiskAssessmentsPass(): Promise<number> {
+async function runRiskAssessmentsPass(allowModel: boolean): Promise<number> {
   const modelVersion = config.AI_MODEL || 'rule-fallback-v2';
   await pool.query(
     `UPDATE risk_assessments SET expires_at=now()
@@ -365,7 +390,7 @@ async function runRiskAssessmentsPass(): Promise<number> {
     )).rows;
     const signals = rawSignals.map((signal) => ({ ...signal, effective_contribution: effectiveContribution(signal) }));
     try {
-      const raw = await callModel(location, group.threat_type, signals);
+      const raw = await callModel(location, group.threat_type, signals, allowModel);
       const assessment = clampAssessment(raw, signals, group.location_id, group.threat_type);
       const previous = await pool.query(
         `SELECT * FROM risk_assessments WHERE location_id=$1 AND threat_type=$2 AND published=true

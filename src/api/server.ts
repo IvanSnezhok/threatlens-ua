@@ -166,12 +166,19 @@ export async function buildServer() {
       publication: { mode, delaySeconds },
       // The three existing caveats keep their text and their order; the fourth is APPENDED, never
       // inserted, so a client that renders `caveats[2]` keeps rendering the same sentence.
+      //
+      // The hold length is INTERPOLATED, never spelled out: `PUBLICATION_DELAY_SECONDS` is validated
+      // at 5..60 in `src/config.ts` precisely so a staging deployment can prove the mechanism at five
+      // seconds, and a hardcoded «15 секунд» would make this document contradict the
+      // `publication.delaySeconds` field two lines above it in the same response. «с» rather than
+      // «секунд» sidesteps Ukrainian plural agreement at 22/33/…; the `delayed_15s` enum name is an
+      // identifier, not a claim, and stays as it is.
       caveats: [
         'Індикативний відсоток є шкалою індексу, а не статистичною ймовірністю.',
         'Система не прогнозує ціль, влучання або точну траєкторію.',
         'Низький індекс не означає безпеку та не скасовує офіційні вказівки.',
         ...(mode === 'delayed_15s'
-          ? ['Публічний показ затримано на 15 секунд за рішенням оператора. Збір і класифікація не затримуються.']
+          ? [`Публічний показ затримано на ${delaySeconds} с за рішенням оператора. Збір і класифікація не затримуються.`]
           : [])
       ]
     };
@@ -292,10 +299,20 @@ export async function buildServer() {
     // `$8` is the publication cutoff, and it gates `created_at`, never `started_at`: `started_at` is
     // the reported real-world time and can precede our discovery of the event by minutes, so a
     // back-dated report would walk straight past any hold.
+    //
+    // `status` and `ended_at` carry the same as-of-cutoff projection `liveThreats` applies, for the
+    // same reason: a threat withdrawn three seconds ago is still on the map as «активна загроза» in
+    // this slice, and shipping the raw terminal value here would publish the all-clear ahead of the
+    // SSE frame that carries it. `actual_status` keeps the truth for /ops and for tests.
     const slice = await publicationSlice();
     const result = await pool.query(
       `${relatedLocationsCte()}
-       SELECT DISTINCT e.id,e.threat_type,e.status,e.evidence_level,e.title,e.summary,e.started_at,e.last_observed_at,e.ended_at
+       SELECT DISTINCT e.id,e.threat_type,
+              CASE WHEN e.status IN ('expired','withdrawn','corrected') AND e.ended_at > $8
+                   THEN 'active' ELSE e.status END AS status,
+              e.status AS actual_status,
+              e.evidence_level,e.title,e.summary,e.started_at,e.last_observed_at,
+              CASE WHEN e.ended_at > $8 THEN NULL ELSE e.ended_at END AS ended_at
        FROM threat_events e LEFT JOIN threat_event_locations el ON el.event_id=e.id
        WHERE ($1::text IS NULL OR EXISTS (SELECT 1 FROM related_locations r WHERE r.id=el.location_id))
          AND ($2::text IS NULL OR e.threat_type=$2)

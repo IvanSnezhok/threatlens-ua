@@ -131,23 +131,44 @@ describe('the outbound envelope', () => {
 });
 
 describe('the hub statements', () => {
+  // The two statements bind the mode-flip clamp at different positions — the poll carries the cursor
+  // as `$1` — so the placeholder is a parameter of the check rather than part of it.
+  const headBound = (statement: string, modeChangedAtParam: string) => {
+    // The head is the version just BELOW the OLDEST row still held, never `max(version) WHERE
+    // created_at <= cutoff`. Those two differ whenever version order and created_at order diverge —
+    // a long write transaction takes a HIGH version at INSERT while carrying its transaction-START
+    // created_at — and the `max` shape then releases every lower-versioned, newer-created row that
+    // committed in between, with no time check of its own. Asserting the DIRECTION of the comparison
+    // is what pins that: `created_at >` cannot be rewritten back to `created_at <=` by accident.
+    expect(statement).toContain('created_at > GREATEST(now() - make_interval');
+    expect(statement).toContain(`${modeChangedAtParam}::timestamptz`);
+    expect(statement).toContain('version - 1');
+    expect(statement).toContain('ORDER BY version LIMIT 1');
+    // The fallback branch: with nothing held (live mode, or an empty tail) the bound degenerates to
+    // the unbounded max(version), which is the byte-identical-behaviour argument for the switch-off
+    // state.
+    expect(statement).toContain('ORDER BY version DESC LIMIT 1');
+    expect(statement).not.toContain('created_at <=');
+  };
+
   it('the hub query is head-bounded in both directions', () => {
     // A per-row `created_at` predicate would let the cursor advance past a row that was not yet
     // releasable and drop it forever. Both halves of the bound have to be in the statement.
     const poll = SSE_SOURCE.slice(SSE_SOURCE.indexOf('WITH head AS'), SSE_SOURCE.indexOf('ORDER BY l.version LIMIT 200'));
-    expect(poll).toContain('version > ');
-    expect(poll).toContain('version <= ');
+    expect(poll).toContain('l.version > ');
+    expect(poll).toContain('l.version <= head.v');
     expect(poll).toContain('GREATEST(');
+    headBound(poll, '$3');
   });
 
-  it('the first-tick cursor query carries the same cutoff', () => {
+  it('the first-tick cursor query carries the same cutoff, in the same direction', () => {
     // Initialising to the unbounded max(version) while the stored mode is delayed_15s would put the
     // cursor above everything written in the last `delaySeconds` before the restart, and
-    // `lastVersion` only ever increases.
-    const start = SSE_SOURCE.indexOf('SELECT COALESCE((SELECT version FROM system_event_log');
-    const first = SSE_SOURCE.slice(start, start + 400);
-    expect(first).toContain('created_at <= GREATEST(now() - make_interval');
-    expect(first).toContain('$2::timestamptz');
+    // `lastVersion` only ever increases. The two statements must also agree with each other: a
+    // first tick bounded differently from every later tick is a hold that depends on uptime.
+    const start = SSE_SOURCE.indexOf('SELECT COALESCE((SELECT version - 1 FROM system_event_log');
+    expect(start, 'the first-tick cursor query must still be one template literal').toBeGreaterThan(-1);
+    headBound(SSE_SOURCE.slice(start, start + 400), '$2');
   });
 });
 

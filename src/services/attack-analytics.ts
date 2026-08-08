@@ -87,12 +87,31 @@ export interface AttackWindow {
   to: Date;
   /** Start of the equally long window immediately before `from`, for the trend comparison. */
   previousFrom: Date;
+  /**
+   * The publication cutoff — a bound on `message_classifications.classified_at`, i.e. on WHEN WE
+   * LEARNED of a message, and a separate axis from `from`/`to`, which bound `published_at`.
+   *
+   * The two must not be conflated. `published_at` is the source's own timestamp (migration 012:
+   * «Publication time, not receipt time»), so bounding the hold with it holds nothing the moment
+   * ingestion lag exceeds the hold, and holds nothing at all for an edited message or a post-
+   * disconnect catch-up, both of which are re-processed with the ORIGINAL publication time. The
+   * analytical question («when did the enemy act») and the publication question («when did this
+   * become a fact we may publish») are different questions about different columns.
+   */
+  cutoffAt: Date;
   bucketMinutes: number;
   timezone: string;
 }
 
-/** Where a period starts and ends. `to` is the request instant; nothing is rounded to a calendar day. */
-export function resolveAttackWindow(period: AttackPeriod, now: Date = new Date()): AttackWindow {
+/**
+ * Where a period starts and ends. `to` is the request instant; nothing is rounded to a calendar day.
+ *
+ * `cutoffAt` defaults to `now`, which is what `live` mode's cutoff is — so every existing caller and
+ * every unit fixture keeps the statement it had, with a predicate that is true for every visible row.
+ */
+export function resolveAttackWindow(
+  period: AttackPeriod, now: Date = new Date(), cutoffAt: Date = now
+): AttackWindow {
   const shape = PERIOD_SHAPE[period];
   const span = shape.days * 86_400_000;
   const to = new Date(now.getTime());
@@ -101,6 +120,7 @@ export function resolveAttackWindow(period: AttackPeriod, now: Date = new Date()
     from: new Date(to.getTime() - span),
     to,
     previousFrom: new Date(to.getTime() - span * 2),
+    cutoffAt: new Date(cutoffAt.getTime()),
     bucketMinutes: shape.bucketMinutes,
     timezone: config.APP_TIMEZONE
   };
@@ -713,7 +733,12 @@ WITH RECURSIVE base AS (
          mc.direction_text, (mc.published_at >= $2) AS is_current,
          ${TYPES_EXPRESSION} AS types
   FROM message_classifications mc
-  WHERE mc.published_at >= $1 AND mc.published_at < $3 AND mc.decision = ANY($4::text[])
+  -- published_at bounds the WINDOW, classified_at bounds the HOLD. See AttackWindow.cutoffAt:
+  -- gating the hold on the publisher's own timestamp lets a message we learned of a second ago into
+  -- the public aggregate the moment it is classified, which is a side channel around the fifteen
+  -- seconds every other public surface is applying to the very same message.
+  WHERE mc.published_at >= $1 AND mc.published_at < $3 AND mc.classified_at <= $6
+    AND mc.decision = ANY($4::text[])
 ),
 placed AS (
   SELECT b.id, cl.location_id
@@ -768,7 +793,7 @@ SELECT * FROM (
 ORDER BY 1, 4 DESC, 2`;
 
   return (await pool.query<DimensionRow>(sql, [
-    window.previousFrom, window.from, window.to, ASSERTING_DECISIONS, window.timezone
+    window.previousFrom, window.from, window.to, ASSERTING_DECISIONS, window.timezone, window.cutoffAt
   ])).rows;
 }
 
@@ -779,7 +804,9 @@ WITH bucketed AS (
          to_timestamp(floor(EXTRACT(EPOCH FROM mc.published_at) / $3::double precision) * $3::double precision) AS at,
          ${TYPES_EXPRESSION} AS types
   FROM message_classifications mc
-  WHERE mc.published_at >= $1 AND mc.published_at < $2 AND mc.decision = ANY($4::text[])
+  -- Same two axes as dimensions() above: the window is published_at, the hold is classified_at.
+  WHERE mc.published_at >= $1 AND mc.published_at < $2 AND mc.classified_at <= $5
+    AND mc.decision = ANY($4::text[])
 )
 -- The spine carries the real first and last instant in each bucket, so wave boundaries are measured
 -- between messages instead of between bucket edges; see clusterWaves(). The per-class rows only
@@ -799,7 +826,7 @@ ORDER BY 1, 2 NULLS FIRST`;
   const rows = (await pool.query<{
     at: Date; threat_type: string | null; messages: number; events_raised: number;
     first_at: Date | null; last_at: Date | null;
-  }>(sql, [window.from, window.to, window.bucketMinutes * 60, ASSERTING_DECISIONS])).rows;
+  }>(sql, [window.from, window.to, window.bucketMinutes * 60, ASSERTING_DECISIONS, window.cutoffAt])).rows;
   return rows.map((row) => ({
     at: row.at.toISOString(),
     threatType: row.threat_type,
@@ -927,7 +954,8 @@ export function resetAttackAnalyticsCache(): void {
 }
 
 export async function attackAnalytics(
-  period: AttackPeriod, now: Date = new Date(), mode: PublicationMode = 'live'
+  period: AttackPeriod, now: Date = new Date(), mode: PublicationMode = 'live',
+  cutoffAt: Date = now
 ): Promise<AttackAnalytics> {
   // The publication mode is in the KEY, not only in the window. A flip moves the window end by the
   // hold length, and a memo keyed on the period alone would serve the other mode's answer for up to
@@ -937,7 +965,7 @@ export async function attackAnalytics(
   const cached = cache.get(key);
   if (cached && now.getTime() - cached.at < ATTACK_CACHE_TTL_MS) return cached.value;
 
-  const window = resolveAttackWindow(period, now);
+  const window = resolveAttackWindow(period, now, cutoffAt);
   const [rows, points] = await Promise.all([dimensions(window), timeline(window)]);
   const value = composeAttackAnalytics(window, rows, points, now);
   cache.set(key, { at: now.getTime(), value });
