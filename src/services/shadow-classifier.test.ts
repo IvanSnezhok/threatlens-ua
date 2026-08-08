@@ -1,0 +1,250 @@
+import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { classifyMessage } from '../domain/classifier.js';
+import type { ClassifiedMessage } from '../types.js';
+import {
+  deterministicVerdict, disagreementFields, normalizePlace, resetShadowRateLimit,
+  shadowClassify, withinRateLimit, type ShadowVerdict
+} from './shadow-classifier.js';
+
+const locations = [
+  { id: 'ua-80', name: 'Київ', aliases: ['києва', 'києві'] },
+  { id: 'ua-city-odesa', name: 'Одеса', aliases: ['одеси', 'одесі', 'одесу'] },
+  { id: 'ua-59', name: 'Сумська область', aliases: ['сумщина', 'сумщині'] }
+];
+
+const classify = (text: string): ClassifiedMessage => classifyMessage(text, locations);
+
+// The feature switch is a database read, and this suite has no database. `codexFeatureEnabled`
+// answers `false` when the query fails, and `false` is also the stored default for `shadow` — so the
+// switch is mocked on, and the "off" case gets its own test below.
+vi.mock('./codex-settings.js', () => ({
+  codexFeatureEnabled: vi.fn(async () => true)
+}));
+const { codexFeatureEnabled } = await import('./codex-settings.js');
+
+// The database write is the last thing `shadowClassify` does and is not what these tests are about;
+// what matters is that a failed write is reported as a skip and never thrown.
+const query = vi.fn(async () => ({ rows: [], rowCount: 0 }));
+vi.mock('../db/pool.js', () => ({ pool: { query: (...args: unknown[]) => query(...args as []) } }));
+
+function verdict(overrides: Partial<ShadowVerdict> = {}): ShadowVerdict {
+  return { threatType: 'uav', locations: ['Київ'], significant: true, confidence: 0.8, ...overrides };
+}
+
+/**
+ * A stand-in for {@link codexChat} with its real contract.
+ *
+ * The client never throws and never parses: it returns a discriminated result whose `content` is the
+ * raw model text. Mocking that shape rather than a convenience wrapper is the whole point — a mock
+ * that handed back a parsed object would let a change in how this module reads the reply pass every
+ * test here and fail in production.
+ */
+function chatReturning(value: unknown) {
+  return vi.fn(async () => ({
+    ok: true as const, content: JSON.stringify(value), model: 'test-model', durationMs: 5
+  }));
+}
+
+function chatFailing(reason: string) {
+  return vi.fn(async () => ({
+    ok: false as const, reason, detail: 'деталь для оператора', model: 'test-model', durationMs: 5
+  }));
+}
+
+const input = (text: string) => ({
+  sourceMessageId: '00000000-0000-4000-8000-000000000001',
+  publishedAt: new Date('2026-03-01T20:00:00Z'),
+  text,
+  classified: classify(text)
+});
+
+beforeEach(() => {
+  resetShadowRateLimit();
+  query.mockClear();
+  vi.mocked(codexFeatureEnabled).mockResolvedValue(true);
+});
+
+describe('normalizePlace', () => {
+  it('brings the two spellings of an oblast together', () => {
+    expect(normalizePlace('Сумська область')).toBe(normalizePlace('Сумській області'));
+    expect(normalizePlace('Сумська область')).toBe(normalizePlace('Сумщина'));
+  });
+
+  it('ignores the settlement prefix and the case ending', () => {
+    expect(normalizePlace('м. Одеса')).toBe(normalizePlace('Одесу'));
+  });
+
+  it('keeps two different places apart', () => {
+    expect(normalizePlace('Київ')).not.toBe(normalizePlace('Одеса'));
+  });
+});
+
+describe('disagreementFields', () => {
+  const deterministic = { threatType: 'uav', locationNames: ['Одеса'], significant: true };
+  const said = (overrides: Partial<ShadowVerdict> = {}) => verdict({ locations: ['Одеса'], ...overrides });
+
+  it('reports agreement when all three axes match', () => {
+    expect(disagreementFields(deterministic, said())).toEqual([]);
+  });
+
+  it('tolerates a different inflection of the same place', () => {
+    expect(disagreementFields(deterministic, said({ locations: ['Одесі'] }))).toEqual([]);
+  });
+
+  it('tolerates the oblast written the short way', () => {
+    expect(disagreementFields(
+      { ...deterministic, locationNames: ['Сумська область'] }, said({ locations: ['Сумщина'] })
+    )).toEqual([]);
+  });
+
+  it('names the class when the model filed the message differently', () => {
+    expect(disagreementFields(deterministic, said({ threatType: 'ballistic_missile' }))).toEqual(['threat_type']);
+  });
+
+  it('names significance when the two sides disagree about raising anything', () => {
+    expect(disagreementFields(deterministic, said({ significant: false }))).toContain('significance');
+  });
+
+  it('does not also count locations when significance already differs', () => {
+    // A withdrawal and a threat naming different places are one disagreement, not two: counting the
+    // location axis as well would inflate the disagreement report with a derived fact.
+    const fields = disagreementFields(deterministic, said({ significant: false, locations: ['Київ'] }));
+    expect(fields).toEqual(['significance']);
+  });
+
+  it('names locations when both agree the message matters but not about where', () => {
+    expect(disagreementFields(deterministic, said({ locations: ['Київ'] }))).toEqual(['locations']);
+  });
+});
+
+describe('deterministicVerdict', () => {
+  it('reads the three axes off a live classification', () => {
+    expect(deterministicVerdict(classify('Ударні БпЛА у напрямку Києва'))).toEqual({
+      threatType: 'uav', locationNames: ['Київ'], significant: true
+    });
+  });
+
+  it('marks a message that names no place as insignificant', () => {
+    expect(deterministicVerdict(classify('Шахед')).significant).toBe(false);
+  });
+});
+
+describe('withinRateLimit', () => {
+  it('allows exactly the budget and refuses the next call', () => {
+    const now = 1_000_000;
+    for (let call = 0; call < 3; call += 1) expect(withinRateLimit(now, 3)).toBe(true);
+    expect(withinRateLimit(now, 3)).toBe(false);
+  });
+
+  it('lets the budget recover once the minute has rolled past', () => {
+    const now = 1_000_000;
+    expect(withinRateLimit(now, 1)).toBe(true);
+    expect(withinRateLimit(now + 59_000, 1)).toBe(false);
+    expect(withinRateLimit(now + 61_000, 1)).toBe(true);
+  });
+});
+
+describe('shadowClassify', () => {
+  it('records agreement when the model reaches the same verdict', async () => {
+    const chat = chatReturning(verdict());
+    const outcome = await shadowClassify(input('Ударні БпЛА у напрямку Києва'), { chat: chat as never });
+    expect(outcome).toMatchObject({ status: 'recorded', agrees: true, fields: [] });
+    expect(chat).toHaveBeenCalledOnce();
+    expect(chat.mock.calls[0]![0]).toMatchObject({ promptVersion: 'shadow-classifier-v1', json: true });
+  });
+
+  it('audits the digest rather than the rendered prompt', async () => {
+    // `ai_runs.input` is what an operator reads back weeks later. The system prompt is a constant on
+    // every row; the message and the verdict it was compared against are the part worth storing.
+    const chat = chatReturning(verdict());
+    await shadowClassify(input('Ударні БпЛА у напрямку Києва'), { chat: chat as never });
+    expect(chat.mock.calls[0]![0].auditInput).toMatchObject({
+      text: 'Ударні БпЛА у напрямку Києва',
+      deterministic: { threatType: 'uav', locationNames: ['Київ'], significant: true }
+    });
+  });
+
+  it('records a disagreement and the axis it is on', async () => {
+    const chat = chatReturning(verdict({ threatType: 'ballistic_missile' }));
+    const outcome = await shadowClassify(input('Ударні БпЛА у напрямку Києва'), { chat: chat as never });
+    expect(outcome).toMatchObject({ status: 'recorded', agrees: false, fields: ['threat_type'] });
+  });
+
+  it('writes the comparison with agrees and both verdicts', async () => {
+    await shadowClassify(input('Ударні БпЛА у напрямку Києва'), { chat: chatReturning(verdict()) as never });
+    const [sql, params] = query.mock.calls[0]! as unknown as [string, unknown[]];
+    expect(sql).toContain('INSERT INTO shadow_classifications');
+    expect(params).toContain(true); // agrees
+    expect(params).toContain('uav');
+    expect(params).toContain('test-model'); // the model the client says it actually used
+  });
+
+  it('stays silent when the client reports a failed call, and never rethrows', async () => {
+    const chat = chatFailing('endpoint_error');
+    const outcome = await shadowClassify(input('Ударні БпЛА у напрямку Києва'), { chat: chat as never });
+    expect(outcome).toEqual({ status: 'skipped', reason: 'model_failed' });
+    expect(query).not.toHaveBeenCalled();
+  });
+
+  it('tells a missing configuration apart from a misbehaving model', async () => {
+    // The distinction costs one set lookup and is the difference between "nobody ever signed in" and
+    // "the model is having a bad night" — which decide whether an operator opens /ops or their quota.
+    const outcome = await shadowClassify(input('Ударні БпЛА у напрямку Києва'), { chat: chatFailing('no_session') as never });
+    expect(outcome).toEqual({ status: 'skipped', reason: 'no_provider' });
+  });
+
+  it('stays silent when the model answers with something that is not a verdict', async () => {
+    // Prose where JSON was asked for, or a threat class that does not exist. Both are the same kind
+    // of failure and neither may reach the table: a corpus with invented labels is worse than none.
+    const outcome = await shadowClassify(input('Ударні БпЛА у напрямку Києва'), {
+      chat: chatReturning({ threatType: 'дрони', locations: [], significant: 'yes' }) as never
+    });
+    expect(outcome).toEqual({ status: 'skipped', reason: 'model_failed' });
+    expect(query).not.toHaveBeenCalled();
+  });
+
+  it('stays silent when the reply is not JSON at all', async () => {
+    const chat = vi.fn(async () => ({ ok: true as const, content: 'Схоже на шахед.', model: 'test-model', durationMs: 5 }));
+    expect(await shadowClassify(input('Ударні БпЛА у напрямку Києва'), { chat: chat as never }))
+      .toEqual({ status: 'skipped', reason: 'model_failed' });
+    expect(query).not.toHaveBeenCalled();
+  });
+
+  it('does not call the model at all when the switch is off', async () => {
+    vi.mocked(codexFeatureEnabled).mockResolvedValue(false);
+    const chat = chatReturning(verdict());
+    expect(await shadowClassify(input('Ударні БпЛА у напрямку Києва'), { chat: chat as never }))
+      .toEqual({ status: 'skipped', reason: 'disabled' });
+    expect(chat).not.toHaveBeenCalled();
+  });
+
+  it('asks the switch by its own name and not by another feature\'s', async () => {
+    await shadowClassify(input('Ударні БпЛА у напрямку Києва'), { chat: chatReturning(verdict()) as never });
+    expect(vi.mocked(codexFeatureEnabled)).toHaveBeenCalledWith('shadow');
+  });
+
+  it('drops messages over the per-minute budget instead of queueing them', async () => {
+    const chat = chatReturning(verdict());
+    const message = input('Ударні БпЛА у напрямку Києва');
+    const limit = 6; // SHADOW_CLASSIFIER_MAX_PER_MINUTE default
+    for (let call = 0; call < limit; call += 1) {
+      expect((await shadowClassify(message, { chat: chat as never })).status).toBe('recorded');
+    }
+    expect(await shadowClassify(message, { chat: chat as never }))
+      .toEqual({ status: 'skipped', reason: 'rate_limited' });
+    expect(chat).toHaveBeenCalledTimes(limit);
+  });
+
+  it('reports a failed write as a skip rather than breaking the caller', async () => {
+    query.mockRejectedValueOnce(new Error('relation does not exist'));
+    const outcome = await shadowClassify(input('Ударні БпЛА у напрямку Києва'), { chat: chatReturning(verdict()) as never });
+    expect(outcome).toMatchObject({ status: 'skipped', reason: 'write_failed', agrees: true });
+  });
+
+  it('never spends a call on an empty message', async () => {
+    const chat = chatReturning(verdict());
+    expect(await shadowClassify({ ...input('Шахед'), text: '   ' }, { chat: chat as never }))
+      .toEqual({ status: 'skipped', reason: 'empty_text' });
+    expect(chat).not.toHaveBeenCalled();
+  });
+});

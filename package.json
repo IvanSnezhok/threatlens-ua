@@ -11,6 +11,7 @@
     "build": "npm run build:web && tsc -p tsconfig.json",
     "start": "node dist/index.js",
     "migrate": "tsx src/db/migrate.ts",
+    "classifier:replay": "tsx scripts/classifier-replay.ts",
     "test": "vitest run",
     "test:unit": "vitest run --project unit",
     "test:integration": "vitest run --project integration",

@@ -1343,7 +1343,8 @@ const promptVersionNames = {
   'v2': 'Оцінка ризику',
   'analytics-narrative-v1': 'Наратив аналітики',
   'nightly-digest-v1': 'Нічний дайджест',
-  'vector-narrative-v1': 'Формулювання екстраполяції'
+  'vector-narrative-v1': 'Формулювання екстраполяції',
+  'shadow-classifier-v1': 'Тіньова класифікація'
 };
 
 function bytesLabel(value) {
@@ -1356,8 +1357,8 @@ function bytesLabel(value) {
 // і його треба назвати вголос, інакше порожня таблиця читається як поломка панелі.
 function aiRunsEmptyState(codex, settings) {
   const off = [];
-  if (settings && !settings.features.narrative && !settings.features.digest && !settings.features.attacks) {
-    off.push('усі три перемикачі Codex вимкнено');
+  if (settings && Object.values(settings.features).every((enabled) => !enabled)) {
+    off.push('усі перемикачі Codex вимкнено');
   }
   if (codex && !codex.narrativeEnabled) off.push('<code>ANALYTICS_NARRATIVE_ENABLED=false</code>');
   if (codex && !codex.baseUrlConfigured) off.push('<code>CODEX_BASE_URL</code> порожній');
@@ -1527,6 +1528,14 @@ const codexFeatureLabels = {
   attacks: {
     title: 'Аналіз атак',
     note: 'Формулювання операторської екстраполяції вектора. Не публікується ніде за межами цієї консолі. Числа так само звіряються з розрахунком.'
+  },
+  // Четвертий перемикач стоїть окремо за суттю, а не лише за порядком: перші три додають текст до
+  // того, на що людина вже дивиться, а цей витрачає виклик на КОЖНЕ прийняте повідомлення й не
+  // з'являється ніде, крім таблиці звірки нижче. Підпис мусить сказати обидві речі: що це тіньовий
+  // режим і що на бойовий шлях він не впливає ніколи.
+  shadow: {
+    title: 'Тіньова класифікація',
+    note: 'Модель читає ті самі повідомлення після того, як правила вже ухвалили рішення, і її вердикт лягає поруч для звірки. На оповіщення, події й карту це не впливає ніколи. Єдиний перемикач, який витрачає виклик на кожне повідомлення, — тому він і найдорожчий.'
   }
 };
 
@@ -1594,6 +1603,87 @@ function wireCodexSettingsSection(root, onSaved) {
     // («усі три вимкнено»), тож показувати новий стан лише в одному місці означало б показати
     // два різні стани поруч.
     await onSaved();
+  });
+}
+
+// ------------------------------------------------------------------------------------------------
+// Тіньова класифікація: де правила й модель розійшлися
+// ------------------------------------------------------------------------------------------------
+//
+// Це не панель якості моделі, а список для читання. Кожна розбіжність — повідомлення, яке варто
+// переглянути людині: або правила пропустили нову лексику, або модель помилилася. Дію з цього
+// робить людина — пише патерн і тест; сама сторінка нічого не змінює й нічого не запускає.
+
+const shadowFieldNames = {
+  significance: 'значущість',
+  threat_type: 'клас загрози',
+  locations: 'локації'
+};
+
+function shadowFieldName(field) {
+  return shadowFieldNames[field] ?? field;
+}
+
+function shadowVerdictLine(label, verdict) {
+  const places = verdict.locations?.length ? verdict.locations.join(', ') : 'без локацій';
+  const significance = verdict.significant ? 'значуще' : 'проігноровано';
+  const confidence = verdict.confidence == null ? '' : ` · впевненість ${verdict.confidence.toFixed(2)}`;
+  return `<p><strong>${escapeHtml(label)}:</strong> ${escapeHtml(verdict.threatType)} · ${escapeHtml(places)} · ${significance}${confidence}</p>`;
+}
+
+// Порожньо буває з двох різних причин, і назвати треба саме ту, що трапилася: вимкнений перемикач —
+// це рішення оператора, а мовчазна модель при ввімкненому — привід відкрити журнал звернень.
+function shadowEmptyState(data, settings) {
+  const off = settings && settings.features && settings.features.shadow === false;
+  return `<div class="empty-state">
+    <strong>Жодного порівняння за ${data.windowHours} год</strong>
+    <p>${off
+      ? 'Перемикач «Тіньова класифікація» вимкнено — модель не викликають узагалі. Це стан за замовчуванням.'
+      : 'Перемикач увімкнено, але порівнянь немає: або модель не обрано й не виконано вхід, або всі виклики впали. Причина буде в журналі звернень нижче.'}</p>
+  </div>`;
+}
+
+function opsShadowSection(data, settings) {
+  if (!data) {
+    return '<section class="ops-section" id="shadow-section"><header class="ops-section-head"><div><p>Звірка класифікатора</p><h2>Тіньова класифікація</h2></div></header><p class="legend-note">Дані недоступні.</p></section>';
+  }
+  // Нуль порівнянь і нуль відсотків згоди — протилежні стани, і плутати їх не можна: перше означає
+  // «модель мовчить», друге — «модель не погоджується з правилами взагалі».
+  const body = data.total === 0
+    ? shadowEmptyState(data, settings)
+    : `<dl class="codex-facts">
+        <div><dt>Порівнянь</dt><dd>${data.total}</dd></div>
+        <div><dt>Згода</dt><dd>${data.agreementPercent}%</dd></div>
+        <div><dt>Розбіжностей</dt><dd>${data.disagreed}</dd></div>
+        <div><dt>Вікно</dt><dd>${data.windowHours} год</dd></div>
+      </dl>
+      ${data.byField?.length ? `<p class="legend-note">За осями: ${data.byField.map((row) => `${escapeHtml(shadowFieldName(row.field))} — ${row.count}`).join(', ')}.</p>` : ''}
+      <div class="ops-channel-list">${data.recentDisagreements.map((row) => `<article>
+        <div>
+          <span>${escapeHtml(row.fields.map(shadowFieldName).join(', '))}</span>
+          <h3>${escapeHtml(new Date(row.publishedAt).toLocaleString('uk-UA'))}</h3>
+          <p>${escapeHtml(row.text)}</p>
+          ${shadowVerdictLine('Правила', row.deterministic)}
+          ${shadowVerdictLine('Модель', row.model)}
+        </div>
+      </article>`).join('')}</div>`;
+  return `<section class="ops-section" id="shadow-section">
+    <header class="ops-section-head">
+      <div><p>Звірка класифікатора</p><h2>Тіньова класифікація</h2></div>
+      <button data-shadow-refresh>Оновити</button>
+    </header>
+    <p class="legend-note">Модель читає ті самі повідомлення після того, як рішення вже ухвалено правилами. На карту, оповіщення й бота це не впливає ніколи. Розбіжність — не помилка моделі й не помилка правил, а привід прочитати повідомлення.</p>
+    ${body}
+  </section>`;
+}
+
+function wireShadowSection(root, settings) {
+  $('[data-shadow-refresh]', root)?.addEventListener('click', async () => {
+    const data = await opsFetch('/ops/shadow-classifier?hours=24').then((r) => r.ok ? r.json() : null).catch(() => null);
+    const section = $('#shadow-section', root);
+    if (!section) return;
+    section.outerHTML = opsShadowSection(data, settings);
+    wireShadowSection(root, settings);
   });
 }
 
@@ -1669,10 +1759,11 @@ async function renderOps() {
   // Стан входу приходить у складі налаштувань, а не окремим запитом: перемикач «увімкнено» поруч
   // із мертвою сесією — найзаплутаніший стан цієї функції, і показати їх із двох різних моментів
   // означало б зробити його ще заплутанішим.
-  const [vectorOps, codexSettings, aiRuns] = await Promise.all([
+  const [vectorOps, codexSettings, aiRuns, shadow] = await Promise.all([
     opsFetch('/ops/vectors').then((result) => result.ok ? result.json() : null).catch(() => null),
     opsFetch('/ops/codex/settings').then((result) => result.ok ? result.json() : null).catch(() => null),
-    opsFetch('/ops/ai-runs?limit=50').then((result) => result.ok ? result.json() : null).catch(() => null)
+    opsFetch('/ops/ai-runs?limit=50').then((result) => result.ok ? result.json() : null).catch(() => null),
+    opsFetch('/ops/shadow-classifier?hours=24').then((result) => result.ok ? result.json() : null).catch(() => null)
   ]);
   const codex = codexSettings?.status ?? null;
   const queued = data.outbox.reduce((sum, item) => sum + Number(item.count), 0);
@@ -1692,15 +1783,17 @@ async function renderOps() {
     </section>
     <div class="ops-group" id="codex-group">
       <header class="ops-group-head"><p>Модель в аналітиці</p><h2>Codex-аналітика</h2>
-        <p>Вхід, вибір моделі, три перемикачі й журнал усіх звернень — усе, що визначає, коли систему пише машина, і що саме вона написала.</p></header>
+        <p>Вхід, вибір моделі, чотири перемикачі, звірка з правилами й журнал усіх звернень — усе, що визначає, коли систему пише машина, і що саме вона написала.</p></header>
       ${opsCodexSection(codex, codexSettings?.settings ?? null)}
       ${opsCodexSettingsSection(codexSettings)}
+      ${opsShadowSection(shadow, codexSettings?.settings ?? null)}
       ${opsAiRunsSection(aiRuns, codex, codexSettings?.settings ?? null)}
     </div>
     ${opsVectorSection(vectorOps)}
     <details class="ops-raw"><summary>Технічний стан і журнали</summary><pre class="ops-json">${escapeHtml(JSON.stringify({ sources: data.sources, outbox: data.outbox, aiRuns: data.aiRuns, database: data.database }, null, 2))}</pre></details>`;
   wireCodexSection(root, codexSettings?.settings ?? null);
   wireCodexSettingsSection(root, () => renderOps());
+  wireShadowSection(root, codexSettings?.settings ?? null);
   wireAiRunsSection(root, codex, codexSettings?.settings ?? null);
   root.querySelectorAll('[data-project-vector]').forEach((button) => button.addEventListener('click', async () => {
     const output = $(`#projection-${button.dataset.projectVector}`, root);

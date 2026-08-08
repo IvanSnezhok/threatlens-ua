@@ -235,6 +235,28 @@ The archive write happens outside the ingestion transaction and its failure is a
 (`threatlens_classification_log_failures_total`), never an exception. During a mass attack the thing
 that must keep working is the map; an analytics row is not worth a dropped threat event.
 
+**Replaying the corpus.** `npm run classifier:replay` reads the archived decisions, classifies the
+stored `source_messages` with the rules as they are now, and reports what moved on three axes: the
+threat class, the resolved locations, and whether the message raises anything at all. The last one is
+split by direction, because "37 messages that used to be ignored now raise an event" and "37 events
+that used to be raised are now silent" are opposite findings. `--dry` is the default and writes
+nothing; `--write` records the fresh verdicts beside the old ones under the current version, which is
+what the `UNIQUE` constraint above was built for. The diff itself lives in
+`src/domain/classifier-replay.ts` and is unit-tested without a database, because a broken diff would
+report a clean replay for a change that broke everything.
+
+**Shadow classification.** With the `shadow` switch on in `/ops`, a model reads the same message
+*after* the deterministic decision has been made and archived, and its verdict is written to
+`shadow_classifications` beside the rules' verdict with an `agrees` flag. The call goes through the
+one Codex client like every other, so it is audited in `ai_runs` under `shadow-classifier-v1`. It runs
+outside the ingestion transaction on a promise nobody waits for, every failure is silence, and there
+is no code path by which its answer can reach an event, an alert or the map —
+`src/services/shadow-classifier.ts` returns void to the pipeline by design. Its product is a reading
+list: `/ops` shows the agreement rate over the last day and the newest disagreements, and the action
+that follows is a human writing a pattern and a test. Calls are capped at
+`SHADOW_CLASSIFIER_MAX_PER_MINUTE` (default 6) and messages over budget are dropped rather than
+queued.
+
 ### Attack analytics over the archive
 
 `src/services/attack-analytics.ts` reads the classification archive back out as a public page: for
@@ -255,8 +277,8 @@ holds the only copy of the transport decision — the streamed Responses API aga
 overrule the URL — and the only copy of the audit write: every call, including the pre-flight
 refusals that never left the process, lands in `ai_runs` with its prompt, output, duration and
 failure reason. The token goes into one `Authorization` header and nowhere else. Which surfaces may
-call at all — narrative, nightly digest, vector extrapolation — is stored in `codex_settings` and
-switched from `/ops`; every surface is complete without a model, so a dead session degrades to the
+call at all — narrative, nightly digest, vector extrapolation, shadow classification — is stored in
+`codex_settings` and switched from `/ops`; every surface is complete without a model, so a dead session degrades to the
 deterministic text rather than to an error, and model-written prose is always labelled.
 
 The commitment stated at the top of this document and on the map itself — the system shows an

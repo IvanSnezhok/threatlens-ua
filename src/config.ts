@@ -123,6 +123,14 @@ const envSchema = z.object({
   // the explicit values exist for a proxy that happens to live on a chatgpt.com path or vice versa.
   CODEX_API_STYLE: z.enum(['auto', 'chat', 'responses']).default('auto'),
 
+  // ---- Shadow classification (model second opinion) --------------------------------------------
+  // How many messages per minute may be sent for a shadow classification. This is a spending limit,
+  // not a throughput setting: a mass attack is when the message rate peaks and when the account's
+  // quota must still be there for the features that face users, so messages over budget are dropped
+  // rather than queued. The switch that turns the feature on at all is `shadow` in `codex_settings`,
+  // not an environment variable — see `src/services/codex-settings.ts`.
+  SHADOW_CLASSIFIER_MAX_PER_MINUTE: z.coerce.number().int().min(0).max(120).default(6),
+
   // ---- Codex sign-in over OAuth ----------------------------------------------------------------
   // The operator presses a button in `/ops` instead of copying a token out of `~/.codex/auth.json`.
   // Everything here describes *where* the browser is sent and *where it comes back to*; whether a

@@ -338,3 +338,161 @@ describe('classifyMessage on redirects', () => {
     expect(result.retraction).toBeUndefined();
   });
 });
+
+// ------------------------------------------------------------------------------------------------
+// v2 vocabulary
+// ------------------------------------------------------------------------------------------------
+//
+// Every indicator added in v2 gets two tests: one real phrase from the monitoring channels that it
+// must catch, and one nearby phrase it must leave alone. The second half is the one that keeps a
+// pattern honest — an indicator that fires on everything raises the alert volume and teaches
+// subscribers to ignore the app, which is a slower and more permanent failure than missing a
+// message.
+
+describe('classifyMessage on ground-attack S-300/S-400', () => {
+  it('reads the Air Force phrasing with an oblast attached', () => {
+    // v1 saw no threat noun here at all: "загроза застосування" only set a national scope when no
+    // place resolved, so the located version — the one that says where the shelling is aimed —
+    // classified as nothing and was discarded. Frontline oblasts get this warning almost daily.
+    const result = classify('Загроза застосування С-300 по Харківщині!');
+    expect(result.threatType).toBe('ballistic_missile');
+    expect(result.locations.map((location) => location.id)).toContain('ua-63');
+    expect(result.indicators).toContain('загроза застосування С-300/С-400');
+    expect(isSignificant(result)).toBe(true);
+  });
+
+  it('reads a strike report that names the system without the standard phrase', () => {
+    const result = classify('Обстріл з С-400 по Сумщині.');
+    expect(result.threatType).toBe('ballistic_missile');
+    expect(result.locations.map((location) => location.id)).toContain('ua-59');
+  });
+
+  it('does not fire on an air-defence report that merely names the system', () => {
+    // "Робота ворожої ППО" is an ambient indicator about the far side. Reading the S-300 in it as a
+    // ground-attack warning would turn every report of Russian air defence into a Ukrainian threat.
+    const result = classify('Робота ворожої ППО, працює С-300 над Курськом.');
+    expect(result.indicators).not.toContain('загроза застосування С-300/С-400');
+  });
+});
+
+describe('classifyMessage on sea-area launches', () => {
+  it('recognizes a launch reported by the water it came from', () => {
+    const result = classify('Пуски крилатих ракет з акваторії Чорного моря.');
+    expect(result.threatType).toBe('cruise_missile');
+    expect(result.indicators).toContain('пуски з морської акваторії');
+    expect(result.nationalScope).toBe(true);
+  });
+
+  it('recognizes the other word order the channels use', () => {
+    const result = classify('З акваторії Азовського моря зафіксовано пуск.');
+    expect(result.indicators).toContain('пуски з морської акваторії');
+  });
+
+  it('leaves a weather note about the same sea alone', () => {
+    const result = classify('Шторм в акваторії Чорного моря, судноплавство обмежене.');
+    expect(result.indicators).not.toContain('пуски з морської акваторії');
+    expect(result.intent).toBe('none');
+  });
+});
+
+describe('classifyMessage on the Banderol cruise missile', () => {
+  it('files a named Banderol as a cruise missile', () => {
+    const result = classify('Бандероль курсом на Одесу.');
+    expect(result.threatType).toBe('cruise_missile');
+    expect(result.locations.map((location) => location.id)).toContain('ua-city-odesa');
+  });
+
+  it('raises nothing for the postal sense of the word', () => {
+    // No lexical guard separates the missile from the parcel, and inventing one would be a guess.
+    // The structural guard is the one that holds: a message that names no place raises nothing.
+    const result = classify('Відділення видає бандероль після 18:00.');
+    expect(isSignificant(result)).toBe(false);
+  });
+});
+
+describe('classifyMessage on reconnaissance drones', () => {
+  it('reads the bare noun beside a place', () => {
+    const result = classify('Розвідник в Одесі.');
+    expect(result.threatType).toBe('uav');
+    expect(result.indicators).toContain('розвідувальна активність БпЛА');
+  });
+
+  it('reads the full phrase the official channels use', () => {
+    const result = classify('Розвідувальний БпЛА над Полтавщиною.');
+    expect(result.threatType).toBe('uav');
+    expect(result.indicators).toContain('розвідувальна активність БпЛА');
+  });
+
+  it('raises nothing for the word with no place attached', () => {
+    // The word also means a human scout, and the location requirement is what keeps a war memoir out
+    // of the threat feed.
+    const result = classify('Розвідник розповів про службу.');
+    expect(isSignificant(result)).toBe(false);
+  });
+});
+
+describe('classifyMessage on naval drones', () => {
+  it('records that the platform was a surface one', () => {
+    const result = classify('Морські безпілотники в напрямку Одеси.');
+    expect(result.indicators).toContain('морські безпілотники');
+    // The class stays `uav`: ThreatType has no naval member, and downgrading the class to buy a
+    // taxonomy would drop a real warning for a coastal city.
+    expect(result.threatType).toBe('uav');
+  });
+
+  it('reads the other name the channels use for the same thing', () => {
+    const result = classify('Безекіпажні катери противника, увага для Одещини.');
+    expect(result.indicators).toContain('морські безпілотники');
+  });
+
+  it('does not attach the marker to an ordinary aerial drone', () => {
+    const result = classify('Ударні БпЛА у напрямку Києва');
+    expect(result.indicators).not.toContain('морські безпілотники');
+  });
+});
+
+describe('classifyMessage on repeat approaches', () => {
+  it('marks a second pass over a place already attacked', () => {
+    const result = classify('Повторно курсом на Одесу.');
+    expect(result.indicators).toContain('повторний захід');
+    expect(result.locations.map((location) => location.id)).toContain('ua-city-odesa');
+    expect(isSignificant(result)).toBe(true);
+  });
+
+  it('does not invent a weapon the message never named', () => {
+    // The phrase almost always describes a Shahed, and "almost always" is a guess. When the text
+    // does say "шахед", the ordinary UAV pattern has already matched.
+    expect(classify('Повторно курсом на Одесу.').threatType).toBe('unknown');
+    expect(classify('Шахед повторно курсом на Одесу.').threatType).toBe('uav');
+  });
+
+  it('leaves an unrelated repetition alone', () => {
+    const result = classify('Повторно публікуємо інструкцію для Одеси.');
+    expect(result.indicators).not.toContain('повторний захід');
+  });
+});
+
+describe('classifyMessage on MiG-31K movements', () => {
+  it('still raises a national ballistic warning on a take-off', () => {
+    const result = classify('Зліт МіГ-31К з аеродрому Саваслейка.');
+    expect(result.threatType).toBe('ballistic_missile');
+    expect(result.nationalScope).toBe(true);
+    expect(result.indicators).toContain('активність МіГ-31К');
+  });
+
+  it('treats a landing as activity on the far side rather than a threat', () => {
+    // The inversion v1 made: a landing is the end of a threat window, and reading it as the start of
+    // one raised a country-wide ballistic warning for a message saying the aircraft was on the
+    // ground.
+    const result = classify('МіГ-31К здійснив посадку на аеродромі Саваслейка.');
+    expect(result.intent).toBe('none');
+    expect(result.nationalScope).toBe(false);
+    expect(result.indicators).not.toContain('активність МіГ-31К');
+  });
+
+  it('does not let a landing sentence disarm a warning in another sentence', () => {
+    const result = classify('МіГ-31К у повітрі. Раніше інший борт здійснив посадку.');
+    expect(result.threatType).toBe('ballistic_missile');
+    expect(result.nationalScope).toBe(true);
+  });
+});

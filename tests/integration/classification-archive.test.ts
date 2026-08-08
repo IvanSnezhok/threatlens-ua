@@ -1,5 +1,9 @@
 import { beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import { ensureMigrated, integrationDatabaseAvailable, resetDatabase, sql } from '../helpers/db.js';
+// Read rather than hard-coded: this file asserts that the archive stamps *the current* version on
+// every decision, and a literal here would have to be edited on every classifier release — which is
+// exactly when the assertion is worth having.
+import { CLASSIFIER_VERSION } from '../../src/domain/classifier.js';
 
 /**
  * Covers `message_classifications` from `migrations/012_threat_assertions_and_classification_log.sql`
@@ -190,7 +194,7 @@ describe.skipIf(!integrationDatabaseAvailable)('classification archive', () => {
       const rows = await classifications();
       expect(rows).toHaveLength(1);
       expect(rows[0]).toMatchObject({
-        source_id: WAR_MONITOR, classifier_version: 'v1', decision: 'event_created',
+        source_id: WAR_MONITOR, classifier_version: CLASSIFIER_VERSION, decision: 'event_created',
         intent: 'threat', created_event: true, ignored_reason: null, threat_type: 'uav',
         candidate_threat_types: ['uav'], national_scope: false, retraction_coverage: null
       });
@@ -316,16 +320,17 @@ describe.skipIf(!integrationDatabaseAvailable)('classification archive', () => {
       await sql(
         `INSERT INTO message_classifications(source_message_id,source_id,classifier_version,
            published_at,decision,intent,created_event,threat_type,candidate_threat_types,event_id)
-         SELECT source_message_id,source_id,'v2',published_at,decision,intent,created_event,
+         SELECT source_message_id,source_id,'v99',published_at,decision,intent,created_event,
                 'combined',ARRAY['uav','ballistic_missile'],event_id
-         FROM message_classifications WHERE classifier_version='v1'`
+         FROM message_classifications WHERE classifier_version=$1`,
+        [CLASSIFIER_VERSION]
       );
       const versions = await sql<{ classifier_version: string; threat_type: string }>(
         `SELECT classifier_version,threat_type FROM message_classifications ORDER BY classifier_version`
       );
       expect(versions.rows).toEqual([
-        { classifier_version: 'v1', threat_type: 'uav' },
-        { classifier_version: 'v2', threat_type: 'combined' }
+        { classifier_version: CLASSIFIER_VERSION, threat_type: 'uav' },
+        { classifier_version: 'v99', threat_type: 'combined' }
       ]);
     });
   });
@@ -357,8 +362,8 @@ describe.skipIf(!integrationDatabaseAvailable)('classification archive', () => {
         EVENTS_BY_OBLAST_AND_VERSION
       );
       expect(result.rows).toEqual([
-        { month, oblast_id: POLTAVA_OBLAST, threat_type: 'uav', classifier_version: 'v1', events: 1 },
-        { month, oblast_id: KHARKIV_OBLAST, threat_type: 'ballistic_missile', classifier_version: 'v1', events: 1 }
+        { month, oblast_id: POLTAVA_OBLAST, threat_type: 'uav', classifier_version: CLASSIFIER_VERSION, events: 1 },
+        { month, oblast_id: KHARKIV_OBLAST, threat_type: 'ballistic_missile', classifier_version: CLASSIFIER_VERSION, events: 1 }
       ]);
       // The Kharkiv event is filed against a *city*; it appears under its oblast only because the
       // roll-up walks the hierarchy.
