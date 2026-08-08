@@ -946,6 +946,225 @@ body { overflow-x: hidden; }
 }
 .safety-note p { margin: 0; max-width: 68ch; color: var(--bone-2); font-size: 13.5px; line-height: 1.6; }
 
+/* ---- 9б. Аналіз атак -------------------------------------------------------------------------- */
+
+/* Ретроспектива — не сигнал, тому на всій сторінці немає жодного кольору, крім бурштинового
+   застереження внизу. Величину кодує довжина смуги; якби смуга ще й була помаранчевою, око читало б
+   її як «зафіксована загроза», тобто як щось, що відбувається просто зараз. */
+
+.period-switch {
+  display: inline-flex;
+  margin-bottom: 26px;
+  border: 1px solid var(--rule-2);
+  background: var(--surface);
+}
+.period-switch button {
+  min-height: 38px;
+  padding: 0 22px;
+  border: 0;
+  border-right: 1px solid var(--rule-2);
+  background: transparent;
+  color: var(--bone-3);
+  font: 500 10px/1 var(--mono);
+  letter-spacing: .12em;
+  text-transform: uppercase;
+  cursor: pointer;
+  transition: color .16s var(--ease), background-color .16s var(--ease);
+}
+.period-switch button:last-child { border-right: 0; }
+.period-switch button:hover { color: var(--bone); background: rgba(233, 231, 224, .04); }
+.period-switch button.is-active { background: var(--bone); color: var(--ink); font-weight: 600; }
+
+/* Слово замість числа в тій самій комірці зведення: «Полтавська» набране цифровим кеглем
+   Unbounded розповзлося б на два рядки й зламало ритм сітки. */
+.metric-grid strong.metric-word {
+  font: 600 clamp(20px, 2.2vw, 26px)/1.15 var(--body);
+  letter-spacing: -.02em;
+}
+
+.chart-block { margin-top: 42px; }
+.chart-block > header { margin-bottom: 18px; }
+.chart-block > header p {
+  margin: 0;
+  color: var(--bone-4);
+  font: 400 10px/1.4 var(--mono);
+  letter-spacing: .13em;
+  text-transform: uppercase;
+}
+.chart-block > header h2 {
+  margin: 9px 0 0;
+  font: 600 21px/1.25 var(--body);
+  letter-spacing: -.02em;
+}
+.chart-foot {
+  margin: 14px 0 0;
+  max-width: 72ch;
+  color: var(--bone-4);
+  font-size: 12.5px;
+  line-height: 1.6;
+}
+
+/* Горизонтальні смуги. Підпис ліворуч фіксованої ширини, щоб доріжки починалися по одній лінії:
+   рвана ліва межа перетворює порівняння довжин на порівняння відступів. */
+.bar-rows { border-top: 1px solid var(--rule-2); }
+.bar-row {
+  display: grid;
+  grid-template-columns: 210px 1fr 56px 84px;
+  align-items: center;
+  gap: 14px;
+  padding: 11px 0;
+  border-bottom: 1px solid var(--rule);
+}
+.bar-label {
+  color: var(--bone-2);
+  font: 400 13px/1.4 var(--body);
+}
+.bar-label-wide { grid-column: 1 / 3; }
+.bar-track {
+  display: block;
+  height: 10px;
+  background: rgba(233, 231, 224, .06);
+}
+.bar-track i {
+  display: block;
+  height: 100%;
+  background: var(--bone-2);
+}
+.bar-row b {
+  color: var(--bone);
+  font: 400 15px/1 var(--mono);
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+}
+.bar-row .trend {
+  color: var(--bone-4);
+  font: 400 10px/1 var(--mono);
+  font-style: normal;
+  letter-spacing: .06em;
+  text-align: right;
+}
+.bar-row .trend.rising, .bar-row .trend.new { color: var(--bone-2); }
+.bar-row .trend.gone { font-style: italic; }
+
+/* Добовий гребінець. 24 колонки фіксованої частки — саме тому це не смуги: у доби є свій порядок,
+   і сортування за величиною зруйнувало б єдине, заради чого цей графік існує. */
+.hour-chart {
+  display: grid;
+  grid-template-columns: repeat(24, 1fr);
+  align-items: end;
+  gap: 3px;
+  height: 168px;
+  padding-top: 8px;
+  border-bottom: 1px solid var(--rule-2);
+}
+.hour-col {
+  display: grid;
+  align-content: end;
+  height: 100%;
+  grid-template-rows: 1fr auto;
+}
+.hour-col i {
+  display: block;
+  align-self: end;
+  min-height: 1px;
+  background: var(--bone-3);
+}
+.hour-col.is-night i { background: var(--bone); }
+.hour-col small {
+  padding-top: 6px;
+  color: var(--bone-4);
+  font: 400 9px/1 var(--mono);
+  text-align: center;
+}
+
+/* Хвилі: час ліворуч, довжина смуги — обсяг повідомлень. Найновіша зверху, бо саме про неї
+   найчастіше й відкривають цю сторінку. */
+.wave-list { border-top: 1px solid var(--rule-2); }
+.wave-list article {
+  display: grid;
+  grid-template-columns: 210px 1fr 56px;
+  align-items: center;
+  gap: 14px;
+  padding: 13px 0;
+  border-bottom: 1px solid var(--rule);
+}
+.wave-list time {
+  color: var(--bone-2);
+  font: 400 11px/1.5 var(--mono);
+  font-variant-numeric: tabular-nums;
+}
+.wave-list b {
+  color: var(--bone);
+  font: 400 15px/1 var(--mono);
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+}
+.wave-list p {
+  grid-column: 1 / -1;
+  margin: 4px 0 0;
+  color: var(--bone-4);
+  font-size: 12px;
+  line-height: 1.6;
+}
+
+.pattern-block {
+  margin-top: 52px;
+  padding-top: 30px;
+  border-top: 1px solid var(--rule-2);
+}
+.pattern-block > header p {
+  margin: 0;
+  color: var(--bone-4);
+  font: 400 10px/1.4 var(--mono);
+  letter-spacing: .13em;
+  text-transform: uppercase;
+}
+.pattern-block > header h2 {
+  margin: 9px 0 0;
+  font: 700 clamp(22px, 2.8vw, 30px)/1.15 var(--display);
+  letter-spacing: -.035em;
+}
+.pattern-headline {
+  margin: 22px 0 0;
+  max-width: 62ch;
+  color: var(--bone);
+  font: 300 18px/1.55 var(--body);
+}
+.pattern-list {
+  margin: 20px 0 0;
+  padding: 0;
+  max-width: 72ch;
+  list-style: none;
+  border-top: 1px solid var(--rule);
+}
+.pattern-list li {
+  padding: 13px 0 13px 22px;
+  position: relative;
+  border-bottom: 1px solid var(--rule);
+  color: var(--bone-2);
+  font-size: 14px;
+  line-height: 1.65;
+}
+.pattern-list li::before {
+  content: '';
+  position: absolute;
+  left: 0; top: 22px;
+  width: 10px;
+  height: 1px;
+  background: var(--rule-3);
+}
+
+/* Застереження — єдине бурштинове місце сторінки, і воно завжди останнє: спершу числа, потім
+   межі їхньої достовірності. Читач, який дійшов сюди, вже бачив усе, про що йдеться. */
+.analytics-note strong {
+  display: block;
+  margin-bottom: 8px;
+  color: var(--bone);
+  font: 600 13px/1.3 var(--body);
+}
+.analytics-note ul { margin: 0; padding-left: 18px; }
+.analytics-note li { margin-top: 6px; }
+
 /* ---- 10. Форми та кнопки ---------------------------------------------------------------------- */
 
 .filter-bar {
@@ -1559,11 +1778,14 @@ code {
     z-index: 40;
     height: 56px;
     display: grid;
-    grid-template-columns: repeat(5, 1fr);
+    grid-template-columns: repeat(6, 1fr);
     background: var(--ink-deep);
     border-top: 1px solid var(--rule-2);
   }
-  .nav a { padding: 0 3px; font-size: 8.5px; letter-spacing: .04em; }
+  /* Шість пунктів замість пʼяти: «Аналіз атак» не влазить в одну колонку одним рядком, тож підпис
+     переноситься й центрується. Скорочувати його до «Атак» не можна — на панелі поруч із
+     «Аналітика» це читалося б як щось, що відбувається зараз. */
+  .nav a { padding: 0 3px; font-size: 8.5px; letter-spacing: .04em; text-align: center; line-height: 1.25; }
   .nav a.is-active::after { top: 0; bottom: auto; }
 
   .system-strip { padding: 0 14px; }
@@ -1608,6 +1830,14 @@ code {
   .filter-bar { display: grid; grid-template-columns: 1fr 1fr; }
   .filter-bar label, .filter-bar select, .filter-bar input { min-width: 0; width: 100%; }
   .filter-bar button { grid-column: 1 / -1; }
+  /* Підпис переїжджає на власний рядок: на телефоні 210 px під назву області не лишили б доріжці
+     нічого, і смуга перестала б бути смугою. */
+  .bar-row { grid-template-columns: 1fr 50px 72px; gap: 10px; }
+  .bar-label, .bar-label-wide { grid-column: 1 / -1; }
+  .wave-list article { grid-template-columns: 1fr 50px; }
+  .wave-list time { grid-column: 1 / -1; }
+  .hour-chart { height: 130px; gap: 2px; }
+  .period-switch { display: grid; grid-template-columns: repeat(3, 1fr); width: 100%; }
   .detail-dialog { width: 100vw; border-left: 0; }
   .detail-body dl, .ops-projection dl { grid-template-columns: 1fr; }
   .detail-head h2 { font-size: 19px; }

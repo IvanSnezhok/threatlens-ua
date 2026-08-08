@@ -962,6 +962,153 @@ async function renderAnalytics() {
   $('.filter-bar', root).addEventListener('submit', (event) => { event.preventDefault(); void load(); }); await load();
 }
 
+// ------------------------------------------------------------------------------------------------
+// Аналіз атак — агрегати з відкритих джерел за добу, тиждень і місяць
+// ------------------------------------------------------------------------------------------------
+//
+// Сторінка навмисно не має жодного кольору, крім бурштинового застереження. Решта інтерфейсу
+// домовилася, що колір означає небезпеку; тут небезпеки немає — тут ретроспектива, і зафарбована
+// стовпчикова діаграма читалася б як сигнал, якого вона не несе. Довжина смуги вже кодує величину.
+//
+// Графіки — на CSS, без жодної бібліотеки. Не з ідеології, а тому, що всі три потрібні форми
+// (горизонтальна смуга, добовий гребінець, шкала хвиль) — це прямокутник заданої довжини, а
+// підключення бібліотеки заради прямокутника коштувало б більше, ніж уся сторінка важить зараз.
+
+const attackPeriodNames = { day: 'Доба', week: 'Тиждень', month: 'Місяць' };
+const attackTrendMarks = { rising: '▲', falling: '▼', steady: '·', new: '+', gone: '—' };
+
+function attackDelta(row) {
+  if (row.previousMessages === 0 && row.messages === 0) return '';
+  // Без попереднього періоду ділити нема на що, і «+∞%» тут було б не числом, а фігурою мови.
+  if (row.deltaPercent === null) return '<em class="trend new" title="у попередньому періоді згадок не було">уперше</em>';
+  const mark = attackTrendMarks[row.trend] ?? '·';
+  return `<em class="trend ${row.trend}" title="проти попереднього періоду">${mark} ${row.deltaPercent > 0 ? '+' : ''}${Math.round(row.deltaPercent)}%</em>`;
+}
+
+// Смуги нормуються на максимум ряду, а не на суму: ряд читають, щоб порівняти позиції між собою,
+// і за часткою від суми найбільша смуга на трьох позиціях зайняла б третину доріжки й перестала б
+// показувати різницю з другою.
+function attackBars(rows, labelOf) {
+  const peak = rows.reduce((max, row) => Math.max(max, row.messages), 0) || 1;
+  return `<div class="bar-rows">${rows.map((row) => `<div class="bar-row">
+    <span class="bar-label">${escapeHtml(labelOf(row))}</span>
+    <span class="bar-track"><i style="width:${Math.max(1.5, (row.messages / peak) * 100)}%"></i></span>
+    <b>${row.messages}</b>${attackDelta(row)}</div>`).join('')}</div>`;
+}
+
+function attackHourChart(hours) {
+  const peak = hours.reduce((max, row) => Math.max(max, row.messages), 0) || 1;
+  return `<div class="hour-chart" role="img" aria-label="Розподіл повідомлень за годинами доби">
+    ${hours.map((row) => `<span class="hour-col${row.hour >= 22 || row.hour < 6 ? ' is-night' : ''}"
+      title="${String(row.hour).padStart(2, '0')}:00 — ${row.messages} повідомл.">
+      <i style="height:${row.messages ? Math.max(2, (row.messages / peak) * 100) : 0}%"></i>
+      <small>${row.hour % 3 === 0 ? String(row.hour).padStart(2, '0') : ''}</small></span>`).join('')}
+    </div><p class="chart-foot">Київський час. Затемнені колонки — нічні години 22:00–06:00.</p>`;
+}
+
+function attackWaveList(waves) {
+  if (!waves.length) {
+    return '<p class="chart-foot">За цей період повідомлення не згрупувалися в жодну хвилю: '
+      + 'окремі поодинокі згадки хвилею не називаються.</p>';
+  }
+  const peak = waves.reduce((max, wave) => Math.max(max, wave.messages), 0) || 1;
+  return `<div class="wave-list">${[...waves].reverse().map((wave) => `<article>
+    <time>${new Date(wave.startedAt).toLocaleDateString('uk-UA', { day: '2-digit', month: 'short' })}
+      · ${shortTime(wave.startedAt)}–${shortTime(wave.endedAt)}</time>
+    <span class="bar-track"><i style="width:${Math.max(2, (wave.messages / peak) * 100)}%"></i></span>
+    <b>${wave.messages}</b>
+    <p>${wave.durationMinutes} хв · ${wave.eventsRaised} подій${wave.threatTypes.length
+      ? ` · ${wave.threatTypes.map((entry) => escapeHtml(entry.label)).join(' + ')}`
+      : ''}</p></article>`).join('')}</div>`;
+}
+
+function attackSummary(data) {
+  const topTarget = data.targets[0];
+  const peak = data.hours.reduce((best, row) => (!best || row.messages > best.messages ? row : best), null);
+  const night = data.hours.reduce((sum, row) => sum + (row.hour >= 22 || row.hour < 6 ? row.messages : 0), 0);
+  const total = data.hours.reduce((sum, row) => sum + row.messages, 0);
+  return `<div class="metric-grid">
+    <div><span>Повідомлень про загрозу</span><strong>${data.totals.messages}</strong>
+      <small>${data.totals.eventsRaised} окремих подій · було ${data.totals.previousMessages}</small></div>
+    <div><span>Найбільше згадок</span><strong class="metric-word">${escapeHtml(topTarget?.oblastName ?? '—')}</strong>
+      <small>${topTarget ? `${topTarget.messages} повідомлень · ${Math.round(topTarget.share * 100)}% усіх` : 'немає даних'}</small></div>
+    <div><span>Пікова година</span><strong>${peak && peak.messages ? `${String(peak.hour).padStart(2, '0')}:00` : '—'}</strong>
+      <small>${total ? `${peak.messages} повідомлень · вночі ${Math.round((night / total) * 100)}%` : 'немає даних'}</small></div>
+  </div>`;
+}
+
+function attackPatternsBlock(patterns) {
+  return `<section class="pattern-block">
+    <header><p>Висновок</p><h2>Патерни та ймовірна стратегія</h2></header>
+    <p class="pattern-headline">${escapeHtml(patterns.headline)}</p>
+    <ul class="pattern-list">${patterns.findings.map((line) => `<li>${escapeHtml(line)}</li>`).join('')}</ul>
+    <div class="analytics-note"><strong>Як це читати</strong>
+      <ul>${patterns.caveats.map((line) => `<li>${escapeHtml(line)}</li>`).join('')}</ul></div>
+  </section>`;
+}
+
+async function renderAttacks() {
+  const root = contentShell(
+    'Відкриті джерела',
+    'Аналіз атак',
+    'Що повідомляли моніторингові канали за добу, тиждень і місяць: типи засобів, території, час доби та хвилі. Це опис минулого, а не прогноз.'
+  );
+  const requested = new URLSearchParams(location.search).get('period');
+  let period = ['day', 'week', 'month'].includes(requested) ? requested : 'day';
+
+  root.innerHTML = `<div class="period-switch" role="group" aria-label="Період аналізу">
+      ${Object.entries(attackPeriodNames).map(([value, label]) =>
+    `<button type="button" data-period="${value}"${value === period ? ' class="is-active" aria-pressed="true"' : ' aria-pressed="false"'}>${label}</button>`).join('')}
+    </div><div id="attacks-body"><p>Завантаження…</p></div>`;
+
+  const body = $('#attacks-body', root);
+  const load = async () => {
+    body.innerHTML = '<p>Завантаження…</p>';
+    let data;
+    try {
+      const response = await fetch(`/api/v1/analytics/attacks?period=${period}`);
+      if (!response.ok) throw new Error('attacks unavailable');
+      data = await response.json();
+    } catch {
+      body.innerHTML = '<p class="chart-foot">Не вдалося отримати аналітику. Спробуйте оновити сторінку.</p>';
+      return;
+    }
+    const means = data.means.filter((row) => row.messages > 0);
+    const targets = data.targets.filter((row) => row.messages > 0).slice(0, 12);
+    body.innerHTML = `${attackSummary(data)}
+      <section class="chart-block"><header><p>Засоби</p><h2>Типи засобів у повідомленнях</h2></header>
+        ${means.length ? attackBars(means, (row) => row.label) : '<p class="chart-foot">Немає повідомлень за цей період.</p>'}
+        <p class="chart-foot">Одне повідомлення про комбінований удар потрапляє в кілька рядків — воно згадує кілька типів.</p></section>
+      <section class="chart-block"><header><p>Час</p><h2>Розподіл за годинами доби</h2></header>
+        ${attackHourChart(data.hours)}</section>
+      <section class="chart-block"><header><p>Території</p><h2>Області, які згадують найчастіше</h2></header>
+        ${targets.length ? attackBars(targets, (row) => row.oblastName) : '<p class="chart-foot">Жодна територія не названа.</p>'}
+        <p class="chart-foot">Згадка області ≠ влучання по ній: це територія, названа в повідомленні про загрозу.</p></section>
+      <section class="chart-block"><header><p>Групування</p><h2>Хвилі атак</h2></header>
+        ${attackWaveList(data.waves)}
+        ${data.combinations.length ? `<p class="chart-foot">Повторювані поєднання в одній хвилі: ${data.combinations
+    .map((pair) => `${escapeHtml(pair.labels[0])} + ${escapeHtml(pair.labels[1])} (${pair.waves} хвиль)`).join('; ')}.</p>` : ''}</section>
+      ${data.directions.length ? `<section class="chart-block"><header><p>Напрямки</p><h2>Формулювання напрямку, які повторюються</h2></header>
+        <div class="bar-rows">${data.directions.map((row) => `<div class="bar-row">
+          <span class="bar-label bar-label-wide">«${escapeHtml(row.direction)}»</span>
+          <b>${row.messages}</b></div>`).join('')}</div>
+        <p class="chart-foot">Дослівні цитати з повідомлень. Система не будує з них маршрут і не екстраполює траєкторію.</p></section>` : ''}
+      ${attackPatternsBlock(data.patterns)}`;
+  };
+
+  root.querySelectorAll('[data-period]').forEach((button) => button.addEventListener('click', () => {
+    period = button.dataset.period;
+    root.querySelectorAll('[data-period]').forEach((other) => {
+      other.classList.toggle('is-active', other === button);
+      other.setAttribute('aria-pressed', String(other === button));
+    });
+    // Період живе в адресі: посилання на «місяць» має відкриватися місяцем, а не добою.
+    history.replaceState({}, '', `/attacks?period=${period}`);
+    void load();
+  }));
+  await load();
+}
+
 async function renderSources() {
   const root = contentShell('Прозорість', 'Джерела та стан', 'Кожне повідомлення має provenance; перепублікації одного першоджерела не рахуються як незалежні докази.');
   const statuses = { current: 'актуальне', stale: 'дані застаріли', error: 'помилка', unknown: 'очікуємо дані', unconfigured: 'потребує токена', disabled: 'вимкнено' };
@@ -1312,6 +1459,7 @@ function renderCurrentRoute() {
   if (route !== '/ops') clearInterval(codexPollTimer);
   if (route === '/') renderMapPage();
   else if (route === '/history') void renderHistory();
+  else if (route === '/attacks') void renderAttacks();
   else if (route === '/analytics') void renderAnalytics();
   else if (route === '/sources') void renderSources();
   else if (route === '/ops') void renderOps();
