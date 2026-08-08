@@ -10,7 +10,8 @@ It does not estimate a target, impact, exact route, number of weapons or persona
 - reported directions without route extrapolation;
 - activity of strategic aviation, MiG-31K, missile carriers and launch systems;
 - UAV launch/activity signals;
-- source tier, independence group, age and geographic relevance.
+- source tier, independence group, age and geographic relevance;
+- measured source trust — a nightly, thirty-day behavioural score per publisher (retractions, corroboration, first reports, lag, readability), consumed only as the bounded modifier below.
 
 National posture signals are propagated to regions with low geographic relevance. A city signal may also contribute to its parent oblast, but the original event geography remains unchanged.
 
@@ -18,11 +19,17 @@ Threat vectors are **not** an input. The public chain is a presentation of messa
 
 ## Weighting
 
-Each signal has a configured base contribution and reliability. Its effective contribution has a two-hour half-life:
+Each signal has a configured base contribution and reliability. Its effective contribution has a two-hour half-life and is modulated by the publisher's measured trust:
 
 ```text
-effective = contribution × reliability × 2 ^ (−age_hours / 2)
+effective = contribution × reliability × 2 ^ (−age_hours / 2) × trust_modifier
 ```
+
+`trust_modifier` is clamped to **[0.6, 1.2]** and is exactly `1.0` for a source that has never been
+measured, so the assessment is complete without the trust layer. Trust modulates a contribution and
+nothing else: it never changes a source's tier, and every hard limit below is applied **after** it —
+no amount of measured good behaviour lifts a Tier C-only location past its cap. The bounds are
+published by `/api/v1/methodology`.
 
 The deterministic fallback sums effective contributions. A configured AI model may explain and adjust the index, but the server overwrites its location, threat type and horizon, rejects invented signal identifiers and applies the same hard limits.
 

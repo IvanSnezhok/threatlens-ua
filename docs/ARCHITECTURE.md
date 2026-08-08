@@ -269,6 +269,48 @@ whitelist; the page states plainly that it reads open sources and is neither a f
 official record. When the previous period is empty the prose says there is no baseline instead of
 claiming a comparison it does not have.
 
+### Dynamic source trust
+
+`sources.tier` says what a channel is *allowed* to be — it is written by hand in a migration and by
+nothing else, and the risk caps stand on it. `src/services/source-trust.ts` measures something
+different: how a publisher has actually behaved over the last thirty days, recomputed once a day from
+the classification archive and appended to `source_trust` (one row per source per run, so "what did
+we think of this channel then" always has an answer; `source_trust_current` is the newest row).
+
+Five metrics, each decay-weighted with a ten-day half-life so last night's retraction outweighs one
+from four weeks ago: the share of assertions later withdrawn (the heaviest term), the share of events
+another *independence group* also asserted, first reports (leadership is decided per group and then
+across groups, so a repost aggregator can never be its group's earliest voice), the median lag behind
+the first reporter over the events it did not lead, and the share of messages the classifier could
+not read (mostly a parser defect metric, so it carries the smallest weight). Below twenty observed
+events the source keeps the neutral 0.5 and its metrics are recorded but not scored.
+
+The score is consumed in exactly one place: `src/services/risk.ts` multiplies a signal's effective
+contribution by a modifier bounded to **[0.6, 1.2]**. The bounds are the design. A source with no
+trust row arrives as NULL through a LEFT JOIN and contributes exactly as it did before the feature
+existed, so a failed nightly run degrades to "no change", not to "everything is suspect". At the
+floor a distrusted source still contributes 60% — a channel that has been wrong before is not a
+channel that is wrong now, and silencing it would let a threat reported only by an imperfect source
+disappear from the map. Four guardrails, each pinned by `src/services/source-trust.test.ts`:
+
+- **Trust does not change tier.** Nothing in the module writes `sources`, and the 3.9/5.9 caps run
+  *after* the modifier, so no amount of good behaviour turns a C into an A.
+- **Official sources never fall below neutral.** A mandated body that had a bad month is still the
+  body with the mandate; demoting it is an editorial decision about its catalogue row, not a silent
+  nightly computation.
+- **A repost is not a first report** — structurally, by the group-then-source leadership order.
+- **Old observations weigh less**, on the same decay curve shape the risk engine uses for freshness.
+
+Every run is stamped with `TRUST_METHODOLOGY_VERSION`, the same contract `classifier_version` has in
+the archive: a step in a source's series must be attributable to us rather than to the channel.
+Nothing here calls a model and nothing here is published raw. The public assessment card carries one
+word per source («довіра джерела: висока / звичайна / знижена», thresholds 0.65 / 0.40, worded by
+`trustLabel` on the server so every surface shares one boundary) with the number folded into the
+collapsed technical block; `/api/v1/methodology` publishes the modifier bounds; and the full
+component breakdown, per-source history and a recalculate-now button live behind `/ops`
+(`src/api/ops-source-trust-routes.ts`), with the methodology carried in the payload beside the rows —
+a trust score without its weights and window is a number an operator can only accept or reject.
+
 ### One model client, one audit trail
 
 Everything that reaches a language model goes through `src/services/codex-client.ts`. The client
@@ -406,6 +448,9 @@ flowchart LR
   are unreachable from the classifier path in either direction.
 - Every classifier decision is archived with the classifier version that made it, so a change in this
   project's rules stays distinguishable from a change in enemy behaviour.
+- Measured source trust modulates a signal's contribution within [0.6, 1.2] and does nothing else: it
+  never changes a source's tier, the tier caps are applied after it, an unmeasured source contributes
+  unchanged, and an official source is never scored below neutral.
 - Source edits create revisions; a replacement event corrects the previous event instead of silently deleting it.
 - Threat events expire after their explicit validity window and remain in history.
 - Notification fanout and delivery are separate, idempotent steps.

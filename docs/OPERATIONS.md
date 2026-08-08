@@ -3,7 +3,7 @@
 ## Health
 
 - `/health/live`: process is running.
-- `/health/ready`: database is reachable and the latest required migration is applied (currently `008_alert_end_debounce.sql`).
+- `/health/ready`: database is reachable and the latest required migration is applied (currently `021_source_trust.sql`).
 - `/api/v1/sources/health`: configured, current, stale, error and unconfigured source states.
 - `/ops/api`: Basic-auth protected worker, AI, source and database state.
 - `/ops`: operator console. Credentials are held only in the active tab's memory; it can add, verify, activate and hide recommended Telegram channels.
@@ -60,8 +60,9 @@ landed close enough together that the ratio is an artefact.
 ## Codex analytics (operator only)
 
 The whole lifecycle lives in one `/ops` group — «Codex-аналітика»: session status, the sign-in
-button, the model dropdown, the three surface switches and the `ai_runs` audit viewer. Nothing about
-it requires editing `.env` or restarting, except `CODEX_BASE_URL` itself.
+button, the model dropdown, the four surface switches (narrative, digest, attacks, shadow
+classification) and the `ai_runs` audit viewer. Nothing about it requires editing `.env` or
+restarting, except `CODEX_BASE_URL` itself.
 
 ```bash
 # Session: is there one, whose is it, when does it die. Never returns a token.
@@ -72,7 +73,7 @@ curl -fsS -u "$OPS_USER:$OPS_PASSWORD" http://localhost:3000/ops/codex/settings
 
 # Pick a model and switch surfaces. Any subset of fields; omitted ones keep their value.
 curl -fsS -u "$OPS_USER:$OPS_PASSWORD" -X PUT -H 'Content-Type: application/json' \
-  -d '{"model":"gpt-5.6-luna","features":{"narrative":true,"digest":true,"attacks":true}}' \
+  -d '{"model":"gpt-5.6-luna","features":{"narrative":true,"digest":true,"attacks":true,"shadow":true}}' \
   http://localhost:3000/ops/codex/settings
 
 # The audit log: every call, including the ones that never left the process.
@@ -90,6 +91,44 @@ Reading it:
   under the model that would have been used (`no_session`, `model_not_selected`, `not_configured`),
   endpoint refusals keep the status code and never the response body, and a `session_expired` streak
   means someone needs to press the sign-in button again.
+- **The shadow switch spends quota during attacks by design.** Shadow classification runs on exactly
+  the messages the classifier is already processing, capped by `SHADOW_CLASSIFIER_MAX_PER_MINUTE`
+  (default 6, messages over budget dropped, never queued). The switch lives here and not in `.env`
+  precisely because the moment to turn it off — an exhausted quota mid-attack — is the worst moment
+  to edit a file and restart. Its runs audit under `shadow-classifier-v1`; `/ops` shows the agreement
+  rate and the newest disagreements, and the follow-up is a pattern and a test, never a state change.
+
+## Source trust (operator only)
+
+The nightly worker scores every source's last thirty days from the classification archive and
+appends one row per source per run; the map shows subscribers one word, the ops surface shows the
+arithmetic. Full contract: `docs/ARCHITECTURE.md`, "Dynamic source trust".
+
+```bash
+# Every source with its current score, label and modifier — and the methodology
+# (weights, window, thresholds) in the same payload, so the number can be checked.
+curl -fsS -u "$OPS_USER:$OPS_PASSWORD" http://localhost:3000/ops/api/source-trust
+
+# The append-only series behind one source's value, newest first.
+curl -fsS -u "$OPS_USER:$OPS_PASSWORD" 'http://localhost:3000/ops/api/source-trust/<source-id>?limit=60'
+
+# Recompute now. Appends a real run, indistinguishable from the nightly one.
+curl -fsS -u "$OPS_USER:$OPS_PASSWORD" -X POST http://localhost:3000/ops/api/source-trust/recalculate
+```
+
+Reading it:
+
+- **`neutral: true` is not a verdict.** Below twenty observed events the window cannot distinguish a
+  bad channel from an unlucky one, so the source keeps 0.5 and `neutralReason` says why, naming the
+  window the run actually used.
+- **An official source at exactly neutral may be floored.** `officialFloorApplied` distinguishes "we
+  measured 0.5" from "we measured worse and the mandate floor held" — the second one is the cue for
+  an editorial look at the channel, since the nightly run deliberately will not demote it.
+- **Trust is not tier.** A source at the 0.6 floor still contributes 60% of its weight, and the
+  3.9/5.9 caps run after the modifier. If a channel deserves less than that, the response is its
+  `sources` row — disable it — not a hope that the measurement will silence it.
+- **A step in a series with an unchanged channel** usually means `TRUST_METHODOLOGY_VERSION` moved;
+  every row carries the version it was computed under, so compare like with like.
 
 ## Analytical queries
 

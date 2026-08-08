@@ -8,10 +8,11 @@ Evidence-first situational awareness for Ukraine: a Telegram bot, responsive sta
 
 - Three official (tier A) alert sources, per-source state reconciliation, and normalized alert periods: the Ukraine Alarm and Alerts.in.ua APIs, plus the official alert channel [@air_alert_ua](https://t.me/air_alert_ua), which needs no API token and works out of the box with the Telegram collector credentials.
 - Two reconciliation models behind one aggregate: snapshot polling for the APIs, and an event-driven path for the channel, which announces raion-level alerts and all-clears one at a time and must never be read as "everything unmentioned is clear".
-- Threat event classifier for UAVs, ballistic and cruise missiles, KABs, aviation, MLRS, artillery, and mortars.
+- Threat event classifier for UAVs, ballistic and cruise missiles, KABs, aviation, MLRS, artillery, and mortars — v2 vocabulary reading the words the channels actually use (ground-attack S-300/S-400, sea-area launches, naval drones, reconnaissance UAVs, repeat approaches, MiG-31K landings demoted to ambient), with a replayable archived corpus (`npm run classifier:replay`) and an optional model-written shadow second opinion that can never touch an event, an alert or the map.
 - Evidence levels: `unverified`, `monitoring`, `confirmed`, and `official`.
 - Corroboration by independent source groups; reposts do not count as independent confirmation.
 - Six-hour per-location risk assessment with time decay, source-tier guardrails, validated AI output, and deterministic fallback.
+- Dynamic source trust, measured nightly from the classification archive over a thirty-day window — retractions, corroboration, first reports, lag behind the leader, unreadable share — and applied as a bounded modifier (0.6–1.2) on a signal's contribution. Trust never changes a source's tier and the tier caps are applied after it; the public assessment card shows one word («довіра джерела: висока / звичайна / знижена»), the full component breakdown lives in `/ops`.
 - Telegram subscriptions, commands, PostgreSQL outbox, retry policy, and delivery rate control.
 - Static HTML/CSS/JS frontend with MapLibre, SSE updates, mobile and TV layouts, history, analytics, source health, and operations views.
 - Explicit internationally recognized Ukraine boundary overlay including the Autonomous Republic of Crimea and Sevastopol; oblast/city clicks open territorial history.
@@ -19,8 +20,8 @@ Evidence-first situational awareness for Ukraine: a Telegram bot, responsive sta
 - Operator-managed catalog of recommended Telegram channels, exposed on the site and through the bot.
 - Codex analytics on a ChatGPT plan, managed entirely from the operations console: an OAuth (PKCE)
   sign-in button instead of a token pasted into `.env` (session stored in PostgreSQL, refreshed
-  automatically, loopback-only callback), a model picker and three per-surface switches — narrative,
-  nightly digest, vector extrapolation — stored in `codex_settings`. The client speaks the streamed
+  automatically, loopback-only callback), a model picker and four per-surface switches — narrative,
+  nightly digest, vector extrapolation, shadow classification — stored in `codex_settings`. The client speaks the streamed
   Responses API against `chatgpt.com/backend-api/codex` (or `chat/completions` against a compatible
   proxy), audits every call in `ai_runs`, and every surface keeps its deterministic fallback: a
   refused or expired model never breaks the flow, and model-written text is always labelled as such.
@@ -220,6 +221,7 @@ Useful endpoints:
 - `/api/v1/methodology` — machine-readable v2 methodology and hard limits.
 - `/metrics` — Prometheus metrics.
 - `/ops/api` and `/ops/run-assessment` — Basic-auth protected operations API.
+- `/ops/api/source-trust` — Basic-auth protected dynamic source trust: every source's current score with the full methodology (weights, window, thresholds) in the payload, per-source history, and a recalculate-now POST.
 - `/ops/vectors` and `/ops/threats/:id/vector-projection` — Basic-auth protected extrapolation of a reported chain, with an explicit uncertainty cone. Stored in its own tables, marked `data_nature = 'calculated'` by constraint, and unreachable from any module that builds a public response.
 - `/ops` — operator login and channel catalog management; channel mutations remain Basic-auth protected.
 
@@ -322,7 +324,7 @@ Every row is either working today or explicitly not. Nothing here is aspirationa
 | | |
 |---|---|
 | **What** | A six-hour relative index per location and threat type, with the signals behind it. |
-| **How** | Time decay with a two-hour half-life, weighted by source reliability. |
+| **How** | Time decay with a two-hour half-life, weighted by source reliability and by measured source trust — a bounded 0.6–1.2 modifier from the nightly archive measurement; a source with no measurement contributes exactly as before. |
 | **Clamps** | Only tier C sources → maximum 3.9. No tier A source → maximum 5.9. Fewer than two independent groups → confidence forced to `low`. The model cannot exceed what the sources support. |
 | **Without a model** | A deterministic engine produces the same shape of output. The model is an improvement, never a dependency. |
 | **Not this** | Not a probability. The indicative percentage is a scale reading. A low score never means safe. |
@@ -363,6 +365,13 @@ a change in enemy tactics. Three queries ship in `docs/OPERATIONS.md`: events by
 time, **where threats are lost** (last asserted vs. withdrawn, with elapsed time), and what each
 source published that raised nothing.
 
+The archive is also what the classifier is tested against and what source trust is measured from.
+`npm run classifier:replay` classifies the stored corpus with today's rules and reports what moved —
+by class, by location, and by whether a message raises anything at all, split by direction. The
+shadow classifier, when its `/ops` switch is on, writes a model's second opinion beside each archived
+decision with an `agrees` flag; its product is a reading list of disagreements, never a change to
+state. And the nightly trust run reads the same archive to score every source's last thirty days.
+
 ## Roadmap
 
 ### In progress
@@ -379,7 +388,7 @@ source published that raised nothing.
 |---|---|
 | **Operator panel: source management** | 58 sources exist, 24 deliberately disabled, and the panel cannot show or toggle any of them — it manages the user-facing recommendation list instead. It also has no view of catalogue gaps, stuck alerts, withdrawals, or which source is holding an alert open. |
 | **Conditional forward warning** | The nightly digest is unconditional and fixed at 23:20. A warning issued *because* a threat is building — for the coming evening or day — does not exist yet. |
-| **Model-based classification** | Classification is still regular expressions. The model currently only scores risk. Moving classification to a model needs a labelled corpus and shadow-mode comparison first — the archive above is what makes that possible. |
+| **Model-based classification** | Classification is still deterministic rules (v2). But the two prerequisites now exist: the archive is a replayable labelled corpus (`npm run classifier:replay`), and shadow mode records a model's verdict beside every rules verdict with an agreement flag. What remains is accumulating enough disagreement data and a deliberate decision to promote — the model still cannot touch an event, an alert or the map. |
 | **Russian-language sources** | Three registered channels stay disabled because the classifier and the location catalogue are Ukrainian-only. |
 | **Delivery rate governor** | Burst coalescing is per source. During a mass attack across 46 subscriptions, aggregate fan-out is unreviewed. |
 
