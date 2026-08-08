@@ -2,8 +2,15 @@ import type { Bot } from 'grammy';
 import { pool } from '../db/pool.js';
 import { relatedLocationsCte } from '../repositories/events.js';
 import {
-  cleanSummary, confidenceLabel, evidenceStatement, humanMoment, levelLabel, threatLabel, validUntilLine
+  cleanSummary, confidenceLabel, evidenceRaisedLine, evidenceStatement, extensionLine,
+  geographyChangedLine, humanMoment, levelLabel, riskLevelChangedLine, threatLabel,
+  threatTypeChangedLine, validUntilLine
 } from './humanize.js';
+import {
+  decideAssessmentNotification, decideThreatNotification, geographyKey, mergePublishedState,
+  threatContentHash,
+  type AssessmentPublishedState, type ThreatPublishedState, type ThreatSnapshot
+} from './notification-policy.js';
 
 function html(value: unknown): string {
   return String(value ?? '').replace(/[&<>'"]/g, (char) => ({
@@ -11,37 +18,124 @@ function html(value: unknown): string {
   })[char]!);
 }
 
-async function insertForSubscribers(args: {
-  locationId: string; type: string; entityId: string; eventVersion: number;
-  priority: number; payload: Record<string, unknown>; threatType?: string; evidenceLevel?: string;
+async function insertForAlertSubscribers(args: {
+  locationId: string; type: 'alert_start' | 'alert_end'; entityId: string; eventVersion: number;
+  priority: number; payload: Record<string, unknown>;
 }) {
+  // Official alerts keep the set-based fanout that threats and analytics gave up. They carry no
+  // per-chat published state, they ignore the evidence and threat-type filters, and every one of
+  // them must arrive — there is nothing here to suppress, so there is nothing to loop over.
+  //
   // `related_locations` is the whole ancestor and descendant chain of the event location, so an
   // oblast subscriber keeps receiving a city event once a raion sits between the two. `DISTINCT`
   // collapses a chat that holds several matching subscriptions (oblast *and* raion *and* city) into
   // the single outbox row `idempotency_key` would otherwise have to absorb.
   await pool.query(
     `${relatedLocationsCte()}
-     INSERT INTO notification_outbox(event_id,alert_period_id,assessment_id,chat_id,notification_type,idempotency_key,priority,payload)
-     SELECT DISTINCT
-            CASE WHEN $2='threat_update' THEN $3::uuid END,
-            CASE WHEN $2 IN ('alert_start','alert_end') THEN $3::uuid END,
-            CASE WHEN $2='assessment_update' THEN $3::uuid END,
-            s.chat_id,$2::text,$3||':'||s.chat_id||':'||$2||':'||$4,$5::integer,$6::jsonb
+     INSERT INTO notification_outbox(alert_period_id,chat_id,notification_type,idempotency_key,priority,payload)
+     SELECT DISTINCT $3::uuid,s.chat_id,$2::text,$3||':'||s.chat_id||':'||$2||':'||$4,$5::integer,$6::jsonb
      FROM subscriptions s JOIN telegram_users u ON u.chat_id=s.chat_id
      WHERE s.enabled=true AND u.enabled=true
        AND EXISTS (SELECT 1 FROM related_locations r WHERE r.id=s.location_id)
-       AND (
-         ($2='alert_start' AND s.notify_alert_start=true) OR
-         ($2='alert_end' AND s.notify_alert_end=true) OR
-         ($2='assessment_update' AND s.notify_analytics=true AND (s.threat_type='*' OR s.threat_type=$7)) OR
-         ($2='threat_update' AND s.notify_threats=true AND (s.threat_type='*' OR s.threat_type=$7)
-           AND CASE $8 WHEN 'official' THEN 3 WHEN 'confirmed' THEN 2 WHEN 'monitoring' THEN 1 ELSE 0 END >=
-               CASE s.minimum_evidence_level WHEN 'official' THEN 3 WHEN 'confirmed' THEN 2 WHEN 'monitoring' THEN 1 ELSE 0 END)
-       )
+       AND (($2='alert_start' AND s.notify_alert_start=true) OR ($2='alert_end' AND s.notify_alert_end=true))
      ON CONFLICT (idempotency_key) DO NOTHING`,
     [args.locationId, args.type, args.entityId, args.eventVersion, args.priority,
-      JSON.stringify(args.payload), args.threatType ?? '*', args.evidenceLevel ?? 'unverified']
+      JSON.stringify(args.payload)]
   );
+}
+
+/**
+ * Chats that may hear about a threat, each with what it was last told about that same threat.
+ *
+ * The subscription filters are identical to the ones the alert fanout applies inline; the join to
+ * `notification_state` is what turns a set-based insert into a per-chat decision. The anchor is an
+ * array because one threat can be attached to several locations at once, and a chat must appear
+ * here exactly once regardless of how many of them it subscribes to.
+ */
+interface ThreatCandidate {
+  chat_id: string;
+  last_threat_type: string | null;
+  last_evidence_level: string | null;
+  last_geography_key: string | null;
+  last_valid_until: Date | null;
+  content_hash: string | null;
+  telegram_message_id: string | null;
+}
+
+async function threatCandidates(args: {
+  locationIds: string[]; entityId: string; threatType: string; evidenceLevel: string;
+}): Promise<ThreatCandidate[]> {
+  const result = await pool.query<ThreatCandidate>(
+    `${relatedLocationsCte('ANY($1::text[])')}
+     SELECT DISTINCT s.chat_id,ns.last_threat_type,ns.last_evidence_level,ns.last_geography_key,
+            ns.last_valid_until,ns.content_hash,ns.telegram_message_id
+     FROM subscriptions s
+     JOIN telegram_users u ON u.chat_id=s.chat_id
+     LEFT JOIN notification_state ns
+       ON ns.entity_kind='threat' AND ns.entity_key=$2 AND ns.chat_id=s.chat_id
+     WHERE s.enabled=true AND u.enabled=true AND s.notify_threats=true
+       AND EXISTS (SELECT 1 FROM related_locations r WHERE r.id=s.location_id)
+       AND (s.threat_type='*' OR s.threat_type=$3)
+       AND CASE $4 WHEN 'official' THEN 3 WHEN 'confirmed' THEN 2 WHEN 'monitoring' THEN 1 ELSE 0 END >=
+           CASE s.minimum_evidence_level WHEN 'official' THEN 3 WHEN 'confirmed' THEN 2 WHEN 'monitoring' THEN 1 ELSE 0 END`,
+    [args.locationIds, args.entityId, args.threatType, args.evidenceLevel]
+  );
+  return result.rows;
+}
+
+/**
+ * Records what a chat is being told, at enqueue time rather than at delivery time.
+ *
+ * The fanout runs once a second; a marker written only after Telegram confirms delivery would let
+ * the next pass decide against an empty history and queue the same escalation twice. Writing it here
+ * means the failure mode is a missed repeat rather than a duplicate, and the outbox keeps its own
+ * at-least-once retries underneath. `telegram_message_id` is deliberately not touched: it belongs to
+ * the delivery worker, and a soft update must not lose the message it is about to edit.
+ *
+ * `expires_at` has a two-hour floor. A source that reports a validity window already in the past —
+ * a mis-parsed «до 22:00» read as yesterday — would otherwise write a row the cleanup deletes on its
+ * next pass, and the chat's published state would evaporate under it: every following mention of the
+ * same threat would look like a first mention and be sent in full. That is precisely the repeat storm
+ * this table exists to stop.
+ */
+async function rememberThreatState(args: {
+  entityId: string; chatId: string; locationId: string; snapshot: ThreatSnapshot;
+}) {
+  await pool.query(
+    `INSERT INTO notification_state(entity_kind,entity_key,chat_id,location_id,last_threat_type,
+       last_evidence_level,last_geography_key,last_valid_until,content_hash,last_notified_at,expires_at)
+     VALUES ('threat',$1,$2,$3,$4,$5,$6,$7::timestamptz,$8,now(),
+       GREATEST(COALESCE($7::timestamptz + interval '6 hours', now() + interval '12 hours'),
+                now() + interval '2 hours'))
+     ON CONFLICT (entity_kind,entity_key,chat_id) DO UPDATE SET
+       location_id=EXCLUDED.location_id,last_threat_type=EXCLUDED.last_threat_type,
+       last_evidence_level=EXCLUDED.last_evidence_level,last_geography_key=EXCLUDED.last_geography_key,
+       last_valid_until=EXCLUDED.last_valid_until,content_hash=EXCLUDED.content_hash,
+       last_notified_at=now(),expires_at=EXCLUDED.expires_at,updated_at=now()`,
+    [args.entityId, args.chatId, args.locationId, args.snapshot.threatType, args.snapshot.evidenceLevel,
+      geographyKey(args.snapshot.locationIds), args.snapshot.validUntil, threatContentHash(args.snapshot)]
+  );
+}
+
+async function rememberAssessmentState(args: {
+  entityKey: string; chatId: string; locationId: string; riskLevel: string; score: number;
+}) {
+  await pool.query(
+    `INSERT INTO notification_state(entity_kind,entity_key,chat_id,location_id,last_risk_level,
+       last_score,last_notified_at,expires_at)
+     VALUES ('assessment',$1,$2,$3,$4,$5,now(),now() + interval '12 hours')
+     ON CONFLICT (entity_kind,entity_key,chat_id) DO UPDATE SET
+       location_id=EXCLUDED.location_id,last_risk_level=EXCLUDED.last_risk_level,
+       last_score=EXCLUDED.last_score,last_notified_at=now(),expires_at=EXCLUDED.expires_at,updated_at=now()`,
+    [args.entityKey, args.chatId, args.locationId, args.riskLevel, args.score]
+  );
+}
+
+/** Location names as one label; long lists are trimmed rather than turned into a wall of names. */
+function locationLabel(names: string[]): string {
+  const unique = [...new Set(names.filter(Boolean))];
+  if (unique.length <= 3) return unique.join(', ');
+  return `${unique.slice(0, 3).join(', ')} та ще ${unique.length - 3}`;
 }
 
 /**
@@ -103,7 +197,7 @@ async function enqueueForEvent(event: any) {
     const alert = (await pool.query(
       `SELECT started_at,ended_at,source_message_id FROM alert_periods WHERE id=$1`, [entityId]
     )).rows[0];
-    await insertForSubscribers({
+    await insertForAlertSubscribers({
       locationId, type, entityId, eventVersion: Number(event.version), priority: type === 'alert_start' ? 0 : 2,
       payload: {
         locationName: location?.name_uk, startedAt: alert?.started_at, endedAt: alert?.ended_at,
@@ -121,22 +215,71 @@ async function enqueueForEvent(event: any) {
   if (event.event_type.startsWith('threat.')
     && event.event_type !== 'threat.expired' && event.event_type !== 'threat.withdrawn') {
     const entityId = String(event.payload.eventId);
+    // `ORDER BY` makes the leading row — and therefore the threat fields read off it — the same on
+    // every pass, so a re-run of the identical event cannot produce a different content hash.
     const threats = await pool.query(
       `SELECT e.*,el.location_id,l.name_uk FROM threat_events e
        JOIN threat_event_locations el ON el.event_id=e.id JOIN locations l ON l.id=el.location_id
-       WHERE e.id=$1`, [entityId]
+       WHERE e.id=$1 ORDER BY el.location_id`, [entityId]
     );
+    if (!threats.rowCount) return;
+    const threat = threats.rows[0];
     const threatSource = await latestEventSource(entityId);
-    for (const threat of threats.rows) {
-      await insertForSubscribers({
-        locationId: threat.location_id, type: 'threat_update', entityId,
-        eventVersion: Number(event.version), priority: threat.evidence_level === 'official' ? 1 : 3,
-        threatType: threat.threat_type, evidenceLevel: threat.evidence_level,
-        payload: {
-          locationName: threat.name_uk, threatType: threat.threat_type, summary: threat.summary,
-          evidenceLevel: threat.evidence_level, lastObservedAt: threat.last_observed_at,
-          validUntil: threat.valid_until, ...threatSource
-        }
+    // One decision per chat about the *whole* threat, not one per location it touches: a threat that
+    // grows a second oblast is one piece of news, and the geography rule can only see that growth if
+    // every location is on the table at once.
+    const snapshot: ThreatSnapshot = {
+      threatType: threat.threat_type,
+      evidenceLevel: threat.evidence_level,
+      locationIds: threats.rows.map((row) => String(row.location_id)),
+      validUntil: threat.valid_until ? new Date(threat.valid_until).toISOString() : null
+    };
+    const names = locationLabel(threats.rows.map((row) => String(row.name_uk)));
+    const candidates = await threatCandidates({
+      locationIds: snapshot.locationIds, entityId,
+      threatType: snapshot.threatType, evidenceLevel: snapshot.evidenceLevel
+    });
+    for (const candidate of candidates) {
+      // A row exists but says nothing about a threat only when the join found no state at all.
+      const published: ThreatPublishedState | null = candidate.last_evidence_level === null
+        && candidate.last_threat_type === null && candidate.content_hash === null
+        ? null
+        : {
+            threatType: candidate.last_threat_type,
+            evidenceLevel: candidate.last_evidence_level,
+            geographyKey: candidate.last_geography_key,
+            validUntil: candidate.last_valid_until ? new Date(candidate.last_valid_until).toISOString() : null,
+            contentHash: candidate.content_hash,
+            telegramMessageId: candidate.telegram_message_id ? Number(candidate.telegram_message_id) : null
+          };
+      const decision = decideThreatNotification(published, snapshot);
+      if (decision.action === 'skip') continue;
+      // A soft update is a courtesy, not a warning: it rides at the quiet priority even when the
+      // threat itself is official, because the only thing it says is "still standing, until later".
+      const priority = decision.kind === 'soft' ? 4 : (snapshot.evidenceLevel === 'official' ? 1 : 3);
+      const inserted = await pool.query(
+        `INSERT INTO notification_outbox(event_id,chat_id,notification_type,idempotency_key,priority,payload)
+         VALUES ($1::uuid,$2,'threat_update',$3,$4,$5::jsonb)
+         ON CONFLICT (idempotency_key) DO NOTHING`,
+        [entityId, candidate.chat_id,
+          `${entityId}:${candidate.chat_id}:threat_update:${Number(event.version)}`, priority,
+          JSON.stringify({
+            locationName: names, threatType: snapshot.threatType, summary: threat.summary,
+            evidenceLevel: snapshot.evidenceLevel, lastObservedAt: threat.last_observed_at,
+            validUntil: threat.valid_until, ...threatSource,
+            updateKind: decision.kind, changes: decision.changes,
+            previousThreatType: published?.threatType ?? null,
+            previousEvidenceLevel: published?.evidenceLevel ?? null,
+            editMessageId: decision.action === 'edit' ? decision.editMessageId : null,
+            state: { kind: 'threat', key: entityId }
+          })]
+      );
+      if (!inserted.rowCount) continue;
+      // What is recorded is what the chat was *told*, which is not the same as the current snapshot:
+      // the fields a delta message stayed silent about keep their published value.
+      await rememberThreatState({
+        entityId, chatId: candidate.chat_id, locationId: String(threat.location_id),
+        snapshot: mergePublishedState(published, snapshot)
       });
     }
     return;
@@ -155,17 +298,58 @@ async function enqueueForEvent(event: any) {
        JOIN source_messages sm ON sm.id=rs.source_message_id JOIN sources s ON s.id=sm.source_id
        WHERE ras.assessment_id=$1 ORDER BY ras.contribution DESC LIMIT 1`, [entityId]
     )).rows[0];
-    await insertForSubscribers({
-      locationId: assessment.location_id, type: 'assessment_update', entityId,
-      eventVersion: Number(event.version), priority: 4, threatType: assessment.threat_type,
-      payload: {
-        locationName: assessment.name_uk, threatType: assessment.threat_type,
-        score: assessment.risk_score, level: assessment.risk_level,
-        indicativePercent: assessment.indicative_percent, confidence: assessment.assessment_confidence,
-        explanation: assessment.explanation, horizonEnd: assessment.horizon_end,
-        ...sourceFields(topSignal)
-      }
-    });
+    // Analytics identity is (location, threat type), not the assessment row: every run inserts a new
+    // row, so keying the published state by assessment id would make every single run look new.
+    const stateKey = `${assessment.location_id}:${assessment.threat_type}`;
+    const score = Number(assessment.risk_score);
+    const generatedAt = new Date(assessment.generated_at ?? Date.now()).toISOString();
+    const candidates = await pool.query<{
+      chat_id: string; last_risk_level: string | null; last_score: string | null; last_notified_at: Date | null;
+    }>(
+      `${relatedLocationsCte()}
+       SELECT DISTINCT s.chat_id,ns.last_risk_level,ns.last_score,ns.last_notified_at
+       FROM subscriptions s
+       JOIN telegram_users u ON u.chat_id=s.chat_id
+       LEFT JOIN notification_state ns
+         ON ns.entity_kind='assessment' AND ns.entity_key=$2 AND ns.chat_id=s.chat_id
+       WHERE s.enabled=true AND u.enabled=true AND s.notify_analytics=true
+         AND EXISTS (SELECT 1 FROM related_locations r WHERE r.id=s.location_id)
+         AND (s.threat_type='*' OR s.threat_type=$3)`,
+      [assessment.location_id, stateKey, assessment.threat_type]
+    );
+    for (const candidate of candidates.rows) {
+      const published: AssessmentPublishedState | null = candidate.last_risk_level === null ? null : {
+        riskLevel: candidate.last_risk_level,
+        score: candidate.last_score === null ? null : Number(candidate.last_score),
+        notifiedAt: candidate.last_notified_at ? new Date(candidate.last_notified_at).toISOString() : null
+      };
+      const decision = decideAssessmentNotification(published, {
+        riskLevel: assessment.risk_level, score, at: generatedAt
+      });
+      if (decision.action === 'skip') continue;
+      const inserted = await pool.query(
+        `INSERT INTO notification_outbox(assessment_id,chat_id,notification_type,idempotency_key,priority,payload)
+         VALUES ($1::uuid,$2,'assessment_update',$3,4,$4::jsonb)
+         ON CONFLICT (idempotency_key) DO NOTHING`,
+        [entityId, candidate.chat_id,
+          `${entityId}:${candidate.chat_id}:assessment_update:${Number(event.version)}`,
+          JSON.stringify({
+            locationName: assessment.name_uk, threatType: assessment.threat_type,
+            score: assessment.risk_score, level: assessment.risk_level,
+            indicativePercent: assessment.indicative_percent, confidence: assessment.assessment_confidence,
+            explanation: assessment.explanation, horizonEnd: assessment.horizon_end,
+            ...sourceFields(topSignal),
+            updateKind: decision.kind, silent: decision.silent,
+            previousLevel: published?.riskLevel ?? null, previousScore: published?.score ?? null,
+            state: { kind: 'assessment', key: stateKey }
+          })]
+      );
+      if (!inserted.rowCount) continue;
+      await rememberAssessmentState({
+        entityKey: stateKey, chatId: candidate.chat_id, locationId: assessment.location_id,
+        riskLevel: assessment.risk_level, score
+      });
+    }
   }
 }
 
@@ -243,8 +427,13 @@ export function formatMessage(row: any, now: Date = new Date()): string {
     const factors = Array.isArray(p.explanation?.raisingFactors) ? p.explanation.raisingFactors.slice(0, 3) : [];
     const horizon = humanMoment(p.horizonEnd, now);
     const confidence = confidenceLabel(p.confidence);
+    // The previous level is stated only when it actually moved, so a routine drift message does not
+    // pretend to be a level change — and a level change is never left to be inferred from a number.
+    const movement = p.previousLevel && p.previousLevel !== p.level
+      ? `\n${html(riskLevelChangedLine(p.previousLevel, p.level, p.updateKind === 'deescalation' ? 'down' : 'up'))}`
+      : '';
     return `📊 <b>Оновлення аналітики — ${html(p.locationName)}</b>\n`
-      + `${html(threatLabel(p.threatType))}: <b>${html(levelLabel(p.level))}</b> · ${html(p.score)}/10\n\n`
+      + `${html(threatLabel(p.threatType))}: <b>${html(levelLabel(p.level))}</b> · ${html(p.score)}/10${movement}\n\n`
       + 'Це орієнтир для планування, а не сигнал тривоги. Окремих дій зараз не потрібно — '
       + 'реагуйте на офіційні сповіщення.'
       + (factors.length ? `\n\nЩо підвищує рівень:\n${factors.map((factor: string) => `• ${html(factor)}`).join('\n')}` : '')
@@ -281,6 +470,14 @@ export function formatMessage(row: any, now: Date = new Date()): string {
         'У разі тривоги прямуйте до визначеного укриття.'
       );
   }
+  // Threat updates. The first message a chat gets about a threat carries the whole picture; every
+  // later one says only what moved, because a person who already read the warning does not need it
+  // restated — they need to know whether anything about it changed.
+  //
+  // The check sits *below* the alert branches on purpose. An official tribute of a raid must never
+  // be reachable from this path: alerts carry no `updateKind`, are never suppressed and are never
+  // edited, and keeping their branches above this one is what guarantees it structurally.
+  if (p.updateKind && p.updateKind !== 'initial') return formatThreatDelta(p, now);
   const summary = cleanSummary(p.summary);
   return `⚠️ <b>${html(p.locationName)} — ${html(threatLabel(p.threatType))}</b>`
     + (summary ? `\n\n${html(summary)}` : '')
@@ -291,6 +488,36 @@ export function formatMessage(row: any, now: Date = new Date()): string {
       validUntilLine(p.validUntil, now),
       sourceLine(p)
     );
+}
+
+const deltaHeadings: Record<string, string> = { escalation: '⬆️', change: '🔀', soft: '⏱' };
+
+/**
+ * A follow-up message about a threat the chat has already been warned about.
+ *
+ * It deliberately omits both the source summary and the shelter instruction: the person read them in
+ * the first message, and repeating them is what makes an update indistinguishable from a repeat. The
+ * link back to the first source stays, because the reader must still be able to check the claim.
+ */
+function formatThreatDelta(p: any, now: Date): string {
+  const changes: string[] = Array.isArray(p.changes) ? p.changes : [];
+  const lines: string[] = [];
+  if (changes.includes('evidence_raised')) lines.push(evidenceRaisedLine(p.evidenceLevel));
+  if (changes.includes('threat_type_changed')) {
+    lines.push(threatTypeChangedLine(p.previousThreatType, p.threatType));
+  }
+  if (changes.includes('geography_changed')) lines.push(geographyChangedLine(String(p.locationName ?? '')));
+  if (changes.includes('validity_extended')) {
+    const extension = extensionLine(p.validUntil, now);
+    if (extension) lines.push(extension);
+  }
+  // A change list that produced no phrase would leave an empty message; the validity line is the one
+  // statement that is always true of a standing threat, so it is the fallback.
+  if (!lines.length) lines.push(validUntilLine(p.validUntil, now) ?? 'Загроза лишається актуальною.');
+  const heading = deltaHeadings[String(p.updateKind)] ?? '🔁';
+  return `${heading} <b>${html(p.locationName)} — оновлення</b>\n${html(threatLabel(p.threatType))}\n\n`
+    + lines.map((line) => html(line)).join('\n')
+    + details(sourceLine(p));
 }
 
 const sendingReclaimSeconds = 300;
@@ -322,15 +549,50 @@ async function deliverBatch(bot: Bot, log: { warn: Function }) {
     await client.query('COMMIT');
     for (const row of batch.rows) {
       try {
-        const sent = await bot.api.sendMessage(String(row.chat_id), formatMessage(row), {
-          parse_mode: 'HTML', disable_notification: row.priority >= 3,
+        const payload = row.payload ?? {};
+        const text = formatMessage(row);
+        const options = {
+          parse_mode: 'HTML' as const,
+          // A de-escalation is worth recording and not worth a sound at night, so the policy can ask
+          // for silence explicitly; everything from priority 3 down was already quiet.
+          disable_notification: payload.silent === true || row.priority >= 3,
           link_preview_options: { is_disabled: true }
-        });
+        };
+        const editMessageId = Number(payload.editMessageId ?? 0) || null;
+        let messageId: number | null = null;
+        if (editMessageId) {
+          // Editing keeps one message per threat in the chat: «ще стоїть, до 04:10» replaces the line
+          // the person already read instead of stacking another push on top of it. The message may be
+          // gone (deleted, or older than Telegram lets us edit), and grammy reports that as an
+          // ordinary API error — falling through to a normal send is the correct answer, not a retry,
+          // because the subscriber has nothing to look at either way.
+          try {
+            await bot.api.editMessageText(String(row.chat_id), editMessageId, text, {
+              parse_mode: options.parse_mode, link_preview_options: options.link_preview_options
+            });
+            messageId = editMessageId;
+          } catch (error: any) {
+            log.warn({ outboxId: row.id, code: String(error?.error?.error_code ?? error?.error_code ?? 'unknown') },
+              'notification edit failed, sending a new message');
+          }
+        }
+        if (messageId === null) {
+          const sent = await bot.api.sendMessage(String(row.chat_id), text, options);
+          messageId = sent.message_id;
+        }
         await pool.query(`UPDATE notification_outbox SET status='sent',sent_at=now(),updated_at=now() WHERE id=$1`, [row.id]);
         await pool.query(
           `INSERT INTO notification_deliveries(outbox_id,telegram_message_id,delivered_status,queued_at,sent_at)
-           VALUES ($1,$2,'sent',$3,now())`, [row.id, sent.message_id, row.created_at]
+           VALUES ($1,$2,'sent',$3,now())`, [row.id, messageId, row.created_at]
         );
+        // The message id is what makes the *next* soft update an edit rather than a new push.
+        if (payload.state?.key) {
+          await pool.query(
+            `UPDATE notification_state SET telegram_message_id=$3,delivered_at=now(),updated_at=now()
+             WHERE entity_kind=$1 AND entity_key=$2 AND chat_id=$4`,
+            [payload.state.kind, payload.state.key, messageId, row.chat_id]
+          );
+        }
       } catch (error: any) {
         const code = String(error?.error?.error_code ?? error?.error_code ?? 'unknown');
         const retryAfter = Number(error?.error?.parameters?.retry_after ?? Math.min(300, 2 ** row.attempts));

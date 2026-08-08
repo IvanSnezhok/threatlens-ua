@@ -440,6 +440,9 @@ describe.skipIf(!integrationDatabaseAvailable)('subscription fanout', () => {
     });
 
     it('keys idempotency per chat, event and system-event version', async () => {
+      // The key still carries the version — that is what keeps the outbox at-least-once. What stops
+      // the second, unchanged version from reaching the subscriber is the published-state check one
+      // layer above it, so only the first version produces a row here.
       await seedUser(9503);
       await seedSubscription({ chatId: 9503, locationId: OBLAST });
       const eventId = await seedThreatEvent({ locationIds: [OBLAST] });
@@ -453,8 +456,7 @@ describe.skipIf(!integrationDatabaseAvailable)('subscription fanout', () => {
         `SELECT idempotency_key FROM notification_outbox ORDER BY idempotency_key`
       );
       expect(keys.rows.map((row) => row.idempotency_key)).toEqual([
-        `${eventId}:9503:threat_update:${firstVersion}`,
-        `${eventId}:9503:threat_update:${secondVersion}`
+        `${eventId}:9503:threat_update:${firstVersion}`
       ]);
     });
 
@@ -484,8 +486,102 @@ describe.skipIf(!integrationDatabaseAvailable)('subscription fanout', () => {
     });
   });
 
+  describe('repeat suppression', () => {
+    /** What `notification_state` remembers having told one chat about one threat. */
+    async function publishedState(eventId: string, chatId: number) {
+      const row = await sql<{ last_evidence_level: string; telegram_message_id: string | null }>(
+        `SELECT last_evidence_level,telegram_message_id FROM notification_state
+         WHERE entity_kind='threat' AND entity_key=$1 AND chat_id=$2`, [eventId, chatId]
+      );
+      return row.rows[0] ?? null;
+    }
+
+    it('sends the first message and stays quiet on a plain re-confirmation', async () => {
+      await seedUser(9701);
+      await seedSubscription({ chatId: 9701, locationId: OBLAST });
+      const eventId = await seedThreatEvent({ locationIds: [OBLAST] });
+      await appendSystemEvent('threat.updated', { eventId });
+      await runFanout();
+      expect(await count('notification_outbox')).toBe(1);
+
+      // Three more channel messages landing on the same threat, changing nothing about it.
+      for (let repeat = 0; repeat < 3; repeat += 1) {
+        await sql(`UPDATE threat_events SET last_observed_at=now(),summary=summary||'.' WHERE id=$1`, [eventId]);
+        await appendSystemEvent('threat.updated', { eventId });
+        await runFanout();
+      }
+
+      expect(await count('notification_outbox')).toBe(1);
+      expect((await publishedState(eventId, 9701))!.last_evidence_level).toBe('monitoring');
+    });
+
+    it('sends again when the evidence level is raised', async () => {
+      await seedUser(9702);
+      await seedSubscription({ chatId: 9702, locationId: OBLAST });
+      const eventId = await seedThreatEvent({ locationIds: [OBLAST], evidenceLevel: 'monitoring' });
+      await appendSystemEvent('threat.updated', { eventId });
+      await runFanout();
+
+      await sql(`UPDATE threat_events SET evidence_level='confirmed' WHERE id=$1`, [eventId]);
+      await appendSystemEvent('threat.updated', { eventId });
+      await runFanout();
+
+      const rows = await sql<{ payload: Record<string, unknown> }>(
+        `SELECT payload FROM notification_outbox ORDER BY created_at`
+      );
+      expect(rows.rows).toHaveLength(2);
+      expect(rows.rows[0]!.payload).toMatchObject({ updateKind: 'initial' });
+      expect(rows.rows[1]!.payload).toMatchObject({ updateKind: 'escalation', changes: ['evidence_raised'] });
+    });
+
+    it('queues a soft update as an edit once the validity window is extended', async () => {
+      await seedUser(9703);
+      await seedSubscription({ chatId: 9703, locationId: OBLAST });
+      const eventId = await seedThreatEvent({ locationIds: [OBLAST] });
+      await appendSystemEvent('threat.updated', { eventId });
+      await runFanout();
+      // Stand in for a delivery: only a message the chat can see is editable.
+      await sql(
+        `UPDATE notification_state SET telegram_message_id=777,delivered_at=now()
+         WHERE entity_kind='threat' AND entity_key=$1 AND chat_id=9703`, [eventId]
+      );
+
+      await sql(`UPDATE threat_events SET valid_until=now()+interval '4 hours' WHERE id=$1`, [eventId]);
+      await appendSystemEvent('threat.updated', { eventId });
+      await runFanout();
+
+      const rows = await sql<{ payload: Record<string, unknown>; priority: number }>(
+        `SELECT payload,priority FROM notification_outbox ORDER BY created_at`
+      );
+      expect(rows.rows).toHaveLength(2);
+      expect(rows.rows[1]!.payload).toMatchObject({
+        updateKind: 'soft', changes: ['validity_extended'], editMessageId: 777
+      });
+      expect(rows.rows[1]!.priority).toBe(4);
+    });
+
+    it('keeps published state per chat, so a new subscriber still gets the full message', async () => {
+      await seedUser(9704);
+      await seedSubscription({ chatId: 9704, locationId: OBLAST });
+      const eventId = await seedThreatEvent({ locationIds: [OBLAST] });
+      await appendSystemEvent('threat.updated', { eventId });
+      await runFanout();
+
+      await seedUser(9705);
+      await seedSubscription({ chatId: 9705, locationId: OBLAST });
+      await appendSystemEvent('threat.updated', { eventId });
+      await runFanout();
+
+      const rows = await sql<{ chat_id: string; payload: Record<string, unknown> }>(
+        `SELECT chat_id,payload FROM notification_outbox ORDER BY chat_id`
+      );
+      expect(rows.rows.map((row) => Number(row.chat_id))).toEqual([9704, 9705]);
+      expect(rows.rows[1]!.payload).toMatchObject({ updateKind: 'initial' });
+    });
+  });
+
   describe('payload', () => {
-    it('carries the resolved location name and a deep link into the outbox payload', async () => {
+    it('carries the resolved location name and the published-state marker into the payload', async () => {
       await seedUser(9601);
       await seedSubscription({ chatId: 9601, locationId: OBLAST });
       const eventId = await seedThreatEvent({ locationIds: [CITY_IN_OBLAST], threatType: 'uav' });
@@ -500,8 +596,27 @@ describe.skipIf(!integrationDatabaseAvailable)('subscription fanout', () => {
         locationName: 'Біла Церква',
         threatType: 'uav',
         evidenceLevel: 'monitoring',
-        mapUrl: `http://localhost:3000/?event=${eventId}`
+        updateKind: 'initial',
+        // The delivery worker writes the Telegram message id back through this marker, which is what
+        // lets the next soft update edit the message instead of pushing a new one.
+        state: { kind: 'threat', key: eventId }
       });
+    });
+
+    it('names every direction a threat covers in one message rather than one message each', async () => {
+      await seedUser(9602);
+      await seedSubscription({ chatId: 9602, locationId: OBLAST });
+      const eventId = await seedThreatEvent({ locationIds: [OBLAST, CITY_IN_OBLAST], threatType: 'uav' });
+      await appendSystemEvent('threat.updated', { eventId });
+
+      await runFanout();
+
+      const row = await sql<{ payload: Record<string, unknown> }>(
+        `SELECT payload FROM notification_outbox WHERE event_id=$1`, [eventId]
+      );
+      expect(await count('notification_outbox')).toBe(1);
+      expect(String(row.rows[0]!.payload.locationName)).toContain('Київська область');
+      expect(String(row.rows[0]!.payload.locationName)).toContain('Біла Церква');
     });
   });
 });

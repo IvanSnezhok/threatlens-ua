@@ -85,14 +85,30 @@ export async function updateSourceFreshness(): Promise<number> {
   return stale.rowCount ?? 0;
 }
 
+/**
+ * Drops the per-chat notification state of threats and assessments that are long over.
+ *
+ * The table holds one row per subscriber per entity, so without this it grows for as long as the
+ * service runs. `expires_at` is set six hours past a threat's validity window (and twelve hours for
+ * an assessment), which is far beyond the point where a repeat could still be mistaken for the same
+ * warning — deleting earlier would only turn the next mention of a stale threat into a fresh
+ * «нова загроза» message.
+ */
+export async function purgeNotificationState(): Promise<number> {
+  const purged = await pool.query(`DELETE FROM notification_state WHERE expires_at < now()`);
+  return purged.rowCount ?? 0;
+}
+
 export function startOperationsScheduler(log: { info: Function; error: Function }): () => void {
   let running = false;
   const run = async () => {
     if (running) return;
     running = true;
     try {
-      const [expired, stale] = await Promise.all([expireThreatEvents(), updateSourceFreshness()]);
-      if (expired || stale) log.info({ expired, stale }, 'operational state updated');
+      const [expired, stale, purged] = await Promise.all([
+        expireThreatEvents(), updateSourceFreshness(), purgeNotificationState()
+      ]);
+      if (expired || stale || purged) log.info({ expired, stale, purged }, 'operational state updated');
     } catch (error) {
       log.error({ error }, 'operational state update failed');
     } finally {

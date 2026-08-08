@@ -22,6 +22,7 @@ interface OutboxSeed {
   /** How long ago `updated_at` was set, in seconds. */
   updatedSecondsAgo?: number;
   priority?: number;
+  payload?: Record<string, unknown>;
 }
 
 let seedCounter = 0;
@@ -37,7 +38,8 @@ async function seedOutbox(seed: OutboxSeed): Promise<string> {
     [
       seed.eventId, seed.chatId, `${seed.eventId}:${seed.chatId}:threat_update:${seedCounter}`,
       seed.priority ?? 3,
-      JSON.stringify({ locationName: 'Київська область', threatType: 'uav', evidenceLevel: 'monitoring', summary: 's' }),
+      JSON.stringify(seed.payload
+        ?? { locationName: 'Київська область', threatType: 'uav', evidenceLevel: 'monitoring', summary: 's' }),
       seed.status, seed.attempts, String(seed.updatedSecondsAgo ?? 0)
     ]
   );
@@ -157,6 +159,65 @@ describe.skipIf(!integrationDatabaseAvailable)('outbox delivery and stuck-messag
 
     expect(await statusOf(fresh)).toEqual({ status: 'sending', attempts: 2 });
     expect(stub.warnings.filter((entry) => 'reclaimed' in entry)).toEqual([]);
+  });
+
+  describe('soft updates', () => {
+    /** Payload of a queued soft update, pointing at a message the chat is already looking at. */
+    function softUpdate(eventId: string, editMessageId: number | null) {
+      return {
+        locationName: 'Київська область', threatType: 'uav', evidenceLevel: 'monitoring',
+        validUntil: new Date(Date.now() + 3_600_000).toISOString(),
+        updateKind: 'soft', changes: ['validity_extended'], editMessageId,
+        state: { kind: 'threat', key: eventId }
+      };
+    }
+
+    async function seedPublishedState(eventId: string, chatId: number, messageId: number) {
+      await sql(
+        `INSERT INTO notification_state(entity_kind,entity_key,chat_id,last_evidence_level,
+           telegram_message_id,expires_at)
+         VALUES ('threat',$1,$2,'monitoring',$3,now()+interval '6 hours')`,
+        [eventId, chatId, messageId]
+      );
+    }
+
+    it('edits the standing message instead of pushing a new one', async () => {
+      await seedUser(8107);
+      const eventId = await seedThreatEvent({ locationIds: [OBLAST] });
+      await seedPublishedState(eventId, 8107, 555);
+      const queued = await seedOutbox({
+        chatId: 8107, eventId, status: 'pending', attempts: 0, payload: softUpdate(eventId, 555)
+      });
+
+      const stub = fakeBot();
+      await runDelivery(stub, async () => (await statusOf(queued)).status === 'sent', 'the soft update to be sent');
+
+      expect(stub.calls).toHaveLength(0);
+      expect(stub.edits).toEqual([expect.objectContaining({ chatId: '8107', messageId: 555 })]);
+      expect(stub.edits[0]!.text).toContain('Загрозу продовжено до');
+    });
+
+    it('falls back to a normal send when the message can no longer be edited', async () => {
+      // Telegram rejects an edit of a deleted or too-old message. The subscriber has nothing to look
+      // at in that case, so the update is worth sending rather than retrying.
+      await seedUser(8108);
+      const eventId = await seedThreatEvent({ locationIds: [OBLAST] });
+      await seedPublishedState(eventId, 8108, 556);
+      const queued = await seedOutbox({
+        chatId: 8108, eventId, status: 'pending', attempts: 0, payload: softUpdate(eventId, 556)
+      });
+
+      const stub = fakeBot({ onEdit: () => { throw telegramError(400); } });
+      await runDelivery(stub, async () => (await statusOf(queued)).status === 'sent', 'the fallback send to happen');
+
+      expect(await statusOf(queued)).toEqual({ status: 'sent', attempts: 1 });
+      expect(stub.calls).toHaveLength(1);
+      const state = await sql<{ telegram_message_id: string }>(
+        `SELECT telegram_message_id FROM notification_state WHERE entity_key=$1 AND chat_id=8108`, [eventId]
+      );
+      // The state now points at the message that actually exists, so the next edit targets it.
+      expect(Number(state.rows[0]!.telegram_message_id)).toBe(1);
+    });
   });
 
   it('delivers strictly by priority before creation time', async () => {

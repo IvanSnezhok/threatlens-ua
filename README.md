@@ -344,6 +344,17 @@ backoff, Telegram `retry_after`, automatic disabling of blocked users, and recla
 mid-send. Standing a threat down sends nothing rather than re-sending the original warning text — a
 message that reads as an all-clear must come from an official source.
 
+Repeats are suppressed one layer above the outbox. `notification_state` records what each chat was
+last *told* about each threat and each (location, threat type) assessment, so a source re-confirming
+a standing threat produces nothing: a message goes out only for a new threat, a raised evidence
+level, a changed threat type or geography, or a validity window pushed more than twenty minutes
+further out — and that last case edits the message the subscriber is already looking at instead of
+pushing a new one. Updates say what moved (`⬆️ Доказовість підвищено…`, `⏱ Загрозу продовжено до
+04:10`) rather than restating the warning. Analytics adds hysteresis on top: a new message on a level
+change or a full point of index movement, with a thirty-minute floor per location and chat that only
+a level increase bypasses, and de-escalations delivered silently. Official alerts and the nightly
+digest are exempt from all of it.
+
 ### Analysis archive
 
 Every classification decision is stored, including the decisions to raise nothing and why, stamped

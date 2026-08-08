@@ -148,6 +148,66 @@ export function validUntilLine(value: unknown, now: Date = new Date()): string |
   return countdown ? `Актуально до ${moment} (${countdown})` : `Орієнтир діяв до ${moment}`;
 }
 
+// ------------------------------------------------------------------------------------------------
+// Update lines
+// ------------------------------------------------------------------------------------------------
+
+/**
+ * Wording for a message that follows an earlier one about the same thing.
+ *
+ * A second message about a standing threat is not a second warning: the reader already knows there
+ * are Shaheds over the oblast. The only reason to interrupt them again is that something moved, so
+ * every line below states exactly the thing that moved and nothing else. Restating the warning is
+ * what turns a monitoring feed into noise a person mutes — and a muted bot warns nobody.
+ *
+ * Like everything else in this module the output is plain text; escaping belongs to the caller.
+ */
+
+/**
+ * Lowercases the first letter so a full-sentence phrase can be pasted after a dash.
+ *
+ * The evidence dictionary above is written as standalone statements («Підтверджено кількома
+ * джерелами») because that is how a first message shows it. Inside «Доказовість підвищено — …» the
+ * same phrase is a subordinate clause, and a capital there reads like two sentences welded together.
+ */
+function asClause(phrase: string): string {
+  return phrase ? phrase[0]!.toLowerCase() + phrase.slice(1) : phrase;
+}
+
+/** «⏱ Загрозу продовжено до 05:10 (ще ~35 хв)» — the whole content of a soft update. */
+export function extensionLine(value: unknown, now: Date = new Date()): string | null {
+  const moment = humanMoment(value, now);
+  if (!moment) return null;
+  const countdown = humanCountdown(value, now);
+  return `⏱ Загрозу продовжено до ${moment}${countdown ? ` (${countdown})` : ''}`;
+}
+
+/** «⬆️ Доказовість підвищено — підтверджено кількома джерелами». */
+export function evidenceRaisedLine(value: unknown): string {
+  return `⬆️ Доказовість підвищено — ${asClause(evidenceStatement(value))}`;
+}
+
+/** «🔀 Характер загрози уточнено: ударні БпЛА → крилаті ракети». */
+export function threatTypeChangedLine(previous: unknown, next: unknown): string {
+  return `🔀 Характер загрози уточнено: ${threatLabel(previous)} → ${threatLabel(next)}`;
+}
+
+/**
+ * «📍 Оновлено перелік напрямків: Київська область, Біла Церква».
+ *
+ * The label is the threat's *whole* current geography, not just the additions: a person who reads
+ * only this line must end up with the same picture as one who received the first message.
+ */
+export function geographyChangedLine(locationLabel: string): string {
+  return `📍 Оновлено перелік напрямків: ${locationLabel}`;
+}
+
+/** «🔽 Рівень знижено: значний → підвищений» / «⬆️ Рівень підвищено: …». */
+export function riskLevelChangedLine(previous: unknown, next: unknown, direction: 'up' | 'down'): string {
+  const movement = direction === 'up' ? '⬆️ Рівень підвищено' : '🔽 Рівень знижено';
+  return `${movement}: ${levelLabel(previous)} → ${levelLabel(next)}`;
+}
+
 // A leading run of emoji, bullets and dashes is how monitoring channels open almost every post. The
 // bot already prints its own status emoji, so keeping theirs produces "⚠️ Київ … ⚠️Загроза".
 // Written as an alternation rather than one character class on purpose: an emoji is a sequence
