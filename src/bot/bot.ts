@@ -4,17 +4,9 @@ import { pool } from '../db/pool.js';
 import { LOCATION_HIERARCHY_MAX_DEPTH } from '../repositories/events.js';
 import { listRecommendedChannels } from '../services/recommended-channels.js';
 
-const threatLabels: Record<string, string> = {
-  uav: 'ударні БпЛА', ballistic_missile: 'балістичні ракети', cruise_missile: 'крилаті ракети',
-  guided_air_bomb: 'КАБ', aviation: 'активність авіації', mlrs: 'РСЗВ', artillery: 'артилерія',
-  mortar: 'мінометний обстріл', combined: 'комбінована загроза', unknown: 'невизначена загроза'
-};
-const levelLabels: Record<string, string> = {
-  background: 'фоновий', elevated: 'підвищений', significant: 'значний', high: 'високий', very_high: 'дуже високий'
-};
-const evidenceLabels: Record<string, string> = {
-  official: 'лише офіційні', confirmed: 'підтверджені+', monitoring: 'моніторинг+', unverified: 'усі згадки'
-};
+import {
+  confidenceLabel, evidenceStatement, evidenceThresholdLabels, humanMoment, levelLabel, threatLabel, validUntilLine
+} from './humanize.js';
 
 function html(value: unknown): string {
   return String(value ?? '').replace(/[&<>'"]/g, (char) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', "'": '&#39;', '"': '&quot;' })[char]!);
@@ -53,7 +45,7 @@ async function settingsKeyboard(chatId: number) {
     keyboard.text(`🗑 ${row.name_uk}`, `unsub:${row.id}`).row();
     keyboard.text(`${row.notify_threats ? '✅' : '❌'} загрози`, `toggle-threat:${row.id}`)
       .text(`${row.notify_analytics ? '✅' : '❌'} аналітика`, `toggle-analytics:${row.id}`).row();
-    keyboard.text(`Доказовість: ${evidenceLabels[row.minimum_evidence_level]}`, `cycle-evidence:${row.id}`).row();
+    keyboard.text(`Доказовість: ${evidenceThresholdLabels[row.minimum_evidence_level] ?? row.minimum_evidence_level}`, `cycle-evidence:${row.id}`).row();
   }
   keyboard.text('＋ Додати територію', 'choose_city');
   return keyboard;
@@ -183,11 +175,14 @@ export function createBot() {
     if (!rows.rowCount) return ctx.reply('Немає активних підписок. Використайте /city.');
     const lines = rows.rows.map((row) => {
       const alert = row.alert_active ? '🔴 активна офіційна тривога' : '⚪ активної офіційної тривоги немає';
-      const threat = row.threat_title ? `\n⚠️ ${html(row.threat_title)} · ${html(row.evidence_level)}` : '';
-      const risk = row.risk_score != null ? `\n📊 ${html(threatLabels[row.assessment_type] ?? row.assessment_type)}: ${html(levelLabels[row.risk_level])}, ${html(row.risk_score)}/10` : '';
+      const validity = validUntilLine(row.valid_until);
+      const threat = row.threat_title
+        ? `\n⚠️ ${html(row.threat_title)}\n${html(evidenceStatement(row.evidence_level))}${validity ? `. ${html(validity)}` : ''}`
+        : '';
+      const risk = row.risk_score != null ? `\n📊 ${html(threatLabel(row.assessment_type))}: ${html(levelLabel(row.risk_level))}, ${html(row.risk_score)}/10` : '';
       return `<b>${html(row.name_uk)}</b> — ${alert}${threat}${risk}`;
     });
-    await ctx.reply(`${lines.join('\n\n')}\n\nСтаном на ${new Date().toLocaleTimeString('uk-UA', { timeZone: config.APP_TIMEZONE })}. Відсутність повідомлення не означає відсутність небезпеки.`, { parse_mode: 'HTML' });
+    await ctx.reply(`${lines.join('\n\n')}\n\nСтаном на ${html(humanMoment(new Date()))}. Відсутність повідомлення не означає відсутність небезпеки.`, { parse_mode: 'HTML' });
   });
 
   bot.command('analytics', async (ctx) => {
@@ -202,8 +197,8 @@ export function createBot() {
     if (!result.rowCount) return ctx.reply('Спочатку додайте територію через /city.');
     const lines = result.rows.map((row) => row.risk_score == null
       ? `<b>${html(row.name_uk)}</b> — актуальної оцінки немає`
-      : `<b>${html(row.name_uk)}</b> — ${html(threatLabels[row.threat_type] ?? row.threat_type)}\n${html(levelLabels[row.risk_level])} · ${html(row.indicative_percent)}% індикативного рівня · ${html(row.risk_score)}/10\nВпевненість: ${html(row.assessment_confidence)}`);
-    await ctx.reply(`🌙 <b>Аналітика станом на ${new Date().toLocaleTimeString('uk-UA', { timeZone: config.APP_TIMEZONE, hour: '2-digit', minute: '2-digit' })}</b>\n\n${lines.join('\n\n')}\n\nЦе індекс публічних сигналів, не статистична ймовірність і не офіційна тривога.`, { parse_mode: 'HTML' });
+      : `<b>${html(row.name_uk)}</b> — ${html(threatLabel(row.threat_type))}\n${html(levelLabel(row.risk_level))} · ${html(row.indicative_percent)}% індикативного рівня · ${html(row.risk_score)}/10\nВпевненість оцінки: ${html(confidenceLabel(row.assessment_confidence))}`);
+    await ctx.reply(`🌙 <b>Аналітика станом на ${html(humanMoment(new Date()))}</b>\n\n${lines.join('\n\n')}\n\nЦе індекс публічних сигналів, не статистична ймовірність і не офіційна тривога.`, { parse_mode: 'HTML' });
   });
 
   const showSettings = async (ctx: any, edit = false) => {
