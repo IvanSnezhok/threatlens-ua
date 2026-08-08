@@ -3,7 +3,7 @@
 ## Health
 
 - `/health/live`: process is running.
-- `/health/ready`: database is reachable and the latest required migration is applied (currently `021_source_trust.sql`).
+- `/health/ready`: database is reachable and the latest required migration is applied (currently `022_publication_runtime.sql`).
 - `/api/v1/sources/health`: configured, current, stale, error and unconfigured source states.
 - `/ops/api`: Basic-auth protected worker, AI, source and database state.
 - `/ops`: operator console. Credentials are held only in the active tab's memory; it can add, verify, activate and hide recommended Telegram channels.
@@ -19,6 +19,108 @@ docker compose logs -f app
 docker compose exec -T app curl -fsS http://localhost:3000/health/ready
 docker compose exec -T postgres psql -U threatlens -d threatlens -c 'TABLE schema_migrations'
 ```
+
+## Publication mode (operator only)
+
+The public presentation can be held back by `PUBLICATION_DELAY_SECONDS` (default 15). The mode lives
+in `runtime_settings` and is switched from `/ops` — «Режим показу» — not from `.env`, because the
+moment to stop holding data is the worst possible moment to edit a file and restart. `live` is the
+default and is byte-identical to a build without the feature. Full contract: `docs/ARCHITECTURE.md`,
+"Publication mode".
+
+The hold is presentation-only. Collection, classification, the alert reconciler, `alert_periods`,
+the audit tables, `/ops`, `/metrics`, `/health/*` and **Telegram notifications** are never delayed.
+The console states that beside the switch; so should anyone answering a question about it.
+
+```bash
+# Stored settings, their bounds, what the hold is doing right now, and who changed what.
+curl -fsS -u "$OPS_USER:$OPS_PASSWORD" http://localhost:3000/ops/api/runtime
+
+# Hold the public view. Any subset of fields; omitted ones keep their value.
+curl -fsS -u "$OPS_USER:$OPS_PASSWORD" -X PUT -H 'Content-Type: application/json' \
+  -d '{"publicationMode":"delayed_15s"}' http://localhost:3000/ops/api/runtime
+
+# Release it.
+curl -fsS -u "$OPS_USER:$OPS_PASSWORD" -X PUT -H 'Content-Type: application/json' \
+  -d '{"publicationMode":"live"}' http://localhost:3000/ops/api/runtime
+```
+
+Reading it:
+
+- **`effective` is the answer, `settings` is only the intent.** `backlogEvents` is how many rows are
+  written but not yet released and `behindSeconds` is how far behind wall clock the last slice was;
+  a stored mode with neither of those is the confusing state this block exists to prevent. In `live`
+  both are zero except for rows written in the same millisecond as the read.
+- **The cutoff cannot move backwards over a flip.** It is
+  `GREATEST(now() - delay, mode_changed_at)`, so switching to `delayed_15s` holds *new* rows and
+  never retracts what was already published. An alert that was open three seconds before the flip is
+  still returned; one that ended before it stays ended.
+- **A 400 with `issues` is the API refusing an impossible pair, not a fault.**
+  `analyticsMaxDelayMs` below `analyticsDebounceMs` is rejected inside the row lock, so two
+  concurrent PUTs both get a 400 naming the field rather than one getting a 500.
+- **`publication.mode` is never itself held.** The public snapshot reports the mode in force right
+  now, so the page cannot claim to be live while data is being held back. That is also why
+  `GET /api/v1/analytics/attacks` drops its shared cache header while the hold is on: a body cached
+  in `live` mode would otherwise be replayed for up to an hour after the flip.
+- **`threatlens_publication_lag_seconds` and `threatlens_publication_backlog_events` describe the
+  last thing a reader was actually served**, not a value a separate scheduler sampled. The lag gauge
+  is nonzero exactly when somebody was shown held data.
+
+## Event-driven analytics (operator only)
+
+Assessments used to move on three unrelated clocks with no invalidation of any kind: the materialised
+views on a fifteen-minute timer, the risk engine on another, and the public attack-analytics memo on
+a 120-second TTL that expires but is never invalidated. A threat observed at 10:00:01 could first
+appear in the map's аналітична оцінка at 10:15:00. The recompute worker adds the missing trigger —
+the moment something the analytics describe actually changed — and the fifteen-minute timer stays as
+the floor beneath it.
+
+It subscribes to the **recorded** event feed, never the published one. In `delayed_15s` a
+`threat.created` on the published feed would not reach it for fifteen seconds, and the map would pay
+the hold twice: once on the presentation and once again on the assessment describing it. Seven event
+types arm a pass — `alert.started`, `alert.ended`, `threat.created`, `threat.updated`,
+`threat.corrected`, `threat.withdrawn`, `threat.expired`. `assessment.updated` is deliberately absent:
+the risk engine writes it, so subscribing to it would make every recompute schedule the next one.
+
+```bash
+# The cadence settings live beside the publication mode.
+curl -fsS -u "$OPS_USER:$OPS_PASSWORD" http://localhost:3000/ops/api/runtime
+
+# Slow it down under load: wait 60s after the last event, never postpone past 5 minutes.
+curl -fsS -u "$OPS_USER:$OPS_PASSWORD" -X PUT -H 'Content-Type: application/json' \
+  -d '{"analyticsDebounceMs":60000,"analyticsMaxDelayMs":300000}' \
+  http://localhost:3000/ops/api/runtime
+
+# Stop event-driven recompute, keeping the fifteen-minute floor.
+curl -fsS -u "$OPS_USER:$OPS_PASSWORD" -X PUT -H 'Content-Type: application/json' \
+  -d '{"analyticsEventDriven":false}' http://localhost:3000/ops/api/runtime
+
+# Run one pass now. Same code path as the automatic ones; «Оновити зараз» in /ops does this.
+curl -fsS -u "$OPS_USER:$OPS_PASSWORD" -X POST \
+  http://localhost:3000/ops/api/analytics/recalculate
+```
+
+Reading it:
+
+- **A skip is an answer, not a failure.** `skipped: 'overlap'` means a pass was already running,
+  `'disabled'` that the switch is off, `'cooldown'` that the previous pass completed less than a
+  minute ago. Each has its own `threatlens_analytics_recompute_total{outcome=…}` series, so «нічого
+  не перерахувалося» is always attributable.
+- **The debounce is not the only bound.** `ANALYTICS_MIN_PASS_INTERVAL_MS` (60 s) is the minimum gap
+  between two *completed* passes and it is compiled in, not settable. Lowering the debounce to two
+  seconds does not produce a pass every two seconds; it produces `skipped_interval`.
+- **`analyticsMaxDelayMs` is the guarantee, `analyticsDebounceMs` is the wait.** Under a continuous
+  stream the debounce window is re-armed indefinitely; the max delay is what fires anyway. The API
+  refuses a max delay below the debounce, because that pair has no meaning.
+- **The manual button always runs**, whatever the switch says — an operator who pressed it has
+  overridden the switch by pressing it — but it is subject to the same overlap and interval guards.
+- **`ANALYTICS_EVENT_DRIVEN_ENABLED=false` in `.env` is a bigger hammer than the switch.** The worker
+  then never subscribes at all. It exists because the reason to stop event-driven recomputation is
+  usually that it is amplifying a database problem, which is the worst moment to need the database
+  to read a flag.
+- **A recompute never calls a model for its numbers.** The Codex leg writes prose over already
+  computed aggregates behind `codexCooldownMs`, and a skipped call is counted in
+  `threatlens_codex_cooldown_skips_total` and reported as `codex: 'cooldown'`.
 
 ## Threat vector extrapolation (operator only)
 
@@ -348,6 +450,103 @@ Production backups must additionally be encrypted and copied to independent obje
   any count taken from it is a lower bound. Ingestion is unaffected by design — the archive write is
   outside the ingestion transaction and its failure is deliberately swallowed — so this is a data
   quality alert, not an outage. The accompanying `warn` line names the source and the decision.
+- **The deployment was left in `delayed_15s`.** The public site is holding every appearance back by
+  fifteen seconds and nobody meant it to. This is a configuration state, not a fault, and it has no
+  self-healing path: the mode is stored, so it survives restarts and redeploys.
+
+  How to see it without opening the site: `threatlens_publication_mode{mode="delayed_15s"}` is `1`,
+  and `threatlens_publication_lag_seconds` is nonzero on every scrape. In the browser the status
+  strip reads «ЗАТРИМКА 15 С» and `#last-update` carries «зріз о …». In `/ops` the «Публікація та
+  аналітика» card shows the amber «Затримка 15 с» pill.
+
+  ```bash
+  curl -fsS -u "$OPS_USER:$OPS_PASSWORD" http://localhost:3000/ops/api/runtime
+  curl -fsS -u "$OPS_USER:$OPS_PASSWORD" -X PUT -H 'Content-Type: application/json' \
+    -d '{"publicationMode":"live"}' http://localhost:3000/ops/api/runtime
+  ```
+
+  The `audit` array in that response answers who set it and when — one row per changed field, with
+  the previous and new values — so «хто ввімкнув затримку» is a lookup rather than an argument.
+  Releasing the hold takes effect within a second or two: the settings memo is primed by the write
+  and its TTL is two seconds. **Never** clear it by editing `runtime_settings` by hand; the audit
+  trail and the `publication.changed` event both come from the endpoint, and a hand-edited row leaves
+  the ops console and the map disagreeing about what happened. What did *not* happen while the hold
+  was on: nothing was lost. Collection, classification and the alert reconciler ran at wall clock,
+  Telegram subscribers were notified on time, and the backlog drains as soon as the mode is `live`.
+- **Recompute storm, or the debounce collapsed.** Symptom: `threatlens_analytics_recompute_total`
+  climbing steeply, `threatlens_analytics_recompute_duration_seconds` widening, and the pool visibly
+  contended — the 15-second ingestion tick, the one-second event poll and every snapshot share twelve
+  connections under a 15-second `statement_timeout`, and a `REFRESH MATERIALIZED VIEW CONCURRENTLY`
+  that exceeds the timeout dies, counts as `failed`, and is retried by the next pass.
+
+  Read the outcome label before changing anything — the counter is split for exactly this:
+
+  ```bash
+  curl -fsS -u "$OPS_USER:$OPS_PASSWORD" http://localhost:3000/metrics \
+    | grep threatlens_analytics_recompute_total
+  ```
+
+  - `outcome="ok"` rising at more than one per minute is impossible; the interval guard forbids it.
+    If it looks that way, two application replicas are running, each with its own in-process
+    debounce. That is the documented single-replica boundary, not a tuning problem.
+  - `outcome="skipped_interval"` rising is **the guard working, not a defect**. Events are arriving
+    faster than one completed pass per minute and the surplus is being refused. Rising
+    `skipped_interval` with a healthy `ok` series is a busy night, and the correct response is none.
+  - `outcome="failed"` rising means the passes themselves are dying — look at the `statement_timeout`
+    and at `refreshMonthlyAnalytics` before touching cadence.
+  - `outcome="skipped_overlap"` rising means passes are taking longer than the window they are armed
+    in; raise `analyticsDebounceMs`, do not lower it.
+
+  Response: raise `analyticsDebounceMs` (and `analyticsMaxDelayMs` with it — the API refuses a max
+  delay below the debounce), or switch `analyticsEventDriven` off and let the fifteen-minute floor
+  carry the load. `ANALYTICS_EVENT_DRIVEN_ENABLED=false` in `.env` is the deployment-level version of
+  the same decision, for when the database is the thing that is unwell.
+
+  **Lowering the debounce is the wrong instinct and the guard is why it is survivable.**
+  `ANALYTICS_MIN_PASS_INTERVAL_MS` is compiled in at 60 seconds and is not settable from `/ops`
+  precisely so that an operator responding to «аналітика відстає» cannot convert one PUT into a
+  standing pair of concurrent view refreshes plus a full risk pass every few seconds. Sixty seconds
+  is still fifteen times faster than the timer this replaced.
+
+  A related report that is not an incident at all: **a burst that lands shortly after a completed
+  pass arms no retry.** Its debounce window opens and closes normally, but the pass it fires would
+  start less than a minute after the previous one finished, so the interval guard refuses it and
+  counts `skipped_interval`. By then the window has been consumed and there is nothing left to
+  re-arm: the next trigger is a further event, or the fifteen-minute floor. With the default
+  twenty-second debounce that is any burst whose last event lands inside roughly the first forty
+  seconds. A refused pass deliberately does **not** stamp the completed-pass clock — otherwise a
+  steady stream one debounce apart would refuse itself forever — so the guard cannot compound.
+
+  An operator seeing «аналітика відстає» within a minute of a pass is therefore watching the
+  minimum-interval guard do its job, not a defect. Nothing on the alerting path waits with it: alerts,
+  threat events, the map and the notifications are unaffected, and only the analytical assessment is
+  a minute behind what a debounce alone would have produced.
+- **`threatlens_publication_settings_read_failures_total > 0`.** The runtime settings row could not be
+  read, or it contained a `publication_mode` this build does not recognise. Both fail **open to
+  `live`**, which is the safe direction — a failure that quietly held the public view back would be
+  invisible — so this is a data-quality alert rather than an outage: the site is serving, and it is
+  serving without a hold.
+
+  Two distinct causes, and the counter does not separate them:
+
+  ```bash
+  docker compose exec -T postgres psql -U threatlens -d threatlens -c \
+    "SELECT publication_mode, mode_changed_at, updated_at, updated_by FROM runtime_settings"
+  ```
+
+  A mode outside `live` / `delayed_15s` is impossible through the CHECK constraint, so seeing one
+  means the constraint is gone — dropped by hand, or absent from a dump restored from before it
+  existed. Restore the constraint, then set the mode through `PUT /ops/api/runtime` so the audit row
+  and the `publication.changed` event exist. If the row is fine, the read itself is failing
+  — a pool exhausted, a database still finishing recovery — and the counter will be accompanied by
+  the usual connection errors. The memo clears its slot on a rejection rather than caching the
+  default, so the next caller retries instead of being pinned to `live` for a whole TTL.
+
+  One consequence worth knowing during a restart: the SSE hub refuses to initialise its cursor on a
+  degraded settings read and simply retries on the next tick. That is deliberate — initialising to
+  the unbounded head while the stored mode is `delayed_15s` would permanently drop everything written
+  in the last few seconds before the restart — so a short burst of this counter at boot means the
+  stream started a second late, not that anything was lost.
 - **Comparing two periods of analytics.** Always split by `classifier_version` or state that you did
   not. A version bump changes what the same message means, and an unsplit comparison reports a change
   in this project's rules as a change in enemy behaviour.

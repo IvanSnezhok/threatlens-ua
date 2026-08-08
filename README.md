@@ -15,6 +15,25 @@ Evidence-first situational awareness for Ukraine: a Telegram bot, responsive sta
 - Dynamic source trust, measured nightly from the classification archive over a thirty-day window — retractions, corroboration, first reports, lag behind the leader, unreadable share — and applied as a bounded modifier (0.6–1.2) on a signal's contribution. Trust never changes a source's tier and the tier caps are applied after it; the public assessment card shows one word («довіра джерела: висока / звичайна / знижена»), the full component breakdown lives in `/ops`.
 - Telegram subscriptions, commands, PostgreSQL outbox, retry policy, and delivery rate control.
 - Static HTML/CSS/JS frontend with MapLibre, SSE updates, mobile and TV layouts, history, analytics, source health, and operations views.
+- Per-territory map state instead of loose point markers. Every oblast, special city and raion carries
+  one aggregated state — official alert, asserted threat, confirmed consequences, analytical
+  assessment — computed on the server and served with the snapshot, plus a catalogue of ten
+  weapon-class glyphs stacked three to a territory with a `+N` badge for the rest. A polygon is lit
+  only for a territory a source named, or for the nearest territory with an outline when the named
+  place has none; an icon is a claim that a weapon class is *here*, so it is emitted only where that
+  claim was actually made. An oblast lit because one raion inside it was named stays muted and
+  carries no icon.
+- Operator-set publication mode. `live` is the default and behaves byte-identically to a build
+  without the feature; `delayed_15s` holds the public presentation — snapshot, SSE stream, map, event
+  rail and public attack analytics — behind a cutoff computed in PostgreSQL rather than queued in
+  the process. Collection, classification, the alert reconciler, the audit tables, `/ops`, `/metrics`
+  and Telegram notifications are never held. The switch, the audit trail of who changed which field,
+  and a running count of events written but not yet released are all in `/ops`.
+- Event-driven analytics recompute. A relevant recorded event arms a pass behind an operator-set
+  debounce, bounded by a maximum delay so a continuous stream cannot postpone it forever and by a
+  sixty-second minimum between completed passes so a lowered debounce cannot turn into a standing
+  refresh storm. The fifteen-minute timer stays as the floor, and an «Оновити зараз» button in `/ops`
+  runs one pass on demand.
 - Explicit internationally recognized Ukraine boundary overlay including the Autonomous Republic of Crimea and Sevastopol; oblast/city clicks open territorial history.
 - Temporarily occupied territories layer sourced from DeepStateMap, filtered by a fail-safe status allowlist and clipped to the recognized border of Ukraine. Reference context only — it never affects alerts or risk scores.
 - Operator-managed catalog of recommended Telegram channels, exposed on the site and through the bot.
@@ -136,6 +155,8 @@ alerting system is worse than one that refuses to boot.
 | `AI_BASE_URL` / `AI_API_KEY` / `AI_MODEL` | Model-written risk explanations. The deterministic engine runs without it. |
 | `MAP_STYLE_URL` | Self-hosted basemap instead of the public one; see `data/map/README.md`. |
 | `OCCUPATION_SOURCE_ENABLED=false` | Turn off the occupied-territories layer. |
+| `PUBLICATION_DELAY_SECONDS` | How long `delayed_15s` holds the public view. Default 15, accepted range 5–60; the *mode* is an operator decision stored in the database, this is only the length. Below 5 s the hold is inside the event poll and the client's own debounce; above 60 s the client would report a deliberate hold as stale data. |
+| `ANALYTICS_EVENT_DRIVEN_ENABLED=false` | Deployment-level kill switch for event-driven recompute. The worker then never subscribes to the event feed at all and only the fifteen-minute timers remain — the reason to stop it is usually a database problem, which is the worst moment to have to read a flag out of the database. |
 
 ## Telegram commands
 
@@ -208,8 +229,14 @@ request to `main`.
 
 Useful endpoints:
 
-- `/api/v1/snapshot` — atomic initial state.
-- `/api/v1/stream` — real-time SSE events.
+- `/api/v1/snapshot` — atomic initial state, including the aggregated per-territory state and a
+  `publication` block naming the mode, the cutoff and how far behind it is. Under `delayed_15s` every
+  row in the payload is as of the cutoff rather than as of now; `publication.mode` itself is never
+  held, so the page can never claim to be live while data is being held back.
+- `/api/v1/stream` — real-time SSE events. Under `delayed_15s` the stream is bounded by the same
+  cutoff, and `?since=` (or `Last-Event-ID`) resumes from a known version without crossing it. The
+  `id:` sequence, the `connected` frame's `{at,version}` field names and the `retry: 3000` line are
+  unchanged.
 - `/api/v1/history` — normalized event history.
 - `/api/v1/locations/:id/timeline` — alerts, threats and assessments for a clicked oblast or city.
 - `/api/v1/vectors` and `/api/v1/threats/:id/vector` — the chain of **reported** observations behind a threat: which source named which place, when, and how strongly the movement between two places was attested. Not a trajectory and not a forecast; the extrapolation of a chain is operator-only and is served by neither of these endpoints.
@@ -221,6 +248,7 @@ Useful endpoints:
 - `/api/v1/methodology` — machine-readable v2 methodology and hard limits.
 - `/metrics` — Prometheus metrics.
 - `/ops/api` and `/ops/run-assessment` — Basic-auth protected operations API.
+- `/ops/api/runtime` — Basic-auth protected publication mode and recompute cadence: the stored settings, the bounds they are checked against, what the hold is doing right now (cutoff, cutoff version, held events, seconds behind), the audit trail of who changed which field, and the sentence stating what the delay does not touch. `PUT` accepts any subset of the fields; a cross-field violation is a 400 with the offending field named, never a 500.
 - `/ops/api/source-trust` — Basic-auth protected dynamic source trust: every source's current score with the full methodology (weights, window, thresholds) in the payload, per-source history, and a recalculate-now POST.
 - `/ops/vectors` and `/ops/threats/:id/vector-projection` — Basic-auth protected extrapolation of a reported chain, with an explicit uncertainty cone. Stored in its own tables, marked `data_nature = 'calculated'` by constraint, and unreachable from any module that builds a public response.
 - `/ops` — operator login and channel catalog management; channel mutations remain Basic-auth protected.
@@ -333,10 +361,13 @@ Every row is either working today or explicitly not. Nothing here is aspirationa
 
 | | |
 |---|---|
-| **Alert polygons** | Oblasts and all 136 raions fill by alert state, driven by feature-state rather than regenerated geometry. Raions appear from zoom 6.0 and take over at 6.8. |
+| **State polygons** | Oblasts and all 136 raions fill by four independent state families — official alert, asserted threat, confirmed consequences, analytical contour — driven by feature-state rather than regenerated geometry. Raions appear from zoom 6.0 and take over at 6.8. |
+| **Per-territory aggregated state** | The snapshot carries one entry per oblast, special city and raion: its alerts, its threats by weapon class with evidence and reported direction, its strongest assessment, and the ranked icon stack. Coverage is stated rather than implied — `direct` (a source named this territory), `unmapped` (a source named a place inside it that has no outline of its own, so no finer layer will ever supersede this one) and `partial` (an ancestor of a named territory that does have its own outline, drawn muted). A national-scope warning produces no territory at all: it is a caption, an event card and a bot message, never 27 lit oblasts. |
+| **Icon catalogue** | Ten weapon-class glyphs in four tones — consequence, confirmed, reported, analytic — ranked by danger, evidence, relation and freshness; three slots per territory and a `+N` badge for what ranking cut. The stack is a small point source that is re-emitted when it changes, kept separate from the polygon layers so the feature-state claim above stays true of the fills. Icons are never arrows and never a route. |
 | **Sovereignty** | The internationally recognized border renders above every fill; Crimea and Sevastopol are Ukraine and labelled as such. |
 | **Occupation** | A separate reference layer under the border. Temporary factual condition, never a change of border. |
 | **Boundaries** | Raion geometry built from OpenStreetMap, matched to the catalogue by KATOTTG code, simplified per shared way so neighbours cannot develop gaps. 1.05 MB, 0.31 MB gzipped. |
+| **Screen readers** | A polite live region beside the map names up to eight territories with their icon stacks in Ukrainian, and says «Показано 8 територій із N» when there are more. With no icons anywhere on the map it falls back to naming the territories under an official alert. The map is a summary, not the record: the «Активні події» rail beside it lists every alert, threat and assessment as ordinary focusable text and is the canonical surface. |
 
 ### Bot
 
@@ -356,6 +387,13 @@ pushing a new one. Updates say what moved (`⬆️ Доказовість під
 change or a full point of index movement, with a thirty-minute floor per location and chat that only
 a level increase bypasses, and de-escalations delivered silently. Official alerts and the nightly
 digest are exempt from all of it.
+
+The bot is also exempt from the publication delay, and structurally so: delivery reads the event log
+through its own durable cursor in `worker_state`, a different consumer from the one the public stream
+uses, so a hold placed on the presentation cannot reach it even by accident. That is the intended
+answer and not an oversight. The recipient of a push asked to be warned; every part of this design
+exists to get the warning to the person under it, and holding an alert back from them for fifteen
+seconds would buy nothing and invert the one trade-off the alert model is built on.
 
 ### Analysis archive
 
@@ -398,3 +436,12 @@ state. And the nightly trust run reads the same archive to score every source's 
 - `sources.enabled` does not gate the two polled API adapters — they check only for a token.
 - Alerts at hromada level resolve to the parent raion; the catalogue has no hromada tier.
 - Abbreviated administrative forms (`р-н`, `обл.`) resolve to the namesake city rather than the district.
+- The map's live region is built from the icon stacks, and an official alert on its own produces no
+  icon. A territory whose only state is an alert therefore contributes no sentence to it while any
+  icon exists elsewhere on the map; the alert-only fallback applies when the map carries no icons at
+  all. Nothing is lost — the «Активні події» rail lists every alert as text and is the canonical
+  screen-reader surface — but the live region is a summary of the map, not of the situation.
+- A threat reported only for a raion carries no icon below zoom 6.8. The raion stack appears only
+  once the raion layer is readable, and the oblast above it is `partial` coverage, which is
+  deliberately never given an icon. Below that zoom the threat is a muted oblast fill, an event card
+  and a territory panel — visible, but not as a weapon-class glyph.

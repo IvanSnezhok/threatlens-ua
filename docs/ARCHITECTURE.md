@@ -376,6 +376,99 @@ finished numbers and may only return a better Ukrainian phrasing; the reply is s
 rejected outright if it contains a single number the computation did not produce, and
 `narrative_origin` records whether an operator is reading the model's wording or the generated one.
 
+### Publication mode: one cutoff, computed in PostgreSQL
+
+An operator may hold the public presentation back by `PUBLICATION_DELAY_SECONDS` by switching
+`runtime_settings.publication_mode` from `live` to `delayed_15s` in `/ops`. The mode is data, the
+length is configuration, and the two are deliberately separate: a staging deployment proves the
+mechanism at five seconds without a code change, and the decision to hold anything at all is never
+buried in `.env`.
+
+The hold is a **bound on the SELECT**, never a queue in the process. `src/services/publication.ts`
+derives one `PublicationSlice { mode, delaySeconds, cutoffAt, cutoffVersion, lastPublishedEventAt,
+headVersion }` from `system_event_log` in a single statement, and `src/api/server.ts` threads it
+through every public read inside one request, so the rows, the `version` and the `generatedAt` a reader is
+served all describe the same instant. A queue would be lost on restart, would double-deliver against
+the reconnect backfill, and would have to be re-sorted after a mode change; a bound cannot be lost,
+replayed or re-ordered, because `system_event_log` remains the only state.
+
+Four properties hold the design together:
+
+- **The cutoff is `GREATEST(now() - delaySeconds, mode_changed_at)`.** Without the clamp, flipping
+  `live → delayed_15s` would move the cutoff fifteen seconds into the past and retract rows that were
+  already published — an early all-clear read from the other direction, which is the one failure this
+  system treats as unrecoverable. `mode_changed_at` is a column, not an in-process variable, so a
+  restart during a flip does not lose it.
+- **The stream is bounded by a releasable head version, not by a per-row predicate.** The hub emits
+  `WHERE version > cursor AND version <= head`. A per-row `created_at` filter would let the cursor
+  advance past a row that was not yet releasable and drop it permanently.
+- **`live` is byte-identical to a build without the feature.** `delaySeconds = 0` makes
+  `cutoffAt = now()` and `cutoffVersion = max(version)`, every added predicate degenerates to the
+  predicate that was already in the tree, and every `CASE` is a no-op. That is what makes the feature
+  safe to ship with the switch off.
+- **Status is reported as of the cutoff.** In `delayed_15s`, `src/repositories/events.ts` returns
+  rows whose *current* status is terminal but which were live at the cutoff, projecting the label
+  back and keeping the raw value in a second column no public surface reads. Otherwise «відкликано»
+  would appear beside an orange «активна загроза» polygon, and a terminal state revealed before the
+  frame that carries it is an early all-clear.
+
+Two limits are known and deliberate rather than latent. A `status` or `evidence_level` **upgrade** on
+an event that is already past the cutoff is not held — the predicates bound when a row became
+visible, not every later revision of it — so a threat can be promoted to `confirmed` in the public
+view before the fifteen seconds are up. And a district attached to an already-published event by a
+later merge **is** held for the full cutoff (`threat_event_locations.created_at`), because under the
+territory model that district is a polygon and an icon stack, which is the most perceivable output
+the map has.
+
+**The Telegram fan-out is exempt, by mechanism.** `src/bot/outbox.ts` reads `system_event_log`
+through its own durable cursor in `worker_state('notification-fanout')`; it is a separate consumer
+from `eventHub`, so a gate placed in the stream cannot reach it even by accident and the exemption
+costs no code. It is also exempt by intent, twice over. The roadmap enumerates the delayed set
+exhaustively — «публічні snapshot, SSE, карта, панель подій і аналітика» — and a push notification is
+in none of it. And the recipient of a push is a subscriber who asked to be warned, not a reader of a
+public map: every part of the alert design exists to get the warning to the person under it, and
+holding an `alert.started` push for fifteen seconds would invert that trade for no benefit at all.
+
+Nothing else in the write path is held either: collection, classification, `alert_source_states`,
+`alert_periods`, `message_classifications`, `threat_assertions`, `shadow_classifications`, `ai_runs`,
+every `/ops/*` route, `/metrics` and `/health/*` run at wall clock in both modes. The operator-facing
+sentence says exactly that, and it is stored beside the switch rather than only in this document,
+because the person flipping it is not reading `docs/ARCHITECTURE.md` at that moment.
+
+### The territory aggregate
+
+The map used to draw threats and assessments as point markers over polygons that only ever carried
+alert state. `src/domain/territory-state.ts` replaces that with one aggregated state per territory:
+for every oblast, special city and raion referenced by the current slice, its alerts, its threats
+folded by weapon class with evidence level and reported direction, its strongest assessment, and a
+ranked icon stack. It is a pure fold over rows the snapshot already fetched plus one bounded ancestry
+query — no new SQL over `threat_event_locations`, no clock of its own (`now` is a required argument,
+so two calls over the same rows produce byte-identical output).
+
+Coverage is stated rather than implied, per state family independently:
+
+| Coverage | What it means |
+| --- | --- |
+| `direct` | a source literally named this territory, or the catalogue resolved a named place to it |
+| `unmapped` | this is the nearest territory *with an outline* above a named place that has none — a city or hromada. It does not fade at raion zoom, because no finer layer will ever supersede it |
+| `partial` | this territory is an ancestor of a named territory that has its own outline. Derived coverage of an explicitly named child, drawn muted, never an assertion about the whole |
+
+An **icon** is a stronger statement than a polygon: a glyph says a weapon class is *here*, a muted
+fill says "somewhere inside". The difference is the whole no-invented-geography rule, so icons are
+emitted only for `direct` and `unmapped` territories and are additionally withheld in three cases.
+A location whose relation is `mentioned` or `official_alert` produces a panel row and no icon —
+`relationFor()` assigns `mentioned` to transit («повз Миколаїв») and as the fall-through for any
+alias in the text, and a weapon glyph on that would be a claim the source never made. An analytic
+assessment becomes an icon only at `significant` or above, while the analytic *contour* keeps the
+lower `elevated` floor. And an analytic `(threatType, riskLevel)` pair carried by more than twenty
+territories in one snapshot produces no icons at all: a national-scope classification is fanned out
+to every oblast as `national_posture` risk signals, and twenty-seven grey glyphs would be geography
+invented from a warning nobody localised.
+
+Nothing in this module reads the database, `src/config.ts` or `pg`, and nothing downstream reads it
+back: the aggregate is a presentation of numbers the risk engine has already computed, and feeding it
+into the engine would count the same reports twice.
+
 ## Event flow
 
 ```mermaid
@@ -464,6 +557,20 @@ flowchart LR
 - The extrapolation of a vector is operator-only and structurally unreachable from public code: its own
   tables, its own service, its own plugin, and no import path from any module that builds a public
   response. Every stored projection row is `data_nature = 'calculated'` by constraint.
+- The publication delay is presentation-only. It never touches `alert_periods`,
+  `alert_source_states`, the classifier, `system_event_log` or the notification outbox: those run at
+  wall clock in both modes, and the hold is expressed as a bound on what a public read returns. It
+  may only ever hide an appearance or extend a disappearance, never the reverse — which is why the
+  cutoff is clamped to `mode_changed_at` and why a delayed read reports status as of the cutoff
+  rather than the terminal label. The Telegram fan-out is exempt through its own `worker_state`
+  cursor, so no gate on the public stream can reach it.
+- The aggregated territory state never feeds risk. It is computed from rows the risk engine has
+  already weighed, in a pure module that reads no database and imports no configuration, and no
+  module in the assessment path reads it back.
+- An icon is emitted only for a territory a source literally named, or for the nearest
+  polygon-bearing ancestor of one when the named place has no outline of its own. An ancestor that
+  merely contains a named territory keeps its muted polygon and gets no icon, because a glyph asserts
+  a weapon class for everything under it and no source said that.
 
 ## Scale boundary
 
