@@ -140,6 +140,80 @@ function endpoint(path: string): string {
   return `${config.CODEX_BASE_URL.replace(/\/$/, '')}${path}`;
 }
 
+/**
+ * Which request shape the endpoint behind `CODEX_BASE_URL` expects.
+ *
+ * The ChatGPT Codex backend (`chatgpt.com/backend-api/codex`) accepts only the Responses API and
+ * only as an SSE stream — a `chat/completions` POST there is a 404. An OpenAI-compatible proxy is
+ * the mirror image. Neither side advertises which it is, so `auto` keys off the base URL, which is
+ * the one fact the operator has already supplied.
+ */
+function transportFor(): 'chat' | 'responses' {
+  if (config.CODEX_API_STYLE !== 'auto') return config.CODEX_API_STYLE;
+  return config.CODEX_BASE_URL.includes('chatgpt.com/backend-api') ? 'responses' : 'chat';
+}
+
+/** Appended to the instructions on the Responses transport, which has no `response_format` knob. */
+const JSON_ONLY_NOTE = 'Відповідай виключно одним валідним JSON-обʼєктом, без жодного тексту до або після нього.';
+
+/**
+ * Extracts the assistant text from a completed Responses-API response object.
+ *
+ * Reasoning models put `reasoning` items in `output` alongside the `message`; only the message
+ * carries text meant for the caller, so everything else is skipped rather than concatenated.
+ */
+function responseOutputText(response: unknown): string {
+  const output = (response as { output?: unknown })?.output;
+  if (!Array.isArray(output)) return '';
+  return output
+    .filter((item): item is { type: string; content?: unknown } => (item as { type?: unknown })?.type === 'message')
+    .flatMap((item) => Array.isArray(item.content) ? item.content : [])
+    .filter((part): part is { type: string; text: string } =>
+      (part as { type?: unknown })?.type === 'output_text' && typeof (part as { text?: unknown })?.text === 'string')
+    .map((part) => part.text)
+    .join('');
+}
+
+/**
+ * Reads an SSE stream from the Codex backend down to one string.
+ *
+ * The whole body is buffered first: a narrative reply is a paragraph, not a transcript, and the
+ * fetch-level `AbortSignal` already bounds how long the buffering may take. The final
+ * `response.completed` object is preferred over the accumulated deltas because it is the server's
+ * own statement of what the reply was; deltas are the fallback for a stream that died after the
+ * text but before the summary event.
+ */
+async function readSseReply(response: Response): Promise<{ ok: true; content: string } | { ok: false; detail: string }> {
+  const raw = await response.text();
+  let deltas = '';
+  let completed: string | null = null;
+  let failure: string | null = null;
+  let sawEvent = false;
+  for (const line of raw.split(/\r?\n/)) {
+    if (!line.startsWith('data:')) continue;
+    const payload = line.slice(5).trim();
+    if (!payload || payload === '[DONE]') continue;
+    let event: { type?: string; delta?: unknown; response?: unknown };
+    try {
+      event = JSON.parse(payload) as typeof event;
+    } catch {
+      continue;
+    }
+    sawEvent = true;
+    if (event.type === 'response.output_text.delta' && typeof event.delta === 'string') deltas += event.delta;
+    if (event.type === 'response.completed') completed = responseOutputText(event.response);
+    if (event.type === 'response.failed') {
+      const message = (event.response as { error?: { message?: unknown } })?.error?.message;
+      failure = typeof message === 'string' ? message.slice(0, 200) : 'модель повідомила про помилку';
+    }
+  }
+  if (failure) return { ok: false, detail: `Codex перервав відповідь: ${failure}` };
+  const content = completed || deltas;
+  if (!sawEvent) return { ok: false, detail: 'відповідь не містить SSE-подій Responses API' };
+  if (!content) return { ok: false, detail: 'Codex повернув порожню відповідь' };
+  return { ok: true, content };
+}
+
 function authHeaders(session: CodexCredentials | null): Record<string, string> | null {
   // The stored session outranks `CODEX_API_KEY` for the same reason the narrative already preferred
   // it: both are bearer tokens for the same account, but only one of them can be renewed without a
@@ -194,23 +268,48 @@ export async function codexChat(request: CodexChatRequest, deps: CodexClientDeps
   const headers = authHeaders(session);
   if (!headers) return fail('no_session', 'Немає збереженої сесії Codex — потрібен вхід через /ops', model);
 
+  const transport = transportFor();
   const doFetch = deps.fetchImpl ?? fetch;
   let response: Response;
   try {
-    response = await doFetch(endpoint('/chat/completions'), {
-      method: 'POST',
-      headers,
-      body: JSON.stringify({
-        model,
-        temperature: 0,
-        ...(request.json ? { response_format: { type: 'json_object' } } : {}),
-        messages: [
-          { role: 'system', content: request.system },
-          { role: 'user', content: request.user }
-        ]
-      }),
-      signal: AbortSignal.timeout(request.timeoutMs ?? config.AI_TIMEOUT_MS)
-    });
+    if (transport === 'responses') {
+      // The shape the Codex CLI sends, minus the tooling: the backend requires `stream: true` and
+      // answers SSE only, rejects sampling knobs like `temperature`, and has no `response_format` —
+      // the JSON contract travels in the instructions instead. `originator` and `OpenAI-Beta` are
+      // part of the same borrowed identity as `CODEX_OAUTH_CLIENT_ID`: this is the client the
+      // service knows, so we speak as it does.
+      response = await doFetch(endpoint('/responses'), {
+        method: 'POST',
+        headers: { ...headers, Accept: 'text/event-stream', 'OpenAI-Beta': 'responses=experimental', originator: 'codex_cli_rs' },
+        body: JSON.stringify({
+          model,
+          instructions: request.json ? `${request.system}\n\n${JSON_ONLY_NOTE}` : request.system,
+          input: [{ type: 'message', role: 'user', content: [{ type: 'input_text', text: request.user }] }],
+          tools: [],
+          tool_choice: 'auto',
+          parallel_tool_calls: false,
+          store: false,
+          stream: true,
+          include: []
+        }),
+        signal: AbortSignal.timeout(request.timeoutMs ?? config.AI_TIMEOUT_MS)
+      });
+    } else {
+      response = await doFetch(endpoint('/chat/completions'), {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({
+          model,
+          temperature: 0,
+          ...(request.json ? { response_format: { type: 'json_object' } } : {}),
+          messages: [
+            { role: 'system', content: request.system },
+            { role: 'user', content: request.user }
+          ]
+        }),
+        signal: AbortSignal.timeout(request.timeoutMs ?? config.AI_TIMEOUT_MS)
+      });
+    }
   } catch (error) {
     // `String(error)` here is our own AbortError or an undici network error; neither carries the
     // request headers, so nothing credential-shaped can reach the audit row through this path.
@@ -225,13 +324,26 @@ export async function codexChat(request: CodexChatRequest, deps: CodexClientDeps
   }
 
   let content: string | undefined;
-  try {
-    const body = await response.json() as { choices?: Array<{ message?: { content?: string } }> };
-    content = body.choices?.[0]?.message?.content ?? undefined;
-  } catch (error) {
-    return fail('endpoint_error', `Відповідь не є JSON: ${String(error).slice(0, 200)}`, model);
+  if (transport === 'responses') {
+    // The stream is consumed inside the same try-shape as the JSON path: a connection that dies
+    // mid-body surfaces as a rejected `text()`, which is a transport fault, not a model refusal.
+    let reply: Awaited<ReturnType<typeof readSseReply>>;
+    try {
+      reply = await readSseReply(response);
+    } catch (error) {
+      return fail('transport_error', String(error).slice(0, 300), model);
+    }
+    if (!reply.ok) return fail('endpoint_error', reply.detail, model);
+    content = reply.content;
+  } else {
+    try {
+      const body = await response.json() as { choices?: Array<{ message?: { content?: string } }> };
+      content = body.choices?.[0]?.message?.content ?? undefined;
+    } catch (error) {
+      return fail('endpoint_error', `Відповідь не є JSON: ${String(error).slice(0, 200)}`, model);
+    }
+    if (!content) return fail('endpoint_error', 'Codex повернув порожню відповідь', model);
   }
-  if (!content) return fail('endpoint_error', 'Codex повернув порожню відповідь', model);
 
   const durationMs = Date.now() - started;
   await audit({
@@ -266,6 +378,9 @@ export async function listCodexModels(deps: CodexClientDeps = {}): Promise<Codex
   });
 
   if (!config.CODEX_BASE_URL) return fallback('CODEX_BASE_URL не задано');
+  // The ChatGPT Codex backend has no `/models` catalogue; asking would 404 on every settings read.
+  // The static list plus whatever is already selected is the entire truth available there.
+  if (transportFor() === 'responses') return fallback('бекенд Codex не публікує перелік моделей');
   const session = await (deps.credentials ?? codexCredentials)().catch(() => null);
   const headers = authHeaders(session);
   if (!headers) return fallback('немає збереженої сесії Codex');

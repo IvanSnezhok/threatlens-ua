@@ -51,7 +51,7 @@ export interface ResolvedCodexSettings extends CodexSettings {
  * answers replaces this list entirely. The list exists so that a console opened while the session
  * is expired still offers something to pick, rather than an empty dropdown that reads as a bug.
  */
-export const FALLBACK_CODEX_MODELS = ['gpt-5.2', 'gpt-5.2-codex', 'o5', 'o5-mini'] as const;
+export const FALLBACK_CODEX_MODELS = ['gpt-5.6-luna', 'gpt-5.2', 'gpt-5.2-codex', 'o5', 'o5-mini'] as const;
 
 interface SettingsRow {
   model: string | null;

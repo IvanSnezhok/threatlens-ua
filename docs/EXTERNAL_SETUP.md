@@ -153,25 +153,29 @@ optimise.
 
 ---
 
-## 7. Codex over ChatGPT OAuth — `CODEX_*` *(optional, and currently unverified)*
+## 7. Codex over ChatGPT OAuth — `CODEX_*` *(optional)*
 
 **Read this before spending time on it.**
 
 The intent is to run inference on a ChatGPT plan instead of an API key. The configuration exists:
 
 ```env
-CODEX_BASE_URL=
+CODEX_BASE_URL=https://chatgpt.com/backend-api/codex
 CODEX_API_KEY=              # OAuth access token, sent as a bearer
 CODEX_MODEL=
 CODEX_ACCOUNT_ID=           # becomes the ChatGPT-Account-Id header
+CODEX_API_STYLE=auto        # auto | chat | responses
 ```
 
 Three caveats, all of them real:
 
-1. **The transport here is a guess.** It is implemented as OpenAI-compatible
-   `POST {CODEX_BASE_URL}/chat/completions`, because no credentials were available to test against
-   the live service. Codex actually speaks the **Responses API**, a different request shape. Point
-   `CODEX_BASE_URL` at a compatible proxy, or the `/responses` shape has to be implemented.
+1. **Two transports, chosen from the URL.** Against `chatgpt.com/backend-api` the client sends the
+   **Responses API** shape the Codex CLI sends — `POST {CODEX_BASE_URL}/responses`, `stream: true`,
+   `store: false`, reply read from the SSE stream, JSON contract carried in the instructions since
+   that backend has no `response_format`. Any other base URL gets OpenAI-compatible
+   `POST {CODEX_BASE_URL}/chat/completions`. `CODEX_API_STYLE` overrides the guess for proxies on a
+   confusing URL. The ChatGPT backend also publishes no `/models`, so the model dropdown there is
+   the static fallback list by design.
 2. **The OAuth client and endpoints are the Codex CLI's, not ours.** `CODEX_OAUTH_CLIENT_ID` and
    `CODEX_OAUTH_ISSUER` carry the values that client publishes. Both are overridable. The sign-in
    itself *has* been exercised against the live service (2026-08-07): the authorisation, the

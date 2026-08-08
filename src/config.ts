@@ -118,6 +118,10 @@ const envSchema = z.object({
   CODEX_API_KEY: z.string().default(''),
   CODEX_MODEL: z.string().default(''),
   CODEX_ACCOUNT_ID: z.string().default(''),
+  // The ChatGPT Codex backend speaks the Responses API over SSE; an OpenAI-compatible proxy speaks
+  // `chat/completions`. `auto` decides by the base URL, which is right for both known deployments;
+  // the explicit values exist for a proxy that happens to live on a chatgpt.com path or vice versa.
+  CODEX_API_STYLE: z.enum(['auto', 'chat', 'responses']).default('auto'),
 
   // ---- Codex sign-in over OAuth ----------------------------------------------------------------
   // The operator presses a button in `/ops` instead of copying a token out of `~/.codex/auth.json`.
