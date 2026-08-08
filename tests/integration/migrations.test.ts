@@ -18,7 +18,9 @@ const MIGRATION_FILES = [
   '014_multi_channel_alert_routing.sql',
   '015_analytics.sql',
   '016_threat_vectors.sql',
-  '017_codex_oauth.sql'
+  '017_codex_oauth.sql',
+  '018_codex_settings.sql',
+  '019_notification_state.sql'
 ];
 
 describe.skipIf(!integrationDatabaseAvailable)('migration runner against live PostgreSQL', () => {
