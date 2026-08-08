@@ -199,6 +199,7 @@ Useful endpoints:
 - `/api/v1/channels` — active administrator-curated Telegram channels.
 - `/api/v1/occupation` — temporarily occupied territories as GeoJSON, with source attribution, upstream revision id, per-status counts and a `stale` flag. Cached (`ETag`, `Last-Modified`, `Cache-Control: public, max-age=120`); returns an empty layer rather than an error when the source is off or unavailable.
 - `/api/v1/analytics/monthly` — monthly summaries.
+- `/api/v1/analytics/attacks?period=day|week|month` — aggregated attack analytics over the classification archive: message counts per threat class, per oblast and per hour of the day, activity clustered into waves, the combinations of classes that repeat across waves, the direction phrasings that recur, and a deterministic Ukrainian conclusion («Патерни та ймовірна стратегія»). Everything is aggregated in SQL, cached for two minutes (`Cache-Control: public, max-age=120`) and counted in **messages**, never in weapons; the payload never exposes a per-source or per-message row, which is what separates it from the operator-only archive endpoints below.
 - `/api/v1/sources/health` — source freshness.
 - `/api/v1/methodology` — machine-readable v2 methodology and hard limits.
 - `/metrics` — Prometheus metrics.
