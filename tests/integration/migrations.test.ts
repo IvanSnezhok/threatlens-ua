@@ -22,7 +22,8 @@ const MIGRATION_FILES = [
   '018_codex_settings.sql',
   '019_notification_state.sql',
   '020_shadow_classifications.sql',
-  '021_source_trust.sql'
+  '021_source_trust.sql',
+  '022_publication_runtime.sql'
 ];
 
 describe.skipIf(!integrationDatabaseAvailable)('migration runner against live PostgreSQL', () => {
@@ -55,7 +56,7 @@ describe.skipIf(!integrationDatabaseAvailable)('migration runner against live Po
 
   it('creates the readiness marker the /health/ready probe queries', async () => {
     // src/api/server.ts gates readiness on this exact filename; a renamed migration must break here.
-    const marker = await sql("SELECT 1 FROM schema_migrations WHERE filename='016_threat_vectors.sql'");
+    const marker = await sql("SELECT 1 FROM schema_migrations WHERE filename='022_publication_runtime.sql'");
     expect(marker.rowCount).toBe(1);
   });
 

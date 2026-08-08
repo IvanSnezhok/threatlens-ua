@@ -99,6 +99,26 @@ const envSchema = z.object({
   // above 900 the window starts approaching the validity window itself and is rejected.
   OSINT_MONITOR_COALESCE_SECONDS: z.coerce.number().int().min(0).max(900).default(120),
 
+  // ---- Publication mode and event-driven analytics ---------------------------------------------
+  // How long `delayed_15s` holds the public presentation. The MODE is an operator decision and lives
+  // in `runtime_settings`; this is only the length, so a staging deployment can prove the mechanism
+  // at five seconds without a code change.
+  //
+  // Below 5 s the hold is inside the event hub's 1 s tick plus the browser's 250 ms refetch debounce
+  // and is indistinguishable from jitter. Above 60 s it would cross the client's own 60 s
+  // «МОЖЛИВА ЗАТРИМКА» threshold and a deliberate hold would be reported to users as a fault.
+  PUBLICATION_DELAY_SECONDS: z.coerce.number().int()
+    .min(5, 'Publication delay must exceed the 1s event poll and the 250ms client debounce')
+    .max(60, 'A publication delay above 60s would be reported to users as stale data')
+    .default(15),
+
+  // Deployment-level kill switch for the whole event-driven recompute path. When false the worker
+  // never subscribes to the event hub at all, whatever `runtime_settings.analytics_event_driven`
+  // says, and the existing fifteen-minute timers are the only trigger. This exists because the
+  // reason to stop event-driven recomputation is usually that it is amplifying a database problem —
+  // and that is the worst possible moment to need the database to read a flag.
+  ANALYTICS_EVENT_DRIVEN_ENABLED: z.string().default('true').transform((value) => value === 'true'),
+
   // ---- Analytics narrative (optional model layer) ----------------------------------------------
   // Everything in `src/services/analytics-archive.ts` is deterministic SQL and never reads any of
   // these. They only control whether a model is asked to *write prose about* numbers that have

@@ -60,7 +60,19 @@ const vectorBasisLabels = {
 // Хороплет тривог. Заливка регіону, а не точка: офіційний канал оголошує тривогу на цілу територію,
 // а в районів у каталозі KATOTTG узагалі немає координат, тож точка для них неможлива в принципі.
 const alertColor = '#ff4747';
+// Дзеркало --threat / --consequence / --analytic із web/styles.css. Карта й інтерфейс мусять
+// називати ту саму річ тим самим кольором. Змінюєш тут — зміни й там.
+// Червоний зарезервовано за офіційною тривогою: жоден інший стан його не бере.
+const threatColor = '#ff7a4d';        // той самий відтінок, що й vectorColor, і з тієї ж причини
+const consequenceColor = '#ffcf8a';
+const analyticColor = '#8f9b94';
 const alertLayerIds = ['alert-oblast-fill','alert-raion-fill','alert-raion-line','alert-oblast-line','alert-oblast-label','alert-raion-label'];
+const threatLayerIds      = ['threat-oblast-fill','threat-raion-fill','threat-raion-line','threat-oblast-line'];
+const consequenceLayerIds = ['consequence-oblast-fill','consequence-raion-fill','consequence-raion-line','consequence-oblast-line'];
+const analyticLayerIds    = ['analytic-raion-line','analytic-oblast-line'];
+// Районний полігон під курсором шукаємо в усіх районних заливках, а не лише в тривожній:
+// вимкнений перемикач «Тривоги» не має відбирати можливість клікнути район.
+const raionFillLayerIds   = ['alert-raion-fill','threat-raion-fill','consequence-raion-fill'];
 // 136 районів на оглядовому масштабі зливаються в кашу й перебивають обласну картину, заради якої карту й відкривають.
 // Тому районний шар починає проявлятися з RAION_ZOOM_MIN і набирає повну силу на RAION_ZOOM_FULL —
 // там одна область займає майже весь кадр, а район читається як окрема пляма й лишається клікабельним і на телефоні.
@@ -73,6 +85,22 @@ const RAION_ZOOM_FULL = 6.8;
 const alertFlag = ['boolean', ['feature-state', 'alert'], false];
 const unmappedFlag = ['boolean', ['feature-state', 'unmapped'], false];
 const partialFlag = ['boolean', ['feature-state', 'partial'], false];
+// Ті самі три ролі, помножені на три нові сімейства станів. Назви ключів тривоги лишаються
+// історичними (unmapped / partial без префікса) саме тому, що вирази шести тривожних шарів мусять
+// лишитися незмінними до байта.
+const threatFlag            = ['boolean', ['feature-state', 'threat'], false];
+const threatUnmappedFlag    = ['boolean', ['feature-state', 'threatUnmapped'], false];
+const threatPartialFlag     = ['boolean', ['feature-state', 'threatPartial'], false];
+const consequenceFlag         = ['boolean', ['feature-state', 'consequence'], false];
+const consequenceUnmappedFlag = ['boolean', ['feature-state', 'consequenceUnmapped'], false];
+const consequencePartialFlag  = ['boolean', ['feature-state', 'consequencePartial'], false];
+const analyticFlag          = ['boolean', ['feature-state', 'analytic'], false];
+const analyticUnmappedFlag  = ['boolean', ['feature-state', 'analyticUnmapped'], false];
+const analyticPartialFlag   = ['boolean', ['feature-state', 'analyticPartial'], false];
+// Аналітична оцінка — найслабший сигнал на карті. Там, де вже є тривога або загроза, вона мовчить
+// повністю: два контури на одному полігоні читаються як два різні твердження про одне й те саме.
+const strongerThanAnalytic = ['any',
+  alertFlag, unmappedFlag, partialFlag, threatFlag, threatUnmappedFlag, threatPartialFlag];
 const fadingLabel = ['==', ['get', 'tone'], 'partial'];
 const crimeaSovereignty = ['==', ['get', 'sovereignty'], 'crimea-ukraine'];
 
@@ -95,6 +123,7 @@ let occupationLegendOpen = null;
 let occupationFetchedAt = null;
 let vectors = [];
 let vectorLegendOpen = null;
+let threatLegendOpen = null;   // 981px — дзеркало CSS-брейкпойнта 980px; тримати синхронно
 let opsAuthorization = '';
 let codexPollTimer = null;
 let lastReceived = null;
@@ -213,33 +242,106 @@ function regionCentroid(id) {
   return point;
 }
 
-// Офіційний канал оголошує тривогу переважно на рівні району, подекуди — на рівні області чи громади.
-// direct — територія, названа в повідомленні дослівно. covered — її батьківські території: без цього
-// на оглядовому масштабі область виглядала б спокійною, поки в її районі триває тривога.
-// unmapped — найближчий предок із контуром, коли в самої названої території контуру немає
-// (громади, а поки що й кілька районів без геометрії). Він відповідає за тривогу на всіх масштабах,
-// бо детальнішого шару, який його підмінить, просто не існує.
-function alertCoverage() {
-  const parents = new Map(locations.map((item) => [item.id, item.parent_id]));
-  const direct = new Set(), covered = new Set(), unmapped = new Set();
-  for (const alert of snapshot?.alerts ?? []) {
-    if (!alert.location_id) continue;
-    direct.add(alert.location_id);
-    const seen = new Set([alert.location_id]);
-    let anchored = regionFeatures.has(alert.location_id);
-    let parent = parents.get(alert.location_id);
-    while (parent && !seen.has(parent)) {
+// Каталог локацій приходить один раз у boot() і більше не змінюється, тож індекси будуються
+// ліниво й назавжди. Без цього кожен тік потоку перебудовував би три мапи по всьому каталогу.
+let locationIndex = null;
+function locationIndexes() {
+  if (!locationIndex) locationIndex = {
+    parents: new Map(locations.map((item) => [item.id, item.parent_id])),
+    types:   new Map(locations.map((item) => [item.id, item.type])),
+    names:   new Map(locations.map((item) => [item.id, item.name_uk]))
+  };
+  return locationIndex;
+}
+// Дзеркало LOCATION_HIERARCHY_MAX_DEPTH із src/repositories/events.ts. Каталог тритирівневий,
+// вісім кроків — це запас на випадок зіпсованого parent_id, а не очікувана глибина.
+const LOCATION_HIERARCHY_MAX_DEPTH = 8;
+
+// Звʼязки, які СТВЕРДЖУЮТЬ загрозу саме для цієї території. `mentioned` сюди не входить свідомо:
+// класифікатор ставить його для транзиту («повз Миколаїв» — щось пройшло повз, у бік того місця
+// не цілилися) і як запасний варіант для будь-якого аліаса, знайденого в тексті. Помаранчева
+// заливка на .28 — це твердження, якого джерело не робило. Такі локації лишаються в панелі
+// території рядком «згадано джерелом»: втрачаємо не інформацію, а лише заяву.
+// `official_alert` є в enum і у двох CHECK, але його не пише жоден код; ранжуємо як mentioned.
+const ASSERTING_RELATIONS = new Set(['explicit_threat', 'reported_direction', 'aftermath']);
+// Доказовість, за якої «наслідки» стають окремим штрихованим полігоном. Регулярка наслідків у
+// relationFor() перевіряє ВЕСЬ текст повідомлення і ніколи не дивиться на аліас, тож у
+// повідомленні «Вибухи в Одесі, ракети повз Миколаїв» aftermath дістається й Миколаєву.
+// Найсильніша фактична заява на карті не має спиратися на найслабший рівень доказовості.
+const CONFIRMING_EVIDENCE = new Set(['official', 'confirmed']);
+// Аналітичний контур має власний поріг: background-оцінка не малює нічого. Поріг контуру нижчий
+// за поріг ІКОНКИ (significant, етап 2) — пунктирний контур це підказка, гліф це заява.
+const ANALYTIC_CONTOUR_FLOOR = new Set(['elevated', 'significant', 'high', 'very_high']);
+
+/**
+ * Стан територій за знімком: чотири незалежні сімейства, по три множини в кожному.
+ *
+ * direct   — територію названо дослівно (у повідомленні або в каталозі, який його розібрав);
+ * covered  — предок названої території; на оглядовому масштабі без цього область виглядала б
+ *            спокійною, поки в її районі триває тривога;
+ * unmapped — найближчий предок із контуром, коли в самої названої території контуру немає
+ *            (місто, громада). Він не гасне з наближенням: детальнішого шару, який його
+ *            підмінить, не існує.
+ *
+ * Географію не вигадуємо: полігон засвічується лише для дослівно названої території або для її
+ * найближчого предка з контуром. Загальнонаціональне попередження (location_id = 'ua') не дає
+ * жодного полігона взагалі — 27 підсвічених областей були б твердженням, якого не робило жодне
+ * джерело.
+ */
+function territoryCoverage() {
+  const { parents, types } = locationIndexes();
+  const family = () => ({ direct: new Set(), covered: new Set(), unmapped: new Set() });
+  const coverage = { alert: family(), threat: family(), consequence: family(), analytic: family() };
+
+  const claim = (fam, id) => {
+    if (!id) return;
+    // Країна — не територія на карті. Див. коментар вище.
+    if (id === 'ua' || types.get(id) === 'country') return;
+    fam.direct.add(id);
+    const seen = new Set([id]);
+    let anchored = regionFeatures.has(id);
+    let parent = parents.get(id);
+    let depth = 0;
+    while (parent && !seen.has(parent) && depth < LOCATION_HIERARCHY_MAX_DEPTH) {
       seen.add(parent);
-      covered.add(parent);
-      if (!anchored && regionFeatures.has(parent)) { anchored = true; unmapped.add(parent); }
+      depth += 1;
+      fam.covered.add(parent);
+      if (!anchored && regionFeatures.has(parent)) { anchored = true; fam.unmapped.add(parent); }
       parent = parents.get(parent);
     }
+  };
+
+  for (const alert of snapshot?.alerts ?? []) claim(coverage.alert, alert.location_id);
+
+  for (const event of snapshot?.threats ?? []) {
+    // liveThreats() агрегує locations[] через jsonb_agg(DISTINCT …), тож одна локація під двома
+    // relation_type приходить двома записами. Згортаємо їх за id, інакше «наслідки» загубилися б
+    // на другому записі, а перший порахувався б двічі.
+    const byLocation = new Map();
+    for (const loc of event.locations ?? []) {
+      const previous = byLocation.get(loc.id) ?? { asserted: false, aftermath: false };
+      byLocation.set(loc.id, {
+        asserted: previous.asserted || ASSERTING_RELATIONS.has(loc.relationType),
+        aftermath: previous.aftermath || loc.relationType === 'aftermath'
+      });
+    }
+    const confirmed = CONFIRMING_EVIDENCE.has(event.evidenceLevel);
+    for (const [id, state] of byLocation) {
+      if (!state.asserted) continue;
+      claim(coverage.threat, id);
+      if (state.aftermath && confirmed) claim(coverage.consequence, id);
+    }
   }
-  return { direct, covered, unmapped };
+
+  for (const risk of snapshot?.assessments ?? []) {
+    if (!ANALYTIC_CONTOUR_FLOOR.has(risk.risk_level)) continue;
+    claim(coverage.analytic, risk.location_id);
+  }
+  return coverage;
 }
 
-function alertLabelCollection(direct, covered, unmapped) {
-  const names = new Map(locations.map((item) => [item.id, item.name_uk]));
+function alertLabelCollection(fam) {
+  const { names } = locationIndexes();
   const features = [];
   const add = (id, tone) => {
     const point = regionCentroid(id);
@@ -250,26 +352,51 @@ function alertLabelCollection(direct, covered, unmapped) {
       label: String(name).replace(/\s+(область|район)$/u, '')
     } });
   };
-  for (const id of direct) add(id, 'direct');
-  for (const id of covered) if (!direct.has(id)) add(id, unmapped.has(id) ? 'unmapped' : 'partial');
+  for (const id of fam.direct) add(id, 'direct');
+  for (const id of fam.covered) if (!fam.direct.has(id)) add(id, fam.unmapped.has(id) ? 'unmapped' : 'partial');
   return { type: 'FeatureCollection', features };
 }
 
-// Стан тривоги накладається через feature-state: геометрія областей і районів (понад мегабайт)
+// Стан території накладається через feature-state: геометрія областей і районів (понад мегабайт)
 // лишається незмінною, на кожен тік потоку змінюються лише кілька десятків прапорців.
-function applyAlertLayers() {
+// removeFeatureState({source}) стирає ВЕСЬ стан джерела, тож усі дванадцять ключів мусять
+// записатися в цьому ж проході — інакше сімейство, записане окремо, буде стерте наступним тіком.
+function territoryStateOf(id, coverage) {
+  const state = {};
+  const add = (fam, direct, unmapped, partial) => {
+    if (fam.direct.has(id)) state[direct] = true;
+    else if (fam.unmapped.has(id)) state[unmapped] = true;
+    else if (fam.covered.has(id)) state[partial] = true;
+  };
+  add(coverage.alert,       'alert',       'unmapped',            'partial');
+  add(coverage.threat,      'threat',      'threatUnmapped',      'threatPartial');
+  add(coverage.consequence, 'consequence', 'consequenceUnmapped', 'consequencePartial');
+  add(coverage.analytic,    'analytic',    'analyticUnmapped',    'analyticPartial');
+  return state;
+}
+
+function applyTerritoryLayers() {
   if (!mapLayersReady || !map) return;
-  const { direct, covered, unmapped } = alertCoverage();
+  const coverage = territoryCoverage();
+  const touched = new Set();
+  for (const fam of Object.values(coverage)) {
+    for (const id of fam.direct) touched.add(id);
+    for (const id of fam.covered) touched.add(id);
+  }
   for (const [source, ids] of [['ukraine-admin', oblastIds], ['ukraine-raions', raionIds]]) {
     if (!map.getSource(source)) continue;
     map.removeFeatureState({ source });
-    for (const id of covered) {
-      if (!ids.has(id) || direct.has(id)) continue;
-      map.setFeatureState({ source, id }, unmapped.has(id) ? { unmapped: true } : { partial: true });
+    for (const id of touched) {
+      if (!ids.has(id)) continue;
+      const state = territoryStateOf(id, coverage);
+      // Порожній стан не пишемо: removeFeatureState уже лишив фічу чистою, а зайвий виклик на
+      // кожну з 136 районних фіч — це робота, яку не видно на екрані.
+      if (Object.keys(state).length) map.setFeatureState({ source, id }, state);
     }
-    for (const id of direct) if (ids.has(id)) map.setFeatureState({ source, id }, { alert: true });
   }
-  map.getSource('alert-labels')?.setData(alertLabelCollection(direct, covered, unmapped));
+  // Підписи лишаються ТІЛЬКИ тривожними: червона назва області для моніторингового повідомлення
+  // стверджувала б більше, ніж сказало джерело. Назву території з іншим станом дає панель.
+  map.getSource('alert-labels')?.setData(alertLabelCollection(coverage.alert));
 }
 
 // Районна геометрія вантажиться окремо й не блокує старт карти. Якщо файлу немає або він зіпсований,
@@ -284,7 +411,7 @@ async function loadRaionBoundaries() {
     raionBoundaries = data;
     indexRegionFeatures();
     map?.getSource('ukraine-raions')?.setData(raionCollection());
-    applyAlertLayers();
+    applyTerritoryLayers();
   } catch { /* без районних контурів карта працює на рівні областей */ }
 }
 
@@ -359,16 +486,6 @@ function eventCard(item, type) {
     <div class="event-foot"><b>${escapeHtml(threatNames[item.threatType] ?? item.threatType)}</b><span>${timeAgo(item.lastObservedAt)}</span></div></article>`;
 }
 
-// Офіційні тривоги тут більше не зʼявляються: їх малює хороплет.
-// Точка в центроїді була доступна лише областям і вдавала локалізацію, якої в повідомленні немає,
-// а район її не отримав би ніколи — координат у каталозі KATOTTG немає.
-function markerCollection() {
-  const features = [];
-  for (const threat of snapshot.threats) for (const loc of threat.locations) if (loc.longitude != null) features.push({ type: 'Feature', id: `t-${threat.id}-${loc.id}`, geometry: { type: 'Point', coordinates: [loc.longitude, loc.latitude] }, properties: { kind: 'threat', entityId: threat.id, title: threat.title, evidence: threat.evidenceLevel } });
-  for (const risk of snapshot.assessments) if (risk.longitude != null) features.push({ type: 'Feature', id: `r-${risk.id}`, geometry: { type: 'Point', coordinates: [risk.longitude, risk.latitude] }, properties: { kind: 'assessment', entityId: risk.id, title: risk.location_name, score: Number(risk.risk_score) } });
-  return { type: 'FeatureCollection', features };
-}
-
 function directionCollection() {
   return { type: 'FeatureCollection', features: snapshot.threats.filter((threat) => threat.geometry?.type === 'LineString').map((threat) => ({ type: 'Feature', id: threat.id, geometry: threat.geometry, properties: { title: threat.title } })) };
 }
@@ -441,11 +558,11 @@ function applyVectors() {
 }
 
 function addVectorLayers() {
-  // Якір: alert-oblast-label. Геометрія ланцюга лягає НАД заливками й контурами тривог, але ПІД усіма
-  // підписами — обласними, районними, підписом суверенітету Криму й підписами міст. Жоден наявний шар
-  // при цьому не зміщується: вставка «перед» існуючим шаром не переставляє нічого іншого.
-  // Маркери подій (threat-pulse, event-labels) додано без beforeId, тож вони лишаються зверху — лінія
-  // не перекриває крапку, на яку клікають.
+  // Якір: alert-oblast-label. Геометрія ланцюга лягає НАД заливками й контурами станів території, але
+  // ПІД усіма підписами — обласними, районними, підписом суверенітету Криму й підписами міст. Жоден
+  // наявний шар при цьому не зміщується: вставка «перед» існуючим шаром не переставляє нічого іншого.
+  // Зверху ланцюга лишається тільки те, що додано без beforeId: лінія напрямку і, з етапу 2,
+  // чотири шари іконок територій. Пояснювальна лінія не перекриває головного показника.
   const anchor = map.getLayer('alert-oblast-label') ? 'alert-oblast-label' : undefined;
   const basis = ['get','basis'];
   map.addSource('threat-vector-segments', { type: 'geojson', data: vectorSegmentCollection() });
@@ -592,13 +709,18 @@ function applyOccupation() {
   renderOccupationLegend();
 }
 
-function hatchPattern(color, alpha) {
+function hatchPattern(color, alpha, direction = 'down') {
   const size = 24, canvas = document.createElement('canvas');
   canvas.width = canvas.height = size;
   const ctx = canvas.getContext('2d');
   ctx.globalAlpha = alpha; ctx.strokeStyle = color; ctx.lineWidth = 2;
   ctx.beginPath();
-  for (let offset = -size; offset < size * 2; offset += size / 2) { ctx.moveTo(offset, 0); ctx.lineTo(offset + size, size); }
+  for (let offset = -size; offset < size * 2; offset += size / 2) {
+    // 'up' — дзеркальний кут до окупаційного штрихування. Два штрихування під одним кутом
+    // на сусідніх полігонах читаються як один шар, і сенс різниці зникає.
+    if (direction === 'up') { ctx.moveTo(offset, size); ctx.lineTo(offset + size, 0); }
+    else { ctx.moveTo(offset, 0); ctx.lineTo(offset + size, size); }
+  }
   ctx.stroke();
   return ctx.getImageData(0, 0, size, size);
 }
@@ -672,6 +794,36 @@ function renderOccupationLegend() {
     </div>`;
 }
 
+// Легенда чотирьох станів карти. Створюється зі скрипта, а не в public/index.html, бо той файл
+// зараз правлять інші гілки. Чотири речення тут дослівно повторюють .map-caption: підпис під картою
+// ховається нижче 980 px, і на телефоні легенда лишається єдиним поясненням трьох нових заливок.
+function renderThreatLegend() {
+  const panels = $('.map-panels');
+  if (!panels) return;
+  let legend = $('#threat-legend');
+  if (!legend) {
+    legend = document.createElement('details');
+    legend.id = 'threat-legend';
+    legend.className = 'occupation-legend';
+    legend.addEventListener('toggle', () => { threatLegendOpen = legend.open; });
+    panels.append(legend);
+  }
+  legend.open = threatLegendOpen ?? window.matchMedia('(min-width: 981px)').matches;
+  legend.innerHTML = `<summary><i class="swatch threat"></i><span class="legend-title">Загрози на карті</span><span class="legend-caret" aria-hidden="true">▾</span></summary>
+    <div class="legend-body">
+      <p class="legend-meta"><span>4 стани</span></p>
+      <ul class="legend-rows">
+        <li><i class="legend-swatch state-alert"></i><span>Офіційна тривога — щільна червона заливка й контур.</span></li>
+        <li><i class="legend-swatch state-threat"></i><span>Активна загроза — помаранчева заливка, слабша за тривогу.</span></li>
+        <li><i class="legend-swatch state-consequence"></i><span>Підтверджена атака або наслідки — штрихування.</span></li>
+        <li><i class="legend-swatch state-analytic"></i><span>Аналітична оцінка — сірий пунктирний контур без заливки. Це не тривога.</span></li>
+      </ul>
+      <p class="legend-note">Приглушений відтінок — стан лише в частині території; наблизьте карту,
+        щоб побачити райони. Полігон засвічується лише для території, названої в повідомленні або
+        в каталозі локацій, і для найближчої території з контуром, якщо в названої його немає.</p>
+    </div>`;
+}
+
 function initMap() {
   occupationLayersReady = false; // карту створюють наново лише при поверненні на маршрут карти — шари доводиться додавати з нуля
   mapLayersReady = false;
@@ -699,6 +851,24 @@ function initMap() {
     map.addSource('sovereignty-labels', { type: 'geojson', data: { type: 'FeatureCollection', features: [
       { type: 'Feature', geometry: { type: 'Point', coordinates: [34.25,45.25] }, properties: { label: 'АР КРИМ · УКРАЇНА' } }
     ] } });
+    // map.addImage не переживає map.remove(), а карту перестворюють на кожне повернення на маршрут
+    // карти, тож реєстрація живе тут, а не в одноразовому модульному коді.
+    // Якщо canvas недоступний — лишаємо суцільну заливку: менше інформації, але не помилка.
+    let consequenceHatchReady = false;
+    try {
+      if (!map.hasImage('consequence-hatch-pattern')) {
+        map.addImage('consequence-hatch-pattern', hatchPattern(consequenceColor, .85, 'up'), { pixelRatio: 2 });
+      }
+      consequenceHatchReady = true;
+    } catch { /* без візерунка наслідки лишаються заливкою й контуром */ }
+    // Один шар — один map.addLayer із власним літеральним id. Через це вибір між візерунком і
+    // суцільним кольором робить помічник фарби, а не друга гілка з тим самим ідентифікатором.
+    const consequenceFillPaint = (opacity) => ({
+      ...(consequenceHatchReady
+        ? { 'fill-pattern': 'consequence-hatch-pattern' }
+        : { 'fill-color': consequenceColor }),
+      'fill-opacity': opacity
+    });
     map.addLayer({ id: 'ukraine-sovereignty-fill', type: 'fill', source: 'ukraine-country', paint: {
       'fill-color': '#72d6ca', 'fill-opacity': .035
     } });
@@ -713,6 +883,21 @@ function initMap() {
     map.addLayer({ id: 'ukraine-state-border', type: 'line', source: 'ukraine-country', paint: {
       'line-color': '#e9e7e0', 'line-width': ['interpolate',['linear'],['zoom'],4,1.8,8,3.4], 'line-opacity': .95
     } });
+    // ---- активна загроза -----------------------------------------------------------------------
+    // Слабша за офіційну тривогу навмисно: це повідомлення моніторингу, а не рішення держави.
+    // Заливка йде ПІД тривожну: додається раніше під тим самим якорем, тож червоне завжди виграє.
+    map.addLayer({ id: 'threat-oblast-fill', type: 'fill', source: 'ukraine-admin', paint: {
+      'fill-color': threatColor,
+      'fill-opacity': ['interpolate',['linear'],['zoom'],
+        RAION_ZOOM_MIN,  ['case', threatFlag, .22, threatUnmappedFlag, .16, threatPartialFlag, .12, 0],
+        RAION_ZOOM_FULL, ['case', threatFlag, .20, threatUnmappedFlag, .16, threatPartialFlag, .04, 0]]
+    } }, 'ukraine-sovereignty-fill');
+    map.addLayer({ id: 'threat-raion-fill', type: 'fill', source: 'ukraine-raions', minzoom: RAION_ZOOM_MIN, paint: {
+      'fill-color': threatColor,
+      'fill-opacity': ['interpolate',['linear'],['zoom'],
+        RAION_ZOOM_MIN,  0,
+        RAION_ZOOM_FULL, ['case', threatFlag, .28, threatUnmappedFlag, .20, threatPartialFlag, .18, 0]]
+    } }, 'ukraine-sovereignty-fill');
     // Заливки тривоги йдуть під ukraine-sovereignty-fill і додаються ПЕРЕД addOccupationLayers(),
     // тож окупаційні шари вставляються поверх них і лишаються читабельними, як і раніше.
     // Золоте підсвічування суверенітету (ukraine-region-fill) теж лишається зверху — воно важливіше за колір тривоги.
@@ -730,7 +915,59 @@ function initMap() {
         RAION_ZOOM_MIN, 0,
         RAION_ZOOM_FULL, ['case', alertFlag, .40, unmappedFlag, .28, partialFlag, .26, 0]]
     } }, 'ukraine-sovereignty-fill');
+    // ---- підтверджена атака / наслідки ---------------------------------------------------------
+    // Штрихування, а не колір: наслідки — це те, що ВЖЕ сталося, і воно не мусить конкурувати
+    // з тривогою відтінком червоного. Лежить НАД тривогою: підтверджений удар важливіший за попередження.
+    map.addLayer({ id: 'consequence-oblast-fill', type: 'fill', source: 'ukraine-admin',
+      paint: consequenceFillPaint(['interpolate',['linear'],['zoom'],
+        RAION_ZOOM_MIN,  ['case', consequenceFlag, .55, consequenceUnmappedFlag, .40, consequencePartialFlag, .18, 0],
+        RAION_ZOOM_FULL, ['case', consequenceFlag, .55, consequenceUnmappedFlag, .40, consequencePartialFlag, .06, 0]])
+    }, 'ukraine-sovereignty-fill');
+    map.addLayer({ id: 'consequence-raion-fill', type: 'fill', source: 'ukraine-raions', minzoom: RAION_ZOOM_MIN,
+      paint: consequenceFillPaint(['interpolate',['linear'],['zoom'],
+        RAION_ZOOM_MIN,  0,
+        RAION_ZOOM_FULL, ['case', consequenceFlag, .55, consequenceUnmappedFlag, .40, consequencePartialFlag, .18, 0]])
+    }, 'ukraine-sovereignty-fill');
     addOccupationLayers();
+    // ---- аналітична оцінка ---------------------------------------------------------------------
+    // Три незалежні осі відмінності від офіційної тривоги: без заливки, пунктиром і сталевим кольором.
+    // Жодна з них окремо не рятує — разом їх неможливо сплутати. Там, де є тривога або загроза,
+    // прозорість примусово нульова: найслабший сигнал не перемальовує сильніший.
+    // crimeaSovereignty перевіряється першим: районні фічі властивості sovereignty не мають узагалі,
+    // тож на них ця гілка просто хибна, і той самий вираз працює на обох рівнях.
+    const analyticOpacity = (partial) => ['case',
+      crimeaSovereignty, 0,
+      strongerThanAnalytic, 0,
+      analyticFlag, .70, analyticUnmappedFlag, .50, analyticPartialFlag, partial, 0];
+    map.addLayer({ id: 'analytic-raion-line', type: 'line', source: 'ukraine-raions', minzoom: RAION_ZOOM_MIN, paint: {
+      'line-color': analyticColor, 'line-dasharray': [1,2],
+      'line-width': ['interpolate',['linear'],['zoom'], 4, 1.0, 8, 2.0],
+      'line-opacity': ['interpolate',['linear'],['zoom'], RAION_ZOOM_MIN, 0, RAION_ZOOM_FULL, analyticOpacity(.22)]
+    } }, 'ukraine-region-lines');
+    map.addLayer({ id: 'analytic-oblast-line', type: 'line', source: 'ukraine-admin', paint: {
+      'line-color': analyticColor, 'line-dasharray': [1,2],
+      'line-width': ['interpolate',['linear'],['zoom'], 4, 1.0, 8, 2.0],
+      'line-opacity': ['interpolate',['linear'],['zoom'],
+        RAION_ZOOM_MIN,  analyticOpacity(.22),
+        RAION_ZOOM_FULL, analyticOpacity(.08)]
+    } }, 'ukraine-region-lines');
+    // ---- активна загроза -----------------------------------------------------------------------
+    map.addLayer({ id: 'threat-raion-line', type: 'line', source: 'ukraine-raions', minzoom: RAION_ZOOM_MIN, paint: {
+      'line-color': threatColor,
+      'line-width': ['interpolate',['linear'],['zoom'], RAION_ZOOM_MIN, .5, 9, 1.4],
+      'line-opacity': ['interpolate',['linear'],['zoom'],
+        RAION_ZOOM_MIN,  0,
+        RAION_ZOOM_FULL, ['case', crimeaSovereignty, 0, threatFlag, .75, threatUnmappedFlag, .55, threatPartialFlag, .30, 0]]
+    } }, 'ukraine-region-lines');
+    // Навколо Криму й Севастополя контуру не малюємо взагалі: там межа лишається золотою, бо це
+    // підсвічування суверенітету. Стан там читається із заливки — так само, як робить тривога.
+    map.addLayer({ id: 'threat-oblast-line', type: 'line', source: 'ukraine-admin', paint: {
+      'line-color': threatColor,
+      'line-width': ['interpolate',['linear'],['zoom'], 4, 1.1, 8, 2.2],
+      'line-opacity': ['interpolate',['linear'],['zoom'],
+        RAION_ZOOM_MIN,  ['case', crimeaSovereignty, 0, threatFlag, .75, threatUnmappedFlag, .55, threatPartialFlag, .30, 0],
+        RAION_ZOOM_FULL, ['case', crimeaSovereignty, 0, threatFlag, .75, threatUnmappedFlag, .55, threatPartialFlag, .10, 0]]
+    } }, 'ukraine-region-lines');
     // Обидва контури тривоги лежать ПІД ukraine-region-lines: інакше червона межа перекрила б
     // золоту лінію суверенітету навколо Криму й Севастополя. Колір тривоги програє суверенітету.
     map.addLayer({ id: 'alert-raion-line', type: 'line', source: 'ukraine-raions', minzoom: RAION_ZOOM_MIN, paint: {
@@ -748,6 +985,19 @@ function initMap() {
       'line-opacity': ['interpolate',['linear'],['zoom'],
         RAION_ZOOM_MIN, ['case', crimeaSovereignty, 0, alertFlag, .85, unmappedFlag, .58, partialFlag, .45, 0],
         RAION_ZOOM_FULL, ['case', crimeaSovereignty, 0, alertFlag, .85, unmappedFlag, .58, partialFlag, .16, 0]]
+    } }, 'ukraine-region-lines');
+    // ---- підтверджена атака / наслідки ---------------------------------------------------------
+    map.addLayer({ id: 'consequence-raion-line', type: 'line', source: 'ukraine-raions', minzoom: RAION_ZOOM_MIN, paint: {
+      'line-color': consequenceColor, 'line-width': 1.6,
+      'line-opacity': ['interpolate',['linear'],['zoom'],
+        RAION_ZOOM_MIN,  0,
+        RAION_ZOOM_FULL, ['case', crimeaSovereignty, 0, consequenceFlag, .9, consequenceUnmappedFlag, .7, consequencePartialFlag, .30, 0]]
+    } }, 'ukraine-region-lines');
+    map.addLayer({ id: 'consequence-oblast-line', type: 'line', source: 'ukraine-admin', paint: {
+      'line-color': consequenceColor, 'line-width': 1.6,
+      'line-opacity': ['interpolate',['linear'],['zoom'],
+        RAION_ZOOM_MIN,  ['case', crimeaSovereignty, 0, consequenceFlag, .9, consequenceUnmappedFlag, .7, consequencePartialFlag, .30, 0],
+        RAION_ZOOM_FULL, ['case', crimeaSovereignty, 0, consequenceFlag, .9, consequenceUnmappedFlag, .7, consequencePartialFlag, .10, 0]]
     } }, 'ukraine-region-lines');
     map.addLayer({ id: 'city-hit', type: 'circle', source: 'ukraine-cities', minzoom: 5.7, paint: {
       'circle-radius': ['interpolate',['linear'],['zoom'],5.7,3,9,6], 'circle-color': '#72d6ca',
@@ -779,36 +1029,33 @@ function initMap() {
       'text-opacity': ['interpolate',['linear'],['zoom'],
         RAION_ZOOM_MIN, 0,
         RAION_ZOOM_FULL, ['case', fadingLabel, .8, 1]] } }, 'crimea-ukraine-label');
-    map.addSource('live-events', { type: 'geojson', data: markerCollection(), promoteId: 'id' });
-    map.addLayer({ id: 'assessment-halo', type: 'circle', source: 'live-events', filter: ['==',['get','kind'],'assessment'], paint: { 'circle-radius': ['+', 12, ['*', ['coalesce',['get','score'],0], 2]], 'circle-color': '#e3b341', 'circle-opacity': .10, 'circle-stroke-width': 1, 'circle-stroke-color': '#e3b341', 'circle-stroke-opacity': .6 } });
-    map.addLayer({ id: 'threat-pulse', type: 'circle', source: 'live-events', filter: ['==',['get','kind'],'threat'], paint: { 'circle-radius': 13, 'circle-color': '#ff7a4d', 'circle-opacity': .18, 'circle-stroke-width': 2, 'circle-stroke-color': '#ff7a4d' } });
-    map.addLayer({ id: 'event-labels', type: 'symbol', source: 'live-events', layout: { 'text-field': ['get','title'], 'text-size': 11, 'text-offset': [0, 2.1], 'text-anchor': 'top', 'text-font': ['Noto Sans Regular'] }, paint: { 'text-color': '#e9e7e0', 'text-halo-color': '#06080c', 'text-halo-width': 1.5 } });
     map.addSource('reported-directions', { type: 'geojson', data: directionCollection() });
     map.addLayer({ id: 'direction-lines', type: 'line', source: 'reported-directions', paint: { 'line-color': '#ff7a4d', 'line-width': 3, 'line-dasharray': [2,2], 'line-opacity': .8 } });
     addVectorLayers();
-    map.on('click', 'event-labels', (event) => {
-      const feature = event.features?.[0]; if (!feature) return;
-      const id = feature.properties.entityId;
-      if (feature.properties.kind === 'threat' && id) void showThreatDetails(id);
-      else if (feature.properties.kind === 'assessment' && id) void showAssessmentDetails(id);
-    });
-    // Один клік має відкрити одну історію, тож територію вибираємо від найточнішої до найзагальнішої:
-    // місто → район → область. Районний шар нижче RAION_ZOOM_MIN не малюється, тож там клік завжди обласний.
+    // Один клік має відкрити одну панель. Обробник висить на кількох шарах, і MapLibre викликає його
+    // окремо для кожного, у якому під точкою є фіча, — тож роботу робимо один раз на один DOM-клік
+    // (originalEvent у всіх викликах той самий обʼєкт) і самі вирішуємо, яка територія точніша:
+    // місто → район → область. Районні заливки нижче RAION_ZOOM_MIN не малюються, тож там клік
+    // завжди обласний, а вимкнений перемикач просто знижує точність, а не ламає клік.
+    let lastTerritoryClick = null;
     const openTerritory = (event) => {
-      const feature = event.features?.[0];
-      const layerId = feature?.layer?.id;
-      if (!feature?.properties?.locationId) return;
-      if (layerId !== 'city-hit' && map.queryRenderedFeatures(event.point, { layers: ['city-hit'] }).length) return;
-      if (layerId === 'ukraine-region-fill' && map.queryRenderedFeatures(event.point, { layers: ['alert-raion-fill'] }).length) return;
-      void showLocationHistory(feature.properties.locationId);
+      if (event.originalEvent && event.originalEvent === lastTerritoryClick) return;
+      lastTerritoryClick = event.originalEvent ?? null;
+      const pick = (ids) => {
+        const layers = ids.filter((id) => map.getLayer(id));
+        return layers.length ? map.queryRenderedFeatures(event.point, { layers })[0] : undefined;
+      };
+      const feature = pick(['city-hit']) ?? pick(raionFillLayerIds) ?? pick(['ukraine-region-fill']);
+      const locationId = feature?.properties?.locationId;
+      if (locationId) showTerritoryPanel(locationId);
     };
-    for (const layer of ['ukraine-region-fill','alert-raion-fill','city-hit']) {
+    for (const layer of ['ukraine-region-fill', ...raionFillLayerIds, 'city-hit']) {
       map.on('click', layer, openTerritory);
       map.on('mouseenter', layer, () => { map.getCanvas().style.cursor = 'pointer'; });
       map.on('mouseleave', layer, () => { map.getCanvas().style.cursor = ''; });
     }
     mapLayersReady = true;
-    applyAlertLayers();
+    applyTerritoryLayers();
     applyVectors();
   });
   $('#fit-ukraine').addEventListener('click', () => map.fitBounds([[21.5,43.2],[41.2,52.5]], { padding: 36, duration: 700 }));
@@ -816,9 +1063,8 @@ function initMap() {
 
 function updateMap() {
   if (!mapLayersReady) return;
-  map.getSource('live-events')?.setData(markerCollection());
   map.getSource('reported-directions')?.setData(directionCollection());
-  applyAlertLayers();
+  applyTerritoryLayers();
   applyVectors();
 }
 
@@ -1024,6 +1270,144 @@ async function showAssessmentDetails(id) {
      <div class="safety-note"><strong>Не статистична ймовірність</strong><p>${escapeHtml(explanation.caveat || 'Це відносний індекс публічних повідомлень, а не ймовірність удару. Низький рівень не означає безпеку.')}</p></div>`);
 }
 
+// Ланцюг предків будується один раз на локацію: каталог після boot() не змінюється, а панель
+// звіряє з ним кожну подію знімка.
+const ancestorChains = new Map();
+function ancestorsOf(id) {
+  if (ancestorChains.has(id)) return ancestorChains.get(id);
+  const { parents } = locationIndexes();
+  const chain = [];
+  const seen = new Set([id]);
+  let parent = parents.get(id);
+  let depth = 0;
+  while (parent && !seen.has(parent) && depth < LOCATION_HIERARCHY_MAX_DEPTH) {
+    seen.add(parent);
+    depth += 1;
+    chain.push(parent);
+    parent = parents.get(parent);
+  }
+  ancestorChains.set(id, chain);
+  return chain;
+}
+
+function territoryRelation(locationId, namedId) {
+  if (!namedId) return null;
+  // Той самий виняток, що й у territoryCoverage(): країна — не територія. Загальнонаціональне
+  // попередження не належить жодній конкретній області, і рядок «названо: Україна» в панелі однієї
+  // з двадцяти семи областей був би тим самим твердженням, якого не робило жодне джерело.
+  if (namedId === 'ua' || locationIndexes().types.get(namedId) === 'country') return null;
+  if (namedId === locationId) return 'direct';
+  if (ancestorsOf(namedId).includes(locationId)) return 'inside';
+  if (ancestorsOf(locationId).includes(namedId)) return 'above';
+  return null;
+}
+
+// Найточніша заява виграє: дослівно названа територія, потім щось усередині неї, потім ширша.
+const TERRITORY_RELATION_RANK = { direct: 0, inside: 1, above: 2 };
+
+function territoryName(id) {
+  const { names } = locationIndexes();
+  return names.get(id) ?? regionFeatures.get(id)?.properties?.nameUk ?? 'Територія';
+}
+
+/**
+ * Панель стану території.
+ *
+ * Подія належить території трьома різними способами, і плутати їх не можна:
+ *   direct — джерело назвало саме цю територію;
+ *   inside — джерело назвало щось усередині неї (район в області, місто в районі);
+ *   above  — джерело назвало ширшу територію (область, коли відкрито район).
+ * У двох останніх випадках дослівна назва показується поруч: користувач мусить бачити, ЩО саме
+ * сказало джерело, а не наш висновок про територію.
+ *
+ * Будується синхронно зі знімка, який уже лежить у памʼяті: панель відкривається за кліком по
+ * полігону, і мережевий похід за тим, що вже прийшло потоком, був би затримкою без причини.
+ */
+function showTerritoryPanel(locationId) {
+  const alerts = (snapshot?.alerts ?? [])
+    .map((alert) => ({ alert, relation: territoryRelation(locationId, alert.location_id) }))
+    .filter((row) => row.relation)
+    .sort((a, b) => TERRITORY_RELATION_RANK[a.relation] - TERRITORY_RELATION_RANK[b.relation]
+      || new Date(a.alert.started_at) - new Date(b.alert.started_at));
+  const alertRow = alerts[0];
+  const alertBlock = alertRow
+    ? `<p class="territory-alert">Офіційна тривога з ${escapeHtml(shortTime(alertRow.alert.started_at))} · ${escapeHtml(timeAgo(alertRow.alert.started_at))}</p>
+       ${alertRow.alert.location_id === locationId ? '' : `<p class="territory-named">Оголошено для: ${escapeHtml(territoryName(alertRow.alert.location_id))}</p>`}`
+    : '';
+
+  // Ті самі три правила, що й у territoryCoverage(): ствердження дає полігон, згадка — лише рядок,
+  // наслідки потребують підтверджувальної доказовості. Панель нічого не додає до карти й нічого не
+  // приховує від неї.
+  const threats = [];
+  for (const event of snapshot?.threats ?? []) {
+    let asserted = null, mentioned = null, aftermath = false;
+    for (const loc of event.locations ?? []) {
+      const relation = territoryRelation(locationId, loc.id);
+      if (!relation) continue;
+      if (ASSERTING_RELATIONS.has(loc.relationType)) {
+        if (!asserted || TERRITORY_RELATION_RANK[relation] < TERRITORY_RELATION_RANK[asserted.relation]) asserted = { relation, id: loc.id };
+        if (loc.relationType === 'aftermath') aftermath = true;
+      } else if (!mentioned || TERRITORY_RELATION_RANK[relation] < TERRITORY_RELATION_RANK[mentioned.relation]) {
+        mentioned = { relation, id: loc.id };
+      }
+    }
+    const named = asserted ?? mentioned;
+    if (!named) continue;
+    threats.push({ event, named, asserted: !!asserted, consequence: aftermath && CONFIRMING_EVIDENCE.has(event.evidenceLevel) });
+  }
+  threats.sort((a, b) => Number(b.asserted) - Number(a.asserted)
+    || new Date(b.event.lastObservedAt) - new Date(a.event.lastObservedAt));
+
+  const threatRows = threats.map(({ event, named, asserted }) => {
+    const namedNote = asserted
+      ? (named.id === locationId ? '' : `<small>Названо: ${escapeHtml(territoryName(named.id))}</small>`)
+      : `<small>Згадано джерелом${named.id === locationId ? '' : `: ${escapeHtml(territoryName(named.id))}`}</small>`;
+    return `<li class="territory-state-row" data-event="${escapeHtml(event.id)}">
+      <b>${escapeHtml(threatNames[event.threatType] ?? event.threatType)}</b>
+      <span>${escapeHtml(statusNames[event.status] ?? event.status)} · ${escapeHtml(evidenceNames[event.evidenceLevel] ?? event.evidenceLevel)} · останнє підтвердження ${escapeHtml(agoOrUnknown(event.lastObservedAt))}</span>
+      ${namedNote}
+      ${event.directionText ? `<small>Напрямок повідомлено джерелом: ${escapeHtml(event.directionText)}</small>` : ''}
+    </li>`;
+  }).join('');
+  const consequence = threats.some((row) => row.consequence)
+    ? '<p class="territory-consequence">Повідомлено про наслідки на території.</p>' : '';
+
+  const assessment = (snapshot?.assessments ?? [])
+    .map((risk) => ({ risk, relation: territoryRelation(locationId, risk.location_id) }))
+    .filter((row) => row.relation)
+    .sort((a, b) => TERRITORY_RELATION_RANK[a.relation] - TERRITORY_RELATION_RANK[b.relation]
+      || Number(b.risk.risk_score) - Number(a.risk.risk_score))[0]?.risk;
+  const assessmentBlock = assessment
+    ? `<div class="territory-state-row is-analytic" data-assessment="${escapeHtml(assessment.id)}">
+        <b>Аналітична оцінка, не тривога</b>
+        <span>${escapeHtml(threatNames[assessment.threat_type] ?? assessment.threat_type)} · ${escapeHtml(String(assessment.risk_score))}/10 · ${escapeHtml(levelNames[assessment.risk_level] ?? assessment.risk_level)} · ${escapeHtml(String(assessment.indicative_percent ?? Math.round(assessment.risk_score * 10)))}% індикативно · впевненість ${escapeHtml(confidenceNames[assessment.assessment_confidence] ?? assessment.assessment_confidence)} · до ${escapeHtml(shortTime(assessment.horizon_end))}</span>
+        ${assessment.location_id === locationId ? '' : `<small>Оцінено для: ${escapeHtml(territoryName(assessment.location_id))}</small>`}
+      </div>`
+    : '';
+
+  // Тиша — теж стан, і вона мусить бути сказана словами. Порожня панель читалася б як збій.
+  const empty = alertBlock || threatRows || assessmentBlock ? ''
+    : `<div class="empty-state"><strong>Активних повідомлень для цієї території немає</strong>
+        <p>Це не означає відсутність загрози. Стежте за офіційними каналами.</p></div>`;
+
+  // Плашку показуємо лише під офіційною тривогою: звичайний стан у цьому домі виглядає мовчазним.
+  const dialog = openDetail(territoryName(locationId), 'Територія',
+    `${alertRow ? '<span class="codex-state is-bad">Офіційна тривога</span>' : ''}
+     ${alertBlock}
+     ${threatRows ? `<ul class="territory-state-list">${threatRows}</ul>` : ''}
+     ${consequence}
+     ${assessmentBlock}
+     ${empty}
+     <div class="safety-note"><strong>Це не прогноз траєкторії</strong>
+       <p>Система показує лише дослівно повідомлену територію або напрямок і не екстраполює маршрут.</p></div>
+     <button class="text-button" data-territory-history>Повна історія території →</button>`);
+  // Обидва переходи, які раніше давав шар підписів подій, лишаються на місці — тепер вони живуть
+  // у рядках панелі, а не в крапці на карті.
+  dialog.querySelectorAll('[data-event]').forEach((row) => row.addEventListener('click', () => void showThreatDetails(row.dataset.event)));
+  dialog.querySelectorAll('[data-assessment]').forEach((row) => row.addEventListener('click', () => void showAssessmentDetails(row.dataset.assessment)));
+  dialog.querySelector('[data-territory-history]')?.addEventListener('click', () => void showLocationHistory(locationId));
+}
+
 async function showLocationHistory(id) {
   const response = await fetch(`/api/v1/locations/${encodeURIComponent(id)}/timeline?limit=100`);
   if (!response.ok) return openDetail('Територію не знайдено', 'Помилка', '<p>Не вдалося завантажити історію.</p>');
@@ -1086,12 +1470,19 @@ function renderMapPage() {
     const assessmentId = card.dataset.assessment;
     if (assessmentId) void showAssessmentDetails(assessmentId);
   });
-  // Ланцюги йдуть у групу «Загрози»: вони пояснюють ті самі події й не заслуговують окремого
-  // перемикача, який довелося б додавати в public/index.html — файл, який зараз правлять інші гілки.
-  const layerGroups = { alerts: alertLayerIds, threats: ['threat-pulse','direction-lines',...vectorLayerIds], assessments: ['assessment-halo'] };
+  // Ланцюги й лінія повідомленого напрямку йдуть у групу «Загрози»: вони пояснюють ті самі події
+  // й не заслуговують окремого перемикача.
+  const layerGroups = {
+    alerts:       alertLayerIds,
+    threats:      [...threatLayerIds, 'direction-lines', ...vectorLayerIds],
+    consequences: consequenceLayerIds,
+    assessments:  analyticLayerIds
+  };
   document.querySelectorAll('.layer-toggle').forEach((button) => button.addEventListener('click', () => {
     button.classList.toggle('is-active');
     const active = button.classList.contains('is-active');
+    // Вигляд кнопки й те, що читає екранна читалка, мусять казати одне й те саме.
+    button.setAttribute('aria-pressed', String(active));
     if (button.dataset.layer === 'occupation') {
       occupationVisible = active;
       applyOccupationVisibility();
@@ -1104,6 +1495,7 @@ function renderMapPage() {
   // Вибір користувача переживає перемальовування сторінки після кожної події потоку.
   legend.open = occupationLegendOpen ?? window.matchMedia('(min-width: 981px)').matches;
   legend.addEventListener('toggle', () => { occupationLegendOpen = legend.open; });
+  renderThreatLegend();
   renderOccupationLegend();
 }
 

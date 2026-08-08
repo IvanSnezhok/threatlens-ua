@@ -53,13 +53,49 @@ const VOLATILE_TABLES = [
   'source_message_revisions', 'source_messages',
   'subscriptions', 'telegram_users',
   'system_event_log', 'worker_state', 'ai_runs',
-  'reference_dataset_syncs', 'occupation_snapshots'
+  'reference_dataset_syncs', 'occupation_snapshots',
+  // Append-only and per-test: every save an ops test performs leaves rows here, and the newest-20
+  // assertions would otherwise read another file's history.
+  'runtime_settings_audit'
 ];
 
+/**
+ * Truncating alone is not enough for a suite that reads module state.
+ *
+ * `resetDatabase()` clears the tables; it cannot clear the in-process caches, cursors and guards
+ * that outlive a TRUNCATE. Every integration file that touches publication, the event hub or the
+ * analytics recompute needs this `beforeEach`, in this order:
+ *
+ * ```ts
+ * beforeEach(async () => {
+ *   await resetDatabase();
+ *   resetRuntimeSettingsCache();   // src/services/runtime-settings.ts
+ *   resetEventHubCursor();         // src/services/sse.ts — REQUIRED: TRUNCATE … RESTART IDENTITY
+ *                                  // restarts `version` at 1 while the hub's cursor keeps its
+ *                                  // value, so without this every `version > cursor` after the
+ *                                  // first test selects nothing and the suite hangs on `waitFor`.
+ *   resetAnalyticsScheduler();     // src/services/analytics-scheduler.ts
+ *   resetRiskRunGuard();           // src/services/risk.ts
+ *   resetAnalyticsNarrativeMemo(); // src/services/analytics-narrative.ts
+ * });
+ * ```
+ */
 export async function resetDatabase(): Promise<void> {
   await sql(`TRUNCATE ${VOLATILE_TABLES.join(',')} RESTART IDENTITY CASCADE`);
   await sql(`DELETE FROM locations WHERE id LIKE 'test-%'`);
   await sql(`UPDATE sources SET last_success_at=NULL,last_error_at=NULL,last_error=NULL,health_status='unknown'`);
+  // `runtime_settings` is not truncated: the row is migration-seeded and a read must never be "no
+  // row, therefore unknown". It is reset by UPDATE so every integration file starts in `live`,
+  // which is what makes "the delayed behaviour" a thing a test has to ask for explicitly.
+  //
+  // `mode_changed_at` is backdated an hour, not set to now(): the cutoff is
+  // GREATEST(now() - delay, mode_changed_at), so a fresh `mode_changed_at` would clamp every
+  // delayed-mode assertion in the suite to "no hold at all" and the tests would pass for the
+  // wrong reason. An hour is longer than any window a test backdates into.
+  await sql(`UPDATE runtime_settings SET publication_mode='live', analytics_event_driven=true,
+             analytics_debounce_ms=20000, analytics_max_delay_ms=120000, codex_cooldown_ms=900000,
+             mode_changed_at=now() - interval '1 hour',
+             updated_at=now(), updated_by='system'`);
 }
 
 /**

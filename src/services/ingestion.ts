@@ -239,11 +239,16 @@ async function reconcileAggregateAlert(
     // the unique index can never hide an active alert or discard a snapshot. Nothing is returned
     // only when the period is already active, which happens when the two adapters reconcile the
     // same location concurrently; the transaction that reopened it emits the event.
+    //
+    // `published_at` is refreshed here and nowhere else on this branch: a period that ends and
+    // reappears became publicly true a second time, and the delayed view must treat it as new.
+    // Leaving the original value would make a reopened alert instantly older than the cutoff — i.e.
+    // visible before it happened.
     const created = await client.query<{ id: string }>(
       `INSERT INTO alert_periods(location_id,alert_type,status,started_at,external_id)
        VALUES ($1,$2,'active',COALESCE($3,now()),$4)
        ON CONFLICT (location_id,alert_type,started_at) DO UPDATE
-         SET status='active',ended_at=NULL,updated_at=now()
+         SET status='active',ended_at=NULL,updated_at=now(),published_at=now()
          WHERE alert_periods.status<>'active'
        RETURNING id`,
       [locationId, alertType, aggregate.rows[0].started_at, `aggregate:${locationId}:${alertType}:${Date.now()}`]

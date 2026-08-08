@@ -46,6 +46,7 @@ const PUBLIC_ENTRY_POINTS = [
   'src/services/threat-vectors.ts',
   'src/repositories/events.ts',
   'src/services/sse.ts',
+  'src/services/publication.ts',
   'src/services/ingestion.ts',
   'src/services/risk.ts',
   'src/services/analytics.ts',
@@ -201,12 +202,31 @@ function bodyOf(functionName: string): string {
  * the two helper bodies at their call sites reconstructs the real sequence, which is the thing the
  * sovereignty rules actually depend on.
  */
-function executionOrderSource(): string {
+/** The raw `map.on('style.load', …)` call, before any helper is inlined into it. */
+function styleLoadBlock(): string {
   const styleLoad = APP_SOURCE.indexOf(`map.on('style.load'`);
-  const block = APP_SOURCE.slice(styleLoad, balanced(APP_SOURCE, APP_SOURCE.indexOf('(', styleLoad), '(', ')') + 1);
-  return block
+  return APP_SOURCE.slice(styleLoad, balanced(APP_SOURCE, APP_SOURCE.indexOf('(', styleLoad), '(', ')') + 1);
+}
+
+function executionOrderSource(): string {
+  return styleLoadBlock()
     .replace('addOccupationLayers();', bodyOf('addOccupationLayers'))
     .replace('addVectorLayers();', bodyOf('addVectorLayers'));
+}
+
+/**
+ * Every `selector { … }` rule of a stylesheet, flattened.
+ *
+ * At-rule preludes fall away with their outer brace, which is exactly what a scan for a property
+ * inside a given selector wants: `@media … { .map-stage { … } }` yields the inner rule.
+ */
+function rulesMatching(css: string, selector: RegExp): string[] {
+  const withoutComments = css.replace(/\/\*[\s\S]*?\*\//g, '');
+  const rules: string[] = [];
+  for (const rule of withoutComments.matchAll(/([^{}]+)\{([^{}]*)\}/g)) {
+    if (selector.test(rule[1]!)) rules.push(rule[0]!);
+  }
+  return rules;
 }
 
 /** Every `map.addLayer(...)` call, with the layer id it was inserted before. */
@@ -238,16 +258,85 @@ describe('map layer order', () => {
   it('adds the layers in the order the sovereignty rules depend on', () => {
     // Exact sequence, not a subset: a reordering of any two of these changes what the map asserts,
     // and the vector layers must appear only at the end.
+    //
+    // Within one anchor the later insert sits higher, so the fills read bottom-to-top as
+    // threat → alert → consequence → occupation and the outlines as
+    // analytic → threat → alert → consequence: the weakest signal never overdraws a stronger one.
     expect(order).toEqual([
       'ukraine-sovereignty-fill', 'ukraine-region-fill', 'ukraine-region-lines', 'ukraine-state-border',
+      'threat-oblast-fill', 'threat-raion-fill',
       'alert-oblast-fill', 'alert-raion-fill',
+      'consequence-oblast-fill', 'consequence-raion-fill',
       'occupation-fill', 'occupation-hatch', 'occupation-line', 'occupation-contested-line',
+      'analytic-raion-line', 'analytic-oblast-line',
+      'threat-raion-line', 'threat-oblast-line',
       'alert-raion-line', 'alert-oblast-line',
+      'consequence-raion-line', 'consequence-oblast-line',
       'city-hit', 'city-labels', 'crimea-ukraine-label', 'alert-oblast-label', 'alert-raion-label',
-      'assessment-halo', 'threat-pulse', 'event-labels', 'direction-lines',
+      'direction-lines',
       'threat-vector-sequence', 'threat-vector-direction', 'threat-vector-transit',
       'threat-vector-nodes', 'threat-vector-order'
     ]);
+  });
+
+  it('anchors every territory-state fill beneath the sovereignty fill', () => {
+    // Заливки живуть під суверенітетом і під державним кордоном — інакше колір стану
+    // перекриває те, що не є станом.
+    for (const id of [
+      'threat-oblast-fill', 'threat-raion-fill', 'alert-oblast-fill', 'alert-raion-fill',
+      'consequence-oblast-fill', 'consequence-raion-fill'
+    ]) {
+      expect(layers.find((layer) => layer.id === id)?.beforeId).toBe('ukraine-sovereignty-fill');
+    }
+  });
+
+  it('anchors every territory-state outline beneath the region lines', () => {
+    for (const id of [
+      'analytic-raion-line', 'analytic-oblast-line', 'threat-raion-line', 'threat-oblast-line',
+      'alert-raion-line', 'alert-oblast-line', 'consequence-raion-line', 'consequence-oblast-line'
+    ]) {
+      expect(layers.find((layer) => layer.id === id)?.beforeId).toBe('ukraine-region-lines');
+    }
+  });
+
+  it('no longer draws analytic circles, event dots or their point source', () => {
+    // Roadmap acceptance: «Аналітичні кола та glow-ефекти повністю відсутні». The scan covers the
+    // whole file, not only the `map.addLayer` sites: a comment naming a deleted layer is a promise
+    // the map no longer keeps.
+    for (const token of [
+      'assessment-halo', 'threat-pulse', 'event-labels', 'live-events',
+      'markerCollection', 'circle-blur'
+    ]) {
+      expect(APP_SOURCE, `web/app.js still names ${token}`).not.toContain(token);
+    }
+  });
+
+  it('keeps glow out of the stylesheet too', () => {
+    // «Аналітичні кола та glow-ефекти повністю відсутні» has a CSS half a JS scan cannot see.
+    const CSS = read('web/styles.css');
+    const rules = rulesMatching(CSS, /#map\b|\.map-stage\b|\.maplibregl-canvas\b/);
+    expect(rules.length).toBeGreaterThan(0);
+    for (const rule of rules) expect(rule).not.toMatch(/box-shadow|filter:\s*blur/);
+  });
+
+  it('keeps the style.load block free of straight apostrophes in Ukrainian words', () => {
+    // balanced() treats ' as a string delimiter and does not skip comments, so one «обʼєкт» written
+    // with U+0027 desynchronises the parser for the rest of the block and every layer assertion in
+    // this file starts testing a nonsense list. The file's convention is the modifier letter ʼ.
+    const block = styleLoadBlock();                    // the raw slice, before the .replace() calls
+    expect(block).not.toMatch(/[а-яіїєґА-ЯІЇЄҐ]'[а-яіїєґА-ЯІЇЄҐ]/u);
+  });
+
+  it('never gives the analytic state a fill', () => {
+    // «Аналітична оцінка — нейтральний контур без заливки, що НЕ може виглядати як офіційна тривога.»
+    const analytic = layers.filter((layer) => layer.id.startsWith('analytic-'));
+    expect(analytic.map((layer) => layer.id)).toEqual(['analytic-raion-line', 'analytic-oblast-line']);
+    const source = executionOrderSource();
+    for (const id of analytic.map((layer) => layer.id)) {
+      const call = source.slice(source.indexOf(`id: '${id}'`));
+      expect(call.slice(0, 400)).toContain(`type: 'line'`);
+      expect(call.slice(0, 400)).toContain('line-dasharray');
+    }
   });
 
   it('keeps the state border above every fill and the Crimea label above the alert labels', () => {

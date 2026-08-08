@@ -14,6 +14,7 @@ import attackAnalyticsRoutes from './attack-analytics-routes.js';
 import occupationRoutes from './occupation-routes.js';
 import opsAiRunsRoutes from './ops-ai-runs-routes.js';
 import opsCodexRoutes from './ops-codex-routes.js';
+import opsRuntimeRoutes from './ops-runtime-routes.js';
 import opsSourceTrustRoutes from './ops-source-trust-routes.js';
 import opsVectorRoutes from './ops-vector-routes.js';
 import vectorRoutes from './vector-routes.js';
@@ -86,7 +87,7 @@ export async function buildServer() {
   app.get('/health/live', async () => ({ status: 'ok', version: process.env.npm_package_version ?? 'dev' }));
   app.get('/health/ready', async (_request, reply) => {
     try {
-      const migration = await pool.query(`SELECT 1 FROM schema_migrations WHERE filename='021_source_trust.sql'`);
+      const migration = await pool.query(`SELECT 1 FROM schema_migrations WHERE filename='022_publication_runtime.sql'`);
       if (!migration.rowCount) return reply.code(503).send({ status: 'not_ready', reason: 'migrations_pending' });
       return { status: 'ready' };
     }
@@ -114,6 +115,7 @@ export async function buildServer() {
   await app.register(opsCodexRoutes);
   await app.register(opsAiRunsRoutes);
   await app.register(opsSourceTrustRoutes);
+  await app.register(opsRuntimeRoutes);
 
   app.get('/api/v1/config', async () => ({
     mapStyleUrl: config.MAP_STYLE_URL,

@@ -6,6 +6,13 @@ export type ThreatType = typeof THREAT_TYPES[number];
 export type EvidenceLevel = 'official' | 'confirmed' | 'monitoring' | 'unverified';
 export type RelationType = 'explicit_threat' | 'mentioned' | 'reported_direction' | 'official_alert' | 'aftermath';
 
+/**
+ * How the public presentation is timed. Nothing here gates collection, classification, audit,
+ * `/ops`, `/metrics` or Telegram delivery — see `src/services/publication.ts`.
+ */
+export const PUBLICATION_MODES = ['live', 'delayed_15s'] as const;
+export type PublicationMode = (typeof PUBLICATION_MODES)[number];
+
 export interface NormalizedMessage {
   sourceId: string;
   externalId: string;

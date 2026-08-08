@@ -71,11 +71,13 @@
   --rule-2:     rgba(233, 231, 224, .17);
   --rule-3:     rgba(233, 231, 224, .30);
 
-  /* Семантика. Ці чотири значення дублюють константи в app.js, які керують шарами MapLibre:
+  /* Семантика. Ці значення дублюють константи в app.js, які керують шарами MapLibre:
      карта й інтерфейс мусять називати ту саму річ тим самим кольором. */
-  --alert:      #ff4747;
+  --alert:      #ff4747;   /* офіційна тривога — колір зарезервовано за нею */
   --threat:     #ff7a4d;
-  --risk:       #e3b341;
+  --consequence:#ffcf8a;   /* нове — підтверджена атака / наслідки */
+  --analytic:   #8f9b94;   /* нове — аналітична оцінка. --risk лишається для карток і графіків ризику */
+  --risk:       #e3b341;   /* БІЛЬШЕ НЕ ВЖИВАЄТЬСЯ НА КАРТІ */
   --sov:        #72d6ca;
 
   --alert-soft: rgba(255, 71, 71, .12);
@@ -411,7 +413,20 @@ body { overflow-x: hidden; }
   background: rgba(255, 71, 71, .34);
 }
 .swatch.threat { background: var(--threat); }
-.swatch.risk   { background: var(--risk); }
+/* Зразки нових станів карти. Форма несе стільки ж, скільки колір: заливка, штрихування й
+   пунктирний контур мусять розрізнятися й у чорно-білому друку, і при дальтонізмі. */
+.swatch.consequence {
+  width: 11px; height: 9px;
+  border-radius: 0;
+  border: 1px solid rgba(255, 207, 138, .6);
+  background: repeating-linear-gradient(-45deg, rgba(255,207,138,.85) 0 1.5px, rgba(255,207,138,.14) 1.5px 4.5px);
+}
+.swatch.analytic {
+  width: 11px; height: 9px;
+  border-radius: 0;
+  border: 1px dashed rgba(143, 155, 148, .85);
+  background: transparent;
+}
 .swatch.occupation {
   width: 11px; height: 9px;
   border-radius: 0;
@@ -531,6 +546,37 @@ body { overflow-x: hidden; }
 }
 .legend-swatch.contested { color: rgba(143, 155, 148, .62); border-style: dashed; background: rgba(143, 155, 148, .16); }
 .legend-swatch.liberated { color: rgba(114, 214, 202, .6); background: rgba(114, 214, 202, .14); }
+
+/* Одне сімейство назв на обидві хвилі. Префікс `state-` ще й тримає ці правила
+   поза простором імен легенди окупації (.legend-swatch.occupied/.contested/.liberated). */
+.legend-swatch.state-alert       { color: rgba(255, 71, 71, .85);  background: rgba(255, 71, 71, .34); }
+.legend-swatch.state-threat      { color: rgba(255, 122, 77, .75); background: rgba(255, 122, 77, .22); }
+.legend-swatch.state-consequence { color: rgba(255, 207, 138, .9);
+  background: repeating-linear-gradient(-45deg, rgba(255,207,138,.85) 0 1.5px, rgba(255,207,138,.14) 1.5px 4.5px); }
+.legend-swatch.state-analytic    { color: rgba(143, 155, 148, .7); border-style: dotted; background: none; }
+
+/* Місце під іконку типу загрози в легенді. Саму графіку додає етап 2. */
+.legend-icon {
+  flex: 0 0 auto;
+  display: inline-grid; place-items: center;
+  width: 20px; height: 20px;
+  border-radius: 5px;
+  background: rgba(233, 231, 224, .10);
+  color: var(--bone-2);
+}
+.legend-icon svg { width: 14px; height: 14px; fill: currentColor; }
+
+/* Текст лише для допоміжних технологій: живий регіон карти не має жодного візуального місця,
+   але без нього карта для читача з екранної читалки лишається порожнім прямокутником. */
+.visually-hidden, #map-aria {
+  position: absolute;
+  width: 1px; height: 1px;
+  margin: -1px; padding: 0;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+  border: 0;
+}
 
 .legend-empty, .legend-note { margin: 0; color: var(--bone-4); font-size: 10.5px; line-height: 1.55; }
 .legend-note { padding-top: 10px; border-top: 1px solid var(--rule); }
@@ -1458,7 +1504,24 @@ body { overflow-x: hidden; }
 .update-list small { color: var(--bone-4); font-size: 11px; line-height: 1.5; }
 .update-list li { padding: 7px 0; border-bottom: 1px solid var(--rule); }
 
-/* ---- 12. Історія території -------------------------------------------------------------------- */
+/* ---- 12. Панель стану та історія території ----------------------------------------------------- */
+
+/* Панель стану території */
+.territory-alert { margin: 0 0 4px; color: #ff9a86; font-size: 13.5px; line-height: 1.5; }
+.territory-named, .territory-consequence { margin: 0 0 14px; color: var(--bone-3); font-size: 12px; line-height: 1.5; }
+.territory-state-list { margin: 0; padding: 0; list-style: none; display: grid; gap: 1px; background: var(--rule); }
+.territory-state-row {
+  display: grid; gap: 4px;
+  padding: 12px 13px;
+  background: var(--surface-2);
+  border-left: 2px solid var(--threat);
+  cursor: pointer;
+}
+.territory-state-row.is-analytic { border-left-color: var(--analytic); }
+.territory-state-row:hover { background: var(--surface-3); }
+.territory-state-row b { color: var(--bone); font: 600 14px/1.25 var(--body); }
+.territory-state-row span { color: var(--bone-2); font-size: 12.5px; line-height: 1.5; }
+.territory-state-row small { color: var(--bone-4); font-size: 11px; line-height: 1.45; }
 
 .territory-summary {
   display: grid;

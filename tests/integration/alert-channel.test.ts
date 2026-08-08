@@ -25,10 +25,16 @@ const AIR_ALERT_UA = 'air-alert-ua';
 const KYIV_ODA = 'gov-kyiv-oblast-oda';
 const VINNYTSIA_ODA = 'gov-vinnytsia-oda';
 
-/** Telegram publication times. The clock printed inside a message is deliberately never used. */
-const T0 = '2026-08-07T09:00:00.000Z';
-const T1 = '2026-08-07T09:05:00.000Z';
-const T2 = '2026-08-07T09:40:00.000Z';
+/**
+ * Telegram publication times. The clock printed inside a message is deliberately never used.
+ * Relative to the run's wall clock: absolute dates armed themselves as "stuck" alerts once the
+ * suite outlived ALERT_CHANNEL_MAX_ALERT_SECONDS, and expireStuckAlertChannelAlerts() started
+ * clearing fixtures the assertions considered fresh.
+ */
+const T0_BASE = Date.now() - 60 * 60 * 1000;
+const T0 = new Date(T0_BASE).toISOString();
+const T1 = new Date(T0_BASE + 5 * 60 * 1000).toISOString();
+const T2 = new Date(T0_BASE + 40 * 60 * 1000).toISOString();
 
 interface ChannelPost { id: string; at: string; text: string }
 

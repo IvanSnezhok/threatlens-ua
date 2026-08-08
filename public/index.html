@@ -60,17 +60,25 @@
         <div id="map" aria-label="Інтерактивна карта України"></div>
         <div class="map-vignette" aria-hidden="true"></div>
         <div class="map-panels">
-          <div class="map-tools" aria-label="Шари карти">
-            <button class="layer-toggle is-active" data-layer="alerts"><i class="swatch alert"></i>Тривоги</button>
-            <button class="layer-toggle is-active" data-layer="threats"><i class="swatch threat"></i>Загрози</button>
-            <button class="layer-toggle is-active" data-layer="assessments"><i class="swatch risk"></i>Аналітика</button>
-            <button class="layer-toggle is-active" data-layer="occupation" hidden><i class="swatch occupation"></i>Окупація</button>
+          <div class="map-tools" role="group" aria-label="Шари карти">
+            <button class="layer-toggle is-active" data-layer="alerts"       aria-pressed="true"><i class="swatch alert"></i>Тривоги</button>
+            <button class="layer-toggle is-active" data-layer="threats"      aria-pressed="true"><i class="swatch threat"></i>Загрози</button>
+            <button class="layer-toggle is-active" data-layer="consequences" aria-pressed="true"><i class="swatch consequence"></i>Наслідки</button>
+            <button class="layer-toggle is-active" data-layer="assessments"  aria-pressed="true"><i class="swatch analytic"></i>Аналітика</button>
+            <button class="layer-toggle is-active" data-layer="occupation"   aria-pressed="true" hidden><i class="swatch occupation"></i>Окупація</button>
           </div>
           <div class="sovereignty-badge"><strong>Крим — Україна</strong><span>Міжнародно визнані кордони</span></div>
           <details class="occupation-legend" id="occupation-legend" hidden></details>
         </div>
         <div class="map-caption">
-          <span>Заливка — активна офіційна тривога: щільна на території з повідомлення, приглушена — коли тривога лише в частині області. Наблизьте карту, щоб побачити райони; клікніть територію, щоб відкрити історію. Напрямки не є прогнозом траєкторії.</span>
+          <!-- Перші чотири речення дослівно збігаються з рядками легенди #threat-legend: підпис
+               ховається нижче 980 px, і два формулювання одного кодування — це два кодування. -->
+          <span>Офіційна тривога — щільна червона заливка й контур.
+            Активна загроза — помаранчева заливка, слабша за тривогу.
+            Підтверджена атака або наслідки — штрихування.
+            Аналітична оцінка — сірий пунктирний контур без заливки. Це не тривога.
+            Приглушений відтінок означає, що стан стосується лише частини території: наблизьте карту, щоб побачити райони.
+            Клікніть територію, щоб побачити її стан. Напрямки не є прогнозом траєкторії.</span>
           <button id="fit-ukraine">Показати всю Україну</button>
         </div>
       </div>
