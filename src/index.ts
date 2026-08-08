@@ -11,6 +11,7 @@ import { startOperationsScheduler } from './services/operations.js';
 import { startNightlyDigestScheduler } from './services/nightly-digest.js';
 import { startLocationCatalogScheduler } from './services/location-catalog.js';
 import { startOccupationScheduler } from './services/occupation.js';
+import { startSourceTrustScheduler } from './services/source-trust.js';
 import { eventHub } from './services/sse.js';
 import { startTelegramCollector } from './sources/telegram.js';
 
@@ -25,6 +26,9 @@ const stopOperations = startOperationsScheduler(app.log);
 const stopNightlyDigests = startNightlyDigestScheduler(app.log);
 const stopLocationCatalog = startLocationCatalogScheduler(app.log);
 const stopOccupation = startOccupationScheduler(app.log);
+// Раз на добу: вікно довіри — тридцять днів, тож частіше перераховувати означало б писати історію
+// заради третього знака після коми.
+const stopSourceTrust = startSourceTrustScheduler(app.log);
 const bot = createBot();
 const stopNotifications = startNotificationWorkers(bot, app.log);
 const stopCollector = await startTelegramCollector(app.log);
@@ -48,7 +52,7 @@ await app.listen({ port: config.PORT, host: '0.0.0.0' });
 
 async function shutdown(signal: string) {
   app.log.info({ signal }, 'shutting down');
-  stopIngestion(); stopRisk(); stopOperations(); stopNightlyDigests(); stopLocationCatalog(); stopOccupation(); stopAnalytics(); stopNotifications(); eventHub.stop();
+  stopIngestion(); stopRisk(); stopOperations(); stopNightlyDigests(); stopLocationCatalog(); stopOccupation(); stopSourceTrust(); stopAnalytics(); stopNotifications(); eventHub.stop();
   bot?.stop();
   await stopCollector?.();
   await app.close();

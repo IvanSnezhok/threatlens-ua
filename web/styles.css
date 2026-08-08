@@ -1433,6 +1433,10 @@ body { overflow-x: hidden; }
 }
 .tech-signals li > span:first-child { color: var(--bone-2); }
 
+/* Пояснення до числової довіри стоїть під переліком сигналів, у тому самому згорнутому блоці:
+   слово «висока/звичайна/знижена» видно завжди, арифметика — лише тому, хто її розгорнув. */
+.tech-details > .legend-note { margin: 0; padding: 12px 14px 0; }
+
 .detail-score {
   display: flex;
   align-items: center;
