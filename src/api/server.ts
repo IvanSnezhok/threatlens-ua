@@ -10,6 +10,7 @@ import { createEventRelay, eventHub, type SystemEvent } from '../services/sse.js
 import { registerAlertChannelMetrics } from '../services/ingestion.js';
 import { hasValidOpsAuth, safeEqual } from './ops-auth.js';
 import analyticsRoutes from './analytics-routes.js';
+import attackAnalyticsRoutes from './attack-analytics-routes.js';
 import occupationRoutes from './occupation-routes.js';
 import opsAiRunsRoutes from './ops-ai-runs-routes.js';
 import opsCodexRoutes from './ops-codex-routes.js';
@@ -103,6 +104,9 @@ export async function buildServer() {
   // instead of leaking onto every response the server sends.
   await app.register(occupationRoutes, { metricsRegistry: registry });
   await app.register(analyticsRoutes);
+  // Public, unlike `analyticsRoutes` above — see the header of the file for why the two cannot share
+  // a plugin scope.
+  await app.register(attackAnalyticsRoutes);
   await app.register(vectorRoutes);
   await app.register(opsVectorRoutes);
   await app.register(opsCodexRoutes);
