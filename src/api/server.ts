@@ -12,6 +12,7 @@ import { delaySecondsFor, observeSseDeliveryLag, publicationSlice, registerPubli
 import { registerAnalyticsSchedulerMetrics } from '../services/analytics-scheduler.js';
 import { resolveRuntimeSettings } from '../services/runtime-settings.js';
 import { registerAlertChannelMetrics } from '../services/ingestion.js';
+import { registerTelegramCollectorMetrics, telegramCollectorStatus } from '../sources/telegram.js';
 import { hasValidOpsAuth, safeEqual } from './ops-auth.js';
 import analyticsRoutes from './analytics-routes.js';
 import attackAnalyticsRoutes from './attack-analytics-routes.js';
@@ -58,14 +59,36 @@ function sourceIsConfigured(row: { id: string; adapter_type: string | null; enab
   }
 }
 
+/** Adapter types the MTProto collector, and only the MTProto collector, is responsible for. */
+const MTPROTO_ADAPTERS = new Set(['mtproto', 'mtproto_alert_channel', 'mtproto_monitor']);
+
+/**
+ * States in which the collector cannot deliver a message from any channel at all.
+ *
+ * `degraded` is deliberately not among them: it means the handlers are live and some channels are
+ * bound, so the deployment is collecting — the unbound handles are reported per source through
+ * `health_status`, which the collector itself writes with `markSourceError`.
+ */
+const COLLECTOR_BLOCKED: ReadonlySet<string> = new Set(['starting', 'flood_wait', 'failed']);
+
 async function sourceHealth() {
   const rows = (await pool.query(
     `SELECT id,name,tier,official,enabled,adapter_type,last_success_at,last_error_at,last_error,
       health_status,stale_after_seconds FROM sources ORDER BY tier,id`
   )).rows;
+  // One reading for the whole response: two calls a few statements apart could report two different
+  // collector states inside a single payload.
+  const collector = telegramCollectorStatus();
   return rows.map((row) => {
     const configured = sourceIsConfigured(row);
-    return { ...row, configured, status: configured ? row.health_status : 'unconfigured' };
+    return {
+      ...row, configured, status: configured ? row.health_status : 'unconfigured',
+      // ADDITIVE, and null for every non-MTProto row: `status` keeps its existing vocabulary
+      // (`current`/`stale`/`error`/`unknown`/`unconfigured`) because the web console maps those by
+      // name. What this adds is the in-process fact the database cannot hold — whether the live
+      // handlers exist at all — so a flood wait is visible before `stale_after_seconds` elapses.
+      collector: MTPROTO_ADAPTERS.has(row.adapter_type) ? collector : null
+    };
   });
 }
 
@@ -79,6 +102,7 @@ export async function buildServer() {
   // incident conditions nobody can observe.
   registerPublicationMetrics(registry);
   registerAnalyticsSchedulerMetrics(registry);
+  registerTelegramCollectorMetrics(registry);
 
   const app = Fastify({ logger: { level: config.NODE_ENV === 'development' ? 'debug' : 'info' }, trustProxy: true });
   await app.register(rateLimit, { max: 300, timeWindow: '1 minute' });
@@ -99,11 +123,26 @@ export async function buildServer() {
   });
 
   app.get('/health/live', async () => ({ status: 'ok', version: process.env.npm_package_version ?? 'dev' }));
+  /**
+   * Readiness now also answers for the MTProto collector.
+   *
+   * The container healthcheck probes `/health/live` (`compose.yaml`), so a not-ready answer here
+   * neither restarts the process nor takes the site down — which is what makes it safe to tell the
+   * truth: a collector sitting out a Telegram flood wait delivers nothing from any channel, and the
+   * whole point of the incident this endpoint now covers is that a `healthy` container and fresh
+   * `last_success_at` values hid exactly that. `disabled` (no MTProto credentials) and `degraded`
+   * (handlers live, some handles unbound) stay ready; `collector` is reported either way, so the
+   * probe is additive for every deployment that never runs a collector at all.
+   */
   app.get('/health/ready', async (_request, reply) => {
     try {
       const migration = await pool.query(`SELECT 1 FROM schema_migrations WHERE filename='022_publication_runtime.sql'`);
       if (!migration.rowCount) return reply.code(503).send({ status: 'not_ready', reason: 'migrations_pending' });
-      return { status: 'ready' };
+      const collector = telegramCollectorStatus();
+      if (COLLECTOR_BLOCKED.has(collector.state)) {
+        return reply.code(503).send({ status: 'not_ready', reason: `collector_${collector.state}`, collector });
+      }
+      return { status: 'ready', collector };
     }
     catch { return reply.code(503).send({ status: 'not_ready' }); }
   });

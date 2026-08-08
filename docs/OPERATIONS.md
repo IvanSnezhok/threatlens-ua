@@ -2,9 +2,9 @@
 
 ## Health
 
-- `/health/live`: process is running.
-- `/health/ready`: database is reachable and the latest required migration is applied (currently `022_publication_runtime.sql`).
-- `/api/v1/sources/health`: configured, current, stale, error and unconfigured source states.
+- `/health/live`: process is running. This is what the container healthcheck probes, so nothing below restarts the app.
+- `/health/ready`: database is reachable, the latest required migration is applied (currently `022_publication_runtime.sql`), and the MTProto collector is not blocked. The response carries a `collector` object in both directions; `503 {"reason":"collector_flood_wait"}` and `collector_failed` are the two states that mean no Telegram channel is being read at all. `disabled` (no MTProto credentials) and `degraded` (handlers live, some handles unbound) stay ready.
+- `/api/v1/sources/health`: configured, current, stale, error and unconfigured source states. MTProto rows additionally carry `collector` — the live handler state, which the database cannot hold.
 - `/ops/api`: Basic-auth protected worker, AI, source and database state.
 - `/ops`: operator console. Credentials are held only in the active tab's memory; it can add, verify, activate and hide recommended Telegram channels.
 - `/metrics`: open in development; in production requires `METRICS_TOKEN` Bearer auth or ops Basic auth.
@@ -427,6 +427,52 @@ Production backups must additionally be encrypted and copied to independent obje
   above the longest plausible real alert on purpose — overnight mass-attack alerts run 8–11 hours and
   frontline raions hold much of a day. Tuning it down converts a defect detector into a generator of
   false "Офіційний відбій" messages, which is the failure this system is built to avoid.
+- **MTProto collector in flood wait (`threatlens_telegram_flood_waits_total > 0`, `/health/ready` 503
+  with `reason=collector_flood_wait`).** Telegram has told the account to stop making a class of
+  request for a named number of seconds, and the collector is sitting the interval out. It issues
+  **nothing** in the meantime — that is the fix, not the symptom: the previous behaviour retried the
+  whole channel list on every incoming update and never got out of the wait.
+
+  What to check, in order:
+
+  ```bash
+  # The state itself: which phase hit the wait, when it ends, how many channels are bound.
+  docker compose exec -T app curl -sS http://localhost:3000/health/ready | jq .collector
+
+  # What the collector has been doing. One line per pass; there is no per-message logging here.
+  docker compose logs app | grep -E 'MTProto collector (handlers ready|has no live channels)|flood wait'
+
+  # Whether anything is still arriving.
+  docker compose exec -T postgres psql -U threatlens -d threatlens -c "
+    SELECT source_id, max(received_at) AS newest, count(*) FILTER (WHERE received_at > now()-interval '1 hour') AS last_hour
+    FROM source_messages GROUP BY source_id ORDER BY newest DESC NULLS LAST LIMIT 20"
+  ```
+
+  `collector.floodWaitUntil` is when the single armed retry fires. **Do not restart the container to
+  hurry it**: a restart re-runs the startup pass immediately, which is exactly the request Telegram
+  refused, and each refusal can extend the interval. Wait it out; the retry re-runs by itself and the
+  sources return to `current` through the normal `markSourceSuccess` path (`source.recovered` rows in
+  `system_event_log` record it).
+
+  `collector.floodWaitSeconds` above a few thousand usually means the session has been rate-limited
+  at the account level rather than for one request. Short waits never reach this state at all — the
+  library sleeps anything at or below `floodSleepThreshold` (60 s) itself.
+- **MTProto collector `degraded`: some handles are not bound.** `/health/ready` stays 200 — the
+  handlers are live and the bound channels are being collected — and `collector.unresolved` names the
+  handles that are not. Each one's `sources` row is marked `error` with the reason, so
+  `/api/v1/sources/health` and `/ops` show it individually. Almost always one of three things:
+
+  1. **The account is not subscribed to the channel.** The collector receives updates only for
+     dialogs its account is in, so an unsubscribed handle can never deliver a message however
+     correctly it is spelled. Join it with the collector account, then wait for the retry (10 minutes)
+     or restart.
+  2. **The handle in `sources.telegram_username` is wrong or the channel renamed.** Open
+     `https://t.me/<handle>`; fix the row rather than the code.
+  3. **The channel became private or was deleted.** `UPDATE sources SET enabled=false WHERE id='…'`
+     — a permanently unreachable row otherwise reports `error` for ever.
+
+  A `degraded` collector never silently downgrades an alert channel: an unbound Tier A handle is a
+  source that stops holding its alerts, which the aggregate treats as one fewer official source.
 - **Telegram 403:** the user is disabled automatically; queued messages stop.
 - **Telegram 429:** delivery uses the provider `retry_after` value.
 - **AI invalid/timeout:** failure is recorded and deterministic fallback is used.
