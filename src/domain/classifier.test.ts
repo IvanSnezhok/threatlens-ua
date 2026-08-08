@@ -496,3 +496,283 @@ describe('classifyMessage on MiG-31K movements', () => {
     expect(result.nationalScope).toBe(true);
   });
 });
+
+// ------------------------------------------------------------------------------------------------
+// v3: repeated threat tokens across a contrast
+// ------------------------------------------------------------------------------------------------
+//
+// `v2` examined the first occurrence of each pattern and nothing else, so a message that denies a
+// weapon and then reports the same weapon was judged entirely on the denial. Every case below
+// published an all-clear for a live threat before this version.
+
+describe('classifyMessage on a threat repeated after a contrast', () => {
+  it('reads the drone after "але", not the one before it', () => {
+    const result = classify('БпЛА не фіксуємо, але БпЛА курсом на Київ');
+    expect(result.intent).toBe('threat');
+    expect(result.threatType).toBe('uav');
+    expect(result.locations.map((location) => location.id)).toContain('ua-80');
+    expect(isSignificant(result)).toBe(true);
+  });
+
+  it('does the same for a repeated ballistic threat', () => {
+    const result = classify('Балістику не фіксуємо, але балістика курсом на Київ');
+    expect(result.intent).toBe('threat');
+    expect(result.threatType).toBe('ballistic_missile');
+    expect(isSignificant(result)).toBe(true);
+  });
+
+  it('does the same for a repeated cruise-missile threat', () => {
+    const result = classify('Крилатих ракет не фіксуємо, проте крилата ракета курсом на Одесу');
+    expect(result.intent).toBe('threat');
+    expect(result.threatType).toBe('cruise_missile');
+    expect(result.locations.map((location) => location.id)).toContain('ua-city-odesa');
+  });
+
+  it('reads every contrastive conjunction the same way', () => {
+    for (const conjunction of ['але', 'проте', 'однак', 'втім']) {
+      const result = classify(`Шахедів не фіксуємо, ${conjunction} шахед курсом на Київ`);
+      expect(result.intent, conjunction).toBe('threat');
+      expect(result.threatType, conjunction).toBe('uav');
+    }
+  });
+
+  it('classifies a mixed denial on what it asserts, not on what it denies', () => {
+    const result = classify('Не фіксуємо балістики, але шахед курсом на Київ');
+    expect(result.threatType).toBe('uav');
+    expect(result.signalThreatTypes).not.toContain('ballistic_missile');
+  });
+
+  it('leaves a clean absence statement a de-escalation', () => {
+    // The negative half of the same rule: with nothing after the denial there is nothing to assert,
+    // and the message must keep meaning what it says.
+    for (const text of ['БпЛА не фіксуємо', 'Балістики не фіксуємо.', 'Крилатих ракет не спостерігаємо']) {
+      const result = classify(text);
+      expect(result.intent, text).toBe('de_escalation');
+      expect(isSignificant(result), text).toBe(false);
+    }
+  });
+
+  it('still refuses to read anticipation of an all-clear as an all-clear', () => {
+    const result = classify('Очікуємо на відбій, БпЛА поки не фіксуємо');
+    expect(result.intent).not.toBe('de_escalation');
+    expect(isDeEscalation(result)).toBe(false);
+  });
+
+  it('does not let a denied strategic indicator hide an asserted one later', () => {
+    const result = classify('Зліт Ту-95 не фіксуємо, але зліт Ту-160 підтверджено.');
+    expect(result.indicators).toContain('зліт стратегічної авіації');
+    expect(result.nationalScope).toBe(true);
+  });
+});
+
+// ------------------------------------------------------------------------------------------------
+// v3 vocabulary
+// ------------------------------------------------------------------------------------------------
+//
+// Every rule below gets the phrase from the archive that it must catch and the nearby phrase it must
+// leave alone. The catalogue is local to this block so the additions cannot perturb the fixtures
+// above, and it holds only places the sampled messages actually name.
+
+describe('classifyMessage on v3 vocabulary', () => {
+  const catalogue = [
+    { id: 'ua-80', name: 'Київ', aliases: ['київ', 'києва', 'києві'] },
+    { id: 'ua-city-odesa', name: 'Одеса', aliases: ['одеси', 'одесі', 'одесу'] },
+    { id: 'ua-city-sumy', name: 'Суми', aliases: ['сумах'] },
+    { id: 'ua-city-dnipro', name: 'Дніпро', aliases: ['дніпра', 'дніпрі'] },
+    { id: 'ua-63', name: 'Харківська область', aliases: ['харківщина', 'харківщині'] },
+    { id: 'ua-59', name: 'Сумська область', aliases: ['сумщина', 'сумщині'] },
+    { id: 'test-vyshhorod', name: 'Вишгород', aliases: ['вишгорода'] },
+    { id: 'test-brovary', name: 'Бровари', aliases: ['броварів', 'броварах'] }
+  ];
+  const read = (text: string) => classifyMessage(text, catalogue);
+
+  describe('the jet-powered Shahed as the channels inflect it', () => {
+    it('reads every form the archive uses', () => {
+      for (const text of [
+        'Одеса 1х реактив Аркадія',
+        '2х реактива по межі Київської області, курс на Київ',
+        'Реактивний керований на Вишгород',
+        'Пара реактивних на Бровари',
+        'Реактивні БпЛА в напрямку Одеси'
+      ]) {
+        const result = read(text);
+        expect(result.threatType, text).toBe('uav');
+        expect(isSignificant(result), text).toBe(true);
+      }
+    });
+
+    it('still leaves reactive artillery to the artillery class', () => {
+      expect(read('Реактивна артилерія по Харківщині').threatType).toBe('mlrs');
+      expect(read('Обстріл з реактивної артилерії по Харківщині').threatType).toBe('mlrs');
+    });
+
+    it('raises nothing for a jet drone that names no place', () => {
+      expect(isSignificant(read('Реактивний'))).toBe(false);
+    });
+  });
+
+  describe('Zala', () => {
+    it('files a named Zala as a reconnaissance UAV', () => {
+      const result = read('Дніпропетровщина: Zala курсом на Дніпро');
+      expect(result.threatType).toBe('uav');
+      expect(isSignificant(result)).toBe(true);
+    });
+
+    it('does not read the Ukrainian word "зала" as a drone', () => {
+      // Cyrillic, and it means "hall". Only the Latin spelling is the aircraft.
+      const result = read('Зала очікування у Києві працює цілодобово.');
+      expect(result.threatType).toBe('unknown');
+      expect(isSignificant(result)).toBe(false);
+    });
+  });
+
+  describe('Молнія', () => {
+    it('files a named Molniya as a UAV', () => {
+      const result = read('Сумщина: Молнія курсом на Суми');
+      expect(result.threatType).toBe('uav');
+      expect(result.locations.map((location) => location.id)).toContain('ua-city-sumy');
+    });
+
+    it('raises nothing when the same word names no place', () => {
+      expect(isSignificant(read('Молнія'))).toBe(false);
+    });
+  });
+
+  describe('the "Ударний Бп" abbreviation', () => {
+    it('reads the structured bulletin', () => {
+      const result = read('Сумська область ◦ Ударний Бп 2 грп.');
+      expect(result.threatType).toBe('uav');
+      expect(result.locations.map((location) => location.id)).toContain('ua-59');
+    });
+
+    it('does not read the two letters on their own', () => {
+      // "Бп" alone is two characters and evidence of nothing; only "ударний Бп" is the weapon.
+      const result = read('Сумська область ◦ Бп 2 грп.');
+      expect(result.threatType).toBe('unknown');
+      expect(result.indicators).toEqual([]);
+    });
+  });
+
+  describe('generic "дрон"', () => {
+    it('reads a count of drones beside a place', () => {
+      const result = read('Київ, у нас 3 дрони біля Трої');
+      expect(result.threatType).toBe('uav');
+      expect(result.indicators).toContain('дрони без уточнення типу');
+      expect(isSignificant(result)).toBe(true);
+    });
+
+    it('reads a verb of motion beside a place', () => {
+      expect(read('Київ. Дрони йдуть на низькій висоті.').threatType).toBe('uav');
+    });
+
+    it('raises nothing for the word with a place but no operational cue', () => {
+      const result = read('У Києві засоби захисту від дронів активовані.');
+      expect(result.threatType).toBe('unknown');
+      expect(isSignificant(result)).toBe(false);
+    });
+
+    it('raises nothing for an operational cue with no Ukrainian place', () => {
+      const result = read('У повітрі 30х різних дронів, у всіх курс західний');
+      expect(isSignificant(result)).toBe(false);
+    });
+
+    it('still ignores a fundraiser for drones', () => {
+      expect(isSignificant(read('Збір на дрони для 47 бригади у Києві. Монобанк.'))).toBe(false);
+    });
+  });
+
+  describe('generic "ракета"', () => {
+    it('reads the shouted one-line warning', () => {
+      const result = read('⚠️ КИЇВ! УВАГА! РАКЕТА!');
+      expect(result.indicators).toContain('ракета без уточнення типу');
+      expect(isSignificant(result)).toBe(true);
+    });
+
+    it('does not guess which kind of missile it was', () => {
+      // Ballistic and cruise arrive with minutes of difference between them; printing a coin toss
+      // as a class would be a claim the message never made.
+      expect(read('⚠️ КИЇВ! УВАГА! РАКЕТА!').threatType).toBe('unknown');
+    });
+
+    it('raises nothing without an operational cue', () => {
+      expect(isSignificant(read('У Києві відкрили виставку ракет.'))).toBe(false);
+    });
+
+    it('raises nothing with no place at all', () => {
+      expect(isSignificant(read('2 ракети'))).toBe(false);
+    });
+  });
+
+  describe('generic "бомба"', () => {
+    it('reads a bomb with a stated direction', () => {
+      const result = read('Бомба у напрямку Вишгорода');
+      expect(result.indicators).toContain('авіабомба без уточнення типу');
+      expect(result.threatType).toBe('unknown');
+      expect(isSignificant(result)).toBe(true);
+    });
+
+    it('does not read a bomb shelter as a bomb', () => {
+      const result = read('У Києві відкрили нове бомбосховище, укриття працює цілодобово.');
+      expect(result.indicators).not.toContain('авіабомба без уточнення типу');
+      expect(isSignificant(result)).toBe(false);
+    });
+  });
+
+  describe('a reported direction with no weapon named', () => {
+    it('raises an unknown event for a bare course', () => {
+      for (const text of ['Курс на Вишгород!', 'Один курсом на Вишгород', 'Поки тримають курс на Вишгород']) {
+        const result = read(text);
+        expect(result.threatType, text).toBe('unknown');
+        expect(result.indicators, text).toContain('повідомлений напрямок без названого типу');
+        expect(isSignificant(result), text).toBe(true);
+      }
+    });
+
+    it('reads the "н.п." form the Air Force uses', () => {
+      const result = read('Курс на н.п. Вишгород та Бровари!');
+      expect(isSignificant(result)).toBe(true);
+      expect(result.locations.map((location) => location.id))
+        .toEqual(expect.arrayContaining(['test-vyshhorod', 'test-brovary']));
+    });
+
+    it('reads "у бік" as a stated direction too', () => {
+      expect(isSignificant(read('У бік Броварів дві штуки'))).toBe(true);
+    });
+
+    it('never infers the class from an earlier message', () => {
+      // The classifier is a pure function of one message; this pins the property that makes that
+      // guarantee observable rather than incidental.
+      expect(read('Шахед курсом на Вишгород').threatType).toBe('uav');
+      expect(read('Курс на Вишгород').threatType).toBe('unknown');
+    });
+
+    it('does not read an exchange rate as a heading', () => {
+      expect(isSignificant(read('Курс долара знову зріс. Київ реагує спокійно.'))).toBe(false);
+      expect(isSignificant(read('Курси англійської у Києві.'))).toBe(false);
+    });
+
+    it('raises nothing for a direction with no Ukrainian place', () => {
+      expect(isSignificant(read('Курсом на Ростов'))).toBe(false);
+    });
+
+    it('does not turn a withdrawal into a threat because it states a direction', () => {
+      const result = read('Відбій загрози ударних БпЛА курсом на Київ');
+      expect(result.intent).toBe('de_escalation');
+      expect(isSignificant(result)).toBe(false);
+    });
+  });
+
+  describe('the ➤ arrow bulletin', () => {
+    it('reads the arrow the way it reads →', () => {
+      const result = read('Рильськ ➤ Суми ➤');
+      expect(result.indicators).toContain('рух цілі за напрямком');
+      expect(result.threatType).toBe('unknown');
+      expect(result.locations.find((location) => location.id === 'ua-city-sumy')?.relationType)
+        .toBe('reported_direction');
+    });
+
+    it('never lets a bare ➤ with no place become an event', () => {
+      expect(isSignificant(read('ДКУ ➤'))).toBe(false);
+    });
+  });
+});

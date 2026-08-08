@@ -2,9 +2,9 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { classifyMessage } from '../domain/classifier.js';
 import type { ClassifiedMessage } from '../types.js';
 import {
-  deterministicVerdict, disagreementFields, normalizePlace, resetShadowRateLimit,
-  scheduleShadowClassification, shadowClassify, shadowSkipCounts, withinRateLimit,
-  type ShadowVerdict
+  deterministicVerdict, disagreementFields, normalizePlace, resetShadowMetrics, resetShadowRateLimit,
+  scheduleShadowClassification, shadowClassifierMetrics, shadowClassify, shadowSkipCounts,
+  withinRateLimit, type ShadowVerdict
 } from './shadow-classifier.js';
 
 const locations = [
@@ -295,5 +295,45 @@ describe('scheduleShadowClassification', () => {
       input('Ударні БпЛА у напрямку Києва'), { chat: chat as never }
     )).not.toThrow();
     await flush();
+  });
+});
+
+/**
+ * The coverage counters.
+ *
+ * "How much labelling material am I actually collecting, and where is the rest going" is the first
+ * question after switching this feature on, and the running total is the only answer that survives a
+ * night of thousands of messages. Attempts must count every call — including the ones that never
+ * reach the model — or the denominator of coverage silently excludes the failures it exists to
+ * measure.
+ */
+describe('shadow coverage metrics', () => {
+  beforeEach(() => {
+    resetShadowMetrics();
+    resetShadowRateLimit();
+  });
+
+  const value = async (name: string, labels?: Record<string, string>) => {
+    const metric = shadowClassifierMetrics().find(([metricName]) => metricName === name)![1];
+    const { values } = await metric.get();
+    const row = labels
+      ? values.find((entry) => Object.entries(labels).every(([key, expected]) => entry.labels[key] === expected))
+      : values[0];
+    return row?.value ?? 0;
+  };
+
+  it('counts an attempt and a recorded outcome for a successful call', async () => {
+    await shadowClassify(input('Ударні БпЛА у напрямку Києва'), { chat: chatReturning(verdict()) as never });
+    expect(await value('threatlens_shadow_attempts_total')).toBe(1);
+    expect(await value('threatlens_shadow_outcomes_total', { status: 'recorded', reason: 'none' })).toBe(1);
+  });
+
+  it('counts an attempt for a skip too, labelled with why', async () => {
+    // The attempt is the denominator: a rate-limited message is one that got no second opinion, and
+    // leaving it out of the count would report the coverage of the calls that happened rather than
+    // of the corpus.
+    await shadowClassify(input('Ударні БпЛА у напрямку Києва'), { chat: chatFailing('endpoint_error') as never });
+    expect(await value('threatlens_shadow_attempts_total')).toBe(1);
+    expect(await value('threatlens_shadow_outcomes_total', { status: 'skipped', reason: 'model_failed' })).toBe(1);
   });
 });

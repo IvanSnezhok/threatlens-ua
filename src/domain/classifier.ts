@@ -27,8 +27,25 @@ import type { ClassifiedMessage, RelationType, ThreatType } from '../types.js';
  *   launch-scope take-off and an ambient-scope landing, so a reported landing at Savasleyka no
  *   longer raises a country-wide ballistic warning. `FOREIGN_PLACE_STEMS` gained the airfields those
  *   landing reports name.
+ * * `v3` — one correction and the vocabulary a manual read of the archive found missing.
+ *
+ *   The correction that matters: `v2` looked at the **first** occurrence of each threat pattern and
+ *   nowhere else, so "БпЛА не фіксуємо, але БпЛА курсом на Київ" was judged entirely on the denied
+ *   first "БпЛА" and filed as an all-clear — the worst available direction for this module to fail
+ *   in. Every occurrence is now examined ({@link allMatches}) and one un-denied occurrence is enough
+ *   to make the message an assertion. The strategic indicators carried the identical single-`exec`
+ *   bug and are repaired the same way.
+ *
+ *   The vocabulary: the jet-powered Shahed as the channels actually inflect it (`реактив`,
+ *   `реактива`, `реактивний`, `реактивних` — `v2` read only the clipped `реакт`), the Zala
+ *   reconnaissance drone, the "Молнія" strike drone, and `Ударний Бп`, the abbreviation the
+ *   structured bulletins use. Plus a location-gated class of **generic** nouns — `дрон`, `ракета`,
+ *   `бомба` — and a bare reported direction with no weapon named at all. Both only mean something
+ *   next to a Ukrainian place, and the generic nouns additionally require an operational cue, so
+ *   neither a parcel-post notice nor a meme about drones can raise anything. A direction with no
+ *   named type produces `unknown`, never a class carried over from an earlier message.
  */
-export const CLASSIFIER_VERSION = 'v2';
+export const CLASSIFIER_VERSION = 'v3';
 
 export interface LocationLexeme {
   id: string;
@@ -50,9 +67,21 @@ const patterns: Array<[ThreatType, RegExp]> = [
   ['guided_air_bomb', /(каб[а-яіїєґ]*|керован[а-яіїєґ]* авіаційн[а-яіїєґ]* бомб[а-яіїєґ]*)/iu],
   // "герань" and "мопед" are the two slang names the OSINT feeds use for a Shahed-type drone, and
   // the bare "реакт" is how they abbreviate a jet-powered one in telegraphic posts
-  // ("3х реакт йдуть по межі Котельва"). The suffix guard keeps it away from "реактивна артилерія",
-  // which is a different weapon and is already matched as `mlrs` below.
-  ['uav', /(бпла|ударн[а-яіїєґ]* дрон[а-яіїєґ]*|безпілотник[а-яіїєґ]*|шахед[а-яіїєґ]*|геран[ья][а-яіїєґ]*|мопед[а-яіїєґ]*|(?<!\p{L})реакт(?:и|ів|ах|ами)?(?!\p{L}))/iu],
+  // ("3х реакт йдуть по межі Котельва").
+  //
+  // `v2` stopped at that clipped form and so read almost none of the traffic: the archive's own
+  // wording is "1х реактив", "2х реактива", "реактивний керований", "пара реактивних", and none of
+  // those end where `реакт(и|ів|ах|ами)` ends. The `ив…` branch takes the whole adjective, and the
+  // trailing guard is what keeps it off "реактивна артилерія" and "реактивні системи залпового
+  // вогню" — different weapons, the first of which is already matched as `mlrs` below. The guard is
+  // a lookahead rather than a suffix list because the adjective inflects freely and the noun after
+  // it is the only thing that says which weapon is meant.
+  //
+  // "Zala" is the reconnaissance drone the intelligence channels name in Latin script, "Молнія" the
+  // strike drone they name in Cyrillic, and "Ударний Бп" the abbreviation the structured bulletins
+  // use for a strike UAV ("Сумська область ◦ Ударний Бп 2 грп."). The `Бп` is only read next to
+  // "ударний": the two letters alone are far too short to be evidence of anything.
+  ['uav', /(бпла|ударн[а-яіїєґ]*\s+(?:дрон[а-яіїєґ]*|бп(?!\p{L}))|безпілотник[а-яіїєґ]*|шахед[а-яіїєґ]*|геран[ья][а-яіїєґ]*|мопед[а-яіїєґ]*|(?<!\p{L})реакт(?:ив[а-яіїєґ]*|и|ів|ах|ами)?(?!\p{L})(?!\s+(?:артилері|систем))|(?<!\p{L})zala(?!\p{L})|(?<!\p{L})молн[иі][яюієї](?!\p{L}))/iu],
   ['aviation', /(стратегічн[а-яіїєґ]* авіаці[а-яіїєґ]*|тактичн[а-яіїєґ]* авіаці[а-яіїєґ]*|активність авіаці[а-яіїєґ]*)/iu],
   ['mlrs', /(рсзв|реактивн[а-яіїєґ]* артилері[а-яіїєґ]*)/iu],
   ['artillery', /(артилерійськ[а-яіїєґ]* обстріл[а-яіїєґ]*|ствольн[а-яіїєґ]* артилері[а-яіїєґ]*)/iu],
@@ -116,6 +145,43 @@ const strategicIndicators: Array<{ name: string; pattern: RegExp; threatTypes: T
 ];
 
 /**
+ * A direction the source states in words, with no weapon named anywhere.
+ *
+ * "Курс на н.п. Дігтярі та Мала Дівиця!", "Один курсом на Вишгород", "У бік Броварів" — a complete
+ * report to the channel's readers, and nothing in it says what is moving. Read as an `unknown`
+ * threat rather than guessed at: the previous message usually named a Shahed, and inferring the
+ * class from it is precisely the inference this module is forbidden to make.
+ *
+ * Every branch requires the direction word to be *stated*, and the word alone is never enough:
+ * "курс долара" and "курси англійської" are the two shapes that would otherwise turn an exchange
+ * rate into a threat. A preposition or a compass adjective has to follow, and `Курси` cannot match
+ * at all — the alternation is the exact word `курс` or `курсом`, both demanding whitespace after.
+ *
+ * A bare "Курс Бородянка", which the feeds also write, is deliberately **not** matched: separating
+ * it from "Курс долара" needs the following word to be capitalised, and a case-insensitive regex
+ * cannot express that — `\p{Lu}` under `i` matches lower case too, which is how that branch turned
+ * a currency report into a threat for Kyiv in review. Such messages fall back to whatever weapon
+ * they name, and to nothing when they name none.
+ */
+const REPORTED_DIRECTION = /((?<!\p{L})курс(?:ом)?\s+(?:на|до|у|в)(?!\p{L})|(?<!\p{L})курс(?:ом)?\s+(?:північн|південн|східн|західн)|[ув]\s+напрямку|(?<!\p{L})[ув]\s+бік|прямує\s+(?:до|на|у|в)(?!\p{L})|руха(?:ється|ються)\s+(?:до|на)(?!\p{L})|трима(?:є|ють|ємо)\s+курс)/iu;
+
+/**
+ * What makes a generic noun an operational report rather than a word.
+ *
+ * `дрон`, `ракета` and `бомба` are ordinary nouns. They appear in news, in jokes, in a sentence
+ * about a bomb shelter and in a warning that a missile is over the city, and no lexical guard tells
+ * those apart. What does tell them apart is the shape of the sentence around them: a direction, a
+ * count, a verb of motion, an alarm word, a launch or a strike. Requiring one of those *and* a
+ * resolved Ukrainian place is what lets "⚠️ КИЇВ! УВАГА! РАКЕТА!" raise an event while "Відділення
+ * видає бандероль" and "засоби захисту від дронів активовані" raise nothing.
+ *
+ * Deliberately excludes "уважно", which these channels append to almost every place name
+ * ("Троя уважно", "Бровари - уважно"): it marks attention, not an observation, and admitting it
+ * would turn the gate into no gate at all.
+ */
+const GENERIC_THREAT_CONTEXT = /((?<!\p{L})курс|напрямк|(?<!\p{L})[ув]\s+бік|прямує|руха(?:ється|ються)|(?<!\p{L})лет(?:ить|ять|іти)|(?<!\p{L})йд(?:е|уть)(?!\p{L})|заход(?:ить|ять)|наближ|(?<!\p{L})увага(?!\p{L})|загроз|небезпек|укритт|(?<!\p{L})тривог|(?<!\p{L})(?:за)?пуск|атаку|удар|збито|\d+\s*х?\s*(?:дрон|ракет|бомб))/iu;
+
+/**
  * Indicators that only mean something next to a place inside Ukraine.
  *
  * "дорозвідка" — a drone re-scouting a target before a strike — is one of the most useful things the
@@ -123,8 +189,11 @@ const strategicIndicators: Array<{ name: string; pattern: RegExp; threatTypes: T
  * out of {@link strategicIndicators} because it must never produce a country-wide event: a bare
  * "дорозвідка" with no place attached says nothing actionable, while the same word next to a
  * resolved location is a concrete UAV signal.
+ *
+ * `requires` is a second gate on top of the location one, for the entries whose pattern is an
+ * ordinary word rather than a weapon name. See {@link GENERIC_THREAT_CONTEXT}.
  */
-const contextIndicators: Array<{ name: string; pattern: RegExp; threatTypes: ThreatType[] }> = [
+const contextIndicators: Array<{ name: string; pattern: RegExp; threatTypes: ThreatType[]; requires?: RegExp }> = [
   {
     // "розвідник" is the bare noun these channels use once the context is established — "Над Одесою
     // розвідник" is a complete report to their readers. It is safe *here* and would not be safe in
@@ -162,8 +231,42 @@ const contextIndicators: Array<{ name: string; pattern: RegExp; threatTypes: Thr
     // event is raised as `unknown` ("Повідомлення про загрозу"), which is the honest reading —
     // something is heading for these places and the message does not say what.
     name: 'рух цілі за напрямком',
-    pattern: /(?:→|➡|⮕|-->|->)\s*\p{L}/u,
+    pattern: /(?:→|➡|⮕|➤|-->|->)\s*\p{L}/u,
     threatTypes: []
+  },
+  {
+    // The same statement in words instead of an arrow. Kept beside the arrow indicator and with the
+    // same empty `threatTypes` for the same reason: a heading says where, never what.
+    name: 'повідомлений напрямок без названого типу',
+    pattern: REPORTED_DIRECTION,
+    threatTypes: []
+  },
+  {
+    // "Київ, у нас 3 дрони біля Трої", "Дніпро /Кам'янське загроза 6х дронів". A drone is a UAV —
+    // that is a synonym, not an inference — so this one does carry a class, unlike the two below.
+    name: 'дрони без уточнення типу',
+    pattern: /(?<!\p{L})дрон(?:а|и|у|ом|ів|ам|ах|ами|і)?(?!\p{L})/iu,
+    threatTypes: ['uav'],
+    requires: GENERIC_THREAT_CONTEXT
+  },
+  {
+    // "⚠️ КИЇВ! УВАГА! РАКЕТА!" — a missile, and the message does not say which kind. Filing it as
+    // ballistic or cruise would be a coin toss printed as a fact, so it raises an `unknown` event.
+    // The endings are enumerated rather than globbed to keep "ракетоносії" and "ракетний" out: a
+    // launch platform and an adjective are not a missile over a city.
+    name: 'ракета без уточнення типу',
+    pattern: /(?<!\p{L})ракет(?:а|и|у|ою|ам|ах|ами|і)?(?!\p{L})/iu,
+    threatTypes: [],
+    requires: GENERIC_THREAT_CONTEXT
+  },
+  {
+    // "Бомба у напрямку Юнаківки/Хотіні", "Там бомби летять". Guided or not is exactly what these
+    // messages do not say, and `guided_air_bomb` would be asserting the difference. The enumerated
+    // endings keep "бомбосховище" out — a shelter is the opposite of a threat.
+    name: 'авіабомба без уточнення типу',
+    pattern: /(?<!\p{L})бомб(?:а|и|у|ою|ам|ах|ами|і)?(?!\p{L})/iu,
+    threatTypes: [],
+    requires: GENERIC_THREAT_CONTEXT
   }
 ];
 
@@ -296,6 +399,24 @@ interface SignalMatch {
   negated: boolean;
 }
 
+/**
+ * Every occurrence of `pattern` in `text`, as spans.
+ *
+ * The reason this exists instead of `pattern.exec`: a denial and the warning it is contrasted with
+ * routinely name the *same* weapon — "БпЛА не фіксуємо, але БпЛА курсом на Київ" — and reading only
+ * the first occurrence reduced that message to its denial and published it as an all-clear. Each
+ * occurrence has to be judged against the clause it actually sits in.
+ *
+ * A copy carries the `g` flag rather than the shared literal being declared global: `lastIndex` is
+ * mutable state on a module-level regex, and a global one left mid-string by a previous call makes
+ * the *next* message's classification depend on the previous message's text.
+ */
+function allMatches(pattern: RegExp, text: string): Array<{ index: number; length: number }> {
+  const flags = pattern.flags.includes('g') ? pattern.flags : `${pattern.flags}g`;
+  return [...text.matchAll(new RegExp(pattern.source, flags))]
+    .map((match) => ({ index: match.index, length: match[0].length }));
+}
+
 /** Every threat token in the message, each tagged with whether its own clause denies it. */
 function signalMatches(text: string): SignalMatch[] {
   const sources: Array<{ pattern: RegExp; threatTypes: ThreatType[] }> = [
@@ -304,12 +425,9 @@ function signalMatches(text: string): SignalMatch[] {
   ];
   const matches: SignalMatch[] = [];
   for (const { pattern, threatTypes } of sources) {
-    const match = pattern.exec(text);
-    if (!match) continue;
-    matches.push({
-      threatTypes, index: match.index, length: match[0].length,
-      negated: negatedAt(text, match.index, match[0].length)
-    });
+    for (const { index, length } of allMatches(pattern, text)) {
+      matches.push({ threatTypes, index, length, negated: negatedAt(text, index, length) });
+    }
   }
   return matches;
 }
@@ -366,7 +484,7 @@ function relationFor(text: string, alias: string): RelationType {
   // The arrow bulletin marks its targets with an arrow and separates them with a slash:
   // "→Кириківка/Тростянець". Everything after the arrow up to the sentence end is a target list, so
   // the second name is as much a direction as the first.
-  if (new RegExp(`(?:→|➡|⮕|-->|->)\\s*[^.!?\\n]{0,40}?${escaped}`, 'iu').test(text)) {
+  if (new RegExp(`(?:→|➡|⮕|➤|-->|->)\\s*[^.!?\\n]{0,40}?${escaped}`, 'iu').test(text)) {
     return 'reported_direction';
   }
   // Transit: "Балістика повз Бровари на Бориспіль". The place being passed and the place being
@@ -601,12 +719,14 @@ export function classifyMessage(text: string, locations: LocationLexeme[]): Clas
 
   // A partially denied message is classified on what it asserts. "Не фіксуємо балістики, але шахеди
   // йдуть на Одесу" is a UAV warning, not a combined UAV-and-ballistic one.
-  const assertedIndicators = matchedIndicators.filter(({ pattern }) => {
-    const match = pattern.exec(text);
-    return match !== null && !negatedAt(text, match.index, match[0].length);
-  });
+  const assertedIndicators = matchedIndicators.filter(({ pattern }) =>
+    allMatches(pattern, text).some(({ index, length }) => !negatedAt(text, index, length)));
+  // Context indicators are gated on a resolved Ukrainian place, and the generic-noun ones on an
+  // operational cue as well. Both gates are the whole reason those patterns are allowed to be
+  // ordinary words: neither "дрон" nor "ракета" is evidence of anything until the message also says
+  // where and shows the shape of a report.
   const matchedContext = found.length
-    ? contextIndicators.filter(({ pattern }) => pattern.test(text))
+    ? contextIndicators.filter(({ pattern, requires }) => pattern.test(text) && (!requires || requires.test(text)))
     : [];
   const matchedTypes = [...new Set([
     ...asserted.flatMap(({ threatTypes }) => threatTypes),
@@ -628,7 +748,7 @@ export function classifyMessage(text: string, locations: LocationLexeme[]): Clas
   const isRedirect = passedBy.length > 0 && towards.length > 0;
 
   const direction = text.match(/(?:[ув] напрямку|курс(?:ом)? на|руха(?:ється|ються) до|прямує до)\s+([^.!\n]{2,80})/iu)?.[0]
-    ?? text.match(/(?:→|➡|⮕|-->|->)\s*([^.!?\n]{2,80})/u)?.[0];
+    ?? text.match(/(?:→|➡|⮕|➤|-->|->)\s*([^.!?\n]{2,80})/u)?.[0];
   return {
     // `redirect` is still an assertion and still raises an event; what it adds is the statement that
     // the places in the "повз …" span are being passed rather than approached. Those locations stay

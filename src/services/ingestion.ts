@@ -4,7 +4,7 @@ import { Counter, type Registry } from 'prom-client';
 import { config } from '../config.js';
 import { pool } from '../db/pool.js';
 import { parseAlertChannelMessage } from '../domain/alert-parser.js';
-import { classifyMessage, isDeEscalation, significanceRejection } from '../domain/classifier.js';
+import { classifyMessage, CLASSIFIER_VERSION, isDeEscalation, significanceRejection } from '../domain/classifier.js';
 import {
   applyDeEscalation, ingestThreat, listLocationLexemes, recordClassification,
   type ClassificationLogEntry
@@ -16,7 +16,7 @@ import { markSourceError, markSourceSuccess } from './operations.js';
 import {
   countChannelError, observeClassificationDuration, observeIngestionLag
 } from './publication.js';
-import { scheduleShadowClassification } from './shadow-classifier.js';
+import { scheduleShadowClassification, shadowClassifierMetrics } from './shadow-classifier.js';
 
 interface AlarmRecord {
   externalId: string;
@@ -461,11 +461,57 @@ const threatWithdrawals = new Counter({
   labelNames: ['source', 'outcome'],
   registers: []
 });
+/**
+ * Every archived decision, by the rule version that made it and what it decided.
+ *
+ * The version label is the point. `message_classifications` records it per row, but nothing exported
+ * it, so "did the new rules change the mix of decisions" was a question that could only be answered
+ * by querying the database after the fact. With this, a version bump shows up on the dashboard as
+ * one series ending and another beginning, and the shapes can be compared directly.
+ */
+const classificationDecisions = new Counter({
+  name: 'threatlens_classifications_total',
+  help: 'Deterministic classifications archived, by classifier version and decision',
+  labelNames: ['version', 'decision'],
+  registers: []
+});
+/**
+ * Why a message raised nothing, per source.
+ *
+ * The two reasons are different operational findings and must not be summed.
+ * `no_threat_recognised` concentrated on one channel means its vocabulary has drifted away from the
+ * rules; `no_location` concentrated on one channel means it names settlements the catalogue does not
+ * hold. The first is fixed in `src/domain/classifier.ts`, the second in the location importer, and
+ * before this counter existed the only way to tell them apart was to read the archive by hand.
+ */
+const classificationRejections = new Counter({
+  name: 'threatlens_classification_rejections_total',
+  help: 'Messages that raised nothing, by source and rejection reason',
+  labelNames: ['source', 'reason'],
+  registers: []
+});
+/**
+ * How often the rules turn a live threat into no threat.
+ *
+ * The dangerous direction, and the one this project can least afford to get wrong: a wrong all-clear
+ * is silent, and the reader who acts on it is the reader who is under the drone. `threat_withdrawals`
+ * already counts withdrawal *outcomes*, including the ones that closed nothing; this counts only the
+ * transitions that actually ended a live event, and carries the classifier version so that a rule
+ * change which starts producing them is visible as a step in the series rather than as an incident
+ * report weeks later.
+ */
+const threatToDeEscalation = new Counter({
+  name: 'threatlens_threat_to_de_escalation_total',
+  help: 'De-escalations that ended a live threat event, by source and classifier version',
+  labelNames: ['source', 'version'],
+  registers: []
+});
 
 /**
  * Attaches this module's metrics to a Prometheus registry, mirroring `registerOccupationMetrics`.
  * Nothing in `src/services` owns the HTTP registry, so the wiring lives wherever the registry is
- * created. The monitoring-channel counter rides along rather than adding a second call site.
+ * created. The monitoring-channel counter rides along rather than adding a second call site, and so
+ * do the shadow-classifier ones: that module is reached only through this one.
  */
 export function registerAlertChannelMetrics(registry: Registry): void {
   const metrics: ReadonlyArray<[string, Counter<string>]> = [
@@ -473,7 +519,11 @@ export function registerAlertChannelMetrics(registry: Registry): void {
     ['threatlens_alert_channel_stuck_alerts_total', alertChannelStuckAlerts],
     ['threatlens_monitor_messages_total', monitorMessages],
     ['threatlens_classification_log_failures_total', classificationLogFailures],
-    ['threatlens_threat_withdrawals_total', threatWithdrawals]
+    ['threatlens_threat_withdrawals_total', threatWithdrawals],
+    ['threatlens_classifications_total', classificationDecisions],
+    ['threatlens_classification_rejections_total', classificationRejections],
+    ['threatlens_threat_to_de_escalation_total', threatToDeEscalation],
+    ...shadowClassifierMetrics()
   ];
   for (const [name, metric] of metrics) {
     if (!registry.getSingleMetric(name)) registry.registerMetric(metric);
@@ -927,6 +977,7 @@ async function archiveClassification(entry: ClassificationLogEntry): Promise<voi
     text: entry.classified.summary,
     classified: entry.classified
   });
+  classificationDecisions.inc({ version: CLASSIFIER_VERSION, decision: entry.decision });
   try {
     await recordClassification(entry);
   } catch (error) {
@@ -990,6 +1041,11 @@ async function classifyAndIngest(message: NormalizedMessage, options: ProcessMes
       outcome: outcome.withdrawal.endedEventIds.length ? 'event_withdrawn'
         : outcome.withdrawal.withdrawnAssertions ? 'assertions_withdrawn' : 'nothing_asserted'
     });
+    // Only when something was actually live and is now not: a withdrawal that closed nothing is a
+    // publisher tidying up, and counting it here would bury the transitions that matter.
+    if (outcome.withdrawal.endedEventIds.length) {
+      threatToDeEscalation.inc({ source: message.sourceId, version: CLASSIFIER_VERSION });
+    }
     await archiveClassification({
       sourceId: message.sourceId, sourceMessageId: outcome.sourceMessageId,
       publishedAt: message.publishedAt, classified, decision: 'de_escalation',
@@ -1001,6 +1057,7 @@ async function classifyAndIngest(message: NormalizedMessage, options: ProcessMes
   if (rejection) {
     const sourceMessageId = await recordUnprocessedMessage(message, 'ignored');
     count('ignored');
+    classificationRejections.inc({ source: message.sourceId, reason: rejection });
     await archiveClassification({
       sourceId: message.sourceId, sourceMessageId, publishedAt: message.publishedAt, classified,
       // "Recognised nothing" and "recognised something that is nowhere" are different findings: the

@@ -31,7 +31,8 @@
  */
 import { classifyMessage, CLASSIFIER_VERSION, significanceRejection } from '../src/domain/classifier.js';
 import {
-  formatReplayReport, replayReport, type ArchivedVerdict, type ReplayInput
+  archivedWasSignificant, formatReplayReport, replayReport,
+  type ArchivedVerdict, type ReplayInput
 } from '../src/domain/classifier-replay.js';
 import { pool } from '../src/db/pool.js';
 import { listLocationLexemes } from '../src/repositories/events.js';
@@ -116,17 +117,6 @@ async function loadArchive(options: Options): Promise<ArchiveRow[]> {
   return result.rows;
 }
 
-/**
- * Whether the archived row raised anything.
- *
- * Read off `decision` rather than off `created_event`, which is false for a message that merged into
- * an existing event — merging is still a significant message, and treating it as insignificant would
- * report a fake "newly significant" for every restatement in the corpus.
- */
-function wasSignificant(row: ArchiveRow): boolean {
-  return row.decision === 'event_created' || row.decision === 'event_merged' || row.decision === 'redirect';
-}
-
 async function writeVerdicts(inputs: ReplayInput[], rows: Map<string, ArchiveRow>): Promise<number> {
   let written = 0;
   for (const { archived, fresh } of inputs) {
@@ -197,7 +187,7 @@ async function main(): Promise<void> {
       classifierVersion: row.classifier_version,
       threatType: row.threat_type,
       locationIds: row.location_ids ?? [],
-      significant: wasSignificant(row)
+      significant: archivedWasSignificant(row.decision)
     };
     return { archived, fresh: classifyMessage(row.raw_text, locations) };
   });

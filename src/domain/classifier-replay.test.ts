@@ -1,7 +1,8 @@
 import { describe, expect, it } from 'vitest';
 import { classifyMessage } from './classifier.js';
 import {
-  diffVerdict, formatReplayReport, replayReport, type ArchivedVerdict, type ReplayInput
+  archivedWasSignificant, diffVerdict, formatReplayReport, replayReport,
+  type ArchivedVerdict, type ReplayInput
 } from './classifier-replay.js';
 import type { ClassifiedMessage } from '../types.js';
 
@@ -139,5 +140,27 @@ describe('formatReplayReport', () => {
     ], 'v2'));
     expect(text).toContain('втрачені події): 1');
     expect(text).toContain('нові події): 0');
+  });
+});
+
+describe('archivedWasSignificant', () => {
+  it('counts every decision that raised or sustained an event', () => {
+    for (const decision of ['event_created', 'event_merged', 'redirect', 'coalesced']) {
+      expect(archivedWasSignificant(decision), decision).toBe(true);
+    }
+  });
+
+  it('counts a coalesced message as significant', () => {
+    // The one that was wrong, and wrong in the dangerous direction. A coalesced message *was*
+    // significant — the burst window is the only reason no second event was created for it. Reading
+    // it as insignificant made a real loss invisible: a coalesced message that a new version stops
+    // recognising went false -> false and was reported as unchanged.
+    expect(archivedWasSignificant('coalesced')).toBe(true);
+  });
+
+  it('does not count the decisions that raised nothing', () => {
+    for (const decision of ['ignored', 'unrecognized', 'de_escalation', 'something_new']) {
+      expect(archivedWasSignificant(decision), decision).toBe(false);
+    }
   });
 });

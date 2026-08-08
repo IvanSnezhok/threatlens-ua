@@ -1,5 +1,8 @@
+import { Registry } from 'prom-client';
 import { describe, expect, it } from 'vitest';
-import { escapeLikePattern, normalizeAlarmResponse, pickLocationMatch } from './ingestion.js';
+import {
+  escapeLikePattern, normalizeAlarmResponse, pickLocationMatch, registerAlertChannelMetrics
+} from './ingestion.js';
 
 describe('official alert normalization', () => {
   it('normalizes a nested active-alert snapshot', () => {
@@ -78,5 +81,43 @@ describe('location match resolution', () => {
 
   it('returns null when nothing matched', () => {
     expect(pickLocationMatch([])).toBeNull();
+  });
+});
+
+/**
+ * The wiring, not the values.
+ *
+ * A counter that is incremented but never registered is invisible on `/metrics` and looks exactly
+ * like a quiet system, which is the failure mode ops instrumentation exists to prevent. This test
+ * asserts only that every name this module owns — including the shadow-classifier ones that ride
+ * along on the same call — reaches a registry, and that calling the registration twice is safe,
+ * because `src/api/server.ts` is not the only place that may ever want a registry.
+ */
+describe('metric registration', () => {
+  const expected = [
+    'threatlens_alert_channel_messages_total',
+    'threatlens_alert_channel_stuck_alerts_total',
+    'threatlens_monitor_messages_total',
+    'threatlens_classification_log_failures_total',
+    'threatlens_threat_withdrawals_total',
+    'threatlens_classifications_total',
+    'threatlens_classification_rejections_total',
+    'threatlens_threat_to_de_escalation_total',
+    'threatlens_shadow_attempts_total',
+    'threatlens_shadow_outcomes_total'
+  ];
+
+  it('attaches every counter this module owns, shadow ones included', () => {
+    const registry = new Registry();
+    registerAlertChannelMetrics(registry);
+    const names = registry.getMetricsAsArray().map((metric) => metric.name);
+    expect(names).toEqual(expect.arrayContaining(expected));
+  });
+
+  it('is safe to call twice on the same registry', () => {
+    const registry = new Registry();
+    registerAlertChannelMetrics(registry);
+    expect(() => registerAlertChannelMetrics(registry)).not.toThrow();
+    expect(registry.getMetricsAsArray()).toHaveLength(expected.length);
   });
 });

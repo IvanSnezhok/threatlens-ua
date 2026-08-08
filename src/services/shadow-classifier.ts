@@ -1,3 +1,4 @@
+import { Counter } from 'prom-client';
 import { z } from 'zod';
 import { config } from '../config.js';
 import { pool } from '../db/pool.js';
@@ -224,6 +225,72 @@ const PREFLIGHT_REASONS: ReadonlySet<CodexFailureReason> =
   new Set<CodexFailureReason>(['not_configured', 'model_not_selected', 'no_session']);
 
 /**
+ * How much labelling material this process is actually collecting, and why it is not collecting
+ * more.
+ *
+ * The log line below counts skips one in a hundred, which answers "is something badly wrong" and
+ * nothing finer. These two answer the question an operator actually has after switching the feature
+ * on: **what fraction of classified messages got a second opinion, and where did the rest go**.
+ *
+ * `attempts` is incremented once per call and is therefore the denominator of coverage — one call
+ * happens per archived deterministic decision, so
+ *
+ *     threatlens_shadow_outcomes_total{status="recorded"} / threatlens_classifications_total
+ *
+ * is the shadow coverage of the classified corpus, and `…/threatlens_shadow_attempts_total` is the
+ * share of attempts that produced a row. Both are left to the query rather than exported as a
+ * gauge: a ratio computed inside the process cannot be aggregated across replicas or restarts, and
+ * a counter divided at query time can.
+ *
+ * `reason` is `none` rather than absent on the recorded path, because a label that appears on some
+ * series of a metric and not others makes every `sum by (reason)` silently drop the successes.
+ */
+const shadowAttempts = new Counter({
+  name: 'threatlens_shadow_attempts_total',
+  help: 'Shadow classifications started, one per archived deterministic decision',
+  registers: []
+});
+const shadowOutcomes = new Counter({
+  name: 'threatlens_shadow_outcomes_total',
+  help: 'Shadow classification outcomes, by status and the reason nothing was recorded',
+  labelNames: ['status', 'reason'],
+  registers: []
+});
+
+/**
+ * This module's metrics, for whoever owns the registry.
+ *
+ * Handed over as data rather than as a `register(registry)` function of its own so that the call
+ * site stays where the other services' registrations already are; `registerAlertChannelMetrics`
+ * attaches them, the same way it attaches the monitoring-channel counters.
+ */
+export function shadowClassifierMetrics(): ReadonlyArray<[string, Counter<string>]> {
+  return [
+    ['threatlens_shadow_attempts_total', shadowAttempts as Counter<string>],
+    ['threatlens_shadow_outcomes_total', shadowOutcomes]
+  ];
+}
+
+/** Test seam: the counters are process-global and a suite asserting on them needs a clean slate. */
+export function resetShadowMetrics(): void {
+  shadowAttempts.reset();
+  shadowOutcomes.reset();
+}
+
+/**
+ * Counts an outcome and hands it straight back.
+ *
+ * Written as a pass-through so that every `return` in {@link shadowClassify} is also the place the
+ * outcome is counted. The alternative — one `.inc()` before each of the eight returns — is one edit
+ * away from a branch that returns without counting, and a coverage metric with a silently
+ * unreachable branch is worse than none.
+ */
+function countOutcome(outcome: ShadowOutcome): ShadowOutcome {
+  shadowOutcomes.inc({ status: outcome.status, reason: outcome.reason ?? 'none' });
+  return outcome;
+}
+
+/**
  * Runs the shadow classification for one message and records the comparison.
  *
  * Awaitable so tests can assert on it. Production code calls
@@ -231,11 +298,12 @@ const PREFLIGHT_REASONS: ReadonlySet<CodexFailureReason> =
  * deliberately dropped.
  */
 export async function shadowClassify(input: ShadowInput, options: ShadowOptions = {}): Promise<ShadowOutcome> {
-  if (!(await codexFeatureEnabled('shadow'))) return { status: 'skipped', reason: 'disabled' };
+  shadowAttempts.inc();
+  if (!(await codexFeatureEnabled('shadow'))) return countOutcome({ status: 'skipped', reason: 'disabled' });
   const text = input.text.trim();
-  if (!text) return { status: 'skipped', reason: 'empty_text' };
+  if (!text) return countOutcome({ status: 'skipped', reason: 'empty_text' });
   const now = options.now ?? Date.now;
-  if (!withinRateLimit(now())) return { status: 'skipped', reason: 'rate_limited' };
+  if (!withinRateLimit(now())) return countOutcome({ status: 'skipped', reason: 'rate_limited' });
 
   const chat = options.chat ?? codexChat;
   const prompt = text.slice(0, TEXT_LIMIT);
@@ -254,9 +322,11 @@ export async function shadowClassify(input: ShadowInput, options: ShadowOptions 
     auditInput: { text: prompt, deterministic, classifierVersion: CLASSIFIER_VERSION }
   }).catch(() => null);
 
-  if (!result) return { status: 'skipped', reason: 'model_failed' };
+  if (!result) return countOutcome({ status: 'skipped', reason: 'model_failed' });
   if (!result.ok) {
-    return { status: 'skipped', reason: PREFLIGHT_REASONS.has(result.reason) ? 'no_provider' : 'model_failed' };
+    return countOutcome({
+      status: 'skipped', reason: PREFLIGHT_REASONS.has(result.reason) ? 'no_provider' : 'model_failed'
+    });
   }
 
   // Prose where JSON was asked for, and a threat class that does not exist, are the same kind of
@@ -265,7 +335,7 @@ export async function shadowClassify(input: ShadowInput, options: ShadowOptions 
   try {
     verdict = shadowVerdictSchema.parse(JSON.parse(result.content) as unknown);
   } catch {
-    return { status: 'skipped', reason: 'model_failed' };
+    return countOutcome({ status: 'skipped', reason: 'model_failed' });
   }
 
   const fields = disagreementFields(deterministic, verdict);
@@ -287,9 +357,9 @@ export async function shadowClassify(input: ShadowInput, options: ShadowOptions 
       ]
     );
   } catch {
-    return { status: 'skipped', reason: 'write_failed', agrees, fields };
+    return countOutcome({ status: 'skipped', reason: 'write_failed', agrees, fields });
   }
-  return { status: 'recorded', agrees, fields };
+  return countOutcome({ status: 'recorded', agrees, fields });
 }
 
 /**

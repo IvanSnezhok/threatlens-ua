@@ -46,6 +46,28 @@ export interface ArchivedVerdict {
   significant: boolean;
 }
 
+/**
+ * Whether an archived `decision` word means the message raised or sustained an event.
+ *
+ * Read off `decision` rather than off `created_event`, which is false for a message that merged into
+ * an existing event — merging is still a significant message, and treating it as insignificant would
+ * report a fake "newly significant" for every restatement in the corpus.
+ *
+ * `coalesced` counts for the same reason and is the more important of the two. A coalesced message
+ * *was* significant; the burst window is why no second event was created for it. Excluding it did
+ * not merely inflate `newlySignificant` — it made the opposite finding **invisible**: a coalesced
+ * message that a new version stops recognising went from `false` to `false` and was reported as
+ * unchanged, which is precisely the loss this whole tool exists to surface. Lives here rather than in
+ * the script so it can be tested; a wrong answer here reports a clean replay for a change that
+ * silenced part of the corpus.
+ */
+const SIGNIFICANT_DECISIONS: ReadonlySet<string> =
+  new Set(['event_created', 'event_merged', 'redirect', 'coalesced']);
+
+export function archivedWasSignificant(decision: string): boolean {
+  return SIGNIFICANT_DECISIONS.has(decision);
+}
+
 export type DiffAxis = 'threat_type' | 'locations' | 'significance';
 
 export interface VerdictDiff {

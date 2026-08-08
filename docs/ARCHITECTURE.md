@@ -257,6 +257,36 @@ that follows is a human writing a pattern and a test. Calls are capped at
 `SHADOW_CLASSIFIER_MAX_PER_MINUTE` (default 6) and messages over budget are dropped rather than
 queued.
 
+**Measured quality.** Agreement with a model is not accuracy — two readers can be wrong together, and
+the model has never seen the conventions these channels write in. `tests/fixtures/classifier-gold.json`
+is the answer: 191 real archived messages, each read and labelled by hand, with the labelling date,
+method and conventions in the file's own header. `src/domain/classifier-gold.test.ts` scores the
+current rules against it on the same three axes the replay compares and asserts each number as a
+**floor**, so a future edit that quietly loses recall fails in CI rather than on somebody's phone at
+three in the morning. `v3` measures significance P=97.2% / R=88.8%, threat-class accuracy 100% over
+the messages both sides call significant, and locations P=R=89.4%.
+
+The fixture separates two things that used to be one number. `assertsThreat` is the reviewer's
+reading of the text; `significant` additionally requires that the place named exists in the location
+catalogue. Twenty-one of the 191 are correct reports about settlements the catalogue does not hold —
+Згурівка, Велика Димерка, Троєщина, Жуляни — and those are a coverage problem for the location
+importer, not a rules problem. Counting them as classifier misses would blame the regexes and hide
+the real cause.
+
+**Watching it in production.** `threatlens_classifications_total{version,decision}` carries the
+classifier version, so a version bump appears on the dashboard as one series ending and another
+beginning instead of as an unexplained shift in the decision mix.
+`threatlens_classification_rejections_total{source,reason}` splits the two reasons a message raises
+nothing, which are fixed in different files: `no_threat_recognised` concentrated on one channel means
+its vocabulary drifted away from `src/domain/classifier.ts`, `no_location` means the catalogue is
+missing its settlements. `threatlens_threat_to_de_escalation_total{source,version}` counts only the
+withdrawals that actually ended a live event — the dangerous direction, and the one a rule change
+must never start producing quietly. `threatlens_shadow_attempts_total` and
+`threatlens_shadow_outcomes_total{status,reason}` give shadow coverage as a query
+(`outcomes{status="recorded"} / classifications_total`) rather than as a gauge, because a ratio
+computed inside one process cannot be aggregated across restarts and a counter divided at query time
+can.
+
 ### Attack analytics over the archive
 
 `src/services/attack-analytics.ts` reads the classification archive back out as a public page: for
