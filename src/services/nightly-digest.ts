@@ -1,5 +1,8 @@
 import { config } from '../config.js';
 import { pool } from '../db/pool.js';
+import { groundedNumbers, ungroundedNumber } from './analytics-narrative.js';
+import { codexChat, type CodexClientDeps } from './codex-client.js';
+import { codexFeatureEnabled } from './codex-settings.js';
 
 interface DigestAssessment {
   chat_id: string;
@@ -26,6 +29,94 @@ function kyivParts(now: Date): { date: string; minutes: number; time: string } {
   return { date: `${value('year')}-${value('month')}-${value('day')}`, minutes: hour * 60 + minute, time: `${value('hour')}:${value('minute')}` };
 }
 
+// ------------------------------------------------------------------------------------------------
+// The optional one-sentence opener written by a model
+// ------------------------------------------------------------------------------------------------
+//
+// Що читає людина о 23:20 — це список оцінок, який згенерував детермінований рушій ризику. Модель
+// не бере участі в жодному числі з цього списку; вона лише може додати один підсумковий рядок
+// під переліком, який стисло каже, на що дивитися першим. Вимкнена — дайджест точно такий, яким був завжди.
+
+export interface DigestFacts {
+  time: string;
+  locations: Array<{ locationName: string; threatType: string; level: string; indicativePercent: number | null; score: string }>;
+  omitted: number;
+}
+
+/** Рівно ті факти, які потрапляють у повідомлення. Модель не бачить нічого понад це. */
+export function digestFacts(rows: DigestAssessment[], omitted: number, time: string): DigestFacts {
+  return {
+    time,
+    locations: rows.map((row) => ({
+      locationName: row.location_name,
+      threatType: row.threat_type,
+      level: row.risk_level,
+      indicativePercent: row.indicative_percent,
+      score: row.risk_score
+    })),
+    omitted
+  };
+}
+
+const DIGEST_SYSTEM_PROMPT = [
+  'Ти пишеш ОДНЕ речення українською для нічного зведення системи повітряних загроз.',
+  'Тобі надано готовий список оцінок. Твоє завдання — спокійно назвати, на що звернути увагу першим.',
+  'Заборонено: вигадувати числа, назви місць чи типи загроз, яких немає у вхідному JSON.',
+  'Заборонено: прогнозувати ціль, влучання, маршрут, час удару або безпеку конкретного місця.',
+  'Заборонено: паніка, заклики, оклики, канцелярит. Тон — рівний і стриманий.',
+  'Поверни лише JSON: {"summary": string} довжиною до 220 символів.'
+].join(' ');
+
+export interface DigestSummary {
+  text: string | null;
+  aiGenerated: boolean;
+  /** Чому моделі не вийшло. null — коли вийшло або коли її й не питали. */
+  rejectionReason: string | null;
+}
+
+const NO_SUMMARY: DigestSummary = { text: null, aiGenerated: false, rejectionReason: null };
+
+export interface DigestSummaryDeps extends CodexClientDeps {
+  /** Перевірка перемикача. Підмінюється в тестах, щоб не тягнути базу в юніт-тест. */
+  featureEnabled?: () => Promise<boolean>;
+}
+
+/**
+ * Один рядок від моделі — або нічого.
+ *
+ * Ніколи не кидає винятків і ніколи не затримує чергу назавжди: усе, що може піти не так, дає
+ * `{ text: null }`, і дайджест іде в тому вигляді, у якому йшов би без моделі. Числа, які модель
+ * написала, перевіряються тим самим механізмом, що й наратив аналітики: одне негрунтоване число
+ * відкидає весь рядок, бо читач не має способу відрізнити вигадану цифру від справжньої.
+ */
+export async function digestSummary(facts: DigestFacts, deps: DigestSummaryDeps = {}): Promise<DigestSummary> {
+  if (!facts.locations.length) return NO_SUMMARY;
+  const enabled = await (deps.featureEnabled ?? (() => codexFeatureEnabled('digest')))();
+  if (!enabled) return NO_SUMMARY;
+
+  const result = await codexChat({
+    promptVersion: 'nightly-digest-v1',
+    system: DIGEST_SYSTEM_PROMPT,
+    user: JSON.stringify(facts),
+    json: true,
+    auditInput: facts
+  }, deps);
+  if (!result.ok) return { text: null, aiGenerated: false, rejectionReason: result.reason };
+
+  let summary: unknown;
+  try {
+    summary = (JSON.parse(result.content) as { summary?: unknown }).summary;
+  } catch {
+    return { text: null, aiGenerated: false, rejectionReason: 'unparsable_json' };
+  }
+  if (typeof summary !== 'string' || !summary.trim() || summary.length > 220) {
+    return { text: null, aiGenerated: false, rejectionReason: 'unusable_summary' };
+  }
+  const invented = ungroundedNumber(summary, groundedNumbers(facts));
+  if (invented) return { text: null, aiGenerated: false, rejectionReason: `ungrounded_number:${invented}` };
+  return { text: summary.trim(), aiGenerated: true, rejectionReason: null };
+}
+
 export async function enqueueNightlyDigests(now = new Date()): Promise<number> {
   const current = kyivParts(now);
   const [targetHour, targetMinute] = config.NIGHTLY_DIGEST_TIME.split(':').map(Number);
@@ -50,9 +141,32 @@ export async function enqueueNightlyDigests(now = new Date()): Promise<number> {
     rows.push(assessment); grouped.set(assessment.chat_id, rows);
   }
 
+  // Кому дайджест уже надіслано сьогодні — з'ясовуємо ДО циклу, а не всередині транзакції.
+  // Планувальник будить цю функцію щопівхвилини аж до півночі, тож після першого успішного прогону
+  // всі підписники вже claimed і робота зводиться до `ON CONFLICT DO NOTHING`. Без цього списку
+  // модель питали б заново на кожному тику — десятки разів за ніч, за дані, які нікуди не підуть.
+  // Вставка з ON CONFLICT нижче лишається справжнім захистом від гонки; це — лише економія.
+  const alreadySent = await pool.query<{ chat_id: string }>(
+    'SELECT chat_id::text FROM nightly_digest_runs WHERE digest_date=$1', [current.date]
+  );
+  const sent = new Set(alreadySent.rows.map((row) => row.chat_id));
+
   let queued = 0;
+  // Один виклик моделі на КОМБІНАЦІЮ оцінок, а не на підписника. Тисяча людей, підписаних на Київ,
+  // отримує той самий перелік, і питати модель тисячу разів про однакові дані означало б витратити
+  // квоту акаунта на буквальні дублікати. Кеш живе рівно один прогін: наступного вечора дані інші.
+  const summaries = new Map<string, DigestSummary>();
+
   for (const [chatId, rows] of grouped) {
+    if (sent.has(chatId)) continue;
     const selected = rows.slice(0, 12);
+    const facts = digestFacts(selected, Math.max(0, rows.length - selected.length), current.time);
+    const key = JSON.stringify(facts);
+    let summary = summaries.get(key);
+    if (!summary) {
+      summary = await digestSummary(facts);
+      summaries.set(key, summary);
+    }
     const client = await pool.connect();
     try {
       await client.query('BEGIN');
@@ -73,7 +187,11 @@ export async function enqueueNightlyDigests(now = new Date()): Promise<number> {
             confidence: row.assessment_confidence, explanation: row.explanation,
             horizonEnd: row.horizon_end
           })),
-          omitted: Math.max(0, rows.length - selected.length)
+          omitted: facts.omitted,
+          // Позначка їде разом із текстом, а не виводиться з його наявності: повідомлення форматує
+          // інший модуль, і він не має здогадуватися, звідки взявся рядок.
+          aiSummary: summary.text,
+          aiGenerated: summary.aiGenerated
         })]
       );
       await client.query(

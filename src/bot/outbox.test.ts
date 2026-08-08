@@ -161,3 +161,45 @@ describe('humanised wording helpers', () => {
     expect(cleanSummary('Ціль зникла\n... далі буде')).toBe('Ціль зникла\n… далі буде');
   });
 });
+
+describe('nightly digest AI summary line', () => {
+  const digestPayload = {
+    generatedTime: '23:20', assessments: [{ locationName: 'Полтава', threatType: 'ballistic_missile',
+      level: 'elevated', indicativePercent: 35, score: 3.5, explanation: {} }], omitted: 0
+  };
+
+  it('names the model as the author of the summarising line', () => {
+    // Читач не має способу відрізнити машинний рядок від порахованого, якщо йому цього не сказати,
+    // а сказати може лише формат повідомлення: сама модель могла б цю фразу й пропустити.
+    const text = formatMessage({ notification_type: 'nightly_digest', payload: {
+      ...digestPayload, aiSummary: 'Найвищий рівень — по Полтаві.', aiGenerated: true
+    } }, now);
+    expect(text).toContain('написала мовна модель');
+    expect(text).toContain('Найвищий рівень — по Полтаві.');
+    // Оцінки лишаються тим, заради чого надіслано повідомлення: машинний рядок іде після них.
+    expect(text.indexOf('Полтава')).toBeLessThan(text.indexOf('написала мовна модель'));
+  });
+
+  it('sends exactly the digest it always sent when the model was not used', () => {
+    const withoutModel = formatMessage({ notification_type: 'nightly_digest', payload: {
+      ...digestPayload, aiSummary: null, aiGenerated: false
+    } });
+    expect(withoutModel).not.toContain('мовна модель');
+    expect(withoutModel).toBe(formatMessage({ notification_type: 'nightly_digest', payload: digestPayload }));
+  });
+
+  it('never prints a stale summary that was not marked as model-written', () => {
+    // Прапорець і текст їдуть разом; якщо прапорець знято, рядок не показуємо, навіть коли він є.
+    const text = formatMessage({ notification_type: 'nightly_digest', payload: {
+      ...digestPayload, aiSummary: 'Щось відхилене.', aiGenerated: false
+    } });
+    expect(text).not.toContain('Щось відхилене.');
+  });
+
+  it('escapes a model-written line like any other untrusted text', () => {
+    const text = formatMessage({ notification_type: 'nightly_digest', payload: {
+      ...digestPayload, aiSummary: '<script>alert(1)</script>', aiGenerated: true
+    } });
+    expect(text).not.toContain('<script>');
+  });
+});

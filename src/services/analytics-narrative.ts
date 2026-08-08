@@ -2,6 +2,7 @@ import { z } from 'zod';
 import { config } from '../config.js';
 import { pool } from '../db/pool.js';
 import { codexCredentials } from './codex-auth.js';
+import { resolveCodexSettings, type ResolvedCodexSettings } from './codex-settings.js';
 import type { StrategicOverview } from './analytics-archive.js';
 
 /**
@@ -37,6 +38,13 @@ export type ModelNarrative = z.infer<typeof narrativeSchema>;
 
 export interface AnalyticsNarrative extends ModelNarrative {
   generatedBy: 'model' | 'deterministic';
+  /**
+   * Whether a model wrote this text. Redundant with `generatedBy` on purpose: consumers that only
+   * need the yes/no — a template deciding whether to print the "написано моделлю" badge — should not
+   * have to know the vocabulary of the enum, and a boolean is the one thing that cannot be forgotten
+   * to be checked.
+   */
+  aiGenerated: boolean;
   model: string | null;
   /** Why the model's text was not used. `null` when it was, or when no model was configured. */
   rejectionReason: string | null;
@@ -181,8 +189,15 @@ function addNumber(target: Set<string>, value: number): void {
   if (magnitude >= 1) target.add(String(round(magnitude / 100, 2)));
 }
 
-/** Every rendering of every number in the facts that a narrative is allowed to contain. */
-export function groundedNumbers(facts: NarrativeFacts): Set<string> {
+/**
+ * Every rendering of every number in the facts that a narrative is allowed to contain.
+ *
+ * Typed as `unknown` rather than `NarrativeFacts` because the walk is structural — it descends any
+ * object and collects any number it finds — and the nightly digest needs exactly the same guarantee
+ * over a differently shaped digest. Narrowing the parameter would have meant a second copy of the
+ * one function in this codebase whose job is to be paranoid.
+ */
+export function groundedNumbers(facts: unknown): Set<string> {
   const allowed = new Set<string>();
   const walk = (value: unknown): void => {
     if (typeof value === 'number') return addNumber(allowed, value);
@@ -302,12 +317,35 @@ interface NarrativeProvider {
 }
 
 /**
+ * The settings read, injectable.
+ *
+ * A unit test asserting "with nothing configured, nothing is called" must not depend on whether a
+ * PostgreSQL happens to be listening on the machine running it — that is a test that passes for the
+ * wrong reason on a developer's laptop and hangs on a build agent.
+ */
+export interface NarrateDeps {
+  settings?: () => Promise<ResolvedCodexSettings>;
+}
+
+/**
  * Which endpoint, if any, is allowed to write the narrative.
  *
- * Codex wins when it is complete, then `AI_*`, then nothing. The gate is
- * `ANALYTICS_NARRATIVE_ENABLED`, checked first and separately: sharing credentials with the risk
- * engine must not mean that configuring the risk engine silently switches on a second model call on
- * a different code path.
+ * Codex wins when it is complete, then `AI_*`, then nothing. There are now two ways to open the
+ * Codex gate and they mean different things:
+ *
+ *   * `ANALYTICS_NARRATIVE_ENABLED` — a deployment decision, made once by whoever owns the
+ *     container. It opens both the Codex path and the `AI_*` path.
+ *   * the `narrative` switch in `codex_settings` — an operational decision, made in `/ops` by
+ *     somebody watching the output, and revocable in one click. It opens the Codex path only.
+ *
+ * The second deliberately does not reach `AI_*`. That path is the risk engine's credential pointed
+ * at a second code path, and a console switch labelled "Codex" must not silently start spending it;
+ * sharing credentials with the risk engine must not mean that configuring the risk engine switches
+ * on a model call somewhere else.
+ *
+ * The chosen model comes from the settings row when there is one, falling back to `CODEX_MODEL`.
+ * A deployment that never opens the console therefore behaves exactly as it did before the settings
+ * table existed.
  *
  * Within Codex the *stored* OAuth session outranks `CODEX_API_KEY`. Both are bearer tokens for the
  * same account and nothing downstream can tell them apart, but only one of them can be renewed
@@ -320,9 +358,12 @@ interface NarrativeProvider {
  * null rather than raising, which lands on the deterministic narrative — the baseline that the
  * analytics are contractually complete without.
  */
-export async function narrativeProvider(): Promise<NarrativeProvider | null> {
-  if (!config.ANALYTICS_NARRATIVE_ENABLED) return null;
-  if (config.CODEX_BASE_URL && config.CODEX_MODEL) {
+export async function narrativeProvider(deps: NarrateDeps = {}): Promise<NarrativeProvider | null> {
+  const settings = await (deps.settings ?? resolveCodexSettings)().catch(() => null);
+  const codexAllowed = config.ANALYTICS_NARRATIVE_ENABLED || settings?.features.narrative === true;
+  const codexModel = settings?.effectiveModel ?? (config.CODEX_MODEL || null);
+
+  if (codexAllowed && config.CODEX_BASE_URL && codexModel) {
     const session = await codexCredentials().catch(() => null);
     const token = session?.accessToken || config.CODEX_API_KEY;
     if (token) {
@@ -332,9 +373,10 @@ export async function narrativeProvider(): Promise<NarrativeProvider | null> {
       };
       const accountId = session?.accountId || config.CODEX_ACCOUNT_ID;
       if (accountId) headers['ChatGPT-Account-Id'] = accountId;
-      return { baseUrl: config.CODEX_BASE_URL, model: config.CODEX_MODEL, headers };
+      return { baseUrl: config.CODEX_BASE_URL, model: codexModel, headers };
     }
   }
+  if (!config.ANALYTICS_NARRATIVE_ENABLED) return null;
   if (config.AI_BASE_URL && config.AI_API_KEY && config.AI_MODEL) {
     return {
       baseUrl: config.AI_BASE_URL,
@@ -369,7 +411,7 @@ async function audit(
   ).catch(() => undefined);
 }
 
-export interface NarrateOptions {
+export interface NarrateOptions extends NarrateDeps {
   /** Injected in tests so the model path can be exercised without a network. */
   fetchImpl?: typeof fetch;
   timeoutMs?: number;
@@ -387,9 +429,12 @@ export async function narrateOverview(
   overview: StrategicOverview, options: NarrateOptions = {}
 ): Promise<AnalyticsNarrative> {
   const facts = narrativeFacts(overview);
-  const provider = await narrativeProvider();
+  const provider = await narrativeProvider(options);
   if (!provider) {
-    return { ...describe(facts), generatedBy: 'deterministic', model: null, rejectionReason: null, facts };
+    return {
+      ...describe(facts), generatedBy: 'deterministic', aiGenerated: false, model: null,
+      rejectionReason: null, facts
+    };
   }
 
   const started = Date.now();
@@ -417,17 +462,36 @@ export async function narrateOverview(
     const rejection = verifyNarrative(parsed, facts);
     if (rejection) {
       await audit('failed', provider.model, facts, parsed, Date.now() - started, rejection);
-      return { ...describe(facts), generatedBy: 'deterministic', model: provider.model, rejectionReason: rejection, facts };
+      return {
+        ...describe(facts), generatedBy: 'deterministic', aiGenerated: false, model: provider.model,
+        rejectionReason: rejection, facts
+      };
     }
     await audit('success', provider.model, facts, parsed, Date.now() - started);
-    return { ...parsed, generatedBy: 'model', model: provider.model, rejectionReason: null, facts };
+    return {
+      ...parsed, caveats: withAiMarker(parsed.caveats), generatedBy: 'model', aiGenerated: true,
+      model: provider.model, rejectionReason: null, facts
+    };
   } catch (error) {
     await audit('failed', provider.model, facts, null, Date.now() - started, error);
     return {
-      ...describe(facts), generatedBy: 'deterministic', model: provider.model,
+      ...describe(facts), generatedBy: 'deterministic', aiGenerated: false, model: provider.model,
       rejectionReason: String(error).slice(0, 200), facts
     };
   }
+}
+
+/**
+ * The sentence that says a machine wrote this.
+ *
+ * Appended after validation, not asked of the model: a disclosure the model could choose to omit is
+ * not a disclosure. The deterministic text carries the mirror-image line ("модель не залучалася"),
+ * so a reader is told which of the two they are looking at in both directions rather than having to
+ * infer it from the absence of a note.
+ */
+export function withAiMarker(caveats: string[]): string[] {
+  const marker = 'Текст переписано мовною моделлю з готових агрегатів; усі числа перевірено на збіг із детермінованим розрахунком.';
+  return caveats.includes(marker) ? caveats : [...caveats, marker];
 }
 
 /** Exposed for tests: the text produced when no model is available. */

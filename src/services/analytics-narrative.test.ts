@@ -1,7 +1,9 @@
 import { describe, expect, it } from 'vitest';
 import {
-  deterministicNarrative, groundedNumbers, narrativeFacts, ungroundedNumber, type NarrativeFacts
+  deterministicNarrative, groundedNumbers, narrativeFacts, narrativeProvider, ungroundedNumber,
+  withAiMarker, type NarrativeFacts
 } from './analytics-narrative.js';
+import type { ResolvedCodexSettings } from './codex-settings.js';
 import type { StrategicOverview } from './analytics-archive.js';
 
 /**
@@ -141,5 +143,56 @@ describe('facts built from an overview', () => {
     // The model is handed the mixed total *and* told it is mixed, so the sentence it writes has to
     // carry the caveat rather than the reader having to know.
     expect(deterministicNarrative(built).caveats.join(' ')).toContain('не є версійно-безпечним');
+  });
+});
+
+// ------------------------------------------------------------------------------------------------
+// Who is allowed to call a model, and how the result is labelled
+// ------------------------------------------------------------------------------------------------
+
+function settingsWith(features: Partial<ResolvedCodexSettings['features']>): () => Promise<ResolvedCodexSettings> {
+  return async () => ({
+    model: 'gpt-5.2',
+    features: { narrative: false, digest: false, attacks: false, ...features },
+    updatedAt: null,
+    effectiveModel: 'gpt-5.2',
+    modelSource: 'stored'
+  });
+}
+
+describe('the gate in front of the model', () => {
+  it('calls nothing when neither the deployment nor the operator asked for it', async () => {
+    expect(await narrativeProvider({ settings: settingsWith({}) })).toBeNull();
+  });
+
+  it('still calls nothing when the operator switched the narrative on but no endpoint is configured', async () => {
+    // The switch grants permission, not capability. `CODEX_BASE_URL` is empty in the test
+    // environment, so there is a token with nowhere to send it â which must read as "off", not as a
+    // request that fails somewhere later.
+    expect(await narrativeProvider({ settings: settingsWith({ narrative: true }) })).toBeNull();
+  });
+
+  it('does not let the Codex switch spend the risk engine credential', async () => {
+    // `AI_*` belongs to the risk engine. A console switch labelled "Codex" must not quietly start
+    // billing a different provider on a different code path; only ANALYTICS_NARRATIVE_ENABLED,
+    // which is off here, opens that branch.
+    expect(await narrativeProvider({ settings: settingsWith({ narrative: true, digest: true, attacks: true }) })).toBeNull();
+  });
+});
+
+describe('labelling machine-written text', () => {
+  it('appends the disclosure rather than asking the model to include it', () => {
+    // A disclosure the model could choose to omit is not a disclosure.
+    const caveats = withAiMarker(['Вікно охоплює одну версію.']);
+    expect(caveats).toHaveLength(2);
+    expect(caveats.at(-1)).toContain('мовною моделлю');
+  });
+
+  it('does not repeat itself if applied twice', () => {
+    expect(withAiMarker(withAiMarker([]))).toHaveLength(1);
+  });
+
+  it('says the opposite thing in the deterministic text, so neither state is inferred from silence', () => {
+    expect(deterministicNarrative(facts).caveats.join(' ')).toContain('модель не залучалася');
   });
 });

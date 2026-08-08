@@ -187,16 +187,42 @@ Open `/ops`, find **Codex / ChatGPT** and press **Увійти через ChatGP
 ChatGPT, comes back to `http://localhost:1455/auth/callback`, and the session is stored in
 PostgreSQL and refreshed from then on. Nothing is written to `.env` and no restart is needed.
 
-Two things still have to be set by hand, because signing in supplies a credential and not an
-endpoint:
+One thing still has to be set by hand, because signing in supplies a credential and not an endpoint:
 
 ```env
 CODEX_BASE_URL=
-CODEX_MODEL=
-ANALYTICS_NARRATIVE_ENABLED=true
 ```
 
-The console states which of the three is missing, so "connected but silent" is never a mystery.
+`CODEX_MODEL` and `ANALYTICS_NARRATIVE_ENABLED` remain valid and still work exactly as before, but
+they are now defaults rather than the decision. The console states which precondition is missing, so
+"connected but silent" is never a mystery.
+
+### Choosing a model and what it may write
+
+`/ops` → **Codex-аналітика** → **Модель і функції**. The model list is fetched from the service on
+every read, falling back to a static list (`gpt-5.2`, `gpt-5.2-codex`, `o5`, `o5-mini`, plus
+`CODEX_MODEL`) and saying so when the service will not answer. Leaving the dropdown on «за
+замовчуванням» defers to `CODEX_MODEL`.
+
+Three switches, all off until somebody turns them on, because the cost of a bad sentence differs by
+three orders of magnitude between them:
+
+| Switch | Where the text lands | If the model fails |
+|---|---|---|
+| Наратив аналітики | the analytics page, operator-facing | deterministic prose, as today |
+| Нічний дайджест | Telegram, to every analytics subscriber | the digest goes out with no summary line |
+| Аналіз атак | the extrapolation note in `/ops` only | the computed wording, unchanged |
+
+In all three the model only rewords numbers that were already computed, and every digit it writes is
+checked against those numbers — one figure the computation did not produce discards the whole text.
+Model-written text is labelled as such: `aiGenerated` on the analytics narrative, and an explicit
+«написала мовна модель» line in the Telegram digest.
+
+Everything Codex is asked, and everything it answers, is recorded in `ai_runs` and readable in the
+same console section — including the calls that never left the process because a switch was off or
+the session had expired.
+
+The settings live in `codex_settings` (migration `018`) and hold no credentials.
 
 **The callback is loopback, and that is a hard limit.** The Codex OAuth client accepts exactly one
 redirect — `http://localhost:<port>/auth/callback` — and we have no client of our own registered

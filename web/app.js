@@ -1179,6 +1179,7 @@ function opsVectorSection(payload) {
 const promptVersionNames = {
   'v2': 'Оцінка ризику',
   'analytics-narrative-v1': 'Наратив аналітики',
+  'nightly-digest-v1': 'Нічний дайджест',
   'vector-narrative-v1': 'Формулювання екстраполяції'
 };
 
@@ -1190,11 +1191,14 @@ function bytesLabel(value) {
 
 // Порожній журнал — не помилка й не «ще не встигло». Це стан «жодна модель ніколи не викликалася»,
 // і його треба назвати вголос, інакше порожня таблиця читається як поломка панелі.
-function aiRunsEmptyState(codex) {
+function aiRunsEmptyState(codex, settings) {
   const off = [];
+  if (settings && !settings.features.narrative && !settings.features.digest && !settings.features.attacks) {
+    off.push('усі три перемикачі Codex вимкнено');
+  }
   if (codex && !codex.narrativeEnabled) off.push('<code>ANALYTICS_NARRATIVE_ENABLED=false</code>');
   if (codex && !codex.baseUrlConfigured) off.push('<code>CODEX_BASE_URL</code> порожній');
-  if (codex && !codex.modelConfigured) off.push('<code>CODEX_MODEL</code> порожній');
+  if (settings && !settings.effectiveModel) off.push('модель не обрано');
   return `<div class="empty-state">
     <strong>Жодного звернення до моделі</strong>
     <p>Таблиця <code>ai_runs</code> порожня: за всю історію цієї бази модель не викликали жодного разу.
@@ -1221,7 +1225,7 @@ function aiRunRow(run) {
   </article>`;
 }
 
-function opsAiRunsSection(data, codex) {
+function opsAiRunsSection(data, codex, settings) {
   if (!data) return `<section class="ops-section"><header class="ops-section-head"><div><p>Аудит моделі</p><h2>Журнал звернень</h2></div></header><p class="legend-note">Журнал недоступний.</p></section>`;
   const totals = data.totals ?? {};
   const facts = Number(totals.total)
@@ -1239,19 +1243,19 @@ function opsAiRunsSection(data, codex) {
     </header>
     ${facts}
     <div class="ops-channel-list ai-run-list">
-      ${data.items?.length ? data.items.map(aiRunRow).join('') : aiRunsEmptyState(codex)}
+      ${data.items?.length ? data.items.map(aiRunRow).join('') : aiRunsEmptyState(codex, settings)}
     </div>
     ${data.items?.length === data.limit ? `<p class="legend-note">Показано останні ${data.limit} — журнал довший.</p>` : ''}
   </section>`;
 }
 
-function wireAiRunsSection(root, codex) {
+function wireAiRunsSection(root, codex, settings) {
   const rerender = async () => {
     const data = await opsFetch('/ops/ai-runs?limit=50').then((r) => r.ok ? r.json() : null).catch(() => null);
     const section = $('#ai-runs-section', root);
     if (!section) return;
-    section.outerHTML = opsAiRunsSection(data, codex);
-    wireAiRunsSection(root, codex);
+    section.outerHTML = opsAiRunsSection(data, codex, settings);
+    wireAiRunsSection(root, codex, settings);
   };
 
   $('[data-ai-runs-refresh]', root)?.addEventListener('click', () => void rerender());
@@ -1291,16 +1295,20 @@ function codexFact(term, value) {
 
 // Умови, за яких збережена сесія нічого не змінить. Їх показуємо ЗАВЖДИ, а не лише коли підключення
 // вже є: «підключено, але тиша» — найгірший стан, і він має бути пояснений до, а не після входу.
-function codexPreconditions(status) {
+// `settings` — те, що оператор обрав нижче в цій же групі. Без нього підказки читалися б як брехня:
+// відколи модель і три перемикачі живуть у /ops, порожній `CODEX_MODEL` більше не означає «моделі
+// немає», а `ANALYTICS_NARRATIVE_ENABLED=false` більше не означає «наративу не буде».
+function codexPreconditions(status, settings) {
   const rows = [];
-  if (!status.narrativeEnabled) rows.push('<code>ANALYTICS_NARRATIVE_ENABLED=false</code> — токен збережеться, але наратив не запитуватиметься. Аналітика лишається повною й без моделі.');
+  const featureOn = settings ? Object.values(settings.features).some(Boolean) : false;
+  if (!status.narrativeEnabled && !featureOn) rows.push('<code>ANALYTICS_NARRATIVE_ENABLED=false</code>, і жоден перемикач нижче не ввімкнено — токен збережеться, але модель не запитуватимуть. Аналітика лишається повною й без неї.');
   if (!status.baseUrlConfigured) rows.push('<code>CODEX_BASE_URL</code> не задано — вхід дає токен, але не адресу, куди його слати.');
-  if (!status.modelConfigured) rows.push('<code>CODEX_MODEL</code> не задано — модель не обрано.');
+  if (settings ? !settings.effectiveModel : !status.modelConfigured) rows.push('Модель не обрано: ні в списку нижче, ні в <code>CODEX_MODEL</code>.');
   if (status.envTokenConfigured) rows.push('У <code>.env</code> лишається <code>CODEX_API_KEY</code>. Збережена сесія має пріоритет — змінна тепер лише запасний варіант.');
   return rows.length ? `<ul class="codex-preconditions">${rows.map((row) => `<li>${row}</li>`).join('')}</ul>` : '';
 }
 
-function opsCodexSection(status) {
+function opsCodexSection(status, settings) {
   if (!status) return '<section class="ops-section"><header class="ops-section-head"><div><p>Модель для наративів</p><h2>Codex / ChatGPT</h2></div></header><p class="legend-note">Стан входу недоступний.</p></section>';
   const state = !status.connected ? { label: 'не підключено', tone: 'off' }
     : status.expired && !status.canRefresh ? { label: 'сесія завершилася', tone: 'bad' }
@@ -1318,7 +1326,7 @@ function opsCodexSection(status) {
       <span class="codex-state is-${state.tone}">${escapeHtml(state.label)}</span>
     </header>
     <dl class="codex-facts">${facts}</dl>
-    ${codexPreconditions(status)}
+    ${codexPreconditions(status, settings)}
     ${status.lastError ? `<p class="legend-warning">Остання помилка: ${escapeHtml(status.lastError)}</p>` : ''}
     ${status.pendingLogin ? `<p class="legend-warning">Вхід триває. Сеанс дійсний до ${escapeHtml(new Date(status.pendingLogin.expiresAt).toLocaleTimeString('uk-UA'))}.</p>` : ''}
     <div class="ops-channel-actions codex-actions">
@@ -1334,13 +1342,105 @@ function opsCodexSection(status) {
   </section>`;
 }
 
-function wireCodexSection(root) {
+// ------------------------------------------------------------------------------------------------
+// Codex: що саме модель робить у системі
+// ------------------------------------------------------------------------------------------------
+//
+// Три перемикачі, а не один. «Увімкнути ШІ» — це не рішення, яке оператор може ухвалити один раз:
+// наратив аналітики бачить лише він сам, дайджест іде тисячам людей у Telegram, а формулювання
+// екстраполяції взагалі не публікується. Ціна помилки в цих трьох місцях різна, тож і вимикач у
+// кожного свій. Під кожним підписано, куди саме потрапить текст, — бо це і є те, що визначає,
+// наскільки страшно його вмикати.
+
+const codexFeatureLabels = {
+  narrative: {
+    title: 'Наратив аналітики',
+    note: 'Модель переказує людською мовою вже пораховані агрегати на сторінці аналітики. Кожне число з її тексту звіряється з розрахунком; одне невідоме — і текст відкидається цілком.'
+  },
+  digest: {
+    title: 'Нічний дайджест',
+    note: 'Один підсумковий рядок під переліком оцінок у Telegram. Іде людям, підписаним на аналітику, з явною позначкою, що його написала модель. Самі оцінки модель не змінює.'
+  },
+  attacks: {
+    title: 'Аналіз атак',
+    note: 'Формулювання операторської екстраполяції вектора. Не публікується ніде за межами цієї консолі. Числа так само звіряються з розрахунком.'
+  }
+};
+
+function codexFeatureField(key, enabled) {
+  const label = codexFeatureLabels[key];
+  return `<label class="codex-feature">
+    <input type="checkbox" data-codex-feature="${escapeHtml(key)}"${enabled ? ' checked' : ''}>
+    <span><strong>${escapeHtml(label.title)}</strong>${escapeHtml(label.note)}</span>
+  </label>`;
+}
+
+function opsCodexSettingsSection(payload) {
+  if (!payload) {
+    return '<section class="ops-section" id="codex-settings-section"><header class="ops-section-head"><div><p>Керування</p><h2>Модель і функції</h2></div></header><p class="legend-note">Налаштування недоступні.</p></section>';
+  }
+  const settings = payload.settings;
+  const models = payload.availableModels ?? [];
+  // Порожній варіант — це справжній вибір, а не «нічого не вибрано»: він означає «беріть те, що
+  // задано в CODEX_MODEL», і саме так поводиться свіжовстановлена система.
+  const options = [
+    `<option value=""${settings.model ? '' : ' selected'}>За замовчуванням${payload.status?.modelConfigured ? ' — CODEX_MODEL' : ' (CODEX_MODEL порожній)'}</option>`,
+    ...models.map((model) => `<option value="${escapeHtml(model)}"${settings.model === model ? ' selected' : ''}>${escapeHtml(model)}</option>`)
+  ].join('');
+  const source = payload.modelsSource === 'api'
+    ? 'Перелік отримано від Codex.'
+    : `Перелік запасний${payload.modelsError ? `: ${escapeHtml(payload.modelsError)}` : ''}.`;
+  const effective = settings.effectiveModel
+    ? `Зараз викликається <code>${escapeHtml(settings.effectiveModel)}</code> (${settings.modelSource === 'stored' ? 'вибір оператора' : 'із CODEX_MODEL'}).`
+    : 'Модель не обрано ніде — жоден виклик не відбудеться.';
+
+  return `<section class="ops-section" id="codex-settings-section">
+    <header class="ops-section-head"><div><p>Керування</p><h2>Модель і функції</h2></div></header>
+    <div class="codex-settings">
+      <label class="codex-model">Модель<select data-codex-model>${options}</select></label>
+      <p class="legend-note">${source} ${effective}</p>
+      <div class="codex-features">
+        ${Object.keys(codexFeatureLabels).map((key) => codexFeatureField(key, settings.features[key])).join('')}
+      </div>
+      <div class="ops-channel-actions codex-actions">
+        <button data-codex-settings-save>Зберегти</button>
+        <output id="codex-settings-status"></output>
+      </div>
+      <p class="legend-note">Вимкнене — це не помилка й не деградація: аналітика, дайджест і екстраполяція повні без моделі. Перемикач лише додає текст поверх готових чисел.</p>
+    </div>
+  </section>`;
+}
+
+function wireCodexSettingsSection(root, onSaved) {
+  const status = $('#codex-settings-status', root);
+
+  $('[data-codex-settings-save]', root)?.addEventListener('click', async () => {
+    const features = {};
+    root.querySelectorAll('[data-codex-feature]').forEach((input) => {
+      features[input.dataset.codexFeature] = input.checked;
+    });
+    status.textContent = 'Зберігаємо…';
+    const result = await opsFetch('/ops/codex/settings', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ model: $('[data-codex-model]', root)?.value || null, features })
+    }).catch(() => null);
+    if (!result?.ok) { status.textContent = 'Не вдалося зберегти.'; return; }
+    status.textContent = 'Збережено.';
+    // Перемальовуємо всю групу: збережений перемикач змінює й підказки в журналі звернень
+    // («усі три вимкнено»), тож показувати новий стан лише в одному місці означало б показати
+    // два різні стани поруч.
+    await onSaved();
+  });
+}
+
+function wireCodexSection(root, settings) {
   const rerender = async () => {
     const status = await opsFetch('/ops/codex').then((r) => r.ok ? r.json() : null).catch(() => null);
     const section = $('#codex-section', root);
     if (!section) return null;
-    section.outerHTML = opsCodexSection(status);
-    wireCodexSection(root);
+    section.outerHTML = opsCodexSection(status, settings);
+    wireCodexSection(root, settings);
     return status;
   };
 
@@ -1403,11 +1503,15 @@ async function renderOps() {
   const data = await response.json();
   // Екстраполяція живе тільки тут. Запит іде на окремий ендпоінт за тим самим Basic-логіном; жоден
   // публічний маршрут її не віддає, і жоден інший екран цієї функції не викликає.
-  const [vectorOps, codex, aiRuns] = await Promise.all([
+  // Стан входу приходить у складі налаштувань, а не окремим запитом: перемикач «увімкнено» поруч
+  // із мертвою сесією — найзаплутаніший стан цієї функції, і показати їх із двох різних моментів
+  // означало б зробити його ще заплутанішим.
+  const [vectorOps, codexSettings, aiRuns] = await Promise.all([
     opsFetch('/ops/vectors').then((result) => result.ok ? result.json() : null).catch(() => null),
-    opsFetch('/ops/codex').then((result) => result.ok ? result.json() : null).catch(() => null),
+    opsFetch('/ops/codex/settings').then((result) => result.ok ? result.json() : null).catch(() => null),
     opsFetch('/ops/ai-runs?limit=50').then((result) => result.ok ? result.json() : null).catch(() => null)
   ]);
+  const codex = codexSettings?.status ?? null;
   const queued = data.outbox.reduce((sum, item) => sum + Number(item.count), 0);
   root.innerHTML = `<div class="ops-metrics"><article><span>Джерела</span><strong>${data.sources.length}</strong></article><article><span>Черга</span><strong>${queued}</strong></article><article><span>Канали</span><strong>${data.channels.filter((item) => item.active).length}</strong></article><article><span>PostgreSQL</span><strong>${escapeHtml(data.database.size)}</strong></article></div>
     <section class="ops-section"><header class="ops-section-head"><div><p>Каталог для користувачів</p><h2>Додати Telegram-канал</h2></div><button id="ops-logout">Вийти</button></header>
@@ -1423,12 +1527,18 @@ async function renderOps() {
       </form>
       <div class="ops-channel-list">${data.channels.map((channel) => `<article class="${channel.active ? '' : 'is-disabled'}"><div><span>${channel.verified ? '✓ перевірено' : escapeHtml(channel.category)}</span><h3>${escapeHtml(channel.title)}</h3><p>@${escapeHtml(channel.username)}${channel.location_name ? ` · ${escapeHtml(channel.location_name)}` : ''}</p></div><div class="ops-channel-actions"><a href="${escapeHtml(channel.url)}" target="_blank" rel="noreferrer">Відкрити ↗</a><button data-channel-toggle="verified" data-id="${channel.id}" data-value="${channel.verified}">${channel.verified ? 'Зняти перевірку' : 'Перевірити'}</button><button data-channel-toggle="active" data-id="${channel.id}" data-value="${channel.active}">${channel.active ? 'Приховати' : 'Активувати'}</button></div></article>`).join('')}</div>
     </section>
-    ${opsCodexSection(codex)}
-    ${opsAiRunsSection(aiRuns, codex)}
+    <div class="ops-group" id="codex-group">
+      <header class="ops-group-head"><p>Модель в аналітиці</p><h2>Codex-аналітика</h2>
+        <p>Вхід, вибір моделі, три перемикачі й журнал усіх звернень — усе, що визначає, коли систему пише машина, і що саме вона написала.</p></header>
+      ${opsCodexSection(codex, codexSettings?.settings ?? null)}
+      ${opsCodexSettingsSection(codexSettings)}
+      ${opsAiRunsSection(aiRuns, codex, codexSettings?.settings ?? null)}
+    </div>
     ${opsVectorSection(vectorOps)}
     <details class="ops-raw"><summary>Технічний стан і журнали</summary><pre class="ops-json">${escapeHtml(JSON.stringify({ sources: data.sources, outbox: data.outbox, aiRuns: data.aiRuns, database: data.database }, null, 2))}</pre></details>`;
-  wireCodexSection(root);
-  wireAiRunsSection(root, codex);
+  wireCodexSection(root, codexSettings?.settings ?? null);
+  wireCodexSettingsSection(root, () => renderOps());
+  wireAiRunsSection(root, codex, codexSettings?.settings ?? null);
   root.querySelectorAll('[data-project-vector]').forEach((button) => button.addEventListener('click', async () => {
     const output = $(`#projection-${button.dataset.projectVector}`, root);
     output.textContent = 'Рахуємо…';

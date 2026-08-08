@@ -8,6 +8,8 @@ import {
   type ReportedVectorSegment,
   type VectorSegmentBasis
 } from './threat-vectors.js';
+import { codexChat } from './codex-client.js';
+import { codexFeatureEnabled } from './codex-settings.js';
 
 /**
  * Operator-only extrapolation of a reported vector. **Nothing here may ever reach a public payload.**
@@ -490,7 +492,57 @@ async function recordAiRun(status: 'success' | 'failed', input: unknown, output:
   ).catch(() => undefined);
 }
 
+const REFINE_SYSTEM_PROMPT = 'Return only JSON: {"narrative": string}. Rewrite the supplied Ukrainian operator note '
+  + 'more clearly. This is an internal extrapolation, not an observation: the wording must keep '
+  + 'saying so. Never introduce a number that is not already in the input, never name a target, '
+  + 'an impact or a place that is not in the candidate list, and never state that anybody reported '
+  + 'the projected movement.';
+
+function refineInput(projection: VectorProjection) {
+  return {
+    bearingDegrees: projection.bearingDegrees,
+    groundSpeedKmh: projection.groundSpeedKmh,
+    horizonMinutes: projection.horizonMinutes,
+    horizonDistanceKm: projection.horizonDistanceKm,
+    uncertainty: projection.uncertainty,
+    basis: projection.basis,
+    candidates: projection.candidates.map((candidate) => ({ name: candidate.name, withinUncertainty: candidate.withinUncertainty })),
+    deterministicNarrative: projection.narrative
+  };
+}
+
+/**
+ * The Codex attempt, which an operator switches on in `/ops` under "аналіз атак".
+ *
+ * Tried before `AI_*` and skipped entirely when the switch is off, so an installation that has
+ * never opened the console behaves exactly as it did before. It returns the projection unchanged on
+ * every failure — including the number-faithfulness check, which is the whole reason a rewording is
+ * allowed to touch this text at all — and `codexChat` has already written the `ai_runs` row by then,
+ * so a refusal is visible in the console without being visible in the output.
+ */
+async function refineWithCodex(projection: VectorProjection): Promise<VectorProjection | null> {
+  if (!await codexFeatureEnabled('attacks')) return null;
+  const input = refineInput(projection);
+  const result = await codexChat({
+    promptVersion: 'vector-narrative-v1',
+    system: REFINE_SYSTEM_PROMPT,
+    user: JSON.stringify(input),
+    json: true,
+    auditInput: input
+  });
+  if (!result.ok) return null;
+  try {
+    const parsed = narrativeSchema.parse(JSON.parse(result.content));
+    if (!narrativeIsFaithful(parsed.narrative, allowedNumbers(projection))) return null;
+    return { ...projection, narrative: parsed.narrative, narrativeOrigin: 'model', modelVersion: result.model };
+  } catch {
+    return null;
+  }
+}
+
 export async function refineNarrative(projection: VectorProjection): Promise<VectorProjection> {
+  const viaCodex = await refineWithCodex(projection).catch(() => null);
+  if (viaCodex) return viaCodex;
   if (!config.AI_BASE_URL || !config.AI_API_KEY || !config.AI_MODEL) return projection;
   const input = {
     bearingDegrees: projection.bearingDegrees,

@@ -269,7 +269,12 @@ export function formatMessage(row: any, now: Date = new Date()): string {
       ? String(p.generatedTime) : humanMoment(p.generatedTime, now);
     const horizon = humanMoment((p.assessments as any[])[0]?.horizonEnd, now);
     const omitted = p.omitted ? `\n\nЩе оцінок: ${html(p.omitted)} — перегляньте на сайті.` : '';
-    return `🌙 <b>Аналітика${generated ? ` станом на ${html(generated)}` : ''}</b>\n\n${lines.join('\n\n')}${omitted}`
+    // Рядок від моделі підписано вголос і поставлено ПІСЛЯ переліку. Оцінки — це те, заради чого
+    // надіслано повідомлення, і машинне речення не має ставати першим, що читає людина вночі.
+    const aiSummary = p.aiGenerated && p.aiSummary
+      ? `\n\n<i>Стисло (написала мовна модель за цими ж оцінками): ${html(p.aiSummary)}</i>`
+      : '';
+    return `🌙 <b>Аналітика${generated ? ` станом на ${html(generated)}` : ''}</b>\n\n${lines.join('\n\n')}${omitted}${aiSummary}`
       + details(
         horizon && `Горизонт оцінки — до ${html(horizon)}`,
         'Рівень сформовано з публічних сигналів. Це не статистична ймовірність, не прогноз цілі та не офіційна тривога.',
