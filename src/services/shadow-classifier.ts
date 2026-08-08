@@ -3,7 +3,7 @@ import { config } from '../config.js';
 import { pool } from '../db/pool.js';
 import { CLASSIFIER_VERSION, significanceRejection } from '../domain/classifier.js';
 import { THREAT_TYPES, type ClassifiedMessage } from '../types.js';
-import { codexChat } from './codex-client.js';
+import { codexChat, type CodexFailureReason } from './codex-client.js';
 import { codexFeatureEnabled } from './codex-settings.js';
 
 /**
@@ -215,8 +215,13 @@ export interface ShadowOutcome {
  * Kept apart because they are the difference between an installation that never switched this on and
  * one whose model is broken, and because that difference is what decides whether an operator should
  * go looking at `/ops` or at their quota. `codexChat` has already recorded either kind in `ai_runs`.
+ *
+ * Typed as a set of {@link CodexFailureReason} rather than of strings on purpose: the client owns
+ * these names, and a rename there has to break this file loudly instead of quietly reclassifying an
+ * unconfigured installation as a misbehaving model.
  */
-const PREFLIGHT_REASONS = new Set(['not_configured', 'model_not_selected', 'no_session']);
+const PREFLIGHT_REASONS: ReadonlySet<CodexFailureReason> =
+  new Set<CodexFailureReason>(['not_configured', 'model_not_selected', 'no_session']);
 
 /**
  * Runs the shadow classification for one message and records the comparison.

@@ -3,7 +3,8 @@ import { classifyMessage } from '../domain/classifier.js';
 import type { ClassifiedMessage } from '../types.js';
 import {
   deterministicVerdict, disagreementFields, normalizePlace, resetShadowRateLimit,
-  shadowClassify, withinRateLimit, type ShadowVerdict
+  scheduleShadowClassification, shadowClassify, shadowSkipCounts, withinRateLimit,
+  type ShadowVerdict
 } from './shadow-classifier.js';
 
 const locations = [
@@ -246,5 +247,53 @@ describe('shadowClassify', () => {
     expect(await shadowClassify({ ...input('Шахед'), text: '   ' }, { chat: chat as never }))
       .toEqual({ status: 'skipped', reason: 'empty_text' });
     expect(chat).not.toHaveBeenCalled();
+  });
+});
+
+/**
+ * The entry point the pipeline actually calls.
+ *
+ * Two properties are worth pinning down here and are not covered by the suite above, because both
+ * are about what the *caller* can observe rather than about what the model said. First, it hands
+ * back nothing: `void` is the guarantee that no future edit in `ingestion.ts` can start branching on
+ * a model's opinion. Second, the counter behind it distinguishes a loss from a decision — a switch
+ * an operator turned off is not a missing row, and counting it would make the log say the feature is
+ * failing when it is merely unused.
+ */
+describe('scheduleShadowClassification', () => {
+  const flush = () => new Promise((resolve) => setTimeout(resolve, 0));
+
+  it('hands the pipeline nothing it could act on', () => {
+    expect(scheduleShadowClassification(
+      input('Ударні БпЛА у напрямку Києва'), { chat: chatReturning(verdict()) as never }
+    )).toBeUndefined();
+  });
+
+  it('counts a lost comparison under the reason it was lost for', async () => {
+    const before = shadowSkipCounts().model_failed ?? 0;
+    scheduleShadowClassification(
+      input('Ударні БпЛА у напрямку Києва'), { chat: chatFailing('endpoint_error') as never }
+    );
+    await vi.waitFor(() => expect(shadowSkipCounts().model_failed ?? 0).toBe(before + 1));
+  });
+
+  it('does not count an operator switching the feature off', async () => {
+    vi.mocked(codexFeatureEnabled).mockResolvedValue(false);
+    const before = shadowSkipCounts().disabled ?? 0;
+    scheduleShadowClassification(
+      input('Ударні БпЛА у напрямку Києва'), { chat: chatReturning(verdict()) as never }
+    );
+    await flush();
+    expect(shadowSkipCounts().disabled ?? 0).toBe(before);
+  });
+
+  it('swallows a rejection instead of leaving it unhandled', async () => {
+    // The belt to `shadowClassify`'s braces: a client that starts throwing must not become an
+    // unhandled rejection that takes the ingestion process down during an attack.
+    const chat = vi.fn(async () => { throw new Error('клієнт зламався'); });
+    expect(() => scheduleShadowClassification(
+      input('Ударні БпЛА у напрямку Києва'), { chat: chat as never }
+    )).not.toThrow();
+    await flush();
   });
 });
