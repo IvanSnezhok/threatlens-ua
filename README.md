@@ -147,6 +147,42 @@ Production startup **fails fast** on weak ops or metrics credentials, a non-HTTP
 demo mode left on, or development database credentials. That is deliberate: a half-configured
 alerting system is worse than one that refuses to boot.
 
+### 6. Updating from `/ops` (optional)
+
+Off by default, and off is a complete configuration: the «Оновлення з main» block in `/ops` says so
+and nothing else changes. Turned on, an operator sees the running commit, the commit on `origin/main`
+and the outcome of every past update, and can confirm one specific commit for deployment.
+
+The app **never** holds the Docker socket. A separate `deployer` container does, publishes no host
+port, and runs exactly one frozen scenario: fetch `origin/main` → build the image → run the pending
+migrations from that image while the old app is still serving → recreate `app` and `caddy` → require
+`/health/ready` to answer with the commit that was just deployed. Every stage is written into
+PostgreSQL, which the scenario deliberately never restarts, so the journal survives the restart it
+describes and is readable the moment the page comes back.
+
+```env
+DEPLOY_ENABLED=true
+DEPLOY_REPO_PATH=/opt/threatlens-ua                              # absolute; mounted at the same path inside
+DEPLOY_REPO_URL=https://github.com/IvanSnezhok/threatlens-ua.git # the only remote that will ever be deployed
+DEPLOY_RUNNER_TOKEN=<openssl rand -hex 32>                       # 32+ chars, or production refuses to boot
+```
+
+```bash
+docker compose up -d deployer   # once, by hand: the scenario never restarts its own runner
+```
+
+Prerequisites and boundaries, in full in `docs/OPERATIONS.md`:
+
+- **Only `refs/heads/main`, only the configured remote.** No branch, tag or fork can be selected —
+  there is no code path and a database CHECK refuses anything else.
+- **Protect `main` on GitHub.** Anyone who can write `main` ships code the moment an operator presses
+  the button. That is a stated prerequisite, not a defect.
+- **Forward-only.** Migrations are never reversed. Rolling code back is a manual action on the host
+  and does not undo a migration, which is why migrations in this project must expand, never rename or
+  drop in the same release.
+- **`postgres`, `backup` and `deployer` are never restarted** by an update; when their compose
+  definition changes the run says so and names the command to run by hand.
+
 ### Optional
 
 | What | Why |
@@ -157,6 +193,9 @@ alerting system is worse than one that refuses to boot.
 | `OCCUPATION_SOURCE_ENABLED=false` | Turn off the occupied-territories layer. |
 | `PUBLICATION_DELAY_SECONDS` | How long `delayed_15s` holds the public view. Default 15, accepted range 5–60; the *mode* is an operator decision stored in the database, this is only the length. Below 5 s the hold is inside the event poll and the client's own debounce; above 60 s the client would report a deliberate hold as stale data. |
 | `ANALYTICS_EVENT_DRIVEN_ENABLED=false` | Deployment-level kill switch for event-driven recompute. The worker then never subscribes to the event feed at all and only the fifteen-minute timers remain — the reason to stop it is usually a database problem, which is the worst moment to have to read a flag out of the database. |
+| `CLASSIFIER_BACKFILL_ENABLED=false` | Stop reading what the collector missed while it was down. On by default: after an interruption longer than `CLASSIFIER_BACKFILL_MIN_GAP_SECONDS` (3600) each classifier Telegram source is caught up from its own archive cursor, bounded by age (6 h), count (300) and pages (5). Official alert channels are never part of this — they have their own reconnect path. |
+| `CLASSIFIER_BACKFILL_MIN_GAP_SECONDS` | The gap that separates "the collector blinked" from "the collector was down". Below it nothing extra happens; a catch-up on every reconnect would be a history burst on every flap. Floor 300. |
+| `DEPLOY_ENABLED=true` | Operator-controlled updates from `/ops`. See section 6 above and `docs/OPERATIONS.md`. |
 
 ## Telegram commands
 

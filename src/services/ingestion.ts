@@ -997,6 +997,16 @@ export interface ProcessMessageOptions {
    * every caller alike.
    */
   monitor?: boolean;
+  /**
+   * The message is being replayed from the catch-up backfill rather than read live.
+   *
+   * Passed straight through to `ingestThreat`, which is where it means something: a message already
+   * past its own thirty-minute validity window lands in the archive and appends nothing to
+   * `system_event_log`, so it can reach neither the map nor a subscriber. Everything else on this
+   * path — classification, the significance rejection, burst coalescing, the decision archive — is
+   * deliberately identical for a replayed message and a live one.
+   */
+  historical?: boolean;
 }
 
 /**
@@ -1082,7 +1092,7 @@ async function classifyAndIngest(message: NormalizedMessage, options: ProcessMes
     return { coalesced: true as const };
   }
   count('classified');
-  const result = await ingestThreat(message, classified);
+  const result = await ingestThreat(message, classified, { historical: options.historical });
   if (result.withdrawal.withdrawnAssertions || result.withdrawal.endedEventIds.length) {
     threatWithdrawals.inc({
       source: message.sourceId,

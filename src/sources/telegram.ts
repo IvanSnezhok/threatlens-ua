@@ -6,6 +6,9 @@ import {
   type AlertChannelMessage, type AlertTelegramChannel, type MonitoredTelegramChannel
 } from '../services/ingestion.js';
 import { markSourceError, markSourceSuccess } from '../services/operations.js';
+import {
+  startClassifierBackfill, type BackfillPort, type BackfillRawMessage
+} from '../services/source-backfill.js';
 
 /**
  * Last-resort definition of the Air Force channel.
@@ -438,6 +441,91 @@ async function backfillAlertChannel(
 }
 
 // ------------------------------------------------------------------------------------------------
+// Catch-up backfill: this collector's side of the port
+// ------------------------------------------------------------------------------------------------
+//
+// `src/services/source-backfill.ts` imports nothing from here and knows nothing about MTProto. It
+// consumes a two-method port, and this is the whole of the implementation — which is what keeps the
+// backfill's decision logic testable without a Telegram session, and what makes "the backfill can
+// never touch an alert channel" a property of the type: `routes()` yields classifier routes only,
+// and there is no other way in.
+//
+// The history read goes through the same peer ids the startup resolve pass bound, so it costs no
+// `contacts.ResolveUsername`, and through the flood gate below, so a wait Telegram named for the
+// live handlers also stops the catch-up read.
+
+/** Deadline of the last flood wait a history read earned, as epoch milliseconds. */
+let historyFloodUntil = 0;
+
+/**
+ * Refuses to issue a request while an interval Telegram named is still running, and records one when
+ * the answer names a new one.
+ *
+ * Both halves matter. Without the first, a sweep of ten sources during a wait is ten more refused
+ * requests, each of which can extend the interval — the exact retry storm the resolve pass was
+ * rewritten to stop. Without the second, the backfill would keep asking until the sweep's own caps
+ * ran out. The gate reads the COLLECTOR's wait as well as its own: a wait imposed on the resolve
+ * phase is a wait on this session, not on that endpoint.
+ */
+async function withFloodGate<T>(operation: () => Promise<T>): Promise<T> {
+  const collectorUntil = Date.parse(collectorStatus.floodWaitUntil ?? '') || 0;
+  const until = Math.max(historyFloodUntil, collectorUntil);
+  if (Date.now() < until) {
+    throw new Error(`Telegram flood wait is in force until ${new Date(until).toISOString()}`);
+  }
+  try {
+    return await operation();
+  } catch (error) {
+    const seconds = floodWaitSeconds(error);
+    if (seconds != null) {
+      historyFloodUntil = Date.now() + waitMs(seconds);
+      collectorFloodWaits.inc({ phase: 'history' });
+    }
+    throw error;
+  }
+}
+
+/** Test seam, and the counterpart of `resetTelegramCollectorStatus()`. */
+export function resetHistoryFloodGate(): void {
+  historyFloodUntil = 0;
+}
+
+/**
+ * The port the catch-up backfill consumes, reading the collector's LIVE routing table.
+ *
+ * `byPeerId` is passed as a getter rather than as a snapshot because the table is rebound whenever a
+ * retry binds a channel the first pass missed. A port holding the first pass's map would keep
+ * backfilling a subset of the channels forever.
+ */
+function createBackfillPort(client: any, byPeerId: () => Map<string, ChannelRoute>): BackfillPort {
+  return {
+    routes: () => [...byPeerId().values()]
+      .filter((route) => route.kind === 'classifier')
+      .map((route) => ({
+        sourceId: route.sourceId, username: route.username,
+        adapterType: route.kind === 'classifier' ? route.adapterType : ''
+      })),
+    async history(username, page): Promise<BackfillRawMessage[]> {
+      // By PEER ID, exactly as the alert backfill does: `getMessages` resolves its entity through
+      // `getInputEntity`, which short-circuits on a numeric string via the cache the resolve pass has
+      // already filled. Passing the handle would add one `contacts.ResolveUsername` per page.
+      const peerId = [...byPeerId().entries()]
+        .find(([, route]) => route.kind === 'classifier' && route.username === username)?.[0];
+      if (!peerId) throw new Error(`Telegram channel ${username} is not bound to a peer id`);
+      const messages = await withFloodGate<any[]>(() => client.getMessages(
+        peerId, page.offsetId ? { limit: page.limit, offsetId: page.offsetId } : { limit: page.limit }
+      ));
+      return (messages ?? []).map((message: any) => ({
+        id: Number(message.id),
+        date: Number(message.date),
+        message: typeof message.message === 'string' ? message.message : null,
+        editDate: message.editDate == null ? null : Number(message.editDate)
+      }));
+    }
+  };
+}
+
+// ------------------------------------------------------------------------------------------------
 // Startup
 // ------------------------------------------------------------------------------------------------
 
@@ -526,6 +614,8 @@ export async function startTelegramCollector(
    */
   let routesByPeerId = new Map<string, ChannelRoute>();
   const backfilled = new Set<string>();
+  /** Set once, on the first pass that reaches readiness. Its sweep re-reads `routesByPeerId`. */
+  let stopClassifierBackfill: (() => void) | null = null;
   let attachedBuilders: unknown[] = [];
   let heartbeat: ReturnType<typeof setInterval> | null = null;
   let cancelRetry: (() => void) | null = null;
@@ -750,6 +840,24 @@ export async function startTelegramCollector(
       await backfillAlertChannel(client, route, peerId, log).catch((error) =>
         log.error({ error, sourceId: route.sourceId }, 'alert channel backlog reconciliation failed'));
     }
+
+    // The classifier catch-up starts LAST and is never awaited.
+    //
+    // Last, because everything above it is the live path: the handlers are attached, the sources are
+    // marked, and the alert channels — whose messages are STATE, and whose gap leaves a raion drawn
+    // wrong on the map — have already been reconciled. Never awaited, because a sweep is minutes of
+    // paged history over ten channels and the live stream must not wait behind it; `startClassifierBackfill`
+    // is documented never to throw into its caller, and its own mutex stops the startup pass and the
+    // periodic sweep from overlapping.
+    //
+    // Started once. Later passes rebind `routesByPeerId`, and the port reads it through a getter, so
+    // a retry that binds a channel the first pass missed is picked up by the next sweep without a
+    // second loop being started.
+    if (!stopClassifierBackfill) {
+      stopClassifierBackfill = startClassifierBackfill(
+        createBackfillPort(client, () => routesByPeerId), log
+      );
+    }
     // A pass that bound most of the list but was cut short still owes the rest a second attempt —
     // and it owes Telegram the interval it named. Retrying the missing handles on the shorter
     // default would put `contacts.ResolveUsername` back inside an active wait, which is the one
@@ -765,6 +873,8 @@ export async function startTelegramCollector(
     stopped = true;
     cancelRetry?.();
     cancelRetry = null;
+    stopClassifierBackfill?.();
+    stopClassifierBackfill = null;
     detach();
     setCollectorStatus({ ...INITIAL_STATUS, detail: 'stopped' });
     await client.disconnect();

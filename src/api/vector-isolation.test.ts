@@ -820,7 +820,8 @@ describe('map text survives a failed icon pipeline', () => {
 
 describe('snapshot refresh and the operations console', () => {
   const source = lazy(() => `function renderCurrentRoute(options = {}) ${bodyOf('renderCurrentRoute')}`);
-  const parameters = ['snapshot', 'activePage', 'map', 'mapLayersReady', 'codexPollTimer', 'renderedRoute',
+  const parameters = ['snapshot', 'activePage', 'map', 'mapLayersReady', 'codexPollTimer', 'deployPollTimer',
+    'renderedRoute',
     'renderMapPage', 'renderHistory', 'renderAttacks', 'renderAnalytics', 'renderSources', 'renderOps', 'renderAbout'];
 
   /**
@@ -833,7 +834,10 @@ describe('snapshot refresh and the operations console', () => {
     const calls: string[] = [];
     const stub = (name: string) => () => { calls.push(name); };
     const render = compileSlice<(options?: unknown) => void>(source(), 'renderCurrentRoute', parameters)(
-      { version: 1 }, () => route, null, false, null, null,
+      // snapshot, activePage, map, mapLayersReady, codexPollTimer, deployPollTimer, renderedRoute…
+      // The deployment card polls `/ops/api/deploy` on its own three-second timer, and leaving `/ops`
+      // has to stop it: the node it repaints does not exist on any other route.
+      { version: 1 }, () => route, null, false, null, null, null,
       stub('map'), stub('history'), stub('attacks'), stub('analytics'), stub('sources'), stub('ops'), stub('about')
     );
     return { render, calls };

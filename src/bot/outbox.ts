@@ -1,4 +1,5 @@
 import type { Bot } from 'grammy';
+import { Counter, type Registry } from 'prom-client';
 import { pool } from '../db/pool.js';
 import { relatedLocationsCte } from '../repositories/events.js';
 import {
@@ -11,6 +12,30 @@ import {
   threatContentHash,
   type AssessmentPublishedState, type ThreatPublishedState, type ThreatSnapshot
 } from './notification-policy.js';
+
+/**
+ * Notifications this worker refused to queue, by the reason it refused.
+ *
+ * Constructed DETACHED (`registers: []`) like every other metric in this project, and attached by
+ * {@link registerOutboxMetrics} — importing the outbox must never mutate a shared registry.
+ *
+ * A non-zero `expired` series is a real operational signal and `docs/OPERATIONS.md` names it as an
+ * incident condition: the fan-out reads `system_event_log` through its own cursor, so a sustained
+ * count means the cursor is running more than thirty minutes behind the events being written, and
+ * subscribers are learning about threats after they stopped applying.
+ */
+const notificationsSuppressed = new Counter({
+  name: 'threatlens_notifications_suppressed_total',
+  help: 'Threat notifications not queued because the threat was no longer valid, by reason',
+  labelNames: ['reason'], registers: []
+});
+
+/** Attaches this module's metrics to the one HTTP registry. Idempotent, like its neighbours. */
+export function registerOutboxMetrics(registry: Registry): void {
+  if (!registry.getSingleMetric('threatlens_notifications_suppressed_total')) {
+    registry.registerMetric(notificationsSuppressed);
+  }
+}
 
 function html(value: unknown): string {
   return String(value ?? '').replace(/[&<>'"]/g, (char) => ({
@@ -224,6 +249,17 @@ async function enqueueForEvent(event: any) {
     );
     if (!threats.rowCount) return;
     const threat = threats.rows[0];
+    // Defence in depth, and the last one on this path. `ingestThreat` already refuses to append a
+    // `system_event_log` row for a message outside its own validity window, so nothing a catch-up
+    // backfill replays should ever reach here — but this branch is reached from ANY threat event in
+    // the log, and a fan-out that has fallen far enough behind would otherwise send a warning whose
+    // deadline passed while it sat in the queue. Warning somebody about a threat that is over is not
+    // a harmless late message: it is a false alarm, and it teaches the reader to discount the next
+    // one. A threat with no declared deadline is not suppressed — there is nothing to have passed.
+    if (threat.valid_until && new Date(threat.valid_until).getTime() <= Date.now()) {
+      notificationsSuppressed.inc({ reason: 'expired' });
+      return;
+    }
     const threatSource = await latestEventSource(entityId);
     // One decision per chat about the *whole* threat, not one per location it touches: a threat that
     // grows a second oblast is one piece of news, and the geography rule can only see that growth if

@@ -56,7 +56,13 @@ const VOLATILE_TABLES = [
   'reference_dataset_syncs', 'occupation_snapshots',
   // Append-only and per-test: every save an ops test performs leaves rows here, and the newest-20
   // assertions would otherwise read another file's history.
-  'runtime_settings_audit'
+  'runtime_settings_audit',
+  // Child before parent. TRUNCATE … CASCADE would reach the events anyway, but naming them in this
+  // order keeps the statement honest about what it destroys and does not depend on the cascade.
+  'deployment_run_events', 'deployment_runs',
+  // Per-source catch-up telemetry. `deployment_state` is deliberately NOT here — it is a
+  // migration-seeded singleton and is reset by UPDATE below, exactly like `runtime_settings`.
+  'source_backfill_state'
 ];
 
 /**
@@ -79,6 +85,11 @@ const VOLATILE_TABLES = [
  *   resetAnalyticsNarrativeMemo(); // src/services/analytics-narrative.ts
  * });
  * ```
+ *
+ * A sixth exists but is needed only by files that read the deployment gauges:
+ * `resetDeploymentMetricsMemo()` (`src/services/deployment.ts`) clears a ten-second memo in front of
+ * the two statements those gauges share. It is not in the list above because nothing else observes
+ * it — a stale reading there affects `/metrics` and no assertion about behaviour.
  */
 export async function resetDatabase(): Promise<void> {
   await sql(`TRUNCATE ${VOLATILE_TABLES.join(',')} RESTART IDENTITY CASCADE`);
@@ -96,6 +107,12 @@ export async function resetDatabase(): Promise<void> {
              analytics_debounce_ms=20000, analytics_max_delay_ms=120000, codex_cooldown_ms=900000,
              mode_changed_at=now() - interval '1 hour',
              updated_at=now(), updated_by='system'`);
+  // Same argument as `runtime_settings`: the row is seeded by migration 023 and a read must never
+  // be "no row, therefore unknown". Reset to the never-checked state so every file starts with an
+  // ops card that says «перевірки ще не було» rather than with another file's observation.
+  await sql(`UPDATE deployment_state SET remote_url=NULL, remote_commit=NULL,
+             working_tree_commit=NULL, working_tree_dirty=false, last_checked_at=NULL,
+             last_check_ok=NULL, last_check_error=NULL, runner_version=NULL, updated_at=now()`);
 }
 
 /**

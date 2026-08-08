@@ -1,3 +1,4 @@
+import { readdirSync } from 'node:fs';
 import { resolve } from 'node:path';
 import Fastify from 'fastify';
 import rateLimit from '@fastify/rate-limit';
@@ -10,6 +11,9 @@ import { activeAlerts, assessmentDetails, currentAssessments, liveThreats, locat
 import { createEventRelay, eventHub, publishedEnvelope, type SystemEvent } from '../services/sse.js';
 import { delaySecondsFor, observeSseDeliveryLag, publicationSlice, registerPublicationMetrics, sliceMeta } from '../services/publication.js';
 import { registerAnalyticsSchedulerMetrics } from '../services/analytics-scheduler.js';
+import { registerDeploymentMetrics } from '../services/deployment.js';
+import { registerBackfillMetrics } from '../services/source-backfill.js';
+import { registerOutboxMetrics } from '../bot/outbox.js';
 import { resolveRuntimeSettings } from '../services/runtime-settings.js';
 import { registerAlertChannelMetrics } from '../services/ingestion.js';
 import { registerTelegramCollectorMetrics, telegramCollectorStatus } from '../sources/telegram.js';
@@ -19,6 +23,8 @@ import attackAnalyticsRoutes from './attack-analytics-routes.js';
 import occupationRoutes from './occupation-routes.js';
 import opsAiRunsRoutes from './ops-ai-runs-routes.js';
 import opsCodexRoutes from './ops-codex-routes.js';
+import opsBackfillRoutes from './ops-backfill-routes.js';
+import opsDeployRoutes from './ops-deploy-routes.js';
 import opsRuntimeRoutes from './ops-runtime-routes.js';
 import opsSourceTrustRoutes from './ops-source-trust-routes.js';
 import opsVectorRoutes from './ops-vector-routes.js';
@@ -63,6 +69,33 @@ function sourceIsConfigured(row: { id: string; adapter_type: string | null; enab
 const MTPROTO_ADAPTERS = new Set(['mtproto', 'mtproto_alert_channel', 'mtproto_monitor']);
 
 /**
+ * Every migration THIS IMAGE ships, read once at module load.
+ *
+ * Readiness used to name one filename — `022_publication_runtime.sql` — which meant a container
+ * carrying migration 023 answered `ready` with 023 unapplied. That was tolerable while readiness was
+ * only a human-facing probe. It stopped being tolerable the moment `src/deployer/runner.ts` began
+ * treating a 200 from `/health/ready` as the proof that an update landed: a hard-coded marker turns
+ * the deploy gate into a check that the PREVIOUS release's schema is present, and a failed migration
+ * would be recorded as a successful deployment.
+ *
+ * The image's own `migrations/` directory is the only honest statement of what this build requires.
+ * Read from disk once rather than per request — the directory cannot change under a running
+ * container, and a readiness probe that stats a directory ten times a minute is a probe that fails
+ * when the disk does.
+ *
+ * An empty list (no directory, e.g. a unit test running from another cwd) degrades to "no migration
+ * requirement", never to "not ready": the database round trip below still proves reachability, which
+ * is the other half of what this endpoint has always answered.
+ */
+const SHIPPED_MIGRATIONS: readonly string[] = (() => {
+  try {
+    return readdirSync(resolve(process.cwd(), 'migrations')).filter((file) => file.endsWith('.sql')).sort();
+  } catch {
+    return [];
+  }
+})();
+
+/**
  * States in which the collector cannot deliver a message from any channel at all.
  *
  * `degraded` is deliberately not among them: it means the handlers are live and some channels are
@@ -103,6 +136,12 @@ export async function buildServer() {
   registerPublicationMetrics(registry);
   registerAnalyticsSchedulerMetrics(registry);
   registerTelegramCollectorMetrics(registry);
+  registerDeploymentMetrics(registry);
+  registerBackfillMetrics(registry);
+  // Without this line `threatlens_notifications_suppressed_total` never appears on /metrics, and
+  // `docs/OPERATIONS.md` names an incident condition — a fanout more than thirty minutes behind the
+  // events it is reading — that nobody could observe.
+  registerOutboxMetrics(registry);
 
   const app = Fastify({ logger: { level: config.NODE_ENV === 'development' ? 'debug' : 'info' }, trustProxy: true });
   await app.register(rateLimit, { max: 300, timeWindow: '1 minute' });
@@ -122,29 +161,68 @@ export async function buildServer() {
     return payload;
   });
 
-  app.get('/health/live', async () => ({ status: 'ok', version: process.env.npm_package_version ?? 'dev' }));
   /**
-   * Readiness now also answers for the MTProto collector.
+   * `commit` and `builtAt` are ADDITIVE; `version` keeps its meaning and its place.
+   *
+   * This is the endpoint the deployment runner reads before it touches anything, to record what was
+   * running when the operator pressed the button (`running_commit_before`). It is also the container
+   * healthcheck, so it must stay a constant-time answer that touches nothing.
+   */
+  app.get('/health/live', async () => ({
+    status: 'ok',
+    version: process.env.npm_package_version ?? 'dev',
+    commit: config.APP_COMMIT,
+    builtAt: config.APP_BUILT_AT || null
+  }));
+  /**
+   * Readiness answers for the schema, for the MTProto collector — and, since the update button
+   * exists, for the identity of the code answering.
    *
    * The container healthcheck probes `/health/live` (`compose.yaml`), so a not-ready answer here
    * neither restarts the process nor takes the site down — which is what makes it safe to tell the
    * truth: a collector sitting out a Telegram flood wait delivers nothing from any channel, and the
-   * whole point of the incident this endpoint now covers is that a `healthy` container and fresh
+   * whole point of the incident this endpoint covers is that a `healthy` container and fresh
    * `last_success_at` values hid exactly that. `disabled` (no MTProto credentials) and `degraded`
    * (handlers live, some handles unbound) stay ready; `collector` is reported either way, so the
    * probe is additive for every deployment that never runs a collector at all.
+   *
+   * **`commit` closes the deploy gate.** The runner polls this endpoint after `compose up` and
+   * requires both a 200 AND `commit === target`. Without the field, a `up -d` that silently kept the
+   * OLD container — because the build produced no new image, because the recreate failed, because
+   * compose matched a stale content hash — would answer 200 from the previous release and the run
+   * would be recorded as a success. The old container answers truthfully here, which is exactly what
+   * makes the check work: it reports the commit IT was built from, and the mismatch is caught.
+   *
+   * The migration set, not one filename: see {@link SHIPPED_MIGRATIONS}.
    */
   app.get('/health/ready', async (_request, reply) => {
     try {
-      const migration = await pool.query(`SELECT 1 FROM schema_migrations WHERE filename='022_publication_runtime.sql'`);
-      if (!migration.rowCount) return reply.code(503).send({ status: 'not_ready', reason: 'migrations_pending' });
+      const applied = await pool.query<{ filename: string }>(
+        `SELECT filename FROM schema_migrations WHERE filename = ANY($1::text[])`,
+        [[...SHIPPED_MIGRATIONS]]
+      );
+      if (applied.rowCount !== SHIPPED_MIGRATIONS.length) {
+        // Both lists, not a count: an operator reading this 503 during an update needs to know which
+        // file is missing, and the diff is the whole answer.
+        return reply.code(503).send({
+          status: 'not_ready', reason: 'migrations_pending',
+          required: [...SHIPPED_MIGRATIONS],
+          applied: applied.rows.map((row) => row.filename).sort(),
+          commit: config.APP_COMMIT
+        });
+      }
       const collector = telegramCollectorStatus();
       if (COLLECTOR_BLOCKED.has(collector.state)) {
-        return reply.code(503).send({ status: 'not_ready', reason: `collector_${collector.state}`, collector });
+        return reply.code(503).send({
+          status: 'not_ready', reason: `collector_${collector.state}`, collector, commit: config.APP_COMMIT
+        });
       }
-      return { status: 'ready', collector };
+      return {
+        status: 'ready', commit: config.APP_COMMIT,
+        migration: SHIPPED_MIGRATIONS.at(-1) ?? null, collector
+      };
     }
-    catch { return reply.code(503).send({ status: 'not_ready' }); }
+    catch { return reply.code(503).send({ status: 'not_ready', commit: config.APP_COMMIT }); }
   });
   app.get('/metrics', async (request, reply) => {
     const bearer = request.headers.authorization?.startsWith('Bearer ') ? request.headers.authorization.slice(7) : '';
@@ -169,6 +247,8 @@ export async function buildServer() {
   await app.register(opsAiRunsRoutes);
   await app.register(opsSourceTrustRoutes);
   await app.register(opsRuntimeRoutes);
+  await app.register(opsDeployRoutes);
+  await app.register(opsBackfillRoutes);
 
   app.get('/api/v1/config', async () => ({
     mapStyleUrl: config.MAP_STYLE_URL,

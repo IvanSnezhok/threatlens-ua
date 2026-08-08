@@ -176,9 +176,91 @@ const envSchema = z.object({
   // interface, so binding to loopback there would drop the callback on the floor.
   CODEX_OAUTH_BIND_ADDRESS: z.string().default('0.0.0.0'),
   // How long a started sign-in stays valid before the listener closes itself.
-  CODEX_OAUTH_LOGIN_TIMEOUT_SECONDS: z.coerce.number().int().min(30).max(1800).default(300)
+  CODEX_OAUTH_LOGIN_TIMEOUT_SECONDS: z.coerce.number().int().min(30).max(1800).default(300),
+
+  // ---- Build identity ---------------------------------------------------------------------------
+  // What this image is. Baked in by `docker compose build` through the `APP_COMMIT`/`APP_BUILT_AT`
+  // build args (see `Dockerfile` and `compose.yaml`), never read from the working tree at runtime —
+  // a container that reported the checkout's HEAD rather than its own would report the *new* commit
+  // the instant the tree moved, which is the one moment the difference matters.
+  //
+  // `/health/ready` returns this value, and the deployment runner refuses to call an update
+  // successful until a ready response carries the commit it just deployed. `unknown` is therefore
+  // not a cosmetic default: an image built outside compose is an image the runner will never accept
+  // as the target, which is the honest outcome — it cannot prove what it is running.
+  APP_COMMIT: z.string().default('unknown'),
+  APP_BUILT_AT: z.string().default(''),
+
+  // ---- Operator-controlled deployment -----------------------------------------------------------
+  // The app never touches the Docker socket. It proxies a confirmed button press to the `deployer`
+  // service, which holds the socket, runs ONE frozen scenario and writes its own journal straight
+  // into PostgreSQL. Everything here is about reaching that service; nothing here describes what the
+  // scenario does — the branch (`refs/heads/main`) and the restarted service list (`app`, `caddy`)
+  // are frozen constants in `src/deployer/runner.ts` and are deliberately not configurable.
+  //
+  // Off by default. A deployment that has not created the runner container must not offer a button
+  // that 502s, and a deployment that never wanted the feature should not have to opt out of it.
+  DEPLOY_ENABLED: z.string().default('false').transform((value) => value === 'true'),
+  // Compose-network name. The runner never publishes a host port (`expose:`, never `ports:`), so
+  // this address is unreachable from the internet by construction.
+  DEPLOY_RUNNER_URL: z.string().url().default('http://deployer:9000'),
+  // Shared bearer, compared with `timingSafeEqual` on the runner side. See the production guard in
+  // the refinement below: a 32-character floor is enforced when the feature is on.
+  DEPLOY_RUNNER_TOKEN: z.string().default(''),
+  // The app NEVER waits for a deployment: the trigger returns 202 with a run id and the runner works
+  // detached. This bounds the proxy hop itself, so a hung runner turns into a named 502 on the ops
+  // page instead of a request the operator's browser sits on while the site restarts underneath it.
+  DEPLOY_RUNNER_TIMEOUT_MS: z.coerce.number().int().min(500).max(30_000).default(5000),
+
+  // ---- Catch-up backfill for classifier Telegram sources ----------------------------------------
+  // After downtime the collector reads what it missed for every enabled classifier source. Official
+  // alert channels are NOT covered here: they have their own reconnect path with its own bounds
+  // (`ALERT_CHANNEL_BACKFILL_*` above), because their messages are state transitions that get folded
+  // to one terminal state per location, and these are events that get archived one by one.
+  //
+  // The names live in this file, with everything else the deployment decides, even though the
+  // service that reads them is `src/services/source-backfill.ts`.
+  CLASSIFIER_BACKFILL_ENABLED: z.string().default('true').transform((value) => value === 'true'),
+  // The gap that separates "the collector blinked" from "the collector was down". Below it nothing
+  // extra happens at all — live collection alone covers a short interruption, and a catch-up read
+  // after every reconnect would be a history burst on every flap. The floor is five minutes for the
+  // same reason: shorter, and a routine reconnect storm becomes a self-inflicted flood wait.
+  CLASSIFIER_BACKFILL_MIN_GAP_SECONDS: z.coerce.number().int().min(300).default(3600),
+  // How far back a single catch-up may reach, whatever the gap says. Six hours matches the risk
+  // engine's horizon: older than that, a message is archive material and can no longer describe
+  // anything current. The ceiling is 48 hours so a misconfiguration cannot ask for a week.
+  CLASSIFIER_BACKFILL_MAX_AGE_SECONDS: z.coerce.number().int().min(600).max(172_800).default(21_600),
+  // Per-source ceilings on one catch-up. Hitting either is `truncated` — a bounded success that the
+  // ops card reports as «дозбір обмежено», not as a failure.
+  CLASSIFIER_BACKFILL_MAX_MESSAGES: z.coerce.number().int().min(1).max(1000).default(300),
+  CLASSIFIER_BACKFILL_MAX_PAGES: z.coerce.number().int().min(1).max(20).default(5),
+  // Telegram's own history page size; 100 is the library's maximum per request.
+  CLASSIFIER_BACKFILL_PAGE_SIZE: z.coerce.number().int().min(10).max(100).default(100),
+  // How many sources one sweep may touch, and how long it pauses between them. Together these are
+  // the request budget: ten sources at one page each, spaced 1.5 s apart, is a minute of gentle
+  // traffic rather than a burst that earns a flood wait on the account the live collector shares.
+  CLASSIFIER_BACKFILL_MAX_SOURCES_PER_SWEEP: z.coerce.number().int().min(1).max(100).default(10),
+  CLASSIFIER_BACKFILL_SOURCE_DELAY_MS: z.coerce.number().int().min(0).max(60_000).default(1500),
+  // Base of the exponential re-run guard: a source is not re-read sooner than this, and a failing
+  // one waits MIN_RERUN_SECONDS * min(2^consecutive_failures, 24). A poison message therefore costs
+  // one read a day, not one every sweep.
+  CLASSIFIER_BACKFILL_MIN_RERUN_SECONDS: z.coerce.number().int().min(60).default(3600),
+  // How often the sweep re-evaluates every source. 0 means "only once, at collector start" — the
+  // kill switch for the periodic path that keeps the startup catch-up working.
+  CLASSIFIER_BACKFILL_CHECK_INTERVAL_SECONDS: z.coerce.number().int().min(0).default(300)
 }).superRefine((env, ctx) => {
   if (env.NODE_ENV !== 'production') return;
+  // The runner token is the only thing standing between somebody who can reach the compose network
+  // and a process that holds the host's Docker socket. The floor is enforced at boot, where it is
+  // visible, rather than at the first press of the button — and only when the feature is actually
+  // on, so a deployment that never created the runner container is not asked for a secret it has no
+  // use for.
+  if (env.DEPLOY_ENABLED && env.DEPLOY_RUNNER_TOKEN.length < 32) {
+    ctx.addIssue({
+      code: 'custom', path: ['DEPLOY_RUNNER_TOKEN'],
+      message: 'Production DEPLOY_ENABLED requires a DEPLOY_RUNNER_TOKEN of at least 32 characters'
+    });
+  }
   if (env.OPS_PASSWORD === 'change-me' || env.OPS_PASSWORD.length < 16) {
     ctx.addIssue({ code: 'custom', path: ['OPS_PASSWORD'], message: 'Production OPS_PASSWORD must contain at least 16 characters' });
   }

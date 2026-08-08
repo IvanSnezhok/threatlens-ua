@@ -1,3 +1,9 @@
+# Pinned, not derived from the directory name. The deployment runner addresses this stack as
+# `docker compose -p threatlens …` from inside its own container, where the checkout is mounted at
+# the host's path — if the project name were inferred, a checkout in a differently named directory
+# would build a SECOND stack beside the running one and the update would appear to do nothing.
+name: threatlens
+
 services:
   caddy:
     image: caddy:2-alpine
@@ -17,7 +23,14 @@ services:
         condition: service_healthy
 
   app:
-    build: .
+    build:
+      context: .
+      # Baked into the image and reported by /health/live and /health/ready. The runner exports both
+      # into the `docker compose build` child environment; a manual `docker compose build app` on the
+      # host leaves them at their defaults, and the resulting image honestly says `unknown`.
+      args:
+        APP_COMMIT: "${APP_COMMIT:-unknown}"
+        APP_BUILT_AT: "${APP_BUILT_AT:-}"
     restart: unless-stopped
     env_file: .env
     expose:
@@ -38,6 +51,56 @@ services:
       retries: 10
     volumes:
       - ./data/map:/app/data/map:ro
+
+  # The one container that may hold the host's Docker socket, and the reason `app` never does.
+  #
+  # `app` terminates untrusted input all day: public HTTP, SSE, ~54 MTProto channels, a Telegram bot,
+  # model output. The Docker socket is unauthenticated root on the host. This service terminates
+  # exactly one input — a bearer token and a 40-character hex string, both regex-checked — and runs
+  # ONE frozen scenario built from literal argv arrays (`src/deployer/runner.ts`). It is reachable
+  # only from the compose network: `expose`, never `ports`, so Caddy is the only thing on this host
+  # with a published port and it proxies exactly one upstream.
+  #
+  # Deliberately NOT `env_file: .env`. Everything in that file — the bot token, the MTProto session,
+  # the ops password — is secret material this process has no use for. Only the named variables
+  # below reach it.
+  #
+  # It must be started by hand once (`docker compose up -d deployer`): the update scenario refuses to
+  # restart it, because a runner that can replace itself mid-run cannot report its own outcome, and
+  # because an attacker who can push to main must not be able to swap the runner via the button.
+  # `docs/OPERATIONS.md` records that, and step 11 of the scenario reports the resulting drift.
+  deployer:
+    build:
+      context: .
+      dockerfile: deploy/Dockerfile
+    restart: unless-stopped
+    # Defaults rather than compose's `${VAR:?}` required form on purpose: a required variable is
+    # interpolated for the WHOLE file, so an unset one would break `docker compose ps`, the runner's
+    # own `up -d app caddy`, and every routine command for deployments that never enabled this
+    # feature. The loudness lives where it belongs instead — `src/deployer/config.ts` refuses to boot
+    # without a real 32-character token and an absolute repository path, and says which one is
+    # missing.
+    environment:
+      DEPLOY_REPO_PATH: ${DEPLOY_REPO_PATH:-/opt/threatlens-ua}
+      DEPLOY_REPO_URL: ${DEPLOY_REPO_URL:-}
+      DEPLOY_RUNNER_TOKEN: ${DEPLOY_RUNNER_TOKEN:-}
+      DEPLOY_DATABASE_URL: postgresql://${POSTGRES_USER:-threatlens}:${POSTGRES_PASSWORD:-change-me}@postgres:5432/${POSTGRES_DB:-threatlens}
+      DEPLOY_COMPOSE_PROJECT: ${COMPOSE_PROJECT_NAME:-threatlens}
+      DEPLOY_CHECK_INTERVAL_SECONDS: ${DEPLOY_CHECK_INTERVAL_SECONDS:-900}
+      DEPLOY_READY_TIMEOUT_SECONDS: ${DEPLOY_READY_TIMEOUT_SECONDS:-300}
+      DEPLOY_MIN_INTERVAL_SECONDS: ${DEPLOY_MIN_INTERVAL_SECONDS:-60}
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      # Mounted at the SAME absolute path inside the container as on the host. `docker compose` runs
+      # here but the daemon runs there: relative paths in compose.yaml are resolved by the daemon
+      # against `--project-directory`, which is a host path. Any other mount point would make every
+      # bind mount in this file resolve to somewhere that does not exist.
+      - ${DEPLOY_REPO_PATH:-/opt/threatlens-ua}:${DEPLOY_REPO_PATH:-/opt/threatlens-ua}
+    expose:
+      - "9000"
+    depends_on:
+      postgres:
+        condition: service_healthy
 
   postgres:
     image: postgres:18-alpine

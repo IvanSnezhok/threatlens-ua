@@ -31,7 +31,18 @@ const configState = vi.hoisted(() => ({
   ALERT_CHANNEL_ENABLED: true, ALERT_CHANNEL_USERNAME: 'air_alert_ua',
   // Backfill is a separate concern with its own coverage; leaving it on would only make every test
   // here also assert `getMessages` paging.
-  ALERT_CHANNEL_BACKFILL_MESSAGES: 0, ALERT_CHANNEL_BACKFILL_SECONDS: 21_600
+  ALERT_CHANNEL_BACKFILL_MESSAGES: 0, ALERT_CHANNEL_BACKFILL_SECONDS: 21_600,
+  // Same argument for the classifier catch-up the collector now starts once its channels are bound:
+  // its decision logic, its window arithmetic and its idempotency have their own coverage in
+  // `src/services/source-backfill.test.ts` and `tests/integration/classifier-backfill.test.ts`.
+  // Leaving it on here would put a `pool.query` — i.e. a real TCP connection — behind every readiness
+  // assertion in this file. Off, `startClassifierBackfill` returns its stop closure and issues
+  // nothing, which is exactly the seam under test: the collector starts it and does not wait for it.
+  CLASSIFIER_BACKFILL_ENABLED: false, CLASSIFIER_BACKFILL_MIN_GAP_SECONDS: 3600,
+  CLASSIFIER_BACKFILL_MAX_AGE_SECONDS: 21_600, CLASSIFIER_BACKFILL_MAX_MESSAGES: 300,
+  CLASSIFIER_BACKFILL_MAX_PAGES: 5, CLASSIFIER_BACKFILL_PAGE_SIZE: 100,
+  CLASSIFIER_BACKFILL_MAX_SOURCES_PER_SWEEP: 10, CLASSIFIER_BACKFILL_SOURCE_DELAY_MS: 0,
+  CLASSIFIER_BACKFILL_MIN_RERUN_SECONDS: 3600, CLASSIFIER_BACKFILL_CHECK_INTERVAL_SECONDS: 0
 }));
 
 const registry = vi.hoisted(() => ({
@@ -56,6 +67,10 @@ vi.mock('../config.js', () => ({ config: configState }));
 
 vi.mock('../services/ingestion.js', () => ({
   ALERT_CHANNEL_SOURCE_ID: 'air-alert-ua',
+  // Read by `src/services/source-backfill.ts`, which the collector now imports for the catch-up port.
+  // A partial module mock has to name every export the whole import graph reaches, not only the ones
+  // this file calls.
+  ALERT_CHANNEL_ADAPTER_TYPE: 'mtproto_alert_channel',
   MONITOR_ADAPTER_TYPE: 'mtproto_monitor',
   loadAlertChannels: async () => {
     if (registry.alertError) throw registry.alertError;

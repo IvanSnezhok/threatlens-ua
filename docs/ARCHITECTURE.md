@@ -526,6 +526,46 @@ flowchart LR
   Outbox --> Telegram[Telegram delivery]
 ```
 
+### Catch-up backfill for classifier sources
+
+After a restart or a long disconnect the collector resumes at the live edge of every channel: whatever
+was published while the process was down is never read. `src/services/source-backfill.ts` closes that
+gap for the classifier sources — the OSINT monitors and the Air Force channel — and it is a second,
+separate loop from the alert-channel reconnect read in `src/sources/telegram.ts`. The separation is
+structural: the service consumes a `BackfillPort` whose `routes()` yields classifier routes only, it
+imports nothing from `teleproto` or the collector, and every database statement it runs is additionally
+scoped to `adapter_type IN ('mtproto','mtproto_monitor')`. `ALERT_CHANNEL_BACKFILL_*` is untouched.
+The two loops cannot share an implementation, because an alert channel publishes *states* that fold to
+one terminal value per location, and a monitoring channel publishes *events* that fold to nothing.
+
+**The cursor is derived, never stored.** It is `max(published_at)` over `source_messages` for that
+source, served by `source_messages_source_published_idx`. The hot path therefore gains zero writes, a
+message that threw is not marked as done, and a rerun of a window that already landed computes an
+empty replay set before a single history request is made. `source_backfill_state` keeps a copy of the
+cursor and the per-source progress for `/ops` and for audit, and is never read back as an input to the
+decision. A source with an empty archive measures its gap from `baseline_at`, written the first time
+it is seen, so registering a channel can never trigger a read back to the beginning of time.
+
+**The gap decision** is `gap = now - cursor`, compared against `CLASSIFIER_BACKFILL_MIN_GAP_SECONDS`
+(3600) with `<=` — sixty minutes exactly is not more than sixty minutes. The window is
+`[max(cursor, now - MAX_AGE_SECONDS), now]`, paged newest-first, bounded by message count and page
+count, and replayed **in chronological order** so an all-clear can never be applied before the alert
+it cancels. Hitting a bound is `truncated`, which is a bounded success and not a failure. One source
+failing raises `consecutive_failures`, which lengthens its own quiet period exponentially
+(`MIN_RERUN_SECONDS · min(2^n, 24)`) and stops nothing else; `markSourceError` is deliberately not
+called, because live collection for that channel is unaffected.
+
+**Stale history is archive, not news, and the seam is `system_event_log`.** A replayed message carries
+`historical: true` into `ingestThreat`, which computes `outsideWindow = publishedAt + 30 min <= now()`
+per message. Outside the window the event is created `expired` with `ended_at = valid_until`, no new
+district is attached to a live event, no risk signal is written, no corroboration promotion and no
+supersession run, and — the load-bearing one — nothing is appended to `system_event_log`. That row is
+the only trigger the public SSE stream and the Telegram fan-out have, so withholding it suppresses the
+map and the notification at once, in one place. Inside the window nothing changes at all: the
+ten-minute-old post at the recent end of a three-hour gap is published exactly as it would have been
+live. A retraction is never suppressed — a publisher's own all-clear is the safety-positive direction —
+and it is bounded instead by `asserted_at <= <the all-clear's own publication time>`.
+
 The occupation layer has its own flow and does not join the one above:
 
 ```mermaid
@@ -564,7 +604,21 @@ flowchart LR
 - Evidence never downgrades when a weaker message is merged into an event.
 - A source withdraws only its own assertions. A threat event ends as `withdrawn` when its last
   holding assertion is taken back, and its validity is never shortened below what the remaining
-  sources still support. A source that never asserted cannot withdraw anything.
+  sources still support. A source that never asserted cannot withdraw anything. A withdrawal is also
+  bounded in time: it reaches only the assertions that were standing, and the risk signals that had
+  been observed, at the moment it was published, and an assertion published *before* a stand-down can
+  never clear the `withdrawn_at` that stand-down wrote.
+- A message may never move an event's observation window backwards. `last_observed_at` and
+  `valid_until` are maxima, and the summary and direction text are rewritten only by a message at
+  least as new as the one they came from. Out-of-order arrival is the normal case for a catch-up
+  backfill and a routine one for a live reconnect, and before this rule a late message could retire a
+  live threat early or replace its prose with an older sentence.
+- A message outside its own validity window never appends to `system_event_log`. It is archived with
+  its original publication time, its provenance and its classification, and it is unreachable from the
+  public map, the SSE stream and the notification fan-out — because that one row is the only thing
+  either of them reads. The window is checked per message, so a replayed gap publishes its recent end
+  and archives its stale tail. Nothing about a live message's handling changes: the rule applies only
+  to a message the caller declares historical.
 - Withdrawal decays that source's risk signals by expiry, never by a negative contribution, and never
   changes an event's evidence level.
 - OSINT withdrawal has no access to official alert state. `alert_source_states` and `alert_periods`

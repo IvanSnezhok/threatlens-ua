@@ -206,6 +206,12 @@ let openTerritoryId = null;
 let aiRunsSurface = '';
 let opsAuthorization = '';
 let codexPollTimer = null;
+// Опитування картки оновлення. Свій таймер, а не спільний із Codex: він мусить пережити те, що
+// вимикає все інше — перезапуск самого застосунку під час оновлення.
+let deployPollTimer = null;
+// Останнє, що картка оновлення бачила. Потрібне рівно для одного стану: опит зірвався, і треба
+// вирішити, чи це «сервер лежить», чи «сервер саме перезапускається, бо оновлення триває».
+let lastDeployData = null;
 let lastReceived = null;
 let refreshTimer = null;
 let backendStatus = 'current';
@@ -3193,8 +3199,323 @@ function wireRuntimeSection(root, onSaved) {
   });
 }
 
+// ------------------------------------------------------------------------------------------------
+// Кероване оновлення з /ops
+// ------------------------------------------------------------------------------------------------
+//
+// Картка мусить лишатися чесною в момент, коли вона сама зникає: оновлення перезбирає й перезапускає
+// той самий контейнер, який її віддає. Тому все, що вона показує, приходить із журналу в базі —
+// PostgreSQL сценарій оновлення свідомо не перезапускає, — а зірваний опит поруч із активним запуском
+// читається як «застосунок перезапускається», а не як «щось зламалося».
+//
+// Підтвердження — у два кроки й без діалогу. Модальне вікно ставить питання «ви впевнені?», на яке
+// чесна відповідь завжди «так», і тому воно нічого не перевіряє. Друге натискання на кнопку, яка
+// відкрито називає СЕМИЗНАЧНИЙ commit, перевіряє рівно те, що треба: що оператор бачив, що саме
+// поїде на сервер.
+
+const DEPLOY_STAGES = ['queued', 'checking', 'building', 'migrating', 'starting', 'waiting_ready'];
+const DEPLOY_STAGE_NAMES = {
+  queued: 'у черзі', checking: 'перевірка', building: 'збірка',
+  migrating: 'міграції', starting: 'запуск', waiting_ready: 'готовність'
+};
+const DEPLOY_ERROR_TEXT = {
+  remote_mismatch: 'origin робочого дерева не збігається з налаштованим репозиторієм',
+  working_tree_dirty: 'у робочому дереві на хості є незбережені зміни',
+  fetch_failed: 'не вдалося прочитати origin/main',
+  commit_moved: 'origin/main зрушив між показом і підтвердженням',
+  checkout_failed: 'не вдалося перемкнути робоче дерево на цільовий commit',
+  build_failed: 'збірка образу завершилася помилкою',
+  migration_failed: 'міграції з цільового образу не застосувалися — старий застосунок працює далі',
+  start_failed: 'docker compose up завершився помилкою',
+  ready_timeout: 'новий застосунок не відповів на /health/ready за відведений час',
+  ready_commit_mismatch: '/health/ready відповідає з іншого commit — контейнер не перестворився',
+  runner_lost: 'процес оновлення зник; запуск закрито як невдалий',
+  journal_unavailable: 'журнал оновлень недоступний',
+  internal_error: 'внутрішня помилка процесу оновлення'
+};
+const DEPLOY_STATUS_NAMES = { succeeded: 'успішно', failed: 'невдало' };
+
+function shortCommit(value) {
+  return value ? String(value).slice(0, 7) : '—';
+}
+
+function deployMoment(value) {
+  return value ? new Date(value).toLocaleString('uk-UA') : '—';
+}
+
+// Тривалість словами, без секунд там, де вони нічого не додають: збірка міряється хвилинами.
+function deployDuration(ms) {
+  if (ms == null || !Number.isFinite(Number(ms))) return '—';
+  const seconds = Math.max(0, Math.round(Number(ms) / 1000));
+  if (seconds < 90) return `${seconds} с`;
+  const minutes = Math.floor(seconds / 60);
+  return `${minutes} хв ${seconds - minutes * 60} с`;
+}
+
+// Тон — не прикраса, як і в решті ops-консолі: синхронізований стан лишається беззвучним, бо жодної
+// дії не вимагає, і саме тому доступне оновлення чи розбіжність помітні.
+function deployPill(data) {
+  if (!data.enabled) return { label: 'вимкнено', tone: 'off' };
+  if (!data.runner?.reachable) return { label: 'Runner недоступний', tone: 'warn' };
+  if (data.current) return { label: 'оновлення триває', tone: 'warn' };
+  if (data.commitState === 'in_sync') return { label: 'Синхронізовано', tone: 'ok' };
+  if (data.commitState === 'behind') return { label: 'Доступне оновлення', tone: 'warn' };
+  if (data.commitState === 'drifted') return { label: 'Розбіжність', tone: 'warn' };
+  return { label: 'стан невідомий', tone: 'off' };
+}
+
+function deployStageStrip(run) {
+  const current = DEPLOY_STAGES.indexOf(run.currentStage ?? run.status);
+  const cells = DEPLOY_STAGES.map((stage, index) => {
+    const state = index < current ? ' is-done' : index === current ? ' is-current' : '';
+    return `<li class="deploy-stage${state}">${escapeHtml(DEPLOY_STAGE_NAMES[stage])}</li>`;
+  }).join('');
+  const started = Date.parse(run.startedAt ?? run.requestedAt);
+  const elapsed = Number.isFinite(started) ? deployDuration(Date.now() - started) : '—';
+  return `<ol class="deploy-stages">${cells}</ol>
+    <p class="legend-note">Триває ${escapeHtml(elapsed)} · ${escapeHtml(shortCommit(run.fromCommit))} → ${escapeHtml(shortCommit(run.toCommit ?? run.expectedCommit))} · запустив ${escapeHtml(run.requestedBy ?? '—')}</p>
+    <p class="legend-warning" id="deploy-restart-note" hidden>Застосунок перезапускається — оновлення триває. Журнал зберігається в базі і зʼявиться після відновлення.</p>`;
+}
+
+function deployRunRow(run) {
+  const failed = run.status === 'failed';
+  const tone = failed ? 'bad' : run.status === 'succeeded' ? 'ok' : 'warn';
+  const label = DEPLOY_STATUS_NAMES[run.status] ?? run.status;
+  const migrations = (run.migrationsApplied ?? []).length;
+  return `<article>
+    <div>
+      <span>${escapeHtml(deployMoment(run.requestedAt))} · ${escapeHtml(run.requestedBy ?? '—')} · ${escapeHtml(shortCommit(run.fromCommit))} → ${escapeHtml(shortCommit(run.toCommit ?? run.expectedCommit))}</span>
+      <h3>${escapeHtml(label)}${failed ? ` — ${escapeHtml(run.currentStage ?? 'невідомий етап')}` : ''}</h3>
+      <p>${escapeHtml(deployDuration(run.durationMs))} · міграцій застосовано: ${migrations}${migrations ? ` (${escapeHtml((run.migrationsApplied ?? []).join(', '))})` : ''}</p>
+      ${failed ? `<p class="legend-warning">${escapeHtml(run.errorCode ?? 'помилка')}: ${escapeHtml(DEPLOY_ERROR_TEXT[run.errorCode] ?? run.errorSummary ?? 'причину не записано')}</p>` : ''}
+      ${failed && run.logTail ? `<details><summary>Журнал команди</summary><pre class="ops-json">${escapeHtml(run.logTail)}</pre></details>` : ''}
+    </div>
+    <div class="ops-channel-actions"><span class="codex-state is-${tone}">${escapeHtml(label)}</span></div>
+  </article>`;
+}
+
+function opsDeploySection(data) {
+  if (!data) {
+    return '<section class="ops-section" id="deploy-section"><header class="ops-section-head"><div><p>Розгортання</p><h2>Оновлення з main</h2></div></header><p class="legend-note">Стан оновлення недоступний.</p></section>';
+  }
+  const repo = data.repo ?? {};
+  const pill = deployPill(data);
+  const target = repo.remoteCommit;
+  // Кнопку вимкнено рівно тоді, коли натискання не мало б сенсу або не мало б адресата: нема чого
+  // оновлювати, нема куди слати, або запуск уже триває.
+  const canDeploy = Boolean(data.enabled && data.runner?.reachable && target && !data.current
+    && data.commitState !== 'in_sync' && !repo.workingTreeDirty);
+  const facts = `<dl class="codex-facts">
+      <div><dt>Образ</dt><dd>${escapeHtml(shortCommit(data.app?.commit))}${data.app?.builtAt ? ` · ${escapeHtml(deployMoment(data.app.builtAt))}` : ''}</dd></div>
+      <div><dt>Робоче дерево</dt><dd>${escapeHtml(shortCommit(repo.workingTreeCommit))}${repo.workingTreeDirty ? ' · є незбережені зміни' : ''}</dd></div>
+      <div><dt>origin/main</dt><dd>${escapeHtml(shortCommit(target))}</dd></div>
+      <div><dt>Перевірено</dt><dd>${escapeHtml(deployMoment(repo.lastCheckedAt))}</dd></div>
+      <div><dt>Останнє оновлення</dt><dd>${data.history?.length ? `${escapeHtml(DEPLOY_STATUS_NAMES[data.history[0].status] ?? data.history[0].status)} · ${escapeHtml(deployMoment(data.history[0].requestedAt))}` : 'ще не було'}</dd></div>
+      <div><dt>Схема</dt><dd>${escapeHtml(String(data.app?.migrations?.newest ?? '—'))}</dd></div>
+    </dl>`;
+  const notes = [];
+  if (!data.enabled) notes.push('Оновлення з панелі вимкнено: <code>DEPLOY_ENABLED=false</code>. Контейнер <code>deployer</code> не потрібен і не запускається.');
+  else if (!data.runner?.reachable) notes.push('Процес оновлення не відповідає. Він запускається на хості один раз: <code>docker compose up -d deployer</code>.');
+  if (repo.workingTreeDirty) notes.push('У робочому дереві на хості є незбережені зміни. Оновлення їх не чіпає і не почнеться, доки вони там.');
+  if (repo.lastCheckOk === false && repo.lastCheckError) notes.push(`Остання перевірка не вдалася: ${escapeHtml(repo.lastCheckError)}`);
+  const pending = data.history?.[0]?.pendingManualServices ?? [];
+  if (pending.length) {
+    notes.push(`Конфігурація цих сервісів змінилася, але оновлення їх свідомо не перезапускає: ${escapeHtml(pending.join(', '))}. На хості: <code>docker compose -p threatlens up -d ${escapeHtml(pending.join(' '))}</code>`);
+  }
+  return `<section class="ops-section" id="deploy-section">
+    <header class="ops-section-head">
+      <div><p>Розгортання · гілка ${escapeHtml(data.limits?.ref ?? 'refs/heads/main')}</p><h2>Оновлення з main</h2></div>
+      <div class="ops-channel-actions">
+        <span class="codex-state is-${pill.tone}">${escapeHtml(pill.label)}</span>
+        <button type="button" data-deploy-check${data.enabled ? '' : ' disabled'}>Перевірити</button>
+        <button type="button" data-deploy-run data-commit="${escapeHtml(target ?? '')}"${canDeploy ? '' : ' disabled'}>Оновити до ${escapeHtml(shortCommit(target))}</button>
+      </div>
+    </header>
+    ${facts}
+    ${notes.map((note) => `<p class="legend-note">${note}</p>`).join('')}
+    <output id="deploy-status"></output>
+    ${data.current ? deployStageStrip(data.current) : ''}
+    <div class="ops-channel-list">${(data.history ?? []).map(deployRunRow).join('')}</div>
+    <div class="safety-note">
+      <strong>Оновлення незворотне</strong>
+      <p>Міграції не відкочуються: код їде вперед, схема — лише вперед. Повернення коду — ручна дія на хості (<code>git checkout &lt;commit&gt;</code> і повторна збірка), і вона не скасовує вже застосованих міграцій. Перезапускаються тільки <code>${escapeHtml((data.limits?.services ?? ['app', 'caddy']).join('</code>, <code>'))}</code>; <code>${escapeHtml((data.limits?.manualServices ?? ['postgres', 'backup', 'deployer']).join('</code>, <code>'))}</code> лишаються на місці й оновлюються руками.</p>
+    </div>
+  </section>`;
+}
+
+function wireDeploySection(root) {
+  clearInterval(deployPollTimer);
+  const section = $('#deploy-section', root);
+  if (!section) return;
+  const status = $('#deploy-status', section);
+
+  const repaint = (data) => {
+    lastDeployData = data;
+    const current = $('#deploy-section', root);
+    if (!current) return;
+    current.outerHTML = opsDeploySection(data);
+    wireDeploySection(root);
+  };
+
+  const load = () => opsFetch('/ops/api/deploy')
+    .then((result) => result.ok ? result.json() : null)
+    .catch(() => null);
+
+  $('[data-deploy-check]', section)?.addEventListener('click', async (event) => {
+    const button = event.currentTarget;
+    button.disabled = true; button.textContent = 'Перевіряємо…';
+    const result = await opsFetch('/ops/api/deploy/check', { method: 'POST' }).catch(() => null);
+    if (!result?.ok) {
+      const payload = await result?.json().catch(() => null);
+      status.textContent = payload?.error === 'runner_unreachable'
+        ? 'Процес оновлення не відповідає.'
+        : 'Не вдалося перевірити origin/main.';
+      button.disabled = false; button.textContent = 'Перевірити';
+      return;
+    }
+    repaint(await load());
+  });
+
+  // Два кроки на одній кнопці. Перше натискання лише перейменовує її, називаючи commit; друге —
+  // надсилає. Через десять секунд кнопка сама повертається до першого стану, щоб «озброєна» кнопка
+  // не чекала випадкового кліку хвилинами.
+  $('[data-deploy-run]', section)?.addEventListener('click', async (event) => {
+    const button = event.currentTarget;
+    const commit = button.dataset.commit;
+    if (!commit) return;
+    if (button.dataset.armed !== 'true') {
+      button.dataset.armed = 'true';
+      button.textContent = `Підтвердити оновлення до ${shortCommit(commit)}`;
+      setTimeout(() => {
+        if (!button.isConnected || button.dataset.armed !== 'true') return;
+        button.dataset.armed = 'false';
+        button.textContent = `Оновити до ${shortCommit(commit)}`;
+      }, 10_000);
+      return;
+    }
+    button.dataset.armed = 'false';
+    button.disabled = true; button.textContent = 'Запускаємо…';
+    const result = await opsFetch('/ops/api/deploy', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ confirm: true, expectedRemoteCommit: commit })
+    }).catch(() => null);
+    const payload = await result?.json().catch(() => null);
+    if (result?.status === 202) status.textContent = `Оновлення запущено (запуск №${payload?.runId ?? '?'}).`;
+    else if (result?.status === 409) status.textContent = 'Оновлення вже триває.';
+    else if (result?.status === 429) status.textContent = `Занадто часто. Спробуйте за ${payload?.retryAfterSeconds ?? 60} с.`;
+    else if (result?.status === 502) status.textContent = 'Процес оновлення не відповідає.';
+    else status.textContent = 'Не вдалося запустити оновлення.';
+    repaint(await load());
+  });
+
+  deployPollTimer = setInterval(async () => {
+    const armed = $('[data-deploy-run]', root)?.dataset.armed === 'true';
+    const data = await load();
+    if (!data) {
+      // Опит зірвався. Якщо востаннє ми бачили активний запуск — це не збій, це і є оновлення:
+      // сервер, який відповідав на цей запит, зараз перестворюється.
+      const note = $('#deploy-restart-note', root);
+      if (note && lastDeployData?.current) note.hidden = false;
+      return;
+    }
+    if (armed) { lastDeployData = data; return; }
+    // Перемальовуємо лише тоді, коли щось справді змінилося: картка з розгорнутим журналом не має
+    // згортатися кожні три секунди.
+    const signature = JSON.stringify([
+      data.commitState, data.enabled, data.runner?.reachable, data.repo?.remoteCommit,
+      data.repo?.lastCheckedAt, data.current?.id, data.current?.status, data.history?.[0]?.id,
+      data.history?.[0]?.status
+    ]);
+    const previous = JSON.stringify([
+      lastDeployData?.commitState, lastDeployData?.enabled, lastDeployData?.runner?.reachable,
+      lastDeployData?.repo?.remoteCommit, lastDeployData?.repo?.lastCheckedAt,
+      lastDeployData?.current?.id, lastDeployData?.current?.status,
+      lastDeployData?.history?.[0]?.id, lastDeployData?.history?.[0]?.status
+    ]);
+    if (signature === previous) { lastDeployData = data; return; }
+    repaint(data);
+  }, 3000);
+}
+
+// ------------------------------------------------------------------------------------------------
+// Дозбір повідомлень після простою
+// ------------------------------------------------------------------------------------------------
+//
+// Тільки читання: ручного запуску тут немає навмисно. Дозбір, викликаний натисканням, — це сплеск
+// історичних запитів у той момент, коли оператор найбільше нервує, а Telegram найменше схильний
+// пробачати; сканування саме перевіряє розрив кожні кілька хвилин.
+//
+// «Обмежено» — не помилка. Вікно має межі за віком, кількістю і сторінками, і джерело, яке в них
+// уперлося, дозбиралося успішно рівно настільки, наскільки йому дозволено.
+
+const BACKFILL_STATUS = {
+  ok: { label: 'дозбір виконано', tone: 'ok' },
+  truncated: { label: 'дозбір обмежено', tone: 'warn' },
+  skipped_small_gap: { label: 'розрив малий', tone: 'off' },
+  skipped_recent: { label: 'перевірено нещодавно', tone: 'off' },
+  skipped_disabled: { label: 'вимкнено', tone: 'off' },
+  no_cursor: { label: 'архів порожній', tone: 'off' },
+  failed: { label: 'помилка', tone: 'bad' }
+};
+const BACKFILL_TRUNCATED = { age: 'віком', count: 'кількістю', pages: 'сторінками' };
+
+function backfillGap(seconds) {
+  if (seconds == null || !Number.isFinite(Number(seconds))) return '—';
+  const value = Math.max(0, Math.round(Number(seconds)));
+  if (value < 90) return `${value} с`;
+  if (value < 5400) return `${Math.round(value / 60)} хв`;
+  return `${(value / 3600).toFixed(1)} год`;
+}
+
+function backfillRow(source) {
+  const state = BACKFILL_STATUS[source.lastRunStatus] ?? { label: 'ще не перевірялося', tone: 'off' };
+  const truncated = source.lastRunStatus === 'truncated' && source.truncatedReason
+    ? ` ${escapeHtml(BACKFILL_TRUNCATED[source.truncatedReason] ?? source.truncatedReason)}`
+    : '';
+  return `<article>
+    <div>
+      <span>${escapeHtml(source.sourceId ?? '')} · розрив ${escapeHtml(backfillGap(source.gapSeconds))}</span>
+      <h3>${escapeHtml(source.name ?? source.sourceId ?? '—')}</h3>
+      <p>курсор ${escapeHtml(deployMoment(source.cursorPublishedAt))} · перевірено ${escapeHtml(deployMoment(source.lastCheckedAt))}</p>
+      <p>прочитано ${escapeHtml(String(source.messagesRead ?? 0))} · застосовано ${escapeHtml(String(source.messagesReplayed ?? 0))} · застарілих ${escapeHtml(String(source.messagesStale ?? 0))} · сторінок ${escapeHtml(String(source.pagesRead ?? 0))}</p>
+      ${source.lastError ? `<p class="legend-warning">${escapeHtml(source.lastError)}</p>` : ''}
+    </div>
+    <div class="ops-channel-actions"><span class="codex-state is-${state.tone}">${escapeHtml(state.label)}${truncated}</span></div>
+  </article>`;
+}
+
+function opsBackfillSection(data) {
+  if (!data) {
+    return '<section class="ops-section" id="backfill-section"><header class="ops-section-head"><div><p>Збір</p><h2>Дозбір після простою</h2></div></header><p class="legend-note">Стан дозбору недоступний.</p></section>';
+  }
+  const thresholds = data.thresholds ?? {};
+  const sources = [...(data.sources ?? [])]
+    .sort((left, right) => Number(right.gapSeconds ?? 0) - Number(left.gapSeconds ?? 0));
+  const failing = sources.filter((source) => source.lastRunStatus === 'failed').length;
+  const pill = failing
+    ? { label: `помилок: ${failing}`, tone: 'bad' }
+    : data.sweep?.running ? { label: 'сканування триває', tone: 'warn' } : { label: 'у нормі', tone: 'off' };
+  return `<section class="ops-section" id="backfill-section">
+    <header class="ops-section-head">
+      <div><p>Збір · класифікаційні Telegram-джерела</p><h2>Дозбір після простою</h2></div>
+      <span class="codex-state is-${pill.tone}">${escapeHtml(pill.label)}</span>
+    </header>
+    <dl class="codex-facts">
+      <div><dt>Поріг розриву</dt><dd>${escapeHtml(backfillGap(thresholds.minGapSeconds ?? 3600))}</dd></div>
+      <div><dt>Вікно</dt><dd>${escapeHtml(backfillGap(thresholds.maxAgeSeconds ?? 21600))}</dd></div>
+      <div><dt>Ліміт повідомлень</dt><dd>${escapeHtml(String(thresholds.maxMessages ?? 300))}</dd></div>
+      <div><dt>Ліміт сторінок</dt><dd>${escapeHtml(String(thresholds.maxPages ?? 5))}</dd></div>
+      <div><dt>Останнє сканування</dt><dd>${escapeHtml(deployMoment(data.sweep?.lastAt))}</dd></div>
+      <div><dt>Джерел у списку</dt><dd>${sources.length}</dd></div>
+    </dl>
+    <p class="legend-note">${escapeHtml(data.notice ?? 'Офіційні alert-канали дозбираються окремим контуром і сюди не входять.')}</p>
+    <div class="ops-channel-list">${sources.map(backfillRow).join('')}</div>
+  </section>`;
+}
+
 async function renderOps() {
   clearInterval(codexPollTimer);
+  clearInterval(deployPollTimer);
   const root = contentShell('Закритий контур', 'Операційна консоль', 'Стан системи та керування каталогом рекомендованих Telegram-каналів.');
   const response = await opsFetch('/ops/api');
   if (response.status === 401) {
@@ -3216,18 +3537,22 @@ async function renderOps() {
   // Стан входу приходить у складі налаштувань, а не окремим запитом: перемикач «увімкнено» поруч
   // із мертвою сесією — найзаплутаніший стан цієї функції, і показати їх із двох різних моментів
   // означало б зробити його ще заплутанішим.
-  const [vectorOps, codexSettings, aiRuns, shadow, sourceTrust, runtime] = await Promise.all([
+  const [vectorOps, codexSettings, aiRuns, shadow, sourceTrust, runtime, deploy, backfill] = await Promise.all([
     opsFetch('/ops/vectors').then((result) => result.ok ? result.json() : null).catch(() => null),
     opsFetch('/ops/codex/settings').then((result) => result.ok ? result.json() : null).catch(() => null),
     opsFetch(aiRunsUrl()).then((result) => result.ok ? result.json() : null).catch(() => null),
     opsFetch('/ops/shadow-classifier?hours=24').then((result) => result.ok ? result.json() : null).catch(() => null),
     opsFetch('/ops/api/source-trust').then((result) => result.ok ? result.json() : null).catch(() => null),
-    opsFetch('/ops/api/runtime').then((result) => result.ok ? result.json() : null).catch(() => null)
+    opsFetch('/ops/api/runtime').then((result) => result.ok ? result.json() : null).catch(() => null),
+    opsFetch('/ops/api/deploy').then((result) => result.ok ? result.json() : null).catch(() => null),
+    opsFetch('/ops/api/backfill').then((result) => result.ok ? result.json() : null).catch(() => null)
   ]);
+  lastDeployData = deploy;
   const codex = codexSettings?.status ?? null;
   const queued = data.outbox.reduce((sum, item) => sum + Number(item.count), 0);
   root.innerHTML = `<div class="ops-metrics"><article><span>Джерела</span><strong>${data.sources.length}</strong></article><article><span>Черга</span><strong>${queued}</strong></article><article><span>Канали</span><strong>${data.channels.filter((item) => item.active).length}</strong></article><article><span>PostgreSQL</span><strong>${escapeHtml(data.database.size)}</strong></article></div>
     ${opsRuntimeSection(runtime)}
+    ${opsDeploySection(deploy)}
     <section class="ops-section"><header class="ops-section-head"><div><p>Каталог для користувачів</p><h2>Додати Telegram-канал</h2></div><button id="ops-logout">Вийти</button></header>
       <form id="channel-form" class="channel-form">
         <label>Назва<input required name="title" maxlength="120" placeholder="Повітряні Сили ЗС України"></label>
@@ -3242,6 +3567,7 @@ async function renderOps() {
       <div class="ops-channel-list">${data.channels.map((channel) => `<article class="${channel.active ? '' : 'is-disabled'}"><div><span>${channel.verified ? '✓ перевірено' : escapeHtml(channel.category)}</span><h3>${escapeHtml(channel.title)}</h3><p>@${escapeHtml(channel.username)}${channel.location_name ? ` · ${escapeHtml(channel.location_name)}` : ''}</p></div><div class="ops-channel-actions"><a href="${escapeHtml(channel.url)}" target="_blank" rel="noreferrer">Відкрити ↗</a><button data-channel-toggle="verified" data-id="${channel.id}" data-value="${channel.verified}">${channel.verified ? 'Зняти перевірку' : 'Перевірити'}</button><button data-channel-toggle="active" data-id="${channel.id}" data-value="${channel.active}">${channel.active ? 'Приховати' : 'Активувати'}</button></div></article>`).join('')}</div>
     </section>
     ${opsSourceTrustSection(sourceTrust)}
+    ${opsBackfillSection(backfill)}
     <div class="ops-group" id="codex-group">
       <header class="ops-group-head"><p>Модель в аналітиці</p><h2>Codex-аналітика</h2>
         <p>Вхід, вибір моделі, чотири перемикачі, звірка з правилами й журнал усіх звернень — усе, що визначає, коли систему пише машина, і що саме вона написала.</p></header>
@@ -3253,6 +3579,9 @@ async function renderOps() {
     ${opsVectorSection(vectorOps)}
     <details class="ops-raw"><summary>Технічний стан і журнали</summary><pre class="ops-json">${escapeHtml(JSON.stringify({ sources: data.sources, outbox: data.outbox, aiRuns: data.aiRuns, database: data.database }, null, 2))}</pre></details>`;
   wireRuntimeSection(root, () => renderOps());
+  // Картка оновлення перемальовує ЛИШЕ себе і має власний таймер: повний renderOps() кожні три
+  // секунди скидав би напівзаповнену форму каналу й напівнабраний пароль сусідніх карток.
+  wireDeploySection(root);
   wireCodexSection(root, codexSettings?.settings ?? null);
   wireCodexSettingsSection(root, () => renderOps());
   wireShadowSection(root, codexSettings?.settings ?? null);
@@ -3298,8 +3627,10 @@ function renderCurrentRoute(options = {}) {
   const fromSnapshot = options?.fromSnapshot === true;
   // Карту знімаємо лише коли справді йдемо з маршруту карти — на місці вона переживає оновлення знімка.
   if (map && route !== '/') { map.remove(); map = null; mapLayersReady = false; }
-  // Опитування стану входу Codex привʼязане до вузла, якого поза консоллю вже немає.
-  if (route !== '/ops') clearInterval(codexPollTimer);
+  // Опитування стану входу Codex і стану оновлення привʼязані до вузлів, яких поза консоллю вже
+  // немає. Таймер оновлення особливо: він перемальовує #deploy-section, а на карті такого вузла
+  // не існує, тож кожні три секунди він шукав би його марно.
+  if (route !== '/ops') { clearInterval(codexPollTimer); clearInterval(deployPollTimer); }
   if (route === '/') renderMapPage();
   else if (route === '/history') void renderHistory();
   else if (route === '/attacks') void renderAttacks();

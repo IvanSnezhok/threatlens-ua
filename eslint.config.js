@@ -87,5 +87,38 @@ export default tseslint.config(
       '@typescript-eslint/no-non-null-assertion': 'off',
       'no-console': 'off'
     }
+  },
+  {
+    /**
+     * The deployment runner's isolation, expressed as a rule rather than as a directory boundary.
+     *
+     * `src/deployer/**` compiles into a SEPARATE container that holds `/var/run/docker.sock`
+     * (`deploy/Dockerfile`, service `deployer`). It lives in the ordinary source tree so that the
+     * project's typecheck, lint and unit tests cover the code that can restart production — but it
+     * must never grow a dependency on the application it deploys. One `import { pool }
+     * from '../db/pool.js'` and the runner would carry `src/config.ts`, which expects the app's whole
+     * `.env`; one `import … from 'fastify'` and the socket-holding process acquires a plugin
+     * ecosystem nobody here has read.
+     *
+     * The allow-list is `node:*`, `pg`, `zod` and this package's own files. Everything else,
+     * including any `../` escape, is an error. Widening it is a deliberate, reviewable act.
+     */
+    files: ['src/deployer/**/*.ts'],
+    // The tests are not part of the image — `deploy/Dockerfile` copies only compiled `dist/deployer`
+    // and `tsconfig.json` excludes `*.test.ts` from the build — so they may import `vitest`. The
+    // structural half of this rule in `compose-contract.test.ts` skips them for the same reason.
+    ignores: ['src/deployer/**/*.test.ts'],
+    rules: {
+      'no-restricted-imports': ['error', {
+        patterns: [{
+          // A negative lookahead rather than a gitignore-style negated group: `!./*` does not
+          // un-match a specifier that begins with `./`, so the group form would forbid this
+          // package's own files. Anything that is not a node builtin, `pg`, `zod` or a sibling in
+          // this directory matches — including every `../` escape.
+          regex: '^(?!node:|pg$|zod$|\\./[^/]+$)',
+          message: 'src/deployer/** may import only node:*, pg, zod and its own files: it builds into the container that holds the Docker socket.'
+        }]
+      }]
+    }
   }
 );

@@ -2,8 +2,8 @@
 
 ## Health
 
-- `/health/live`: process is running. This is what the container healthcheck probes, so nothing below restarts the app.
-- `/health/ready`: database is reachable, the latest required migration is applied (currently `022_publication_runtime.sql`), and the MTProto collector is not blocked. The response carries a `collector` object in both directions; `503 {"reason":"collector_flood_wait"}` and `collector_failed` are the two states that mean no Telegram channel is being read at all. `disabled` (no MTProto credentials) and `degraded` (handlers live, some handles unbound) stay ready.
+- `/health/live`: process is running. This is what the container healthcheck probes, so nothing below restarts the app. It also carries `commit` and `builtAt` — what image is actually serving, baked in at build time.
+- `/health/ready`: database is reachable, **every migration shipped in this image** is applied, and the MTProto collector is not blocked. The migration check is a set comparison against the image's own `migrations/` directory, not one hard-coded filename: a 503 answers `{"reason":"migrations_pending","required":[…],"applied":[…]}` so the diff is readable. A ready response carries `commit` (the image's `APP_COMMIT`) and `migration` (the newest shipped file) — the deployment runner requires both a 200 and a matching `commit` before it records an update as successful, which is what stops a `compose up` that silently kept the old container from being reported as a success. The response carries a `collector` object in both directions; `503 {"reason":"collector_flood_wait"}` and `collector_failed` are the two states that mean no Telegram channel is being read at all. `disabled` (no MTProto credentials) and `degraded` (handlers live, some handles unbound) stay ready.
 - `/api/v1/sources/health`: configured, current, stale, error and unconfigured source states. MTProto rows additionally carry `collector` — the live handler state, which the database cannot hold.
 - `/ops/api`: Basic-auth protected worker, AI, source and database state.
 - `/ops`: operator console. Credentials are held only in the active tab's memory; it can add, verify, activate and hide recommended Telegram channels.
@@ -257,6 +257,191 @@ Reading it:
   `sources` row — disable it — not a hope that the measurement will silence it.
 - **A step in a series with an unchanged channel** usually means `TRUST_METHODOLOGY_VERSION` moved;
   every row carries the version it was computed under, so compare like with like.
+
+## Deployment from /ops
+
+Off unless `DEPLOY_ENABLED=true`. Off is a complete configuration: the «Оновлення з main» block says
+so, no `deployer` container is needed, and updates stay a manual `git pull && docker compose up -d
+--build` on the host.
+
+### Prerequisites, in order
+
+1. **An absolute checkout path, mounted at the same path inside the runner.**
+   `DEPLOY_REPO_PATH=/opt/threatlens-ua` and the bind mount in `compose.yaml` is
+   `${DEPLOY_REPO_PATH}:${DEPLOY_REPO_PATH}`. This is not a stylistic choice: `docker compose` runs
+   *inside* the runner, but the daemon that executes the resulting mounts runs *outside*, and
+   relative bind mounts in `compose.yaml` are resolved daemon-side against `--project-directory`,
+   which is a host path. Mount the checkout anywhere else and every relative mount in the file
+   resolves to a directory that does not exist on the host.
+2. **`name: threatlens` in `compose.yaml`** (already there). The runner addresses the stack as
+   `docker compose -p threatlens`; an inferred project name would build a second stack beside the
+   running one and the update would appear to do nothing.
+3. **A real token.** `openssl rand -hex 32` into `DEPLOY_RUNNER_TOKEN`. Production refuses to boot
+   with `DEPLOY_ENABLED=true` and fewer than 32 characters, and the runner itself refuses to start.
+4. **Start the runner once, by hand:** `docker compose up -d deployer`. The scenario deliberately
+   never restarts it — a runner that replaces itself mid-run cannot report its own outcome, and
+   somebody who can push to `main` must not be able to swap the runner by way of the button.
+5. **Branch protection on `main`.** Anyone who can write `main` ships code the moment an operator
+   presses the button. Stated prerequisite, not a defect.
+
+### What the button can and cannot do
+
+| Can | Cannot |
+|---|---|
+| Rebuild and restart at the current `origin/main` of the configured remote | Choose a branch, tag, fork, remote or arbitrary commit — no code path, plus a DB `CHECK (remote_ref='refs/heads/main')` |
+| Run pending migrations from the target image | Reach a shell, or pass any operator-supplied byte to a subprocess argument |
+| Recreate `app` and `caddy` | Restart `postgres`, `backup` or `deployer` |
+| Read the journal and the tail of a failing command | Run two updates at once, or more often than `DEPLOY_MIN_INTERVAL_SECONDS` |
+
+The app never holds the Docker socket, and `src/deployer/compose-contract.test.ts` fails the build if
+that changes. The runner publishes no host port (`expose`, never `ports`) and Caddy proxies exactly
+one upstream, `app:3000`.
+
+### The scenario, stage by stage
+
+`checking` → `building` → `migrating` → `starting` → `waiting_ready` → `succeeded` | `failed`.
+«idle» is the absence of an active row.
+
+1. `checking` — origin URL matches, working tree clean, `git fetch` origin/main, the fetched SHA
+   equals the one the operator confirmed, record `HEAD` and what `/health/live` reports, then
+   `git checkout --detach <target>`. If the checkout and the running container are both already at
+   the target, the run finishes `succeeded` with `already_current` and nothing is built.
+2. `building` — `docker compose build app` with `APP_COMMIT`/`APP_BUILT_AT` in the child environment.
+3. `migrating` — `schema_migrations` is read, `docker compose run --rm --no-deps -T app node
+   dist/db/migrate.js` runs from the freshly built image **while the old app is still serving**, and
+   the set difference lands in `migrations_applied`. An empty list is the healthy result of a
+   code-only release.
+4. `starting` — `docker compose up -d --no-build app caddy`.
+5. `waiting_ready` — poll `/health/ready` until it answers 200 **and** `commit` equals the target,
+   up to `DEPLOY_READY_TIMEOUT_SECONDS`.
+6. A best-effort drift probe compares the compose definitions of `postgres`, `backup` and `deployer`
+   against the running containers and records `pending_manual_services`. It can never fail a run.
+
+**Why the migration is a separate step before the restart.** `src/index.ts` still runs `migrate()`
+at boot, and that stays as the cold-start cover. But boot-time migration happens *after* the old
+container has been destroyed: a failing migration then leaves a crash-looping new container and a
+site that is down. Running it from the new image while the old one still serves means a failure ends
+the run at `migrating` with the site untouched — the least bad outcome of a bad release, and the one
+the runbook wants.
+
+**The cost, stated:** between the migration and the restart, old code runs against the new schema.
+That makes expand/contract a hard project rule — a migration may add; it may not rename or drop a
+column the previous release still reads, in the same release. Every migration in this repository
+complies.
+
+### Reading it by hand
+
+```bash
+# The whole card the console renders, in one request.
+curl -fsS -u "$OPS_USER:$OPS_PASSWORD" http://localhost:3000/ops/api/deploy
+
+# Ask what origin/main holds right now. `git ls-remote`, no fetch, nothing written to the checkout.
+curl -fsS -u "$OPS_USER:$OPS_PASSWORD" -X POST http://localhost:3000/ops/api/deploy/check
+
+# Trigger. `confirm` and a 40-hex commit are the ONLY accepted keys; anything else is a 400.
+curl -fsS -u "$OPS_USER:$OPS_PASSWORD" -X POST -H 'Content-Type: application/json' \
+  -d '{"confirm":true,"expectedRemoteCommit":"<40 hex>"}' http://localhost:3000/ops/api/deploy
+
+# The journal, straight from the database — this is what survives the restart it describes.
+docker compose exec -T postgres psql -U threatlens -d threatlens -c "
+  SELECT id, status, current_stage, requested_at, requested_by,
+         left(from_commit,7) AS from, left(to_commit,7) AS to,
+         error_code, cardinality(migrations_applied) AS migrations
+  FROM deployment_runs ORDER BY requested_at DESC LIMIT 10"
+
+docker compose exec -T postgres psql -U threatlens -d threatlens -c "
+  SELECT at, stage, outcome, duration_ms, detail FROM deployment_run_events
+  WHERE run_id=(SELECT max(id) FROM deployment_runs) ORDER BY id"
+
+# What the last check saw.
+docker compose exec -T postgres psql -U threatlens -d threatlens -c 'TABLE deployment_state'
+```
+
+`log_tail` on a failed row is the end of the failing command's output, already stripped of the runner
+token and the PostgreSQL password. It is rendered verbatim in `/ops`.
+
+### Recovery, per `error_code`
+
+| `error_code` | What happened | What to do |
+|---|---|---|
+| `remote_mismatch` | The checkout's `origin` is not `DEPLOY_REPO_URL` | Fix the remote on the host, or the variable. Nothing was touched. |
+| `working_tree_dirty` | Uncommitted changes on the host | Commit, stash or discard them. The runner refuses rather than discarding somebody's work. |
+| `fetch_failed` | `git fetch` could not reach the remote | Network, DNS, rate limit. Read `log_tail`. Nothing was touched. |
+| `commit_moved` | `origin/main` moved between the page render and the confirmation | Reload `/ops` and confirm the new SHA. This is the guard working. |
+| `checkout_failed` | `git checkout --detach` failed | Read `log_tail`; usually a permission or a local ref problem. Working tree may be mid-checkout — inspect it on the host. |
+| `build_failed` | The image did not build | The site is untouched and still serving. Read `log_tail`, fix, push, press again. |
+| `migration_failed` | **The good failure.** A migration from the new image failed | The old container is still serving. Each migration file runs in its own transaction, so the schema is consistent at whichever file failed. Fix the migration, push, press again. Do not hand-edit `schema_migrations`. |
+| `start_failed` | `docker compose up` failed | Read `log_tail` (port conflict, missing volume). `docker compose ps` on the host; the old container may already be gone. |
+| `ready_timeout` | The new container never became ready | `docker compose logs app`. The migrations already ran, so a rollback is a code rollback only (below). |
+| `ready_commit_mismatch` | `/health/ready` answers 200 from a **different** commit | The recreate did not happen or brought back the old container. `docker compose ps` and `docker compose up -d --force-recreate app` on the host. This is the check that stops a no-op being recorded as a success. |
+| `runner_lost` | The runner process died mid-run | The next runner start reclaims the row and marks it. Check `docker compose ps deployer` and its logs; the update may or may not have landed — compare `/health/live`'s `commit` with `origin/main`. |
+
+### Rollback boundaries
+
+- **Forward-only.** Migrations are never reversed by anything in this system, and no endpoint offers
+  it. A bad release is fixed by a new commit.
+- **Rolling code back is a manual host action**, and it does not undo a migration:
+
+  ```bash
+  cd "$DEPLOY_REPO_PATH"
+  git checkout --detach <known-good-commit>
+  APP_COMMIT=$(git rev-parse HEAD) docker compose -p threatlens build app
+  docker compose -p threatlens up -d --no-build app caddy
+  ```
+
+  This works only because migrations expand rather than rename or drop. If a release did break that
+  rule, the rollback path is a restore from `backups/` (see "Backups"), which loses everything
+  written since the dump — which is why the rule is a rule.
+- **`postgres`, `backup` and `deployer` never move.** When their compose definition changes, the run
+  records `pending_manual_services` and `/ops` prints the command; run it during a maintenance
+  window, not during an attack.
+
+## Catch-up backfill (дозбір)
+
+After downtime the collector reads what it missed for every enabled **classifier** Telegram source.
+Official alert channels are not part of this contour at all: they have their own reconnect path
+(`ALERT_CHANNEL_BACKFILL_*`), because their messages are state transitions that get folded to one
+terminal state per location, while these are events that get archived one by one.
+
+### The decision, per source
+
+```
+gap = now - cursor.published_at        # cursor is derived from source_messages, not stored state
+skipped_disabled    the feature or the source is off
+no_cursor           the archive is empty; baseline_at was just written, so the gap is zero
+skipped_recent      read too recently (exponential guard after failures)
+skipped_small_gap   gap <= CLASSIFIER_BACKFILL_MIN_GAP_SECONDS      # 59 min -> skip, 60 min -> skip
+run                 otherwise                                        # 61 min -> run
+```
+
+The window is `[max(cursor, now - MAX_AGE_SECONDS), now]`, paged newest-first and replayed in
+chronological order. **`truncated` is a success**, not a failure: the window hit its bound by age,
+count or pages, and everything inside it was replayed. `/ops` says «дозбір обмежено» and names which
+bound. A permanently truncated source is a configuration decision, not an incident.
+
+**Why a stale message never becomes news.** The single trigger for the public map, the SSE stream and
+every Telegram notification is a row in `system_event_log`. A replayed message whose own 30-minute
+validity window has already closed is archived — `source_messages`, `message_classifications`, a
+`threat_events` row born `expired` — and appends *nothing* to `system_event_log`. No log row means no
+fanout and no map change, in one place rather than in five. A message from inside the window is
+treated exactly as a live one, because it is one.
+
+```bash
+# Per-source progress, worst gap first.
+docker compose exec -T postgres psql -U threatlens -d threatlens -c "
+  SELECT source_id, last_run_status, truncated_reason, last_gap_seconds,
+         cursor_published_at, messages_read, messages_replayed, messages_stale, pages_read,
+         consecutive_failures, left(coalesce(last_error,''),80) AS error
+  FROM source_backfill_state ORDER BY last_gap_seconds DESC NULLS LAST"
+
+# Clear the exponential re-run guard for one source after fixing the cause.
+docker compose exec -T postgres psql -U threatlens -d threatlens -c "
+  UPDATE source_backfill_state SET consecutive_failures=0, last_run_at=NULL WHERE source_id='…'"
+```
+
+There is deliberately **no manual trigger**. An operator-fired history burst is exactly the request
+shape that earns a Telegram flood wait, and a flood wait stops live collection for every channel on
+the account. The sweep re-checks every `CLASSIFIER_BACKFILL_CHECK_INTERVAL_SECONDS` (300) by itself.
 
 ## Analytical queries
 
@@ -635,5 +820,37 @@ Production backups must additionally be encrypted and copied to independent obje
 - **Comparing two periods of analytics.** Always split by `classifier_version` or state that you did
   not. A version bump changes what the same message means, and an unsplit comparison reports a change
   in this project's rules as a change in enemy behaviour.
+- **A deployment ended in `failed`.** Every stage transition is in `deployment_runs` /
+  `deployment_run_events`, and the tail of the failing command is in `log_tail`. The per-`error_code`
+  response table is in "Deployment from /ops" above; the three worth repeating here are
+  `migration_failed` (the **good** failure — the old container is still serving, fix the migration
+  and press again), `ready_commit_mismatch` (the recreate did not happen; `/health/ready` is
+  answering from the previous image, so `docker compose up -d --force-recreate app` on the host) and
+  `runner_lost` (the runner process died mid-run; the next runner start reclaims the row, and whether
+  the update landed is answered by comparing `/health/live`'s `commit` with `origin/main`).
+
+  A run that appears stuck is distinguished from a dead one by `heartbeat_at`, refreshed every ten
+  seconds. A non-terminal row whose heartbeat is minutes old is an abandoned run and is reclaimed the
+  next time a runner takes the lock — including at runner start, so `docker compose restart deployer`
+  is the fastest way to resolve one.
+- **`pending_manual_services` is non-empty on the last run.** The compose definition of `postgres`,
+  `backup` or `deployer` changed and the update deliberately did not restart it — postgres holds the
+  journal a run needs in order to report its own failure, and the runner cannot restart itself. The
+  console prints the command; run it during a maintenance window:
+  `docker compose -p threatlens up -d <services>`. Ignoring it is safe but means the running
+  container no longer matches the file, which is exactly the drift the probe exists to surface.
+- **`threatlens_notifications_suppressed_total{reason="expired"} > 0`.** The fanout tried to deliver
+  a threat whose validity window had already closed and refused. A small count right after a
+  catch-up read is expected — it is the defence-in-depth layer behind the `system_event_log` seam
+  doing its job. A count that keeps growing outside a catch-up means the notification worker is more
+  than thirty minutes behind the events it is reading: check `worker_state` for
+  `notification-fanout`, the outbox backlog in `/ops/api`, and whether delivery is failing rather
+  than the events being stale.
+- **A source stuck in `failed` in `source_backfill_state`.** One source failing never stops live
+  collection, never stops the other sources' catch-up, and never marks the source unhealthy —
+  `last_error` and `consecutive_failures` are the whole signal. The exponential guard backs the retry
+  off to `MIN_RERUN_SECONDS * min(2^failures, 24)`, i.e. at most once a day, so a poison message is
+  bounded rather than a loop. After fixing the cause, clear the guard with the `UPDATE` in "Catch-up
+  backfill" above. `truncated` is **not** a failure and needs no response.
 - **Edited monitored message:** revision is stored; incompatible previous event is marked corrected.
 - **Incorrect channel recommendation:** hide it in `/ops`; public API, site and bot stop returning it immediately.

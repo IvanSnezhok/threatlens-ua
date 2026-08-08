@@ -106,6 +106,17 @@ async function appendSystemEvent(client: PoolClient, eventType: string, payload:
   return Number(result.rows[0]?.version ?? 0);
 }
 
+/**
+ * How long one message keeps the event it raised valid, in milliseconds.
+ *
+ * The same thirty minutes every `interval '30 minutes'` in this file writes, expressed once so that
+ * the *decision* built on it — "is this message still inside its own validity window?" — is taken
+ * from the same number the rows are written with. `src/services/source-backfill.ts` reads it to
+ * label a replayed message `stale`, and {@link ingestThreat} reads it to decide whether a historical
+ * message may publish at all. Two copies of that constant is two definitions of "expired".
+ */
+export const THREAT_VALIDITY_MS = 30 * 60_000;
+
 const evidenceRank: Record<EvidenceLevel, number> = { unverified: 0, monitoring: 1, confirmed: 2, official: 3 };
 function strongestEvidence(left: EvidenceLevel, right: EvidenceLevel): EvidenceLevel {
   return evidenceRank[left] >= evidenceRank[right] ? left : right;
@@ -125,6 +136,13 @@ const LIVE_STATUSES = ['observed', 'confirmed', 'active'];
  * was over and is now reporting it again is asserting, not contradicting itself, and its row has to
  * count towards keeping the event alive. `GREATEST` on the timestamps keeps an out-of-order replay
  * from shortening a window that a newer message already extended.
+ *
+ * **The conflict branch is gated on the withdrawal being older than this assertion.** Re-assertion
+ * means "I said it was over, and now I am saying it again"; it does not mean "a message published
+ * before my all-clear has just been read". Without the `WHERE`, replaying an hour-old post — which
+ * is exactly what a catch-up backfill does — would clear a `withdrawn_at` that a *later* stand-down
+ * wrote and put a threat its own publisher has already retracted back on the map. Zero rows updated
+ * is the correct, silent outcome in that case: the newer statement stands.
  */
 async function assertThreat(
   client: PoolClient,
@@ -142,7 +160,9 @@ async function assertThreat(
        asserted_message_id=EXCLUDED.asserted_message_id,
        valid_until=GREATEST(threat_assertions.valid_until,EXCLUDED.valid_until),
        withdrawn_at=NULL,withdrawn_message_id=NULL,withdrawal_reason=NULL,
-       updated_at=now()`,
+       updated_at=now()
+     WHERE threat_assertions.withdrawn_at IS NULL
+        OR threat_assertions.withdrawn_at <= EXCLUDED.asserted_at`,
     [values.eventId, values.sourceId, values.independenceGroup, values.locationId,
       values.threatType, values.observedAt, values.sourceMessageId]
   );
@@ -191,13 +211,19 @@ const NO_WITHDRAWAL: WithdrawalOutcome = {
  *     enforced here, once, in SQL. A withdrawal from channel A cannot reach a row owned by channel
  *     B, so a mis-parsed joke or a channel testing its keyboard can never clear a threat two other
  *     monitors are still reporting — and a source that never asserted matches no rows and therefore
- *     changes nothing at all, without needing a special case.
+ *     changes nothing at all, without needing a special case. It is additionally bounded in TIME:
+ *     `asserted_at <= $2` means a stand-down retracts only what was standing **when it was
+ *     published**. Without that bound an hour-old all-clear read off a channel's history — the
+ *     ordinary output of a catch-up backfill — would close an assertion the same source made ten
+ *     minutes ago and take a live warning off the map, which is the one direction
+ *     `docs/ARCHITECTURE.md` §Consistency rules calls unrecoverable.
  *  2. **Decay this source's risk signals** for the same places and classes, by pulling `expires_at`
- *     back to now. Not a negative contribution: a negative term could drive a location's index to
- *     zero while a real threat from other sources is still running, whereas expiry says only "the
- *     basis for *this* signal is gone" and leaves the time decay in `src/services/risk.ts` to handle
- *     the rest. Scoped on `source_messages.source_id` rather than `independence_group`, because a
- *     repost aggregator shares its group with the channel it copies.
+ *     back to now — and, for the same reason, only the signals this source had already observed by
+ *     the moment the all-clear was published. Not a negative contribution: a negative term could
+ *     drive a location's index to zero while a real threat from other sources is still running,
+ *     whereas expiry says only "the basis for *this* signal is gone" and leaves the time decay in
+ *     `src/services/risk.ts` to handle the rest. Scoped on `source_messages.source_id` rather than
+ *     `independence_group`, because a repost aggregator shares its group with the channel it copies.
  *  3. **Re-derive each touched event.** The event lives while any assertion still holds, exactly as
  *     an official alert lives while `bool_or(holds)` over `alert_source_states`. When something
  *     still holds, `valid_until` is recomputed as the maximum the survivors support, so it can never
@@ -216,6 +242,7 @@ export async function applyRetraction(client: PoolClient, scope: RetractionScope
         SET withdrawn_at=$2::timestamptz,withdrawn_message_id=$3,withdrawal_reason=$4,updated_at=now()
       WHERE source_id=$1
         AND withdrawn_at IS NULL
+        AND asserted_at <= $2::timestamptz
         AND ($5::text[] IS NULL OR location_id = ANY($5::text[]))
         AND ($6::text[] IS NULL OR threat_type = ANY($6::text[]))
       RETURNING event_id,asserted_at`,
@@ -228,6 +255,7 @@ export async function applyRetraction(client: PoolClient, scope: RetractionScope
       WHERE sm.id=rs.source_message_id
         AND sm.source_id=$1
         AND rs.expires_at > $2::timestamptz
+        AND rs.observed_at <= $2::timestamptz
         AND ($3::text[] IS NULL OR rs.location_id = ANY($3::text[]))
         AND ($4::text[] IS NULL OR rs.threat_type = ANY($4::text[]))`,
     [scope.sourceId, scope.at, scope.locationIds, scope.threatTypes]
@@ -448,11 +476,54 @@ export interface IngestThreatResult {
   sourceMessageId: string;
   /** Present for `redirect`: what the same message took back for the place it says was passed. */
   withdrawal: WithdrawalOutcome;
+  /**
+   * Whether this call appended a lifecycle row to `system_event_log`.
+   *
+   * False for a duplicate and for a message replayed from outside its own validity window. That row
+   * is the ONLY trigger for the public SSE stream and for the Telegram fan-out
+   * (`src/bot/outbox.ts`), so `published: false` is the machine-readable form of "this landed in the
+   * archive and nowhere else".
+   */
+  published: boolean;
+}
+
+export interface IngestThreatOptions {
+  /**
+   * The message is being replayed from the catch-up backfill rather than read live.
+   *
+   * On its own the flag changes nothing: a message replayed ten minutes after publication is still
+   * news, and `src/services/source-backfill.ts` replays a downtime window that ends at *now*. What
+   * it enables is the check below — `publishedAt + THREAT_VALIDITY_MS <= now()`, i.e. "this message
+   * is already outside the window it would have created" — and only messages that fail that check
+   * are treated as archive.
+   *
+   * It is opt-in, and it is opt-in from the CALLER rather than derived from the timestamp, because
+   * the live path must keep its current behaviour exactly: a live message that arrives forty minutes
+   * late through a Telegram outage is still the collector observing the channel, and silently
+   * demoting it would be a behaviour change nobody asked for.
+   */
+  historical?: boolean;
 }
 
 export async function ingestThreat(
-  message: NormalizedMessage, classified: ClassifiedMessage
+  message: NormalizedMessage, classified: ClassifiedMessage, options: IngestThreatOptions = {}
 ): Promise<IngestThreatResult> {
+  /**
+   * "Stale history is archive, not news", as one boolean.
+   *
+   * The seam is `system_event_log`: nothing reaches the public map or a subscriber's phone except
+   * through a row in that table, so refusing to write one suppresses both at once and does it in a
+   * single place instead of in a rule the SSE relay and the fan-out would each have to re-derive.
+   * Everything else this flag switches off — new districts on a live event, risk signals,
+   * corroboration promotion, supersession — is a state change that would ALSO be perceivable, and
+   * each of them is disabled for its own reason at the site where it happens.
+   *
+   * A retraction is deliberately NOT switched off. A publisher's own all-clear is the safety-positive
+   * direction, and with the `asserted_at <= $2` bound in {@link applyRetraction} it can only ever
+   * reach what was standing when it was published.
+   */
+  const outsideWindow = Boolean(options.historical)
+    && message.publishedAt.getTime() + THREAT_VALIDITY_MS <= Date.now();
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
@@ -468,7 +539,7 @@ export async function ingestThreat(
       await client.query('COMMIT');
       return {
         id: duplicate.rows[0].event_id, version: await systemVersion(), created: false,
-        sourceMessageId: duplicate.rows[0].id, withdrawal: NO_WITHDRAWAL
+        sourceMessageId: duplicate.rows[0].id, withdrawal: NO_WITHDRAWAL, published: false
       };
     }
     const previousMessage = await client.query<{ id: string; event_id: string | null }>(
@@ -554,10 +625,27 @@ export async function ingestThreat(
     if (existing.rowCount && existing.rows[0]) {
       eventId = existing.rows[0].id;
       const nextEvidence = strongestEvidence(existing.rows[0].evidence_level, evidenceLevel);
+      // Every column that describes WHEN the event was last seen moves forwards only, and the two
+      // columns of prose are rewritten only by a message at least as new as the one they came from.
+      //
+      // Before this, any late message dragged a live window backwards: an out-of-order arrival — and
+      // every message a catch-up backfill replays is out of order by construction — reset
+      // `last_observed_at` to its own older timestamp and recomputed `valid_until` from it, so a
+      // threat another message had just extended to 04:10 could be pulled back to 03:40 and expire
+      // early. `GREATEST` makes both monotonic. The prose is guarded separately because it is not a
+      // maximum of anything: overwriting «курс на Полтавщину» with an hour-old «повз Бровари» is not
+      // a shorter window, it is a wrong sentence on a live marker.
+      //
+      // `$3 >= last_observed_at` reads the row's PRE-UPDATE value: PostgreSQL evaluates every SET
+      // expression against the old tuple, so the guard and the assignment beside it cannot disagree.
       await client.query(
-        `UPDATE threat_events SET summary=$2,last_observed_at=$3,updated_at=now(),
-         evidence_level=$4,status=CASE WHEN $4='official' THEN 'active' ELSE status END,
-         direction_text=COALESCE($5,direction_text),valid_until=$3::timestamptz + interval '30 minutes'
+        `UPDATE threat_events SET
+           summary=CASE WHEN $3::timestamptz >= last_observed_at THEN $2 ELSE summary END,
+           last_observed_at=GREATEST(last_observed_at,$3::timestamptz),updated_at=now(),
+           evidence_level=$4,status=CASE WHEN $4='official' THEN 'active' ELSE status END,
+           direction_text=CASE WHEN $3::timestamptz >= last_observed_at
+             THEN COALESCE($5,direction_text) ELSE direction_text END,
+           valid_until=GREATEST(valid_until,$3::timestamptz + interval '30 minutes')
          WHERE id=$1`,
         [eventId, classified.summary, message.publishedAt, nextEvidence, classified.directionText ?? null]
       );
@@ -571,33 +659,59 @@ export async function ingestThreat(
       }
     } else {
       created = true;
+      // Born expired, with `ended_at` already set to the deadline the message itself carried.
+      //
+      // Writing `observed` and letting the sweeper retire it later would leave a window — however
+      // short — in which a three-hour-old post is a live threat, and `liveThreats` has a second
+      // branch that deliberately keeps terminal rows visible while `ended_at > cutoff`: an event
+      // that ended at 03:40 and was inserted at 06:40 fails that branch by three hours, so setting
+      // `ended_at` here is what makes the row unreachable from the map in delayed mode as well as in
+      // live mode. `/api/v1/history` filters on nothing but `created_at <= cutoff`, so the event is
+      // still in the archive an operator and a reader can page through — which is the whole point of
+      // replaying the window at all.
       const result = await client.query<{ id: string }>(
-        `INSERT INTO threat_events(threat_type,status,evidence_level,title,summary,started_at,last_observed_at,direction_text,valid_until)
-         VALUES ($1,$2,$3,$4,$5,$6::timestamptz,$6::timestamptz,$7,$6::timestamptz + interval '30 minutes') RETURNING id`,
-        [classified.threatType, evidenceLevel === 'official' ? 'active' : 'observed', evidenceLevel,
-          classified.title, classified.summary, message.publishedAt, classified.directionText ?? null]
+        `INSERT INTO threat_events(threat_type,status,evidence_level,title,summary,started_at,last_observed_at,direction_text,valid_until,ended_at)
+         VALUES ($1,$2,$3,$4,$5,$6::timestamptz,$6::timestamptz,$7,$6::timestamptz + interval '30 minutes',
+           CASE WHEN $8 THEN $6::timestamptz + interval '30 minutes' ELSE NULL END) RETURNING id`,
+        [classified.threatType,
+          outsideWindow ? 'expired' : evidenceLevel === 'official' ? 'active' : 'observed', evidenceLevel,
+          classified.title, classified.summary, message.publishedAt, classified.directionText ?? null,
+          outsideWindow]
       );
       eventId = result.rows[0]!.id;
     }
 
-    for (const location of eventLocations) {
-      await client.query(
-        `INSERT INTO threat_event_locations(event_id,location_id,relation_type) VALUES ($1,$2,$3)
-         ON CONFLICT DO NOTHING`, [eventId, location.id, location.relationType]
-      );
-      // The source's own claim over this place, one row per constituent threat class. The event now
-      // lives while at least one such row holds, instead of purely on the 30-minute timer, and the
-      // same row is what a later withdrawal from this source — and only from this source — matches.
-      for (const signalThreatType of classified.signalThreatTypes) {
-        await assertThreat(client, {
-          eventId, sourceId: message.sourceId, independenceGroup: sourceRow.independence_group,
-          locationId: location.id, threatType: signalThreatType,
-          observedAt: message.publishedAt, sourceMessageId
-        });
+    // A stale message may furnish the event it just created — that event is expired and drawn
+    // nowhere — but it may not attach a district or an assertion to an event that is LIVE. Under the
+    // territory model a district is a polygon and an icon stack, so growing the geography of a
+    // standing threat from an hour-old post changes the most perceivable output the map has, and
+    // `decideThreatNotification` reads exactly that growth as `geography_changed`. The assertion
+    // rides with the district for the same reason and one more: an assertion is a claim about NOW,
+    // and a message outside its own validity window is by definition not making one.
+    if (created || !outsideWindow) {
+      for (const location of eventLocations) {
+        await client.query(
+          `INSERT INTO threat_event_locations(event_id,location_id,relation_type) VALUES ($1,$2,$3)
+           ON CONFLICT DO NOTHING`, [eventId, location.id, location.relationType]
+        );
+        // The source's own claim over this place, one row per constituent threat class. The event now
+        // lives while at least one such row holds, instead of purely on the 30-minute timer, and the
+        // same row is what a later withdrawal from this source — and only from this source — matches.
+        for (const signalThreatType of classified.signalThreatTypes) {
+          await assertThreat(client, {
+            eventId, sourceId: message.sourceId, independenceGroup: sourceRow.independence_group,
+            locationId: location.id, threatType: signalThreatType,
+            observedAt: message.publishedAt, sourceMessageId
+          });
+        }
       }
     }
+    // No risk signal from a message outside its own window. `src/services/risk.ts` decays on a
+    // two-hour half-life and gates on `expires_at > now()` alone, so a three-hour-old signal still
+    // contributes about a third of its weight — a backfill would quietly raise the analytic index of
+    // every oblast in the replayed window hours after the reports it is built from stopped applying.
     const baseContribution = sourceRow.official ? 2.5 : sourceRow.tier === 'B' ? 1.5 : 0.6;
-    for (const target of signalTargets) {
+    for (const target of outsideWindow ? [] : signalTargets) {
       for (const signalThreatType of classified.signalThreatTypes) {
         await client.query(
           `INSERT INTO risk_signals(signal_type,source_message_id,location_id,threat_type,source_tier,
@@ -613,7 +727,11 @@ export async function ingestThreat(
       `INSERT INTO event_evidence(event_id,source_message_id,evidence_role,confidence) VALUES ($1,$2,$3,$4)
        ON CONFLICT DO NOTHING`, [eventId, sourceMessageId, sourceRow.independence_group, evidenceLevel === 'official' ? 1 : 0.55]
     );
-    if (evidenceLevel !== 'official') {
+    // Corroboration is a statement about the present tense — "two independent groups are reporting
+    // this" — and a message from outside its own validity window is not reporting anything now. It
+    // is also the one branch here that can raise a LIVE event's evidence level, which
+    // `decideThreatNotification` reads as `evidence_raised` and sends as an escalation.
+    if (evidenceLevel !== 'official' && !outsideWindow) {
       const corroboration = await client.query<{ independent_sources: number }>(
         `SELECT count(DISTINCT s.independence_group)::integer AS independent_sources
          FROM event_evidence ee
@@ -637,7 +755,12 @@ export async function ingestThreat(
         }
       }
     }
-    if (previousMessage.rows[0]?.event_id && previousMessage.rows[0].event_id !== eventId) {
+    // Supersession is switched off for the same reason: it ENDS a live event (`status='corrected'`,
+    // `ended_at=now()`) and announces that through `threat.corrected`. An edit read out of a
+    // channel's history hours later must not retire a threat that is standing now. The revision row
+    // and `supersedes_message_id` above are untouched — they are provenance, which issue #3 requires
+    // a backfill to preserve, and neither is visible on any public surface.
+    if (!outsideWindow && previousMessage.rows[0]?.event_id && previousMessage.rows[0].event_id !== eventId) {
       const previousEvent = await client.query<{ evidence_level: EvidenceLevel; status: string }>(
         `SELECT evidence_level,status FROM threat_events WHERE id=$1 FOR UPDATE`,
         [previousMessage.rows[0].event_id]
@@ -690,9 +813,18 @@ export async function ingestThreat(
         });
       }
     }
-    const version = await appendSystemEvent(client, created ? 'threat.created' : 'threat.updated', { eventId });
+    // THE SEAM. No row here means no SSE frame and no outbox line — `fanoutNewEvents` walks this
+    // table and nothing else. The version still has to be answered truthfully, so it is read after
+    // the COMMIT (through the pool, never through this client, which is still holding a transaction
+    // and would need a second connection to answer a question it has already asked).
+    const version = outsideWindow
+      ? 0
+      : await appendSystemEvent(client, created ? 'threat.created' : 'threat.updated', { eventId });
     await client.query('COMMIT');
-    return { id: eventId, version, created, sourceMessageId, withdrawal };
+    return {
+      id: eventId, version: outsideWindow ? await systemVersion() : version,
+      created, sourceMessageId, withdrawal, published: !outsideWindow
+    };
   } catch (error) {
     await client.query('ROLLBACK');
     throw error;

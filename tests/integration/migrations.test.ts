@@ -23,7 +23,8 @@ const MIGRATION_FILES = [
   '019_notification_state.sql',
   '020_shadow_classifications.sql',
   '021_source_trust.sql',
-  '022_publication_runtime.sql'
+  '022_publication_runtime.sql',
+  '023_deployment_and_backfill.sql'
 ];
 
 describe.skipIf(!integrationDatabaseAvailable)('migration runner against live PostgreSQL', () => {
@@ -54,10 +55,53 @@ describe.skipIf(!integrationDatabaseAvailable)('migration runner against live Po
     expect(after.rows).toEqual(before.rows);
   });
 
-  it('creates the readiness marker the /health/ready probe queries', async () => {
-    // src/api/server.ts gates readiness on this exact filename; a renamed migration must break here.
-    const marker = await sql("SELECT 1 FROM schema_migrations WHERE filename='022_publication_runtime.sql'");
-    expect(marker.rowCount).toBe(1);
+  it('leaves every migration shipped in the image applied, which is what /health/ready now asks', async () => {
+    // This replaces a test that named ONE filename. `/health/ready` used to gate on that hard-coded
+    // string, so readiness answered 200 with a newer migration unapplied — and the deployment runner
+    // in `src/deployer/runner.ts` treats a 200 from `/health/ready` as proof that the update landed.
+    // A readiness gate that cannot see a pending migration would let a half-migrated deployment be
+    // recorded as a success, so the probe now compares the *set* of `*.sql` files shipped in the
+    // image against `schema_migrations`, and so does this test.
+    const { readdir } = await import('node:fs/promises');
+    const { resolve } = await import('node:path');
+    const shipped = (await readdir(resolve(process.cwd(), 'migrations')))
+      .filter((file) => file.endsWith('.sql')).sort();
+    // The literal list at the top of this file is the human-readable half: a migration added without
+    // touching it fails here rather than silently widening the set the next assertion checks.
+    expect(shipped).toEqual(MIGRATION_FILES);
+
+    const applied = await sql<{ filename: string }>('SELECT filename FROM schema_migrations');
+    const appliedSet = new Set(applied.rows.map((row) => row.filename));
+    const missing = shipped.filter((file) => !appliedSet.has(file));
+    expect(missing, 'shipped migrations that /health/ready would report as pending').toEqual([]);
+    // Newest on disk specifically: `ensureMigrated()` probes exactly this file to decide whether a
+    // reused database is current, and the readiness gate fails the moment it is absent.
+    expect(appliedSet.has(shipped.at(-1)!)).toBe(true);
+  });
+
+  it('registers the deployment journal, its single-active lock and the backfill cursor index', async () => {
+    // Migration 023 carries two independent sections and a half-applied pair would leave /ops
+    // rendering a card whose table does not exist.
+    const tables = await sql<{ table_name: string }>(
+      `SELECT table_name FROM information_schema.tables
+        WHERE table_schema='public'
+          AND table_name IN ('deployment_runs','deployment_run_events','deployment_state','source_backfill_state')
+        ORDER BY table_name`
+    );
+    expect(tables.rows.map((row) => row.table_name)).toEqual([
+      'deployment_run_events', 'deployment_runs', 'deployment_state', 'source_backfill_state'
+    ]);
+    const indexes = await sql<{ indexname: string }>(
+      `SELECT indexname FROM pg_indexes
+        WHERE indexname IN ('deployment_runs_single_active_uidx','source_messages_source_published_idx')
+        ORDER BY indexname`
+    );
+    expect(indexes.rows.map((row) => row.indexname)).toEqual([
+      'deployment_runs_single_active_uidx', 'source_messages_source_published_idx'
+    ]);
+    // Singleton, seeded by the migration: reading it must never be "no row, therefore unknown".
+    const state = await sql<{ n: string }>(`SELECT count(*)::text AS n FROM deployment_state`);
+    expect(Number(state.rows[0]!.n)).toBe(1);
   });
 
   it('seeds the reference catalogue the ingestion and fanout paths depend on', async () => {
