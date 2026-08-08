@@ -1,7 +1,8 @@
 import { z } from 'zod';
 import { config } from '../config.js';
 import { pool } from '../db/pool.js';
-import { codexCredentials } from './codex-auth.js';
+import { codexCredentials, type CodexCredentials } from './codex-auth.js';
+import { codexChat } from './codex-client.js';
 import { resolveCodexSettings, type ResolvedCodexSettings } from './codex-settings.js';
 import type { StrategicOverview } from './analytics-archive.js';
 
@@ -310,21 +311,31 @@ function describe(facts: NarrativeFacts): ModelNarrative {
 // The model call
 // ------------------------------------------------------------------------------------------------
 
-interface NarrativeProvider {
-  baseUrl: string;
-  model: string;
-  headers: Record<string, string>;
-}
+/**
+ * Two providers, two transports, on purpose.
+ *
+ * The Codex path carries no endpoint and no headers: the call goes through {@link codexChat}, which
+ * owns the transport decision (Responses API against the ChatGPT backend, `chat/completions`
+ * against a proxy) and the audit of the call itself. Keeping a URL here was how this module ended
+ * up speaking `chat/completions` to a backend that never accepted it. The `AI_*` path keeps its
+ * plain OpenAI-compatible request — that endpoint is the risk engine's and speaks nothing else.
+ */
+export type NarrativeProvider =
+  | { kind: 'codex'; model: string }
+  | { kind: 'ai'; baseUrl: string; model: string; headers: Record<string, string> };
 
 /**
- * The settings read, injectable.
+ * The settings and credential reads, injectable.
  *
  * A unit test asserting "with nothing configured, nothing is called" must not depend on whether a
  * PostgreSQL happens to be listening on the machine running it — that is a test that passes for the
- * wrong reason on a developer's laptop and hangs on a build agent.
+ * wrong reason on a developer's laptop and hangs on a build agent. The credential read is here for
+ * the same reason: with `CODEX_BASE_URL` set, deciding between the two providers requires knowing
+ * whether a session exists, and that knowledge lives in a database table.
  */
 export interface NarrateDeps {
   settings?: () => Promise<ResolvedCodexSettings>;
+  credentials?: () => Promise<CodexCredentials | null>;
 }
 
 /**
@@ -364,21 +375,17 @@ export async function narrativeProvider(deps: NarrateDeps = {}): Promise<Narrati
   const codexModel = settings?.effectiveModel ?? (config.CODEX_MODEL || null);
 
   if (codexAllowed && config.CODEX_BASE_URL && codexModel) {
-    const session = await codexCredentials().catch(() => null);
+    // The token is looked at only to decide whether this provider is available; it travels no
+    // further. `codexChat` re-reads the credential itself at call time, which also means a refresh
+    // between this check and the call is the client's to perform, not ours to have pre-empted.
+    const session = await (deps.credentials ?? codexCredentials)().catch(() => null);
     const token = session?.accessToken || config.CODEX_API_KEY;
-    if (token) {
-      const headers: Record<string, string> = {
-        Authorization: `Bearer ${token}`,
-        'Content-Type': 'application/json'
-      };
-      const accountId = session?.accountId || config.CODEX_ACCOUNT_ID;
-      if (accountId) headers['ChatGPT-Account-Id'] = accountId;
-      return { baseUrl: config.CODEX_BASE_URL, model: codexModel, headers };
-    }
+    if (token) return { kind: 'codex', model: codexModel };
   }
   if (!config.ANALYTICS_NARRATIVE_ENABLED) return null;
   if (config.AI_BASE_URL && config.AI_API_KEY && config.AI_MODEL) {
     return {
+      kind: 'ai',
       baseUrl: config.AI_BASE_URL,
       model: config.AI_MODEL,
       headers: { Authorization: `Bearer ${config.AI_API_KEY}`, 'Content-Type': 'application/json' }
@@ -438,6 +445,50 @@ export async function narrateOverview(
   }
 
   const started = Date.now();
+  const deterministic = (rejectionReason: string): AnalyticsNarrative => ({
+    ...describe(facts), generatedBy: 'deterministic', aiGenerated: false, model: provider.model,
+    rejectionReason: rejectionReason.slice(0, 200), facts
+  });
+
+  // What the model sent back, however it was transported. Parsing, schema, grounding and labelling
+  // are identical for both providers — the only thing the branch below decides is the wire.
+  const conclude = async (content: string): Promise<AnalyticsNarrative> => {
+    try {
+      const parsed = narrativeSchema.parse(JSON.parse(content));
+      const rejection = verifyNarrative(parsed, facts);
+      if (rejection) {
+        await audit('failed', provider.model, facts, parsed, Date.now() - started, rejection);
+        return deterministic(rejection);
+      }
+      if (provider.kind === 'ai') await audit('success', provider.model, facts, parsed, Date.now() - started);
+      return {
+        ...parsed, caveats: withAiMarker(parsed.caveats), generatedBy: 'model', aiGenerated: true,
+        model: provider.model, rejectionReason: null, facts
+      };
+    } catch (error) {
+      await audit('failed', provider.model, facts, null, Date.now() - started, error);
+      return deterministic(String(error));
+    }
+  };
+
+  if (provider.kind === 'codex') {
+    // `codexChat` audits the call itself — including the transport and pre-flight failures — under
+    // this same prompt version, so this path writes no success row of its own: one call, one row.
+    // A grounding rejection still lands as its own `failed` row above, because "the model answered
+    // and the answer was refused" is a fact the transport log alone cannot express.
+    const result = await codexChat({
+      promptVersion: 'analytics-narrative-v1',
+      system: SYSTEM_PROMPT,
+      user: JSON.stringify(facts),
+      json: true,
+      model: provider.model,
+      timeoutMs: options.timeoutMs,
+      auditInput: facts
+    }, { fetchImpl: options.fetchImpl, credentials: options.credentials, settings: options.settings });
+    if (!result.ok) return deterministic(`${result.reason}: ${result.detail}`);
+    return conclude(result.content);
+  }
+
   const doFetch = options.fetchImpl ?? fetch;
   try {
     const response = await doFetch(`${provider.baseUrl.replace(/\/$/, '')}/chat/completions`, {
@@ -458,26 +509,10 @@ export async function narrateOverview(
     const body = await response.json() as { choices?: Array<{ message?: { content?: string } }> };
     const content = body.choices?.[0]?.message?.content;
     if (!content) throw new Error('narrative endpoint returned empty content');
-    const parsed = narrativeSchema.parse(JSON.parse(content));
-    const rejection = verifyNarrative(parsed, facts);
-    if (rejection) {
-      await audit('failed', provider.model, facts, parsed, Date.now() - started, rejection);
-      return {
-        ...describe(facts), generatedBy: 'deterministic', aiGenerated: false, model: provider.model,
-        rejectionReason: rejection, facts
-      };
-    }
-    await audit('success', provider.model, facts, parsed, Date.now() - started);
-    return {
-      ...parsed, caveats: withAiMarker(parsed.caveats), generatedBy: 'model', aiGenerated: true,
-      model: provider.model, rejectionReason: null, facts
-    };
+    return conclude(content);
   } catch (error) {
     await audit('failed', provider.model, facts, null, Date.now() - started, error);
-    return {
-      ...describe(facts), generatedBy: 'deterministic', aiGenerated: false, model: provider.model,
-      rejectionReason: String(error).slice(0, 200), facts
-    };
+    return deterministic(String(error));
   }
 }
 
