@@ -2,7 +2,7 @@ import { config } from '../config.js';
 import { pool } from '../db/pool.js';
 
 /**
- * What the operator chose in `/ops`: one model, three switches.
+ * What the operator chose in `/ops`: one model, four switches.
  *
  * ================================================================================================
  * Why this is separate from `codex-auth.ts`
@@ -25,7 +25,15 @@ import { pool } from '../db/pool.js';
  * to the environment-only view rather than propagating.
  */
 
-export const CODEX_FEATURES = ['narrative', 'digest', 'attacks'] as const;
+/**
+ * The call sites an operator may switch on and off, in the order the console shows them.
+ *
+ * `shadow` joined the first three in migration 020 and is deliberately last: the other three add
+ * text to something a human is already looking at, while this one spends a call on every ingested
+ * message and produces nothing anybody sees except a comparison table in `/ops`. Same mechanism,
+ * very different cost, and the ordering is the only place that says so before the labels do.
+ */
+export const CODEX_FEATURES = ['narrative', 'digest', 'attacks', 'shadow'] as const;
 export type CodexFeature = (typeof CODEX_FEATURES)[number];
 
 export type CodexFeatureFlags = Record<CodexFeature, boolean>;
@@ -58,12 +66,13 @@ interface SettingsRow {
   narrative_enabled: boolean;
   digest_enabled: boolean;
   attacks_enabled: boolean;
+  shadow_enabled: boolean;
   updated_at: Date;
 }
 
 const DEFAULTS: CodexSettings = {
   model: null,
-  features: { narrative: false, digest: false, attacks: false },
+  features: { narrative: false, digest: false, attacks: false, shadow: false },
   updatedAt: null
 };
 
@@ -73,7 +82,8 @@ function fromRow(row: SettingsRow): CodexSettings {
     features: {
       narrative: row.narrative_enabled,
       digest: row.digest_enabled,
-      attacks: row.attacks_enabled
+      attacks: row.attacks_enabled,
+      shadow: row.shadow_enabled
     },
     updatedAt: row.updated_at.toISOString()
   };
@@ -134,7 +144,8 @@ export function applySettingsPatch(current: CodexSettings, patch: CodexSettingsP
     features: {
       narrative: patch.features?.narrative ?? current.features.narrative,
       digest: patch.features?.digest ?? current.features.digest,
-      attacks: patch.features?.attacks ?? current.features.attacks
+      attacks: patch.features?.attacks ?? current.features.attacks,
+      shadow: patch.features?.shadow ?? current.features.shadow
     },
     updatedAt: current.updatedAt
   };
@@ -142,7 +153,7 @@ export function applySettingsPatch(current: CodexSettings, patch: CodexSettingsP
 
 export async function readCodexSettings(): Promise<CodexSettings> {
   const result = await pool.query<SettingsRow>(
-    `SELECT model,narrative_enabled,digest_enabled,attacks_enabled,updated_at
+    `SELECT model,narrative_enabled,digest_enabled,attacks_enabled,shadow_enabled,updated_at
        FROM codex_settings WHERE singleton`
   );
   const row = result.rows[0];
@@ -158,14 +169,14 @@ export async function resolveCodexSettings(): Promise<ResolvedCodexSettings> {
 export async function saveCodexSettings(patch: CodexSettingsPatch): Promise<CodexSettings> {
   const next = applySettingsPatch(await readCodexSettings(), patch);
   const result = await pool.query<SettingsRow>(
-    `INSERT INTO codex_settings(singleton,model,narrative_enabled,digest_enabled,attacks_enabled,updated_at)
-     VALUES (true,$1,$2,$3,$4,now())
+    `INSERT INTO codex_settings(singleton,model,narrative_enabled,digest_enabled,attacks_enabled,shadow_enabled,updated_at)
+     VALUES (true,$1,$2,$3,$4,$5,now())
      ON CONFLICT (singleton) DO UPDATE SET
        model=EXCLUDED.model, narrative_enabled=EXCLUDED.narrative_enabled,
        digest_enabled=EXCLUDED.digest_enabled, attacks_enabled=EXCLUDED.attacks_enabled,
-       updated_at=now()
-     RETURNING model,narrative_enabled,digest_enabled,attacks_enabled,updated_at`,
-    [next.model, next.features.narrative, next.features.digest, next.features.attacks]
+       shadow_enabled=EXCLUDED.shadow_enabled, updated_at=now()
+     RETURNING model,narrative_enabled,digest_enabled,attacks_enabled,shadow_enabled,updated_at`,
+    [next.model, next.features.narrative, next.features.digest, next.features.attacks, next.features.shadow]
   );
   return fromRow(result.rows[0]!);
 }

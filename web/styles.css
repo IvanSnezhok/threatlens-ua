@@ -1781,6 +1781,12 @@ body { overflow-x: hidden; }
 .codex-feature span { color: var(--bone-3); font-size: 12px; line-height: 1.6; }
 .codex-feature strong { display: block; margin-bottom: 5px; color: var(--bone); font-size: 13px; font-weight: 500; }
 #codex-settings-status { align-self: center; color: var(--bone-3); font-size: 12px; }
+/* Розбіжності тіньової класифікації: текст повідомлення й два вердикти під ним. Рядок може бути
+   довгим — це матеріал для читання, а не метрика, тож перенос дозволено скрізь. */
+#shadow-section article > div:first-child { min-width: 0; }
+#shadow-section article p { overflow-wrap: anywhere; }
+#shadow-section article p strong { color: var(--bone-3); }
+
 #codex-login-hint:not(:empty) { margin-top: 16px; color: var(--bone-3); font-size: 12.5px; }
 #codex-login-hint .territory-all { max-width: 420px; }
 

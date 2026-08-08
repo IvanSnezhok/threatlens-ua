@@ -14,8 +14,21 @@ import type { ClassifiedMessage, RelationType, ThreatType } from '../types.js';
  * it for comments, refactoring or renames. The archive keeps one row per (message, version), so a
  * bumped version replayed over stored history produces a second opinion beside the first instead of
  * overwriting it, which is what makes this corpus usable for regression-testing a new classifier.
+ *
+ * ## Version history
+ *
+ * * `v1` — the original rule set.
+ * * `v2` — vocabulary the monitoring channels use that `v1` did not read. Ground-attack use of
+ *   S-300/S-400 ("загроза застосування С-300 по Харківщині"), which `v1` saw as a message with no
+ *   threat noun in it at all; launches from the Black and Azov sea areas; the "Бандероль" (S8000)
+ *   cruise missile; naval drones, which `v1` matched as an ordinary UAV with nothing recording that
+ *   the platform was a surface one; a bare "розвідник" beside a place; a repeat approach
+ *   ("повторно курсом на Одесу") with no weapon named; and the split of MiG-31K activity into a
+ *   launch-scope take-off and an ambient-scope landing, so a reported landing at Savasleyka no
+ *   longer raises a country-wide ballistic warning. `FOREIGN_PLACE_STEMS` gained the airfields those
+ *   landing reports name.
  */
-export const CLASSIFIER_VERSION = 'v1';
+export const CLASSIFIER_VERSION = 'v2';
 
 export interface LocationLexeme {
   id: string;
@@ -29,7 +42,11 @@ const patterns: Array<[ThreatType, RegExp]> = [
   ['ballistic_missile', /(баліст[а-яіїєґ]*|іскандер[-– ]?м|kn[-– ]?(23|24))/iu],
   // "Онікс"/П-800 and "швидкісна ціль" are how the monitoring channels name a supersonic
   // anti-ship missile and an unidentified fast target; both are cruise-class for our purposes.
-  ['cruise_missile', /(крилат[а-яіїєґ]* ракет[а-яіїєґ]*|іскандер[-– ]?к|калібр[а-яіїєґ]*|он[іи]кс|п[-– ]?800|швидкісн[а-яіїєґ]*\s+ціл[а-яіїєґ]*)/iu],
+  // "Бандероль" (S8000) is a cruise missile the channels started naming in 2025 and report exactly
+  // the way they report a Kalibr. The word also means "parcel", and no lexical guard separates the
+  // two — the structural one does: {@link isSignificant} refuses to raise anything that names no
+  // place, so a post office notice classifies as a threat about nowhere and is dropped.
+  ['cruise_missile', /(крилат[а-яіїєґ]* ракет[а-яіїєґ]*|іскандер[-– ]?к|калібр[а-яіїєґ]*|он[іи]кс|п[-– ]?800|(?<!\p{L})бандерол[а-яіїєґ]*|швидкісн[а-яіїєґ]*\s+ціл[а-яіїєґ]*)/iu],
   ['guided_air_bomb', /(каб[а-яіїєґ]*|керован[а-яіїєґ]* авіаційн[а-яіїєґ]* бомб[а-яіїєґ]*)/iu],
   // "герань" and "мопед" are the two slang names the OSINT feeds use for a Shahed-type drone, and
   // the bare "реакт" is how they abbreviate a jet-powered one in telegraphic posts
@@ -59,9 +76,41 @@ type IndicatorScope = 'launch' | 'ambient';
 
 const strategicIndicators: Array<{ name: string; pattern: RegExp; threatTypes: ThreatType[]; scope: IndicatorScope }> = [
   { name: 'зліт стратегічної авіації', pattern: /(зліт|підня(?:то|лися)|у повітрі).{0,45}(ту[-– ]?(95|160)|стратегічн[а-яіїєґ]* авіаці)/iu, threatTypes: ['cruise_missile'], scope: 'launch' },
-  { name: 'активність МіГ-31К', pattern: /(міг[-– ]?31к|mig[-– ]?31k|носі[йя].{0,20}кинджал)/iu, threatTypes: ['ballistic_missile'], scope: 'launch' },
+  // The trailing guard is what keeps a *landing* out of the launch class: "МіГ-31К здійснив посадку"
+  // is the end of a threat window, not the start of one, and it is reported in the same telegraphic
+  // shape as the take-off. Without it every landing report raised a country-wide ballistic warning —
+  // the exact inversion of what the message said. Scoped to the clause so a later sentence about
+  // some other aircraft landing cannot suppress a live warning.
+  { name: 'активність МіГ-31К', pattern: /(міг[-– ]?31к|mig[-– ]?31k|носі[йя].{0,20}кинджал)(?![^.!?\n]{0,40}(?:посадк|приземл|призем))/iu, threatTypes: ['ballistic_missile'], scope: 'launch' },
+  // The mirror of the above, and the reason it is `ambient`: a MiG-31K on the ground at Savasleyka
+  // is a fact about Savasleyka. Ambient scope means the foreign-place guard is allowed to suppress
+  // it, which is what these reports need — they name a Russian airfield and nothing else.
+  {
+    name: 'посадка МіГ-31К',
+    pattern: /((?:міг[-– ]?31к|mig[-– ]?31k)[^.!?\n]{0,40}(?:посадк|приземл|призем)|(?:посадк|приземл|призем)[а-яіїєґ]*[^.!?\n]{0,40}(?:міг[-– ]?31к|mig[-– ]?31k))/iu,
+    threatTypes: ['ballistic_missile'], scope: 'ambient'
+  },
   { name: 'активність пускових установок', pattern: /(с[-– ]?300|с[-– ]?400|іскандер).{0,45}(активн|робот|переміщ|готовн|пуск)/iu, threatTypes: ['ballistic_missile'], scope: 'launch' },
+  // S-300/S-400 fired at ground targets, which the Air Force warns about in a fixed phrase:
+  // "Загроза застосування С-300 по Харківщині". `v1` read this as a message containing no threat
+  // noun whatsoever — "загроза застосування" set `nationalScope` only when no place resolved, so the
+  // *located* version, the one that actually says where the shelling is aimed, classified as
+  // nothing at all and was discarded. Frontline oblasts receive this warning almost daily.
+  {
+    name: 'загроза застосування С-300/С-400',
+    pattern: /(?:загроз[а-яіїєґ]*\s+застосуванн[а-яіїєґ]*|застосуванн[а-яіїєґ]*|удар[а-яіїєґ]*|обстріл[а-яіїєґ]*|пуск[а-яіїєґ]*)[^.!?\n]{0,30}(?<!\p{L})с[-– ]?[34]00/iu,
+    threatTypes: ['ballistic_missile'], scope: 'launch'
+  },
   { name: 'активність ракетоносіїв у морі', pattern: /(ракетоносі[йї]|носі[йї].{0,25}калібр|корабл[а-яіїєґ]*.{0,25}калібр)/iu, threatTypes: ['cruise_missile'], scope: 'launch' },
+  // A launch reported by the water it came from rather than by the platform that fired it:
+  // "Пуски з акваторії Чорного моря". Both word orders occur, so both are matched. Kept at launch
+  // scope even though the sea named is usually outside Ukraine — that is the whole point of the
+  // scope distinction, and this is the earliest warning a coastal oblast ever gets.
+  {
+    name: 'пуски з морської акваторії',
+    pattern: /((?:пуск|запуск|старт)[а-яіїєґ]*[^.!?\n]{0,40}(?:акватор[а-яіїєґ]*|чорного\s+моря|чорному\s+морі|азовського\s+моря|азовському\s+морі)|(?:акватор[а-яіїєґ]*|чорного\s+моря|чорному\s+морі|азовського\s+моря|азовському\s+морі)[^.!?\n]{0,40}(?:пуск|запуск|старт)[а-яіїєґ]*)/iu,
+    threatTypes: ['cruise_missile'], scope: 'launch'
+  },
   { name: 'ознаки підготовки БпЛА', pattern: /(пуск|запуск|старт|груп[а-яіїєґ]*).{0,35}(шахед|бпла|безпілотник)/iu, threatTypes: ['uav'], scope: 'launch' },
   { name: 'робота ворожої ППО', pattern: /(робот[а-яіїєґ]*|активн[а-яіїєґ]*).{0,25}(ворож[а-яіїєґ]* ппо|ппо рф)/iu, threatTypes: ['ballistic_missile','cruise_missile'], scope: 'ambient' }
 ];
@@ -77,9 +126,33 @@ const strategicIndicators: Array<{ name: string; pattern: RegExp; threatTypes: T
  */
 const contextIndicators: Array<{ name: string; pattern: RegExp; threatTypes: ThreatType[] }> = [
   {
+    // "розвідник" is the bare noun these channels use once the context is established — "Над Одесою
+    // розвідник" is a complete report to their readers. It is safe *here* and would not be safe in
+    // {@link strategicIndicators}: the same word means a human scout, and the location requirement
+    // is what keeps a war memoir out of the threat feed.
     name: 'розвідувальна активність БпЛА',
-    pattern: /(дорозвідк[а-яіїєґ]*|розвідувальн[а-яіїєґ]*\s+(бпла|дрон[а-яіїєґ]*|безпілотник[а-яіїєґ]*))/iu,
+    pattern: /(дорозвідк[а-яіїєґ]*|(?<!\p{L})розвідник[а-яіїєґ]*|розвідувальн[а-яіїєґ]*\s+(бпла|дрон[а-яіїєґ]*|безпілотник[а-яіїєґ]*))/iu,
     threatTypes: ['uav']
+  },
+  {
+    // Surface drones. The class stays `uav` — the word "безпілотник" in the message already matched
+    // it and `ThreatType` has no naval member — but the indicator records that the platform was a
+    // surface one, which is the difference between a warning for a coastal city and a warning for
+    // shipping. Naming it is what makes the distinction recoverable from the archive later; silently
+    // downgrading the class would drop a real warning to buy a taxonomy.
+    name: 'морські безпілотники',
+    pattern: /(морськ[а-яіїєґ]*\s+(?:безпілотник|дрон)[а-яіїєґ]*|безекіпажн[а-яіїєґ]*\s+катер[а-яіїєґ]*|надводн[а-яіїєґ]*\s+(?:безпілотник|дрон)[а-яіїєґ]*)/iu,
+    threatTypes: ['uav']
+  },
+  {
+    // A second pass over a place already attacked: "повторно курсом на Одесу". `threatTypes` is
+    // empty on purpose. The phrase almost always describes a Shahed, but "almost always" is a guess,
+    // and a message that names no weapon must not be told what weapon it named — when the text does
+    // say "шахед", the ordinary UAV pattern has already matched and this indicator only adds the
+    // fact that it is a repeat.
+    name: 'повторний захід',
+    pattern: /(?<!\p{L})(?:повторн[а-яіїєґ]*|знову)\s+(?:[^.!?\n]{0,20}?)(?:курс(?:ом)?\s+на|у\s+напрямку|в\s+напрямку|заход[а-яіїєґ]*|захід)/iu,
+    threatTypes: []
   },
   {
     // The arrow bulletin: "✈️Сумщина: →Кириківка/Тростянець. ✈️Харківщина: →Гути/Богодухів."
@@ -114,6 +187,9 @@ const FOREIGN_PLACE_STEMS = [
   'брянськ', 'брянск', 'брянщин', 'курськ', 'курск', 'курщин', 'бєлгород', 'белгород', 'білгород',
   'москв', 'ростов', 'воронеж', 'таганрог', 'новоросійськ', 'рязан', 'саратов', 'енгельс', 'энгельс',
   'оленья', 'оленєгорськ', 'шайковк', 'міллеров', 'морозовськ', 'приморсько-ахтарськ', 'єйськ',
+  // MiG-31K basing airfields. Added with the landing indicator: a landing report names one of these
+  // and nothing else, and without the stem it would resolve no Ukrainian place and go country-wide.
+  'саваслейк', 'ахтубінськ',
   'краснодар', 'анапа', 'сочі', 'тамань', 'кубан',
   // Belarus
   'мозир', 'гомел', 'мінськ', 'барановичі', 'лунінец', 'мачулищ', 'бобруйськ', 'речиц', 'калинковичі'

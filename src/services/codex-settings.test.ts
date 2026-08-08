@@ -15,7 +15,7 @@ import {
 
 const stored: CodexSettings = {
   model: null,
-  features: { narrative: false, digest: false, attacks: false },
+  features: { narrative: false, digest: false, attacks: false, shadow: false },
   updatedAt: '2026-08-08T00:00:00.000Z'
 };
 
@@ -63,10 +63,12 @@ describe('the model catalogue', () => {
 
 describe('applying a patch', () => {
   it('leaves untouched fields exactly as they were', () => {
-    const current: CodexSettings = { ...stored, model: 'o5', features: { narrative: true, digest: true, attacks: false } };
+    const current: CodexSettings = {
+      ...stored, model: 'o5', features: { narrative: true, digest: true, attacks: false, shadow: true }
+    };
     const next = applySettingsPatch(current, { features: { digest: false } });
     expect(next.model).toBe('o5');
-    expect(next.features).toEqual({ narrative: true, digest: false, attacks: false });
+    expect(next.features).toEqual({ narrative: true, digest: false, attacks: false, shadow: true });
   });
 
   it('reads a cleared model field as "defer to CODEX_MODEL", not as a model named ""', () => {
@@ -79,8 +81,16 @@ describe('applying a patch', () => {
     expect(applySettingsPatch({ ...stored, model: 'o5' }, { model: null }).model).toBeNull();
   });
 
-  it('switches a feature on without touching the other two', () => {
+  it('switches a feature on without touching the other three', () => {
     const next = applySettingsPatch(stored, { features: { attacks: true } });
-    expect(next.features).toEqual({ narrative: false, digest: false, attacks: true });
+    expect(next.features).toEqual({ narrative: false, digest: false, attacks: true, shadow: false });
+  });
+
+  it('treats the shadow switch as one of the four, not as a special case', () => {
+    // It arrived a migration later than its neighbours and is the only per-message call site, which
+    // is precisely why it must go through the same patch path: a switch with its own code path is a
+    // switch that will one day be forgotten by a change made to the other three.
+    const next = applySettingsPatch(stored, { features: { shadow: true } });
+    expect(next.features).toEqual({ narrative: false, digest: false, attacks: false, shadow: true });
   });
 });

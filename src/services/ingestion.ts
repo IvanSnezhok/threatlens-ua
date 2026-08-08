@@ -11,6 +11,7 @@ import {
 } from '../repositories/events.js';
 import type { NormalizedMessage } from '../types.js';
 import { markSourceError, markSourceSuccess } from './operations.js';
+import { scheduleShadowClassification } from './shadow-classifier.js';
 
 interface AlarmRecord {
   externalId: string;
@@ -868,6 +869,22 @@ async function recordUnprocessedMessage(message: NormalizedMessage, status: stri
  * says so.
  */
 async function archiveClassification(entry: ClassificationLogEntry): Promise<void> {
+  // The shadow classifier hangs off this one function rather than off the four branches that call
+  // it, because "the deterministic decision is final and written down" is exactly the moment a second
+  // opinion becomes meaningful and cannot influence anything. It is started before the archive write
+  // is awaited on purpose — the two are independent, neither waits for the other, and the model call
+  // is fire-and-forget in both directions.
+  //
+  // The text handed over is `classified.summary`: the same message, whitespace-collapsed and capped
+  // at 500 characters. That is what the classifier itself read as far as any human review is
+  // concerned, and taking it from here avoids threading the raw message through four call sites for
+  // a feature that must never be load-bearing.
+  scheduleShadowClassification({
+    sourceMessageId: entry.sourceMessageId,
+    publishedAt: entry.publishedAt,
+    text: entry.classified.summary,
+    classified: entry.classified
+  });
   try {
     await recordClassification(entry);
   } catch (error) {

@@ -4,6 +4,7 @@ import { hasValidOpsAuth } from './ops-auth.js';
 import { beginCodexLogin, cancelPendingLogin, codexStatus, disconnectCodex } from '../services/codex-auth.js';
 import { listCodexModels } from '../services/codex-client.js';
 import { readCodexSettings, resolveSettings, saveCodexSettings } from '../services/codex-settings.js';
+import { shadowAgreement } from '../services/shadow-classifier.js';
 
 function authorised(request: FastifyRequest): boolean {
   return hasValidOpsAuth(request.headers.authorization);
@@ -98,7 +99,11 @@ const opsCodexRoutes: FastifyPluginAsync = async (app) => {
     features: z.object({
       narrative: z.boolean(),
       digest: z.boolean(),
-      attacks: z.boolean()
+      attacks: z.boolean(),
+      // The shadow classifier, off by default. Listed here like the rest rather than behind its own
+      // route: an operator switching model use on and off wants one form, and a switch reachable
+      // only by a different path is a switch nobody finds when the quota runs out.
+      shadow: z.boolean()
     }).partial().optional()
   });
 
@@ -110,6 +115,31 @@ const opsCodexRoutes: FastifyPluginAsync = async (app) => {
     }
     const saved = await saveCodexSettings(parsed.data);
     return { settings: resolveSettings(saved) };
+  });
+
+  /**
+   * How often the shadow classifier and the rules agree, and the newest cases where they did not.
+   *
+   * This is the whole point of the shadow feature made readable: the disagreements are the messages
+   * worth a human's attention, and the percentage is the only honest way to say whether the rules
+   * have started drifting from the language the channels actually use. Nothing here can be acted on
+   * automatically — the output is a reading list, and the action it leads to is somebody writing a
+   * pattern and a test.
+   *
+   * The window is bounded at a month and the sample at a hundred because both numbers reach a
+   * sequential scan over a table that grows with every ingested message, behind a route an operator
+   * refreshes by hand.
+   */
+  const agreementQuery = z.object({
+    hours: z.coerce.number().int().min(1).max(720).default(24),
+    examples: z.coerce.number().int().min(1).max(100).default(10)
+  });
+
+  app.get('/ops/shadow-classifier', async (request, reply) => {
+    if (!authorised(request)) return unauthorized(reply);
+    const parsed = agreementQuery.safeParse(request.query);
+    if (!parsed.success) return reply.code(400).send({ error: 'invalid_query' });
+    return shadowAgreement(parsed.data.hours, parsed.data.examples);
   });
 };
 
