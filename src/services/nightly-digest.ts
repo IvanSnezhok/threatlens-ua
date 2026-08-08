@@ -96,6 +96,7 @@ export async function digestSummary(facts: DigestFacts, deps: DigestSummaryDeps 
 
   const result = await codexChat({
     promptVersion: 'nightly-digest-v1',
+    surface: 'digest',
     system: DIGEST_SYSTEM_PROMPT,
     user: JSON.stringify(facts),
     json: true,

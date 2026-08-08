@@ -110,7 +110,7 @@ describe.skipIf(!integrationDatabaseAvailable)('location hierarchy', () => {
       const eventId = await seedThreatEvent({ locationIds: [branch.city] });
       const { locationTimeline } = await import('../../src/repositories/events.js');
 
-      const timeline = await locationTimeline(branch.oblast);
+      const timeline = await locationTimeline(branch.oblast, new Date());
 
       expect(timeline!.counts.threats).toBe(1);
       expect(timeline!.items.map((item) => item.id)).toEqual([eventId]);
@@ -121,7 +121,7 @@ describe.skipIf(!integrationDatabaseAvailable)('location hierarchy', () => {
       const eventId = await seedThreatEvent({ locationIds: [branch.oblast] });
       const { locationTimeline } = await import('../../src/repositories/events.js');
 
-      const timeline = await locationTimeline(branch.city);
+      const timeline = await locationTimeline(branch.city, new Date());
 
       expect(timeline!.counts.threats).toBe(1);
       expect(timeline!.items.map((item) => item.id)).toEqual([eventId]);
@@ -135,7 +135,7 @@ describe.skipIf(!integrationDatabaseAvailable)('location hierarchy', () => {
       const { locationTimeline } = await import('../../src/repositories/events.js');
 
       for (const anchor of [branch.oblast, branch.raion, branch.city]) {
-        expect((await locationTimeline(anchor))!.counts.alerts).toBe(3);
+        expect((await locationTimeline(anchor, new Date()))!.counts.alerts).toBe(3);
       }
     });
 
@@ -146,7 +146,7 @@ describe.skipIf(!integrationDatabaseAvailable)('location hierarchy', () => {
       await seedAlert(other.raion);
       const { locationTimeline } = await import('../../src/repositories/events.js');
 
-      const timeline = await locationTimeline(branch.oblast);
+      const timeline = await locationTimeline(branch.oblast, new Date());
 
       expect(timeline!.counts).toMatchObject({ threats: 0, alerts: 0, assessments: 0 });
       expect(timeline!.items).toEqual([]);
@@ -158,14 +158,14 @@ describe.skipIf(!integrationDatabaseAvailable)('location hierarchy', () => {
       const eventId = await seedThreatEvent({ locationIds: [branch.city] });
       const { locationTimeline } = await import('../../src/repositories/events.js');
 
-      const timeline = await locationTimeline(branch.oblast);
+      const timeline = await locationTimeline(branch.oblast, new Date());
 
       expect(timeline!.items.map((item) => item.id)).toEqual([eventId]);
     });
 
     it('still returns null for a location that is not in the catalogue', async () => {
       const { locationTimeline } = await import('../../src/repositories/events.js');
-      expect(await locationTimeline('test-does-not-exist')).toBeNull();
+      expect(await locationTimeline('test-does-not-exist', new Date())).toBeNull();
     });
   });
 

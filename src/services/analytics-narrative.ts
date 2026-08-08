@@ -1,10 +1,14 @@
+import { Counter } from 'prom-client';
 import { z } from 'zod';
 import { config } from '../config.js';
+import { CLASSIFIER_VERSION } from '../domain/classifier.js';
 import { pool } from '../db/pool.js';
 import { codexCredentials, type CodexCredentials } from './codex-auth.js';
 import { codexChat } from './codex-client.js';
 import { resolveCodexSettings, type ResolvedCodexSettings } from './codex-settings.js';
-import type { StrategicOverview } from './analytics-archive.js';
+import {
+  DEFAULT_WINDOW_DAYS, resolveWindow, strategicOverview, type AnalyticsWindow, type StrategicOverview
+} from './analytics-archive.js';
 
 /**
  * Prose about the analytics — the only part of this feature a model touches.
@@ -408,12 +412,20 @@ async function audit(
 ): Promise<void> {
   // A failed audit write must never cost the caller its analytics: the numbers were already
   // computed and are correct whether or not this row lands.
+  //
+  // `validation_status` is the point of this row. `codexChat` has already written the *transport*
+  // row and marked it `'skipped'`, because a transport knows nothing about grounding; this row is
+  // written only when the model answered and the answer was refused, which is a fact the transport
+  // log alone cannot express. That is also why any counting keyed on `ai_runs` double-counts Codex
+  // narratives, and why the Codex cooldown is keyed on an in-memory timestamp instead.
   await pool.query(
-    `INSERT INTO ai_runs(model,prompt_version,input,output,status,error,duration_ms)
-     VALUES ($1,'analytics-narrative-v1',$2,$3,$4,$5,$6)`,
+    `INSERT INTO ai_runs(model,prompt_version,input,output,status,error,duration_ms,
+                         surface,classifier_version,validation_status,fallback_reason)
+     VALUES ($1,'analytics-narrative-v1',$2,$3,$4,$5,$6,'narrative',$7,$8,$5)`,
     [
       model, JSON.stringify(input), output == null ? null : JSON.stringify(output), status,
-      error == null ? null : String(error).slice(0, 800), durationMs
+      error == null ? null : String(error).slice(0, 800), durationMs,
+      CLASSIFIER_VERSION, status === 'failed' ? 'rejected' : 'passed'
     ]
   ).catch(() => undefined);
 }
@@ -422,6 +434,11 @@ export interface NarrateOptions extends NarrateDeps {
   /** Injected in tests so the model path can be exercised without a network. */
   fetchImpl?: typeof fetch;
   timeoutMs?: number;
+  /**
+   * Already-resolved provider. Omitted everywhere except the cached wrapper, which has to look the
+   * provider up before the cooldown check and must not pay for a second settings + credential read.
+   */
+  provider?: NarrativeProvider | null;
 }
 
 /**
@@ -436,7 +453,10 @@ export async function narrateOverview(
   overview: StrategicOverview, options: NarrateOptions = {}
 ): Promise<AnalyticsNarrative> {
   const facts = narrativeFacts(overview);
-  const provider = await narrativeProvider(options);
+  // `undefined` means "nobody has looked yet"; an explicit `null` means "looked, and there is none".
+  // The cached wrapper has to resolve the provider before the cooldown check, and paying a second
+  // settings read plus a second credential refresh here would make the memo cost what it saves.
+  const provider = options.provider !== undefined ? options.provider : await narrativeProvider(options);
   if (!provider) {
     return {
       ...describe(facts), generatedBy: 'deterministic', aiGenerated: false, model: null,
@@ -478,6 +498,8 @@ export async function narrateOverview(
     // and the answer was refused" is a fact the transport log alone cannot express.
     const result = await codexChat({
       promptVersion: 'analytics-narrative-v1',
+      surface: 'narrative',
+      classifierVersion: CLASSIFIER_VERSION,
       system: SYSTEM_PROMPT,
       user: JSON.stringify(facts),
       json: true,
@@ -532,4 +554,220 @@ export function withAiMarker(caveats: string[]): string[] {
 /** Exposed for tests: the text produced when no model is available. */
 export function deterministicNarrative(facts: NarrativeFacts): ModelNarrative {
   return describe(facts);
+}
+
+// ------------------------------------------------------------------------------------------------
+// The memo, the cooldown, and the one path the route and the worker share
+// ------------------------------------------------------------------------------------------------
+
+/**
+ * A memo, not a store.
+ *
+ * Migration 015's header argues at length against introducing a new staleness axis by persisting
+ * derived analytics until a month-bucketed year query stops fitting the 15 s `statement_timeout`,
+ * and storing prose is exactly that axis. So the prose lives in memory for ten minutes and nowhere
+ * else, and a restart costs one model call.
+ *
+ * Two keys, not one. `windowKey` alone would serve prose about numbers next to a freshly recomputed
+ * overview that no longer matches them — the one failure mode a *grounded* narrative is not allowed
+ * to have. `factsKey` is the already-rounded digest the model was allowed to talk about, so an event
+ * that changes nothing the narrative says leaves the memo standing and an event that moves a number
+ * invalidates it by construction. That is the event-driven invalidation, and it needs no
+ * invalidation call at all.
+ */
+interface NarrativeMemo {
+  windowKey: string;
+  factsKey: string;
+  at: number;
+  value: AnalyticsNarrative;
+}
+
+let memo: NarrativeMemo | null = null;
+let lastCodexAt = 0;
+
+/**
+ * In-flight dedupe. {@link narrativeFor} is reachable from two ungated places at once —
+ * `GET /ops/api/analytics/narrative`, whose only hook is ops auth, and {@link warmNarrative} inside
+ * a recompute — so without this, two ops tabs opened together plus a debounced pass all read the
+ * same stale `lastCodexAt`, all pass {@link withinCodexCooldown}, and all call the model: three
+ * calls, three `ai_runs` transport rows, three `lastCodexAt` writes. The operator's «мінімальний
+ * інтервал між Codex-запусками» would then be enforced against sequence but not against
+ * concurrency, which is the one axis a mass attack does not respect.
+ */
+let inFlight: { key: string; promise: Promise<AnalyticsNarrative> } | null = null;
+
+/** Ten minutes — the same length as the window quantum, so exactly one canonical window is live. */
+export const NARRATIVE_MEMO_TTL_MS = 600_000;
+export const NARRATIVE_WINDOW_QUANTUM_MS = 600_000;
+export const CODEX_COOLDOWN_REJECTION = 'codex_cooldown';
+
+/**
+ * Declared here, next to the cooldown it counts, and registered by
+ * `registerAnalyticsSchedulerMetrics` — the import the other way round would be a cycle, because the
+ * scheduler already imports this module.
+ */
+export const codexCooldownSkips = new Counter({
+  name: 'threatlens_codex_cooldown_skips_total',
+  help: 'Model calls not made because the operator-set minimum interval had not elapsed',
+  labelNames: ['surface'],
+  registers: []
+});
+
+/**
+ * Test seam. Clears the memo AND the cooldown clock AND the in-flight slot: a suite that could reset
+ * only one of them would have a second case fail for a reason the first case caused.
+ */
+export function resetAnalyticsNarrativeMemo(): void {
+  memo = null;
+  lastCodexAt = 0;
+  inFlight = null;
+}
+
+/**
+ * The window the worker warms and the console reads, quantised so the two can agree.
+ *
+ * `resolveWindow` defaults `to` to `new Date()` at millisecond precision, so a key built from it
+ * would never match between a warm written at 10:03:12.481 and a page loaded a second later — the
+ * memo would be dead code. `to` is therefore floored to a ten-minute boundary, the same length as
+ * the memo's own TTL. The cost is that the strategic narrative describes data up to ten minutes old,
+ * which is nothing next to its thirty-day window and is already the staleness the memo grants.
+ */
+export function canonicalNarrativeWindow(now: Date = new Date()): AnalyticsWindow {
+  const to = new Date(Math.floor(now.getTime() / NARRATIVE_WINDOW_QUANTUM_MS) * NARRATIVE_WINDOW_QUANTUM_MS);
+  const from = new Date(to.getTime() - DEFAULT_WINDOW_DAYS * 86_400_000);
+  return resolveWindow({ from, to });
+}
+
+export function narrativeWindowKey(window: AnalyticsWindow): string {
+  return `${window.from.toISOString()}|${window.to.toISOString()}|${window.bucket}`;
+}
+
+/**
+ * Whether the minimum interval between two model calls on this surface has NOT yet elapsed.
+ *
+ * At exactly `cooldownMs` the call is allowed: the setting is a minimum gap, and `>=` would make a
+ * fifteen-minute cooldown mean fifteen minutes plus a tick, drifting for ever. `cooldownMs === 0`
+ * disables the cooldown — the column's CHECK allows 0 and the ops field documents it as «без
+ * обмеження». `lastAt === 0` means nothing has been called yet, and a first call is never held.
+ *
+ * In memory, like `withinRateLimit` in `shadow-classifier.ts`, and for the same reason: a limiter
+ * that needs a round trip to decide whether to make a round trip is not a limiter. Single process is
+ * the deployed shape; over-budget work is DROPPED, never queued — a queued narrative would arrive
+ * fifteen minutes later describing a wave that had ended.
+ */
+export function withinCodexCooldown(now: number, lastAt: number, cooldownMs: number): boolean {
+  if (cooldownMs <= 0) return false;
+  if (lastAt === 0) return false;
+  return now - lastAt < cooldownMs;
+}
+
+export interface CachedNarrateOptions extends NarrateOptions {
+  cooldownMs?: number;
+  now?: number;
+}
+
+export interface WarmNarrativeOptions extends CachedNarrateOptions {
+  cooldownMs: number;
+}
+
+export interface NarrativeWarmOutcome {
+  codex: 'used' | 'cooldown' | 'disabled' | 'failed';
+  fallback: boolean;
+  narrative: AnalyticsNarrative | null;
+}
+
+/**
+ * The one path the ops route and the recompute worker share.
+ *
+ * {@link narrateOverview} itself is deliberately left alone — no cooldown, no memo, same five unit
+ * tests and the same three integration cases. Putting the cooldown inside it would make the second
+ * call in any test file silently deterministic, and would hold a caller that explicitly asked for a
+ * fresh narrative over a hand-picked window.
+ */
+export async function narrativeFor(
+  window: AnalyticsWindow, overview: StrategicOverview, options: CachedNarrateOptions = {}
+): Promise<AnalyticsNarrative> {
+  const at = options.now ?? Date.now();
+  const facts = narrativeFacts(overview);
+  const windowKey = narrativeWindowKey(window);
+  const factsKey = JSON.stringify(facts);
+
+  if (memo && memo.windowKey === windowKey && memo.factsKey === factsKey
+    && at - memo.at < NARRATIVE_MEMO_TTL_MS) {
+    return memo.value;
+  }
+
+  const provider = options.provider !== undefined ? options.provider : await narrativeProvider(options);
+  // No provider at all is not a fallback and not an incident: it is the deployment's baseline, and
+  // `narrateOverview` already labels it («модель не залучалася»). Nothing is memoised — the
+  // deterministic text is a pure function of facts we already hold.
+  if (!provider) return narrateOverview(overview, { ...options, provider: null });
+
+  const cooldownMs = options.cooldownMs ?? 0;
+  if (withinCodexCooldown(at, lastCodexAt, cooldownMs)) {
+    codexCooldownSkips.inc({ surface: 'narrative' });
+    return {
+      ...deterministicNarrative(facts), generatedBy: 'deterministic', aiGenerated: false,
+      model: provider.model, rejectionReason: CODEX_COOLDOWN_REJECTION, facts
+    };
+  }
+
+  // Two callers with the same window AND the same facts are asking the same question; the second
+  // awaits the first's answer instead of buying a second model call.
+  const key = `${windowKey}|${factsKey}`;
+  if (inFlight && inFlight.key === key) return inFlight.promise;
+
+  // RESERVE THE SLOT BEFORE THE AWAIT. The setting is a minimum gap between call STARTS — which is
+  // what `withinCodexCooldown`'s own comment argues — and stamping only after the call resolves
+  // enforces it against sequence but not against concurrency. On the reserve-then-fail path the
+  // stamp stays: a failed call is spend (a timed-out endpoint costs the same wall clock and the same
+  // connection as a good answer), and retrying a broken endpoint on every debounce window is the
+  // outcome that costs the most.
+  lastCodexAt = at;
+  const promise = (async () => {
+    const value = await narrateOverview(overview, { ...options, provider });
+    // Memoised only when a provider was actually consulted. A deterministic answer is free to
+    // recompute, and memoising a cooldown fallback would keep serving it after the cooldown expired.
+    if (value.model !== null) memo = { windowKey, factsKey, at, value };
+    return value;
+  })().finally(() => { if (inFlight?.key === key) inFlight = null; });
+  inFlight = { key, promise };
+  return promise;
+}
+
+/**
+ * The recompute's Codex leg: warm the memo so an operator opening `/ops` usually gets an
+ * event-fresh narrative for free.
+ */
+export async function warmNarrative(options: WarmNarrativeOptions): Promise<NarrativeWarmOutcome> {
+  const at = options.now ?? Date.now();
+  // Same three-state rule as `narrativeFor`: `undefined` means "look it up", an explicit `null`
+  // means "there is none". The lookup is a settings read plus a credential refresh, and a caller
+  // that already paid for it must not pay again on the way into the same pass.
+  const provider = options.provider !== undefined ? options.provider : await narrativeProvider(options);
+  // Cheap checks BEFORE the six-slice fan-out. `strategicOverview` is the most expensive thing in a
+  // recompute, and running it to produce prose we are not going to ask for would turn a twenty-second
+  // debounce into a standing load on the archive.
+  if (!provider) return { codex: 'disabled', fallback: false, narrative: null };
+  if (withinCodexCooldown(at, lastCodexAt, options.cooldownMs)) {
+    codexCooldownSkips.inc({ surface: 'narrative' });
+    return { codex: 'cooldown', fallback: true, narrative: null };
+  }
+
+  const window = canonicalNarrativeWindow(new Date(at));
+  let overview: StrategicOverview;
+  try {
+    overview = await strategicOverview(window);
+  } catch {
+    // `resolveWindow` and the slices raise `AnalyticsInputError` for a caller's mistake; a worker is
+    // not a route and has to catch it itself rather than let it become a 500 nobody is looking at.
+    return { codex: 'failed', fallback: true, narrative: null };
+  }
+
+  const value = await narrativeFor(window, overview, { ...options, provider, now: at });
+  return {
+    codex: value.aiGenerated ? 'used' : 'failed',
+    fallback: !value.aiGenerated,
+    narrative: value
+  };
 }

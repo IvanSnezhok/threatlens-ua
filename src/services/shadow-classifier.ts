@@ -243,6 +243,8 @@ export async function shadowClassify(input: ShadowInput, options: ShadowOptions 
 
   const result = await chat({
     promptVersion: 'shadow-classifier-v1',
+    surface: 'shadow',
+    classifierVersion: CLASSIFIER_VERSION,
     system: SYSTEM_PROMPT,
     user: prompt,
     json: true,

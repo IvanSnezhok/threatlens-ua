@@ -1,5 +1,6 @@
 import { z } from 'zod';
 import { config } from '../config.js';
+import { CLASSIFIER_VERSION } from '../domain/classifier.js';
 import { pool } from '../db/pool.js';
 import {
   raionCentroids,
@@ -481,13 +482,19 @@ export function narrativeIsFaithful(narrative: string, allowed: Set<number>): bo
 }
 
 async function recordAiRun(status: 'success' | 'failed', input: unknown, output: unknown, error?: unknown, durationMs?: number): Promise<void> {
+  // `validation_status` is a real verdict on this path, not a placeholder: `narrativeIsFaithful`
+  // has already run by the time either call site gets here, so `'passed'` means the rewording
+  // introduced no number the computation did not produce, and `'rejected'` means it did and the
+  // deterministic wording stands.
   await pool.query(
-    `INSERT INTO ai_runs(model,prompt_version,input,output,status,error,duration_ms)
-     VALUES ($1,'vector-narrative-v1',$2,$3,$4,$5,$6)`,
+    `INSERT INTO ai_runs(model,prompt_version,input,output,status,error,duration_ms,
+                         surface,classifier_version,validation_status,fallback_reason)
+     VALUES ($1,'vector-narrative-v1',$2,$3,$4,$5,$6,'attacks',$7,$8,$5)`,
     [
       config.AI_MODEL || 'deterministic', JSON.stringify(input),
       output === undefined ? null : JSON.stringify(output), status,
-      error === undefined ? null : String(error).slice(0, 800), durationMs ?? null
+      error === undefined ? null : String(error).slice(0, 800), durationMs ?? null,
+      CLASSIFIER_VERSION, status === 'success' ? 'passed' : 'rejected'
     ]
   ).catch(() => undefined);
 }
@@ -525,6 +532,8 @@ async function refineWithCodex(projection: VectorProjection): Promise<VectorProj
   const input = refineInput(projection);
   const result = await codexChat({
     promptVersion: 'vector-narrative-v1',
+    surface: 'attacks',
+    classifierVersion: CLASSIFIER_VERSION,
     system: REFINE_SYSTEM_PROMPT,
     user: JSON.stringify(input),
     json: true,

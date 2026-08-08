@@ -11,6 +11,11 @@ import {
 } from '../repositories/events.js';
 import type { NormalizedMessage } from '../types.js';
 import { markSourceError, markSourceSuccess } from './operations.js';
+// One-way import, on purpose: the observations are ops instrumentation and this file stays free of
+// ops code by calling three named functions rather than by growing a second metrics block.
+import {
+  countChannelError, observeClassificationDuration, observeIngestionLag
+} from './publication.js';
 import { scheduleShadowClassification } from './shadow-classifier.js';
 
 interface AlarmRecord {
@@ -343,6 +348,7 @@ export async function syncOfficialAlerts(log?: { warn: Function }): Promise<void
     recordUnresolvedLocations('ukraine-alarm', snapshot.unresolved, log);
   } catch (error) {
     await markSourceError('ukraine-alarm', error);
+    countChannelError('ukraine-alarm', 'collect');
     throw error;
   }
 }
@@ -361,6 +367,7 @@ export async function syncAlertsInUa(log?: { warn: Function }): Promise<void> {
     recordUnresolvedLocations('alerts-in-ua', snapshot.unresolved, log);
   } catch (error) {
     await markSourceError('alerts-in-ua', error);
+    countChannelError('alerts-in-ua', 'collect');
     throw error;
   }
 }
@@ -585,40 +592,51 @@ export async function ingestAlertChannelMessages(
   const desired = new Map<string, AlertChannelState>();
   const unresolved: string[] = [];
   for (const message of ordered) {
-    const parsed = parseAlertChannelMessage(message.text, message.publishedAt);
-    if (parsed.kind === 'unrecognized') {
-      summary.unrecognized += 1;
-      alertChannelMessages.inc({ source: sourceId, outcome: 'unrecognized' });
-      await recordAlertChannelMessage(sourceId, message, 'unrecognized');
-      // A channel that changes its wording must make this loud. Silently reporting no alerts is the
-      // one outcome an alert source is never allowed to have. Ordinary channel prose does not reach
-      // here — the parser files it as `ignored: 'unrelated'` — so this warning stays a signal on a
-      // channel that publishes news between its alerts.
-      log?.warn(
-        { sourceId, externalId: message.externalId, headline: parsed.headline },
-        'alert channel message matched no known format and was not applied'
-      );
-      continue;
-    }
-    if (parsed.kind === 'ignored') {
-      summary.ignored += 1;
-      alertChannelMessages.inc({ source: sourceId, outcome: `ignored:${parsed.reason}` });
-      await recordAlertChannelMessage(sourceId, message, 'ignored');
-      continue;
-    }
-    summary.events += 1;
-    alertChannelMessages.inc({ source: sourceId, outcome: parsed.event.action });
-    await recordAlertChannelMessage(sourceId, message, 'alert');
-    for (const name of parsed.event.locationNames) {
-      const locationId = await resolveLocationId({ locationName: name });
-      if (!locationId) { unresolved.push(name); continue; }
-      desired.set(`${locationId}:${parsed.event.alertType}`, {
-        locationId,
-        alertType: parsed.event.alertType,
-        active: parsed.event.action === 'start',
-        observedAt: parsed.event.observedAt,
-        externalId: `${sourceId}:${message.externalId}`
-      });
+    // Measured from the channel's own timestamp, not from ours: the number an operator needs is
+    // "how old was this when we accepted it", and our clock cannot answer that.
+    observeIngestionLag(sourceId, (Date.now() - message.publishedAt.getTime()) / 1000);
+    const startedAt = Date.now();
+    try {
+      const parsed = parseAlertChannelMessage(message.text, message.publishedAt);
+      if (parsed.kind === 'unrecognized') {
+        summary.unrecognized += 1;
+        alertChannelMessages.inc({ source: sourceId, outcome: 'unrecognized' });
+        countChannelError(sourceId, 'parse');
+        await recordAlertChannelMessage(sourceId, message, 'unrecognized');
+        // A channel that changes its wording must make this loud. Silently reporting no alerts is the
+        // one outcome an alert source is never allowed to have. Ordinary channel prose does not reach
+        // here — the parser files it as `ignored: 'unrelated'` — so this warning stays a signal on a
+        // channel that publishes news between its alerts.
+        log?.warn(
+          { sourceId, externalId: message.externalId, headline: parsed.headline },
+          'alert channel message matched no known format and was not applied'
+        );
+        continue;
+      }
+      if (parsed.kind === 'ignored') {
+        summary.ignored += 1;
+        alertChannelMessages.inc({ source: sourceId, outcome: `ignored:${parsed.reason}` });
+        await recordAlertChannelMessage(sourceId, message, 'ignored');
+        continue;
+      }
+      summary.events += 1;
+      alertChannelMessages.inc({ source: sourceId, outcome: parsed.event.action });
+      await recordAlertChannelMessage(sourceId, message, 'alert');
+      for (const name of parsed.event.locationNames) {
+        const locationId = await resolveLocationId({ locationName: name });
+        if (!locationId) { unresolved.push(name); continue; }
+        desired.set(`${locationId}:${parsed.event.alertType}`, {
+          locationId,
+          alertType: parsed.event.alertType,
+          active: parsed.event.action === 'start',
+          observedAt: parsed.event.observedAt,
+          externalId: `${sourceId}:${message.externalId}`
+        });
+      }
+    } finally {
+      // In a `finally` because two of the three branches `continue`; a per-branch call would
+      // silently stop measuring the day a fourth branch is added.
+      observeClassificationDuration('alert', (Date.now() - startedAt) / 1000);
     }
   }
 
@@ -894,6 +912,7 @@ async function archiveClassification(entry: ClassificationLogEntry): Promise<voi
     await recordClassification(entry);
   } catch (error) {
     classificationLogFailures.inc({ source: entry.sourceId });
+    countChannelError(entry.sourceId, 'persist');
     console.warn(JSON.stringify({
       level: 'warn', msg: 'classification archive write failed', sourceId: entry.sourceId,
       decision: entry.decision, error: error instanceof Error ? error.message : String(error)
@@ -910,7 +929,27 @@ export interface ProcessMessageOptions {
   monitor?: boolean;
 }
 
+/**
+ * The measured wrapper around the classifier path.
+ *
+ * The body below is unchanged and lives in {@link classifyAndIngest}; this exists only so the two
+ * observations have somewhere to stand that every caller passes through. The duration is taken in a
+ * `finally` because four of the five terminal branches return early, and a per-branch call would
+ * silently stop measuring the day a sixth branch is added.
+ */
 export async function processMessage(message: NormalizedMessage, options: ProcessMessageOptions = {}) {
+  // Ingestion lag is measured from the source's own timestamp, not from ours: the number an operator
+  // needs is "how old was this when we accepted it", and our clock cannot answer that.
+  observeIngestionLag(message.sourceId, (Date.now() - message.publishedAt.getTime()) / 1000);
+  const startedAt = Date.now();
+  try {
+    return await classifyAndIngest(message, options);
+  } finally {
+    observeClassificationDuration('classifier', (Date.now() - startedAt) / 1000);
+  }
+}
+
+async function classifyAndIngest(message: NormalizedMessage, options: ProcessMessageOptions = {}) {
   const locations = await listLocationLexemes();
   const classified = classifyMessage(message.text, locations);
   const count = (outcome: string) => {
@@ -1019,12 +1058,26 @@ export function startIngestionScheduler(log: { info: Function; warn: Function; e
     if (running) return;
     running = true;
     try {
-      await Promise.all([
+      // `allSettled`, not `all`: `all` settles at the FIRST rejection and leaves the other legs
+      // running, so `finally { running = false }` would release the overlap guard with a nationwide
+      // snapshot still half-applied — and a rejection is the *normal* case, because both sync
+      // functions rethrow after `markSourceError`. The next tick would then start a second
+      // `persistOfficialAlertSnapshot` concurrently with the first, and two snapshots interleaving
+      // their `alert_source_states` writes can compute the aggregate from a half-applied snapshot
+      // and produce a spurious «Офіційний відбій» / re-open pair. Each rejected result is logged
+      // individually; `markSourceError` has already run inside the leg that produced it, so nothing
+      // is lost by not rethrowing.
+      const results = await Promise.allSettled([
         syncOfficialAlerts(log), syncAlertsInUa(log),
         // The channel is pushed to, not polled; the only thing the scheduler owes it is the
         // maximum-duration backstop, which has to run whether or not any message arrives.
         expireStuckAlertChannelAlerts(log)
       ]);
+      for (const result of results) {
+        if (result.status === 'rejected') {
+          log.error({ error: result.reason }, 'official alert synchronization leg failed');
+        }
+      }
     }
     catch (error) { log.error({ error }, 'official alert synchronization failed'); }
     finally { running = false; }

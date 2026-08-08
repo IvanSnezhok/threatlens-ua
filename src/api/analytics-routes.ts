@@ -13,7 +13,9 @@ import {
   threatTypeDynamics,
   type AnalyticsWindow
 } from '../services/analytics-archive.js';
-import { narrateOverview } from '../services/analytics-narrative.js';
+import { canonicalNarrativeWindow, narrativeFor } from '../services/analytics-narrative.js';
+import { runManualRecompute } from '../services/analytics-scheduler.js';
+import { resolveRuntimeSettings } from '../services/runtime-settings.js';
 
 /**
  * Operator-only analytics over the classification archive.
@@ -140,11 +142,48 @@ const analyticsRoutes: FastifyPluginAsync = async (app) => {
    * response still carries the full overview and a deterministic narrative whose `generatedBy` says
    * `deterministic`.
    */
-  slice('/ops/api/analytics/narrative', async (window) => {
-    const overview = await strategicOverview(window);
-    return { ...overview, narrative: await narrateOverview(overview) };
+  slice('/ops/api/analytics/narrative', async (window, query) => {
+    // A default request is served from the canonical window so the console and the recompute worker
+    // agree on one memo key; an operator who pinned `from`/`to` gets exactly the window they asked
+    // for, and a memo miss, which is the honest answer to a bespoke question.
+    const effective = isDefaultNarrativeQuery(query) ? canonicalNarrativeWindow() : window;
+    // The deterministic numbers are still computed per request, deliberately: the memo exists to
+    // stop repeat *model* calls, not to stop SQL, and serving memoised prose beside numbers computed
+    // at a different instant is the one thing a grounded narrative may not do. `narrativeFor`'s
+    // second key is the facts digest, which is what makes that safe rather than merely intended.
+    const overview = await strategicOverview(effective);
+    const settings = await resolveRuntimeSettings();
+    return {
+      ...overview,
+      narrative: await narrativeFor(effective, overview, { cooldownMs: settings.codexCooldownMs })
+    };
   });
+
+  /**
+   * «Оновити зараз».
+   *
+   * POST because it appends a run: the worker's debounced pass is unaffected and the two are
+   * indistinguishable afterwards — an operator's run is a real run. The precedent is
+   * `POST /ops/api/source-trust/recalculate`, whose comment says the same thing.
+   *
+   * It bypasses the debounce (that is the point of pressing a button) and it overrides
+   * `analytics_event_driven` (an operator who pressed it has already made that decision), but it
+   * respects the Codex cooldown and reports it, and it shares the `running` flag with the worker so
+   * a double-click cannot start two recomputes. Always 200: `skipped` and `codex` carry the outcome,
+   * and a status code cannot say "it ran, but the model was on cooldown".
+   *
+   * `runManualRecompute()`, NOT `recomputeAnalytics('manual')`. A pass that does not go through
+   * `execute()` never drains `rearm` or resets `firstPendingAt`, so the ops button would silently
+   * swallow a whole burst's pending recompute until the fifteen-minute floor.
+   */
+  app.post('/ops/api/analytics/recalculate', async () => runManualRecompute());
 };
+
+/** Every filter absent — the shape the `/ops` page requests when it just opens. */
+function isDefaultNarrativeQuery(query: AnalyticsQuery): boolean {
+  return query.from == null && query.to == null && query.bucket == null
+    && query.version == null && query.threatType == null && query.oblast == null;
+}
 
 export default analyticsRoutes;
 export { analyticsRoutes };

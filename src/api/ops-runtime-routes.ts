@@ -2,6 +2,7 @@ import type { FastifyPluginAsync, FastifyReply, FastifyRequest } from 'fastify';
 import { z } from 'zod';
 import { config } from '../config.js';
 import { PUBLICATION_MODES } from '../types.js';
+import { publicationSlice, sliceMeta, type PublicationSlice } from '../services/publication.js';
 import {
   RuntimeSettingsRangeError,
   applyRuntimeSettingsPatch,
@@ -39,6 +40,25 @@ const BOUNDS = {
 } as const;
 
 /**
+ * What the hold is actually doing right now, as opposed to what is stored.
+ *
+ * `backlogEvents` is the number this card exists for — «скільки подій уже записано, але ще не
+ * опубліковано». In `live` mode it is zero except for rows written in the same millisecond as the
+ * read. A stored switch without this block is the confusing state the whole endpoint was designed to
+ * avoid: a mode label with nothing to say whether it is taking effect.
+ */
+function effectiveOf(slice: PublicationSlice, now: Date) {
+  return {
+    delaySeconds: slice.delaySeconds,
+    cutoffAt: slice.cutoffAt.toISOString(),
+    cutoffVersion: slice.cutoffVersion,
+    lastPublishedEventAt: slice.lastPublishedEventAt?.toISOString() ?? null,
+    backlogEvents: slice.headVersion - slice.cutoffVersion,
+    behindSeconds: sliceMeta(slice, now).behindSeconds
+  };
+}
+
+/**
  * PUT, not PATCH, because the console sends the whole form — but the body is validated as a patch so
  * a `curl` that only wants to flip the mode does not have to restate four numbers it does not care
  * about. `.strict()` because a typo'd key ("publicationModes") silently doing nothing is the failure
@@ -73,8 +93,10 @@ const opsRuntimeRoutes: FastifyPluginAsync = async (app) => {
    */
   app.get('/ops/api/runtime', async (request, reply) => {
     if (!authorised(request)) return unauthorized(reply);
-    const [settings, audit] = await Promise.all([readRuntimeSettings(), readRuntimeSettingsAudit(20)]);
-    return { settings, bounds: BOUNDS, audit, notice: NOTICE };
+    const [settings, audit, slice] = await Promise.all([
+      readRuntimeSettings(), readRuntimeSettingsAudit(20), publicationSlice()
+    ]);
+    return { settings, effective: effectiveOf(slice, new Date()), bounds: BOUNDS, audit, notice: NOTICE };
   });
 
   app.put('/ops/api/runtime', async (request, reply) => {
@@ -105,8 +127,12 @@ const opsRuntimeRoutes: FastifyPluginAsync = async (app) => {
       }
       throw error;
     }
-    const audit = await readRuntimeSettingsAudit(20);
-    return { settings, bounds: BOUNDS, audit, notice: NOTICE };
+    // The same shape as GET, `effective` included: the console re-renders from this response, and a
+    // form that showed the new mode beside the previous slice would be the "switch on beside a dead
+    // session" state this endpoint exists to prevent. `saveRuntimeSettings` primes the settings
+    // memo, so the slice below already reads the mode that was just written.
+    const [audit, slice] = await Promise.all([readRuntimeSettingsAudit(20), publicationSlice()]);
+    return { settings, effective: effectiveOf(slice, new Date()), bounds: BOUNDS, audit, notice: NOTICE };
   });
 };
 

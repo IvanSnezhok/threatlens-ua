@@ -1,6 +1,7 @@
 import { readFileSync, readdirSync, statSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { describe, expect, it } from 'vitest';
+import { THREAT_ICON_LABELS_UK, THREAT_ICON_PATHS } from '../domain/threat-icons.js';
 
 /**
  * Structural proof that the operator-only extrapolation cannot reach a public response.
@@ -211,7 +212,8 @@ function styleLoadBlock(): string {
 function executionOrderSource(): string {
   return styleLoadBlock()
     .replace('addOccupationLayers();', bodyOf('addOccupationLayers'))
-    .replace('addVectorLayers();', bodyOf('addVectorLayers'));
+    .replace('addVectorLayers();', bodyOf('addVectorLayers'))
+    .replace('addTerritoryIconLayers();', bodyOf('addTerritoryIconLayers'));
 }
 
 /**
@@ -275,8 +277,55 @@ describe('map layer order', () => {
       'city-hit', 'city-labels', 'crimea-ukraine-label', 'alert-oblast-label', 'alert-raion-label',
       'direction-lines',
       'threat-vector-sequence', 'threat-vector-direction', 'threat-vector-transit',
-      'threat-vector-nodes', 'threat-vector-order'
+      'threat-vector-nodes', 'threat-vector-order',
+      'territory-icon-slot-0', 'territory-icon-slot-1', 'territory-icon-slot-2', 'territory-icon-badge'
     ]);
+  });
+
+  it('keeps the threat icons above every other layer', () => {
+    // Іконки — головний показник карти, тож вони додаються без якоря й лягають на самий верх.
+    const iconIds = ['territory-icon-slot-0', 'territory-icon-slot-1', 'territory-icon-slot-2', 'territory-icon-badge'];
+    const lastVector = Math.max(...['threat-vector-sequence', 'threat-vector-direction', 'threat-vector-transit',
+      'threat-vector-nodes', 'threat-vector-order'].map((id) => order.indexOf(id)));
+    for (const id of iconIds) {
+      expect(layers.find((layer) => layer.id === id)?.beforeId).toBeNull();
+      expect(order.indexOf(id)).toBeGreaterThan(lastVector);
+    }
+  });
+
+  it('registers every icon image before the first icon layer', () => {
+    // Проти мовчазної підміни: глобальний обробник styleimagemissing підставляє прозорий піксель
+    // 1×1 на будь-який невідомий id БЕЗ попередження, тож шар, доданий раніше за реєстрацію
+    // зображень, малював би ніщо і виглядав би як «іконок просто немає».
+    //
+    // Перевіряємо СИРИЙ блок style.load, а не executionOrderSource(): там літеральний виклик
+    // `addTerritoryIconLayers();` уже замінено тілом функції, indexOf повернув би -1 і твердження
+    // перевернулося б на протилежне.
+    const block = styleLoadBlock();
+    const images = block.indexOf('addThreatIconImages(');
+    const layersCall = block.indexOf('addTerritoryIconLayers();');
+    expect(images).toBeGreaterThan(-1);
+    expect(layersCall).toBeGreaterThan(-1);
+    expect(images).toBeLessThan(layersCall);
+  });
+
+  it('keeps the four icon layers out of every layer-toggle group', () => {
+    // Іконка йде за своїм сімейством, вона не пʼятий перемикач: тон `consequence` гасне разом із
+    // «Наслідками», а не окремо від них.
+    const start = APP_SOURCE.indexOf('const layerGroups = {');
+    expect(start).toBeGreaterThan(-1);
+    const literal = APP_SOURCE.slice(start, balanced(APP_SOURCE, APP_SOURCE.indexOf('{', start), '{', '}') + 1);
+    expect(literal).not.toContain('territory-icon-');
+  });
+
+  it('mirrors every threat-icon glyph and label into the browser bundle', () => {
+    // Текстове сканування src/domain/threat-icons.ts тут не працює: там кожен path зібрано з
+    // кількох рядків через `+`, тож повного значення в тому файлі немає як суцільного підрядка.
+    // Тому значення імпортуються в рантаймі, а web/app.js зобовʼязаний писати кожен path ОДНИМ
+    // нерозривним літералом — інакше ця перевірка нічого б не означала.
+    for (const value of [...Object.values(THREAT_ICON_PATHS), ...Object.values(THREAT_ICON_LABELS_UK)]) {
+      expect(APP_SOURCE, `web/app.js is missing the mirrored value ${value.slice(0, 24)}…`).toContain(value);
+    }
   });
 
   it('anchors every territory-state fill beneath the sovereignty fill', () => {
@@ -374,5 +423,8 @@ describe('map layer order', () => {
     const source = read('web/app.js');
     expect(source).toContain(`map.on('style.load'`);
     expect(source).not.toContain(`map.on('load'`);
+    // Єдиний обробник масштабу у файлі: MapLibre забороняє ['zoom'] усередині filter, тож рівень
+    // деталізації іконок перемикається перевипуском джерела, а не виразом у стилі.
+    expect(source).toContain(`map.on('zoomend'`);
   });
 });

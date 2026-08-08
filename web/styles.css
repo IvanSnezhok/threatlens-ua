@@ -316,6 +316,11 @@ body { overflow-x: hidden; }
 .system-strip[data-state="delayed"] strong { color: var(--risk); }
 .system-strip[data-state="delayed"] .status-dot { background: var(--risk); animation: none; }
 
+/* Свідома затримка оператора — стан, а не помилка: приглушений акцент, без пульсації крапки. */
+.system-strip[data-state="held"] { color: rgba(233, 231, 224, .72); }
+.system-strip[data-state="held"] strong { color: var(--consequence); }
+.system-strip[data-state="held"] .status-dot { background: var(--consequence); animation: none; }
+
 .system-strip[data-state="stale"] {
   background: rgba(255, 71, 71, .12);
   border-bottom-color: rgba(255, 71, 71, .3);
@@ -358,6 +363,9 @@ body { overflow-x: hidden; }
   flex-direction: column;
   align-items: flex-start;
   gap: 8px;
+  /* Три розгорнуті легенди на невисокому екрані вищі за max-height. Без цього рядка стос просто
+     виливався б за межі карти й нижня легенда ставала недосяжною. */
+  overflow-y: auto;
   pointer-events: none;
 }
 .map-panels > * { pointer-events: auto; }
@@ -555,16 +563,16 @@ body { overflow-x: hidden; }
   background: repeating-linear-gradient(-45deg, rgba(255,207,138,.85) 0 1.5px, rgba(255,207,138,.14) 1.5px 4.5px); }
 .legend-swatch.state-analytic    { color: rgba(143, 155, 148, .7); border-style: dotted; background: none; }
 
-/* Місце під іконку типу загрози в легенді. Саму графіку додає етап 2. */
+/* Гліф типу загрози в легенді: інлайновий SVG, тонований через currentColor. */
 .legend-icon {
   flex: 0 0 auto;
-  display: inline-grid; place-items: center;
-  width: 20px; height: 20px;
-  border-radius: 5px;
-  background: rgba(233, 231, 224, .10);
-  color: var(--bone-2);
+  width: 15px; height: 15px;
+  color: var(--threat);
 }
-.legend-icon svg { width: 14px; height: 14px; fill: currentColor; }
+.legend-icon svg { display: block; width: 100%; height: 100%; }
+/* Дві колонки на будь-якій ширині: десять рядків в один стовпчик — це вже не легенда, а список. */
+.legend-icons { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 7px 10px; }
+.legend-icons li { font-size: 11px; }
 
 /* Текст лише для допоміжних технологій: живий регіон карти не має жодного візуального місця,
    але без нього карта для читача з екранної читалки лишається порожнім прямокутником. */
@@ -608,6 +616,25 @@ body { overflow-x: hidden; }
   transition: background-color .16s var(--ease);
 }
 .map-caption button:hover { background: rgba(233, 231, 224, .1); }
+
+/* Плашка режиму публікації. Стоїть над підписом карти, бо підпис ховається нижче 980 px, а те, що
+   показ затримано, мусить лишатися видимим на телефоні теж. Тон — той самий пісочний, що й у
+   смузі стану: це стан, а не помилка. */
+.map-chip {
+  position: absolute;
+  left: var(--gutter); right: var(--gutter); bottom: 96px;
+  z-index: 2;
+  margin: 0;
+  max-width: 720px;
+  padding: 9px 12px;
+  border: 1px solid rgba(255, 207, 138, .4);
+  border-left: 2px solid var(--consequence);
+  background: rgba(10, 12, 16, .92);
+  color: #f2e2c4;
+  font: 400 10.5px/1.5 var(--mono);
+  pointer-events: none;
+}
+.map-chip[hidden] { display: none; }
 
 /* ---- 8. Рейка подій --------------------------------------------------------------------------- */
 
@@ -1523,6 +1550,104 @@ body { overflow-x: hidden; }
 .territory-state-row span { color: var(--bone-2); font-size: 12.5px; line-height: 1.5; }
 .territory-state-row small { color: var(--bone-4); font-size: 11px; line-height: 1.45; }
 
+/* Вкладки панелі території. Ролі tablist / tab / tabpanel уже в розмітці — тут лише вигляд. */
+.territory-tabs {
+  display: flex;
+  gap: 7px;
+  margin-bottom: 16px;
+  padding-bottom: 12px;
+  border-bottom: 1px solid var(--rule);
+}
+.territory-tabs button {
+  padding: 8px 13px;
+  border: 1px solid var(--rule-2);
+  background: transparent;
+  color: var(--bone-3);
+  font: 400 10px/1 var(--mono);
+  letter-spacing: .07em;
+  text-transform: uppercase;
+  cursor: pointer;
+  transition: color .16s var(--ease), border-color .16s var(--ease), background-color .16s var(--ease);
+}
+.territory-tabs button:hover { color: var(--bone); border-color: var(--rule-3); }
+.territory-tabs button.is-active { background: var(--bone); border-color: var(--bone); color: var(--ink); }
+
+.territory-state { display: flex; align-items: center; flex-wrap: wrap; gap: 9px; margin: 0 0 12px; }
+.territory-coverage {
+  color: var(--bone-4);
+  font: 400 9px/1.4 var(--mono);
+  letter-spacing: .1em;
+  text-transform: uppercase;
+}
+.territory-alert small, .territory-publication {
+  display: block;
+  color: var(--bone-3);
+  font-size: 12px;
+  line-height: 1.5;
+}
+.territory-publication {
+  margin: 14px 0 0;
+  padding: 9px 11px;
+  border-left: 2px solid var(--consequence);
+  background: rgba(255, 207, 138, .08);
+  color: #f2e2c4;
+}
+.territory-loading { margin: 0; color: var(--bone-3); font-size: 12.5px; }
+
+.territory-threats { margin: 0 0 16px; padding: 0; list-style: none; display: grid; gap: 1px; background: var(--rule); }
+.territory-threat {
+  width: 100%;
+  display: grid; gap: 4px;
+  padding: 12px 13px;
+  border: 0;
+  border-left: 2px solid var(--threat);
+  background: var(--surface-2);
+  text-align: left;
+  font: inherit;
+  cursor: pointer;
+  transition: background-color .16s var(--ease);
+}
+.territory-threat:hover { background: var(--surface-3); }
+/* Згадка — не загроза для цієї території: сірий бік, а не помаранчевий. Різниця мусить читатися
+   до того, як людина дочитає текст. */
+.territory-threat.is-mentioned { border-left-color: var(--rule-3); }
+.tt-head { display: flex; align-items: baseline; flex-wrap: wrap; gap: 9px; }
+.tt-head b { color: var(--bone); font: 600 14px/1.25 var(--body); }
+.tt-head em {
+  color: var(--bone-4);
+  font: 400 9px/1.4 var(--mono);
+  font-style: normal;
+  letter-spacing: .1em;
+  text-transform: uppercase;
+}
+.tt-meta { color: var(--bone-2); font-size: 12.5px; line-height: 1.5; }
+.tt-sources, .tt-direction { color: var(--bone-4); font-size: 11px; line-height: 1.45; }
+
+.territory-assessment {
+  width: 100%;
+  display: grid; gap: 7px;
+  padding: 13px;
+  border: 0;
+  border-left: 2px solid var(--analytic);
+  background: var(--surface-2);
+  text-align: left;
+  font: inherit;
+  cursor: pointer;
+  transition: background-color .16s var(--ease);
+}
+.territory-assessment:hover { background: var(--surface-3); }
+.ta-kicker {
+  color: var(--bone-4);
+  font: 400 9px/1.4 var(--mono);
+  letter-spacing: .1em;
+  text-transform: uppercase;
+}
+.ta-score { display: flex; align-items: baseline; gap: 11px; }
+.ta-score strong { color: var(--bone); font: 600 24px/1 var(--display); letter-spacing: -.03em; }
+.ta-score strong small { font-size: 12px; color: var(--bone-4); }
+.ta-score > span { color: var(--bone-2); font-size: 12.5px; line-height: 1.5; }
+.ta-meta { color: var(--bone-4); font-size: 11px; line-height: 1.45; }
+
 .territory-summary {
   display: grid;
   grid-template-columns: repeat(3, 1fr);
@@ -1848,6 +1973,32 @@ body { overflow-x: hidden; }
 .codex-feature span { color: var(--bone-3); font-size: 12px; line-height: 1.6; }
 .codex-feature strong { display: block; margin-bottom: 5px; color: var(--bone); font-size: 13px; font-weight: 500; }
 #codex-settings-status { align-self: center; color: var(--bone-3); font-size: 12px; }
+
+/* Числове поле в тій самій сітці, що й прапорці: одна картка — одне рішення, незалежно від того,
+   вмикач це чи мілісекунди. */
+.codex-feature { flex-wrap: wrap; }
+.codex-feature-title { flex: 1 1 100%; color: var(--bone); font-size: 13px; font-weight: 500; }
+.codex-feature-note { flex: 1 1 100%; color: var(--bone-3); font-size: 12px; line-height: 1.6; }
+.codex-feature input[type="number"] {
+  flex: 1 1 100%;
+  width: 100%; height: auto;
+  margin: 0;
+  padding: 9px 10px;
+  border: 1px solid var(--rule-2);
+  background: var(--surface);
+  color: var(--bone);
+  font: 400 13px/1 var(--mono);
+}
+#runtime-section .codex-model { margin-top: 18px; }
+#runtime-section .codex-facts { margin-top: 20px; }
+#runtime-section .ops-channel-list { margin-top: 20px; }
+#runtime-section .ops-section-head .codex-state { align-self: center; }
+#runtime-status, #analytics-recalculate-status {
+  align-self: center;
+  color: var(--bone-3);
+  font-size: 12px;
+}
+#analytics-recalculate-status:not(:empty) { display: block; margin-top: 12px; }
 /* Розбіжності тіньової класифікації: текст повідомлення й два вердикти під ним. Рядок може бути
    довгим — це матеріал для читання, а не метрика, тож перенос дозволено скрізь. */
 #shadow-section article > div:first-child { min-width: 0; }
@@ -2000,6 +2151,9 @@ code {
   .map-tools, .occupation-legend { width: 100%; }
   .legend-body { max-height: 30vh; }
   .map-caption { display: none; }
+  /* Підпису карти тут немає, тож плашка лишається єдиним місцем, де сказано про затримку. Вона
+     стоїть над рейкою подій і не має права накрити перемикачі шарів угорі. */
+  .map-chip { left: 10px; right: 10px; bottom: calc(38vh + 16px); max-width: none; font-size: 10px; }
 
   .content-shell { padding: 40px 18px 90px; background-image: linear-gradient(180deg, var(--surface) 0, var(--ink) 380px); }
   .content-heading { margin-bottom: 32px; padding-bottom: 20px; }

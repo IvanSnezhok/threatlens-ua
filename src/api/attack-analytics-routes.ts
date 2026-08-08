@@ -1,4 +1,5 @@
 import type { FastifyPluginAsync, FastifyReply } from 'fastify';
+import { publicationSlice } from '../services/publication.js';
 import { ATTACK_PERIODS, attackAnalytics, isAttackPeriod } from '../services/attack-analytics.js';
 
 /**
@@ -50,8 +51,19 @@ const attackAnalyticsRoutes: FastifyPluginAsync = async (app) => {
     if (!isAttackPeriod(period)) {
       return reply.code(400).send({ error: 'invalid_period', expected: ATTACK_PERIODS });
     }
-    const payload = await attackAnalytics(period);
-    setCacheControl(reply, CACHEABLE);
+    const slice = await publicationSlice();
+    // `min()`, not `slice.cutoffAt` outright: `delaySeconds` is non-negative so the two are the same
+    // value, and writing the min is what makes that visibly a property of the code rather than of
+    // the configuration. `resolveAttackWindow` already takes `to = now`, so this moves the window
+    // end AND the payload's own `generatedAt` to the cutoff in one step.
+    const asOf = new Date(Math.min(Date.now(), slice.cutoffAt.getTime()));
+    const payload = await attackAnalytics(period, asOf, slice.mode);
+    // The memo key fixes only the server side. A body produced in `live` mode sits in browser and
+    // CDN caches and is replayed for 120 s fresh and up to an hour stale AFTER the operator flips —
+    // on this surface the hold would simply not take effect, which fails «у delayed_15s — не раніше
+    // 15 секунд». `no-store`, not `max-age=15`: `stale-while-revalidate` is what makes the hour-long
+    // tail possible, and an already-issued `s-maxage` cannot be expired on a flip.
+    setCacheControl(reply, slice.mode === 'delayed_15s' ? 'no-store' : CACHEABLE);
     return payload;
   });
 };

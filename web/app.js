@@ -9,6 +9,68 @@ const threatNames = {
   aviation: 'Активність авіації', mlrs: 'РСЗВ', artillery: 'Артилерія',
   mortar: 'Мінометний обстріл', combined: 'Комбінована загроза', unknown: 'Невизначена загроза'
 };
+
+// Дзеркальна копія каталогу іконок із src/domain/threat-icons.ts — фронтенд збирається окремим
+// бандлом і не імпортує з src/. Змінюєш тут — зміни й там. Розбіжність тут не падає складанням:
+// вона малює не ту іконку, тож її ловить тест дзеркала у src/api/vector-isolation.test.ts.
+// Кожен path — ОДИН нерозривний рядковий літерал, без конкатенації через `+`. Тест дзеркала
+// імпортує THREAT_ICON_PATHS у рантаймі й перевіряє includes() по тексту цього файлу; розбитий на
+// частини рядок такої перевірки не пройде, і дзеркало лишилося б неперевіреним.
+//
+// Жоден гліф не є стрілкою, вектором або чимось, що показує на місце: стрілка на полігоні —
+// це заява про передбачену ціль, а система цього не робить і каже так у восьми місцях.
+const threatIconPaths = {
+  ballistic_missile: 'M2.6 21.6 C3.9 13.6 7.6 7.6 13.6 4.4 C16.3 3.0 18.6 3.6 19.9 5.8 L17.5 7.2 C16.9 6.2 15.9 6.0 14.7 6.6 C9.6 9.3 6.4 14.4 5.1 21.6 Z M16.3 9.4 L23.1 9.4 L19.7 21.8 Z',
+  guided_air_bomb: 'M12 21.6 C9.0 21.6 6.6 19.0 6.6 15.4 C6.6 10.6 9.0 5.4 12 1.8 C15.0 5.4 17.4 10.6 17.4 15.4 C17.4 19.0 15.0 21.6 12 21.6 Z M7.2 4.2 L12 8.0 L16.8 4.2 L16.8 6.6 L12 10.4 L7.2 6.6 Z M17.0 12.2 L22.6 10.4 L22.6 12.6 L17.0 14.2 Z',
+  cruise_missile: 'M3.6 10.6 L17.8 10.6 C20.4 10.6 22.4 11.5 22.4 12.6 C22.4 13.7 20.4 14.6 17.8 14.6 L3.6 14.6 Z M10.6 10.6 L8.2 6.4 L11.0 6.4 L13.4 10.6 Z M10.6 14.6 L8.2 18.8 L11.0 18.8 L13.4 14.6 Z M3.6 10.6 L1.6 5.6 L4.4 5.6 L6.0 10.6 Z',
+  combined: 'M13.2 3.2 L19.6 3.2 L16.6 14.4 Z M7.4 8.6 L13.0 20.2 L1.8 20.2 Z',
+  mlrs: 'M2.6 19.2 L21.4 19.2 L21.4 21.8 L2.6 21.8 Z M6.8 3.4 L8.4 7.0 L8.4 18.2 L5.2 18.2 L5.2 7.0 Z M12 2.2 L13.6 5.8 L13.6 18.2 L10.4 18.2 L10.4 5.8 Z M17.2 3.4 L18.8 7.0 L18.8 18.2 L15.6 18.2 L15.6 7.0 Z',
+  uav: 'M12 2.6 L22.4 17.2 L1.6 17.2 Z M10.6 6.4 L13.4 6.4 L13.4 21.4 L10.6 21.4 Z M4.6 21.4 L10.6 17.6 L10.6 21.4 Z M19.4 21.4 L13.4 17.6 L13.4 21.4 Z',
+  artillery: 'M3.6 21.6 L20.4 21.6 L18.0 16.2 L6.0 16.2 Z M8.6 17.6 L11.0 15.2 L21.2 5.0 L18.8 7.4 Z',
+  mortar: 'M4.2 20.0 L19.8 20.0 L19.8 22.4 L4.2 22.4 Z M6.6 19.3 L11.0 7.1 L15.0 8.5 L10.6 20.7 Z M14.6 1.6 C16.1 3.0 16.8 4.3 16.8 5.3 C16.8 6.6 15.8 7.5 14.6 7.5 C13.4 7.5 12.4 6.6 12.4 5.3 C12.4 4.3 13.1 3.0 14.6 1.6 Z',
+  aviation: 'M12 1.6 C13.0 2.9 13.5 4.4 13.5 6.0 L13.5 20.0 C13.5 21.2 12.9 22.2 12 22.4 C11.1 22.2 10.5 21.2 10.5 20.0 L10.5 6.0 C10.5 4.4 11.0 2.9 12 1.6 Z M10.5 9.0 L0.8 15.4 L0.8 17.2 L10.5 14.6 Z M13.5 9.0 L23.2 15.4 L23.2 17.2 L13.5 14.6 Z M10.5 18.4 L5.6 21.0 L5.6 22.2 L10.5 21.0 Z M13.5 18.4 L18.4 21.0 L18.4 22.2 L13.5 21.0 Z',
+  unknown: 'M6.4 2.8 H17.6 A3.6 3.6 0 0 1 21.2 6.4 V17.6 A3.6 3.6 0 0 1 17.6 21.2 H6.4 A3.6 3.6 0 0 1 2.8 17.6 V6.4 A3.6 3.6 0 0 1 6.4 2.8 Z M12.0 6.0 C9.8 6.0 8.2 7.5 8.2 9.6 H10.8 C10.8 8.8 11.3 8.3 12.0 8.3 C12.8 8.3 13.3 8.8 13.3 9.5 C13.3 10.2 12.9 10.7 12.1 11.3 C11.0 12.1 10.7 12.9 10.7 14.2 V14.8 H13.3 V14.4 C13.3 13.6 13.6 13.2 14.4 12.6 C15.5 11.8 15.9 10.9 15.9 9.5 C15.9 7.4 14.3 6.0 12.0 6.0 Z M10.6 16.4 H13.4 V19.2 H10.6 Z'
+};
+// Дзеркальна копія ICON_TONE_ARIA_UK із src/domain/threat-icons.ts. Змінюєш тут — зміни й там.
+const threatIconAria = {
+  consequence: 'повідомлено наслідки',
+  confirmed: 'підтверджене джерело',
+  reported: 'повідомлення моніторингу',
+  analytic: 'аналітична оцінка, не тривога'
+};
+// Підпис іконки — це та сама назва класу, яку вже показує картка події. Окрема копія розійшлася б.
+const threatIconLabels = threatNames;
+const iconTones = ['consequence', 'confirmed', 'reported', 'analytic'];
+// #ff4747 тут не зʼявляється ніколи: червоне зарезервоване за офіційною тривогою, а тривога —
+// це заливка полігона, а не іконка. Іконка, що позичила б колір тривоги, дала б повідомленню
+// моніторингу вигляд рішення держави.
+const iconChipColor = { consequence: '#ffcf8a', confirmed: '#ff7a4d', reported: '#ff7a4d', analytic: '#8f9b94' };
+const iconChipAlpha = { consequence: 1, confirmed: 1, reported: .72, analytic: 1 };
+const iconImageId = (threatType, tone) => `ti-${threatType}-${tone}`;
+const iconAriaLabel = (threatType, tone) => `${threatIconLabels[threatType] ?? threatType} — ${threatIconAria[tone]}`;
+const ICON_CHIP_PX = 30;        // CSS px — фінальний розмір фішки на карті
+const ICON_PIXEL_RATIO = 2;     // бітмап 60×60, як у occupation-hatch-pattern
+const ICON_GLYPH_BOX = 18;      // CSS px — у цей квадрат вписується гліф
+const ICON_GLYPH_GRID = 24;     // сітка, на якій намальовано path-рядки
+// icon-offset вимірюється в пікселях, помножених на icon-size (тут 1), а НЕ в ширинах іконки:
+// в емах кегля вимірюється лише text-offset, і саме для нього правильні ICON_BADGE_OFFSET.
+// Крок 34 px проти фішки 30 px лишає 4 px проміжку — рівно стільки, щоб власний темний обвід
+// фішки читався як роздільник на будь-якому масштабі.
+const ICON_SLOT_OFFSETS = {
+  1: [[0, 0]],
+  2: [[-17, 0], [17, 0]],
+  3: [[-34, 0], [0, 0], [34, 0]]
+};
+const ICON_BADGE_OFFSET = { 1: [1.9, 0], 2: [3.5, 0], 3: [5.5, 0] };
+const MAX_ICON_SLOTS = 3;
+// Усі чотири шари несуть той самий locationId на тій самій фічі, тож дотик по іконці, по проміжку
+// між іконками або по бейджу «+N» відкриває ту саму панель. Саме тому 30-піксельна фішка є
+// прийнятною ціллю для пальця: точність дотику тут не є вимогою.
+const iconLayerIds = ['territory-icon-slot-0', 'territory-icon-slot-1', 'territory-icon-slot-2', 'territory-icon-badge'];
+// Тон іконки належить тій самій групі перемикачів, що й полігон, який він пояснює. Перемикач
+// «Тривоги» не ховає жодної іконки: офіційна тривога — це не іконка, це заливка.
+const iconToneGroup = { consequence: 'consequences', confirmed: 'threats', reported: 'threats', analytic: 'assessments' };
+
 const levelNames = { background: 'фоновий', elevated: 'підвищений', significant: 'значний', high: 'високий', very_high: 'дуже високий' };
 const evidenceNames = { official: 'офіційно', confirmed: 'підтверджено', monitoring: 'моніторинг', unverified: 'не перевірено' };
 const confidenceNames = { low: 'низька', medium: 'середня', high: 'висока' };
@@ -124,6 +186,13 @@ let occupationFetchedAt = null;
 let vectors = [];
 let vectorLegendOpen = null;
 let threatLegendOpen = null;   // 981px — дзеркало CSS-брейкпойнта 980px; тримати синхронно
+// Реєстрація сорока зображень і чотири шари, що їх малюють. Обидва прапорці скидаються разом із
+// картою: map.addImage не переживає map.remove(), а карту знищують на кожному переході з маршруту.
+let iconImagesReady = false;
+let iconLayersReady = false;
+let iconTier = null;           // 'oblast' | 'raion'
+let openTerritoryId = null;
+let aiRunsSurface = '';
 let opsAuthorization = '';
 let codexPollTimer = null;
 let lastReceived = null;
@@ -340,6 +409,83 @@ function territoryCoverage() {
   return coverage;
 }
 
+function snapshotTerritories() {
+  return snapshot?.territories ?? [];
+}
+
+// Найближча територія, для якої в браузері справді є контур. Сервер вважає район «таким, що має
+// контур», за його типом, а браузер — за тим, чи приїхав ADM2: loadRaionBoundaries() лінива й
+// ковтає власну помилку, а setFeatureState на неіснуючій фічі — мовчазний no-op. Без цього підйому
+// районна загроза просто зникала б із карти, поки геометрія в польоті.
+function nearestPolygonAncestor(id) {
+  if (!id) return null;
+  if (regionFeatures.has(id)) return id;
+  for (const ancestor of ancestorsOf(id)) if (regionFeatures.has(ancestor)) return ancestor;
+  return null;
+}
+
+// Найсильніше покриття сімейства: direct > unmapped > partial. Той самий порядок, яким сервер
+// згортає кілька дослівно названих локацій в одну територію.
+const COVERAGE_RANK = { direct: 2, unmapped: 1, partial: 0 };
+function strongestCoverage(rows) {
+  let best = null;
+  for (const row of rows) {
+    if (!best || (COVERAGE_RANK[row.coverage] ?? -1) > (COVERAGE_RANK[best] ?? -1)) best = row.coverage;
+  }
+  return best;
+}
+
+// TerritoryAssessment не несе location_id, а сукупне state.coverage могла підняти згадка, яка не
+// малює нічого. Тож дослівно названу територію оцінки дістаємо з тієї самої оцінки у
+// snapshot.assessments за її ідентифікатором — інакше пунктирний контур вийшов би яскравішим,
+// ніж сказала модель.
+function analyticCoverageOf(state) {
+  const named = (snapshot?.assessments ?? [])
+    .find((risk) => risk.id === state.assessment?.assessmentId)?.location_id;
+  if (!named) return state.coverage;
+  if (named === state.locationId) return 'direct';
+  return nearestPolygonAncestor(named) === state.locationId ? 'unmapped' : 'partial';
+}
+
+/**
+ * Ті самі чотири сімейства, але з готового серверного `territories[]`.
+ *
+ * Полігон засвічує СТАН, а не присутність рядка: alertActive / threatActive / consequences /
+ * analyticStatus. Територія, яку джерело лише згадало, приходить у `territories[]` з
+ * `asserted: false` — вона мусить бути в панелі рядком «Згадано джерелом» і не має світити нічого.
+ *
+ * Території без контуру (ADM2 ще в польоті або його немає взагалі) підіймаються до найближчого
+ * предка з контуром і пишуть йому ключ *Unmapped: детальнішого шару, який його підмінить, там
+ * не буде, тож він не гасне з наближенням.
+ */
+function territoryCoverageFromStates() {
+  const family = () => ({ direct: new Set(), covered: new Set(), unmapped: new Set() });
+  const coverage = { alert: family(), threat: family(), consequence: family(), analytic: family() };
+
+  const claim = (fam, id, tone) => {
+    const anchor = nearestPolygonAncestor(id);
+    if (!anchor) return;
+    if (anchor !== id) { fam.covered.add(anchor); fam.unmapped.add(anchor); return; }
+    if (tone === 'direct') { fam.direct.add(id); return; }
+    fam.covered.add(id);
+    if (tone === 'unmapped') fam.unmapped.add(id);
+  };
+
+  for (const state of snapshotTerritories()) {
+    if (state.alertActive) claim(coverage.alert, state.locationId, strongestCoverage(state.alerts ?? []) ?? state.coverage);
+    const asserted = (state.threats ?? []).filter((threat) => threat.asserted);
+    if (state.threatActive) claim(coverage.threat, state.locationId, strongestCoverage(asserted) ?? state.coverage);
+    const consequences = (state.threats ?? []).filter((threat) => threat.consequence);
+    if (state.consequences) claim(coverage.consequence, state.locationId, strongestCoverage(consequences) ?? state.coverage);
+    // Поріг контуру (>= elevated) сервер уже застосував, ставлячи analyticStatus. Поріг ІКОНКИ
+    // вищий (significant) і живе в icons[], тож контур і гліф лишаються двома різними заявами.
+    if (state.analyticStatus && state.analyticStatus !== 'none') {
+      claim(coverage.analytic, state.locationId, analyticCoverageOf(state));
+    }
+  }
+  return coverage;
+}
+
 function alertLabelCollection(fam) {
   const { names } = locationIndexes();
   const features = [];
@@ -377,7 +523,10 @@ function territoryStateOf(id, coverage) {
 
 function applyTerritoryLayers() {
   if (!mapLayersReady || !map) return;
-  const coverage = territoryCoverage();
+  // Знімок без `territories[]` — це старий сервер або частковий деплой, а не помилка. Тоді карту
+  // веде розкладка хвилі 1: полігони лишаються, іконок просто немає. Деградація в бік меншої
+  // кількості інформації, ніколи — у бік помилки.
+  const coverage = snapshotTerritories().length ? territoryCoverageFromStates() : territoryCoverage();
   const touched = new Set();
   for (const fam of Object.values(coverage)) {
     for (const id of fam.direct) touched.add(id);
@@ -412,6 +561,9 @@ async function loadRaionBoundaries() {
     indexRegionFeatures();
     map?.getSource('ukraine-raions')?.setData(raionCollection());
     applyTerritoryLayers();
+    // Центроїдів районів не існує, поки не приїхав ADM2, тож стеки іконок для них треба
+    // перевипустити саме тут: прибуття файлу асинхронне й нефатальне.
+    updateTerritoryIcons();
   } catch { /* без районних контурів карта працює на рівні областей */ }
 }
 
@@ -420,14 +572,29 @@ setInterval(() => { $('#clock strong').textContent = kyivTime(); updateFreshness
 function updateFreshness() {
   if (!lastReceived) return;
   const age = (Date.now() - lastReceived.getTime()) / 1000;
+  const publication = snapshot?.publication ?? null;   // відсутнє у старому payload
+  const held = publication?.mode === 'delayed_15s';
   const strip = $('#system-strip');
   const backendProblem = backendStatus === 'degraded' || backendStatus === 'unconfigured';
-  strip.dataset.state = age > 180 || backendProblem ? 'stale' : age > 60 ? 'delayed' : 'current';
+  // «held» стоїть НИЖЧЕ за «delayed» і «stale»: свідома затримка оператора — це не несправність,
+  // але справжня несправність поверх неї має лишатися видимою.
+  strip.dataset.state = age > 180 || backendProblem ? 'stale'
+    : age > 60 ? 'delayed'
+      : held ? 'held' : 'current';
   $('#system-state').textContent = age > 180 ? 'ДАНІ ЗАСТАРІЛИ'
     : backendStatus === 'degraded' ? 'ОФІЦІЙНІ ДЖЕРЕЛА НЕДОСТУПНІ'
       : backendStatus === 'unconfigured' ? 'ДЖЕРЕЛА НЕ НАЛАШТОВАНІ'
-        : age > 60 ? 'МОЖЛИВА ЗАТРИМКА' : 'ДАНІ АКТУАЛЬНІ';
-  $('#last-update').textContent = `оновлено ${Math.round(age)} с тому`;
+        : age > 60 ? 'МОЖЛИВА ЗАТРИМКА'
+          : held ? 'ЗАТРИМКА 15 С' : 'ДАНІ АКТУАЛЬНІ';
+  // Три показники, яких вимагає дорожня карта: режим (у #system-state), фактична свіжість
+  // («оновлено N с тому») і ЧАС ОСТАННЬОЇ ОПУБЛІКОВАНОЇ ПОДІЇ. Третій без цього рядка не мав би
+  // жодного споживача взагалі: він рахувався у зрізі й показувався тільки в /ops.
+  $('#last-update').textContent = held
+    ? `оновлено ${Math.round(age)} с тому · зріз о ${shortTime(publication.cutoffAt)} · `
+      + (publication.lastPublishedEventAt
+        ? `остання подія о ${shortTime(publication.lastPublishedEventAt)}`
+        : 'подій ще не було')
+    : `оновлено ${Math.round(age)} с тому`;
 }
 
 async function loadSnapshot() {
@@ -443,7 +610,11 @@ async function loadSnapshot() {
 }
 
 function connectStream() {
-  const source = new EventSource('/api/v1/stream');
+  // Точка відновлення: без неї кожна подія, закомічена між зрізом знімка й рукостисканням потоку,
+  // лишалася б невидимою для цієї вкладки, доки не прийде якась наступна. Сервер трактує ?since=
+  // рівно як Last-Event-ID, а верхньою межею добору лишається зріз публікації — тож повз затримку
+  // це не пропускає нічого.
+  const source = new EventSource(`/api/v1/stream?since=${snapshot?.version ?? 0}`);
   source.addEventListener('connected', () => { lastReceived = new Date(); updateFreshness(); });
   const schedule = () => {
     lastReceived = new Date();
@@ -452,7 +623,9 @@ function connectStream() {
   };
   // 'threat.withdrawn' and 'threat.expired' end a threat. Without them the map keeps drawing it
   // until some unrelated event happens to arrive, which is the one direction that must not lag.
-  ['alert.started','alert.ended','threat.created','threat.updated','threat.corrected','threat.withdrawn','threat.expired','assessment.updated','source.stale','source.recovered'].forEach((name) => source.addEventListener(name, schedule));
+  // 'publication.changed' і 'analytics.updated' — нові імена: іменовані події EventSource НЕ
+  // падають у загальний обробник message, тож без цього рядка клієнт мовчки б їх ігнорував.
+  ['alert.started','alert.ended','threat.created','threat.updated','threat.corrected','threat.withdrawn','threat.expired','assessment.updated','source.stale','source.recovered','publication.changed','analytics.updated'].forEach((name) => source.addEventListener(name, schedule));
   source.onerror = markOffline;
 }
 
@@ -794,6 +967,237 @@ function renderOccupationLegend() {
     </div>`;
 }
 
+// ------------------------------------------------------------------------------------------------
+// Іконки типів загроз — растеризація, джерело, шари
+// ------------------------------------------------------------------------------------------------
+//
+// Canvas → ImageData → map.addImage, без SDF, по одному попередньо тонованому зображенню на пару
+// (клас, тон). Той самий шлях, яким уже живе occupation-hatch-pattern, і обраний він з однієї
+// причини: він СИНХРОННИЙ. new Image() з data:-адресою змагався б зі style.load, а глобальний
+// обробник styleimagemissing підставляє на будь-який невідомий id прозорий піксель 1×1 мовчки, без
+// жодного попередження в консолі, — тож запізніле зображення малювалося б як ніщо, і «іконки немає»
+// не відрізнялося б від «іконка не додалася».
+
+function roundedRectPath(ctx, x, y, w, h, r) {
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.arcTo(x + w, y, x + w, y + h, r);
+  ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r);
+  ctx.arcTo(x, y, x + w, y, r);
+  ctx.closePath();
+}
+
+// Одна фішка = один клас × один тон. Тон уже вкладено в пікселі: MapLibre не вміє фарбувати
+// звичайне (не-SDF) зображення, і це свідомий обмін — 40 крихітних канвасів проти дистанційних
+// полів, які довелося б рахувати самим.
+function threatIconImage(threatType, tone) {
+  const canvas = document.createElement('canvas');
+  canvas.width = canvas.height = ICON_CHIP_PX * ICON_PIXEL_RATIO;
+  const ctx = canvas.getContext('2d');
+  if (!ctx) return null;
+  ctx.scale(ICON_PIXEL_RATIO, ICON_PIXEL_RATIO);
+
+  // 1. фішка
+  roundedRectPath(ctx, 0.75, 0.75, ICON_CHIP_PX - 1.5, ICON_CHIP_PX - 1.5, 8);
+  ctx.globalAlpha = iconChipAlpha[tone];
+  ctx.fillStyle = iconChipColor[tone];
+  ctx.fill();
+  ctx.globalAlpha = 1;
+
+  // 2. наслідки — штрихування під 45°, обрізане самою фішкою. Той самий словник, яким шар
+  //    окупації вже позначає «територія у спірному стані»; кут протилежний, щоб два штрихування
+  //    ніколи не злилися в одне.
+  if (tone === 'consequence') {
+    ctx.save();
+    ctx.clip();
+    ctx.globalAlpha = .25; ctx.strokeStyle = '#06080c'; ctx.lineWidth = 2;
+    ctx.beginPath();
+    for (let offset = -ICON_CHIP_PX; offset < ICON_CHIP_PX * 2; offset += 6) {
+      ctx.moveTo(offset, ICON_CHIP_PX); ctx.lineTo(offset + ICON_CHIP_PX, 0);
+    }
+    ctx.stroke();
+    ctx.restore();
+    roundedRectPath(ctx, 0.75, 0.75, ICON_CHIP_PX - 1.5, ICON_CHIP_PX - 1.5, 8);
+  }
+
+  // 3. обвід фішки — щоб помаранчева фішка читалася і на помаранчевій заливці загрози
+  ctx.globalAlpha = .9; ctx.strokeStyle = '#06080c'; ctx.lineWidth = 1.5; ctx.stroke();
+  ctx.globalAlpha = 1;
+
+  // 4. повідомлене, але не підтверджене — пунктирне кільце. Форма, а не лише прозорість:
+  //    прозорість на світлій підкладці не читається взагалі.
+  if (tone === 'reported') {
+    ctx.setLineDash([2, 2]);
+    roundedRectPath(ctx, 3.25, 3.25, ICON_CHIP_PX - 6.5, ICON_CHIP_PX - 6.5, 5.5);
+    ctx.globalAlpha = .85; ctx.strokeStyle = '#0b0d10'; ctx.lineWidth = 1; ctx.stroke();
+    ctx.setLineDash([]); ctx.globalAlpha = 1;
+  }
+
+  // 5. гліф
+  const scale = ICON_GLYPH_BOX / ICON_GLYPH_GRID;
+  const inset = (ICON_CHIP_PX - ICON_GLYPH_BOX) / 2;
+  ctx.save();
+  ctx.translate(inset, inset);
+  ctx.scale(scale, scale);
+  ctx.fillStyle = '#0b0d10';
+  ctx.fill(new Path2D(threatIconPaths[threatType] ?? threatIconPaths.unknown), 'evenodd');
+  ctx.restore();
+
+  return ctx.getImageData(0, 0, canvas.width, canvas.height);
+}
+
+// Реєстрація ЗАВЖДИ передує додаванню шарів — див. коментар про styleimagemissing вище.
+// map.addImage НЕ переживає map.remove(), а карту знищують на кожному переході з маршруту '/',
+// тож це виклик усередині style.load, а не одноразова ініціалізація рівня модуля.
+function addThreatIconImages(map) {
+  let registered = 0;
+  for (const threatType of Object.keys(threatIconPaths)) {
+    for (const tone of iconTones) {
+      const id = iconImageId(threatType, tone);
+      if (map.hasImage(id)) { registered += 1; continue; }
+      const image = threatIconImage(threatType, tone);
+      if (!image) return false;
+      map.addImage(id, image, { pixelRatio: ICON_PIXEL_RATIO });
+      registered += 1;
+    }
+  }
+  return registered === Object.keys(threatIconPaths).length * iconTones.length;
+}
+
+function iconFamilyVisible(tone) {
+  const group = iconToneGroup[tone];
+  const toggle = group ? $(`.layer-toggle[data-layer="${group}"]`) : null;
+  return !toggle || toggle.classList.contains('is-active');
+}
+
+// «РСЗВ» мусить лишитися «РСЗВ». Опускаємо першу літеру лише тоді, коли друга вже мала.
+function lowerFirstUk(value) {
+  return /^[A-ZА-ЯЁІЇЄҐ][a-zа-яёіїєґ]/u.test(value) ? value[0].toLowerCase() + value.slice(1) : value;
+}
+
+// Рядок для читача екрана. Карта для нього — порожній <canvas>, тож стан територій мусить існувати
+// текстом. Вісім територій, не більше: далі це вже не оперативна картина, а диктант.
+function territoryAriaSentence(territory, shownIcons, overflow) {
+  const parts = [];
+  if (territory.alertActive) parts.push('офіційна тривога');
+  for (const icon of shownIcons) parts.push(lowerFirstUk(icon.labelUk ?? threatIconLabels[icon.threatType] ?? icon.threatType));
+  // Те саме число, що й у бейджі. Читач екрана і карта не мають права рахувати по-різному.
+  if (overflow > 0) parts.push(`ще ${overflow} тип${pluralUk(overflow, '', 'и', 'ів')}`);
+  return `${territory.name}: ${parts.join(', ')}.`;
+}
+
+// Пріоритет стека рахує сервер (`territories[].icons` + `iconOverflow`). Браузер його НЕ
+// перераховує: інакше карта й тести сортували б за двома різними реалізаціями одного правила.
+function territoryIconCollection() {
+  const features = [];
+  const tier = iconTier ?? 'oblast';
+  for (const territory of snapshotTerritories()) {
+    // Районні стеки зʼявляються лише коли районний шар уже читається; обласні (`direct` /
+    // `unmapped`) лишаються на всіх масштабах — детальнішого шару, який їх підмінить, не існує,
+    // і це та сама межа, за якою вже гасне обласний підпис тривоги.
+    if (tier === 'oblast' && territory.tier === 'raion') continue;
+    const point = regionCentroid(territory.locationId);
+    if (!point) continue;                       // adm2 ще не приїхав або контуру немає взагалі
+    const all = territory.icons ?? [];
+    const visible = all.filter((icon) => iconFamilyVisible(icon.tone));
+    if (!visible.length) continue;
+    const slots = visible.slice(0, MAX_ICON_SLOTS);
+    const offsets = ICON_SLOT_OFFSETS[slots.length];
+    // «+N» рахує тільки те, що відрізало РАНЖУВАННЯ. Поки нічого не приховано, це число сервера.
+    // Щойно перемикач прибрав хоч одного кандидата, серверне число більше не описує цей стек:
+    // воно сказало б «+1» над стеком, у якому кандидатів було чотири, а показано два. Тоді «+N»
+    // рахує лише те, що ранжування відрізало СЕРЕД іконок, які користувач вирішив бачити.
+    // Іконка, яку вимкнув користувач, — це не «решта», це вибір.
+    const hidden = all.length - visible.length;
+    const overflow = hidden > 0
+      ? Math.max(0, visible.length - MAX_ICON_SLOTS)
+      : Math.max(0, visible.length - MAX_ICON_SLOTS) + (territory.iconOverflow ?? 0);
+    const properties = {
+      locationId: territory.locationId,
+      tier: territory.tier,
+      overflow,
+      overflowLabel: `+${overflow}`,
+      // Зсув бейджа рахується від slots.length, тобто від іконок, які реально намальовано.
+      badgeOffset: ICON_BADGE_OFFSET[slots.length],
+      aria: territoryAriaSentence(territory, slots, overflow)
+    };
+    slots.forEach((icon, index) => {
+      properties[`icon${index}`] = icon.iconId ?? iconImageId(icon.threatType, icon.tone);
+      properties[`off${index}`] = offsets[index];
+    });
+    features.push({ type: 'Feature', id: `ti-${territory.locationId}`,
+      geometry: { type: 'Point', coordinates: point }, properties });
+  }
+  return { type: 'FeatureCollection', features };
+}
+
+// Спільний конструктор ЛИШЕ для layout: у ньому немає ні `map.addLayer(`, ні `id:`, тож парсер
+// порядку шарів його не бачить і не мусить бачити.
+// ['array','number',2,…] — явне твердження типу. `['get','off0']` має тип `value`, а icon-offset
+// очікує array<number,2>; покладатися на неявне приведення означало б залежати від деталі
+// реалізації парсера виразів.
+const slotLayout = (index) => ({
+  'icon-image': ['get', `icon${index}`],
+  'icon-size': 1,
+  'icon-offset': ['array', 'number', 2, ['get', `off${index}`]],
+  // Стек, у якому колізія погасила один слот, БРЕХАВ БИ про те, що є на території.
+  'icon-allow-overlap': true,
+  // …але підписи він відштовхує: назва області має поступитися іконці, а не лягти на неї.
+  'icon-ignore-placement': false,
+  'icon-padding': 2
+});
+
+function addTerritoryIconLayers() {
+  if (!iconImagesReady) return;   // без зображень шар малював би прозорі пікселі 1×1
+  map.addSource('territory-icons', { type: 'geojson', data: territoryIconCollection() });
+  // Три окремі виклики з рядковими літералами id. Фабрика тут неможлива: тест порядку шарів читає
+  // ТЕКСТ виклику й шукає в ньому id: '…' в одинарних лапках.
+  map.addLayer({ id: 'territory-icon-slot-0', type: 'symbol', source: 'territory-icons',
+    filter: ['has', 'icon0'], layout: slotLayout(0) });
+  map.addLayer({ id: 'territory-icon-slot-1', type: 'symbol', source: 'territory-icons',
+    filter: ['has', 'icon1'], layout: slotLayout(1) });
+  map.addLayer({ id: 'territory-icon-slot-2', type: 'symbol', source: 'territory-icons',
+    filter: ['has', 'icon2'], layout: slotLayout(2) });
+  // Шрифт бейджа приходить із того самого віддаленого джерела гліфів, що й шість наявних текстових
+  // шарів. Якщо гліфи не завантажаться, бейдж мовчки зникне, а самі іконки — растрові зображення —
+  // лишаться. Це правильна деградація: три найважливіші типи намальовані, втрачено лише «і ще N».
+  map.addLayer({ id: 'territory-icon-badge', type: 'symbol', source: 'territory-icons',
+    filter: ['>', ['get', 'overflow'], 0],
+    layout: {
+      'text-field': ['get', 'overflowLabel'], 'text-size': 11,
+      'text-font': ['Noto Sans Regular'],
+      'text-offset': ['array', 'number', 2, ['get', 'badgeOffset']],
+      'text-allow-overlap': true
+    },
+    paint: { 'text-color': '#e9e7e0', 'text-halo-color': '#06080c', 'text-halo-width': 1.6 } });
+  iconLayersReady = true;
+}
+
+function updateTerritoryIcons() {
+  if (!mapLayersReady || !iconLayersReady) return;
+  map.getSource('territory-icons')?.setData(territoryIconCollection());
+  writeMapAria();
+}
+
+function writeMapAria() {
+  const node = $('#map-aria');
+  if (!node) return;
+  const features = territoryIconCollection().features;
+  const shown = features.slice(0, 8).map((feature) => feature.properties.aria);
+  // Знімок без territories[] не дає жодної іконки, але тривоги в ньому є, і карта для читача
+  // екрана не має права мовчати про них.
+  const lines = shown.length ? shown : (snapshot?.alerts ?? []).slice(0, 8)
+    .map((alert) => `${alert.location_name}: офіційна тривога.`);
+  const text = lines.length
+    ? `${lines.join(' ')}${shown.length && features.length > 8 ? ` Показано 8 територій із ${features.length}.` : ''}`
+    : 'Активних позначок на карті немає.';
+  // aria-live перечитує вузол при КОЖНІЙ зміні тексту, а знімок оновлюється до чотирьох разів на
+  // секунду. Без цієї перевірки читач екрана під час хвилі говорив би без упину.
+  if (node.textContent === text) return;
+  node.textContent = text;
+}
+
 // Легенда чотирьох станів карти. Створюється зі скрипта, а не в public/index.html, бо той файл
 // зараз правлять інші гілки. Чотири речення тут дослівно повторюють .map-caption: підпис під картою
 // ховається нижче 980 px, і на телефоні легенда лишається єдиним поясненням трьох нових заливок.
@@ -806,30 +1210,87 @@ function renderThreatLegend() {
     legend.id = 'threat-legend';
     legend.className = 'occupation-legend';
     legend.addEventListener('toggle', () => { threatLegendOpen = legend.open; });
-    panels.append(legend);
+    // Одразу під перемикачами шарів: легенда пояснює саме їх, а не шар окупації.
+    panels.insertBefore(legend, $('.sovereignty-badge') ?? null);
   }
   legend.open = threatLegendOpen ?? window.matchMedia('(min-width: 981px)').matches;
+  // Гліф у легенді — той самий рядок path, що вже лежить у бандлі, вставлений інлайновим SVG:
+  // ні data:-адреси, ні зайвого запиту. Тон беремо «підтверджене джерело» — це нейтральний
+  // представник класу, а не заява про стан якоїсь конкретної території.
+  const iconRow = (threatType) => {
+    const label = threatIconLabels[threatType] ?? threatType;
+    const aria = iconAriaLabel(threatType, 'confirmed');
+    return `<li><i class="legend-icon" role="img" aria-label="${escapeHtml(aria)}">`
+      + `<svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">`
+      + `<path fill="currentColor" fill-rule="evenodd" d="${threatIconPaths[threatType]}"/></svg>`
+      + `</i><span>${escapeHtml(label)}</span></li>`;
+  };
   legend.innerHTML = `<summary><i class="swatch threat"></i><span class="legend-title">Загрози на карті</span><span class="legend-caret" aria-hidden="true">▾</span></summary>
     <div class="legend-body">
-      <p class="legend-meta"><span>4 стани</span></p>
+      <p class="legend-meta"><span>4 стани · 10 типів</span></p>
       <ul class="legend-rows">
         <li><i class="legend-swatch state-alert"></i><span>Офіційна тривога — щільна червона заливка й контур.</span></li>
         <li><i class="legend-swatch state-threat"></i><span>Активна загроза — помаранчева заливка, слабша за тривогу.</span></li>
         <li><i class="legend-swatch state-consequence"></i><span>Підтверджена атака або наслідки — штрихування.</span></li>
         <li><i class="legend-swatch state-analytic"></i><span>Аналітична оцінка — сірий пунктирний контур без заливки. Це не тривога.</span></li>
       </ul>
+      <ul class="legend-rows legend-icons">${Object.keys(threatIconPaths).map(iconRow).join('')}</ul>
+      <p class="legend-note">Показано до трьох найважливіших типів; решта — у бейджі +N. Іконка не означає прогнозу цілі.</p>
       <p class="legend-note">Приглушений відтінок — стан лише в частині території; наблизьте карту,
         щоб побачити райони. Полігон засвічується лише для території, названої в повідомленні або
         в каталозі локацій, і для найближчої території з контуром, якщо в названої його немає.</p>
     </div>`;
 }
 
+// Живий регіон і плашка режиму публікації живуть у .map-stage, а не в public/index.html: той файл
+// правлять інші гілки, а обидва вузли мають існувати рівно тоді, коли на екрані є карта.
+function ensureMapOverlays() {
+  const stage = $('.map-stage');
+  if (!stage) return;
+  if (!$('#map-aria')) {
+    const node = document.createElement('div');
+    node.id = 'map-aria';
+    node.className = 'visually-hidden';
+    node.setAttribute('role', 'status');
+    node.setAttribute('aria-live', 'polite');
+    stage.append(node);
+  }
+  if (!$('#publication-chip')) {
+    const chip = document.createElement('p');
+    chip.id = 'publication-chip';
+    chip.className = 'map-chip';
+    chip.setAttribute('role', 'status');
+    chip.hidden = true;
+    chip.textContent = 'Показ затримано на 15 с за рішенням оператора. Збір даних не затримується.';
+    stage.append(chip);
+  }
+}
+
+function updatePublicationChip() {
+  const chip = $('#publication-chip');
+  if (!chip) return;
+  chip.hidden = snapshot?.publication?.mode !== 'delayed_15s';
+}
+
 function initMap() {
   occupationLayersReady = false; // карту створюють наново лише при поверненні на маршрут карти — шари доводиться додавати з нуля
   mapLayersReady = false;
+  iconImagesReady = false;
+  iconLayersReady = false;
+  iconTier = null;
+  ensureMapOverlays();
   map = new maplibregl.Map({ container: 'map', style: config.mapStyleUrl, center: [31.2, 48.8], zoom: 5.1, attributionControl: false });
   map.on('styleimagemissing', (event) => {
     if (!map.hasImage(event.id)) map.addImage(event.id, { width: 1, height: 1, data: new Uint8Array([0,0,0,0]) });
+  });
+  // Єдиний обробник масштабу у файлі. MapLibre забороняє вираз ['zoom'] усередині filter, а згасання
+  // прозорістю лишило б невидимі іконки займати місце в колізіях і виштовхувати справжні за межі
+  // карти. Тому джерело просто перевипускається на межі районного масштабу.
+  map.on('zoomend', () => {
+    const next = map.getZoom() >= RAION_ZOOM_FULL ? 'raion' : 'oblast';
+    if (next === iconTier) return;           // шторм панорамування нічого не коштує
+    iconTier = next;
+    updateTerritoryIcons();
   });
   map.addControl(new maplibregl.NavigationControl({ showCompass: false }), 'top-right');
   map.addControl(new maplibregl.AttributionControl({ compact: true }), 'bottom-left');
@@ -837,6 +1298,13 @@ function initMap() {
   // тож при повільному або недоступному tiles.openfreemap.org жоден наш шар не зʼявився б —
   // ні державний кордон, ні підпис Криму, ні окупація. Стиль розібрано — можна додавати шари.
   map.on('style.load', () => {
+    // Сорок зображень реєструються ПЕРШИМИ, до будь-якого шару іконок. Якщо canvas недоступний або
+    // addImage кинув — iconImagesReady лишається false, addTerritoryIconLayers() виходить одразу,
+    // і жодного шару іконок немає взагалі. Полігони при цьому не змінюються: деградація в бік
+    // меншої кількості інформації, ніколи — у бік помилки.
+    try {
+      iconImagesReady = addThreatIconImages(map);
+    } catch { iconImagesReady = false; }
     map.addSource('ukraine-country', { type: 'geojson', data: countryBoundary });
     map.addSource('ukraine-admin', { type: 'geojson', data: adminBoundaries, promoteId: 'locationId' });
     // promoteId дослівно збігається з locations.id у базі — саме він робить можливим setFeatureState
@@ -1032,24 +1500,37 @@ function initMap() {
     map.addSource('reported-directions', { type: 'geojson', data: directionCollection() });
     map.addLayer({ id: 'direction-lines', type: 'line', source: 'reported-directions', paint: { 'line-color': '#ff7a4d', 'line-width': 3, 'line-dasharray': [2,2], 'line-opacity': .8 } });
     addVectorLayers();
+    addTerritoryIconLayers();
     // Один клік має відкрити одну панель. Обробник висить на кількох шарах, і MapLibre викликає його
     // окремо для кожного, у якому під точкою є фіча, — тож роботу робимо один раз на один DOM-клік
     // (originalEvent у всіх викликах той самий обʼєкт) і самі вирішуємо, яка територія точніша:
-    // місто → район → область. Районні заливки нижче RAION_ZOOM_MIN не малюються, тож там клік
+    // іконка → місто → район → область. Стек іконок — найточніша заява про територію на карті,
+    // тож він виграє в усіх. Районні заливки нижче RAION_ZOOM_MIN не малюються, тож там клік
     // завжди обласний, а вимкнений перемикач просто знижує точність, а не ламає клік.
+    //
+    // alert-raion-fill лишається районною ціллю кліку навіть там, де fill-opacity дорівнює 0:
+    // queryRenderedFeatures перевіряє геометрію й видимість шару, а не прозорість фарби. Саме тому
+    // тихий район узагалі клікабельний.
+    //
+    // queryRenderedFeatures кидає виняток на неіснуючому шарі, а шарів іконок може не бути взагалі
+    // (canvas недоступний), тож список фільтруємо перед кожним запитом.
+    const liveLayers = (ids) => ids.filter((id) => map.getLayer(id));
     let lastTerritoryClick = null;
     const openTerritory = (event) => {
       if (event.originalEvent && event.originalEvent === lastTerritoryClick) return;
       lastTerritoryClick = event.originalEvent ?? null;
-      const pick = (ids) => {
-        const layers = ids.filter((id) => map.getLayer(id));
-        return layers.length ? map.queryRenderedFeatures(event.point, { layers })[0] : undefined;
-      };
-      const feature = pick(['city-hit']) ?? pick(raionFillLayerIds) ?? pick(['ukraine-region-fill']);
+      const feature = event.features?.[0];
+      const layerId = feature?.layer?.id;
       const locationId = feature?.properties?.locationId;
-      if (locationId) showTerritoryPanel(locationId);
+      if (!locationId) return;
+      const onIcon = iconLayerIds.includes(layerId);
+      if (!onIcon && map.queryRenderedFeatures(event.point, { layers: liveLayers(iconLayerIds) }).length) return;
+      if (!onIcon && layerId !== 'city-hit' && map.queryRenderedFeatures(event.point, { layers: liveLayers(['city-hit']) }).length) return;
+      if (layerId === 'ukraine-region-fill'
+          && map.queryRenderedFeatures(event.point, { layers: liveLayers(raionFillLayerIds) }).length) return;
+      void showTerritoryPanel(locationId);
     };
-    for (const layer of ['ukraine-region-fill', ...raionFillLayerIds, 'city-hit']) {
+    for (const layer of [...iconLayerIds, 'ukraine-region-fill', ...raionFillLayerIds, 'city-hit']) {
       map.on('click', layer, openTerritory);
       map.on('mouseenter', layer, () => { map.getCanvas().style.cursor = 'pointer'; });
       map.on('mouseleave', layer, () => { map.getCanvas().style.cursor = ''; });
@@ -1057,6 +1538,8 @@ function initMap() {
     mapLayersReady = true;
     applyTerritoryLayers();
     applyVectors();
+    iconTier = map.getZoom() >= RAION_ZOOM_FULL ? 'raion' : 'oblast';
+    updateTerritoryIcons();
   });
   $('#fit-ukraine').addEventListener('click', () => map.fitBounds([[21.5,43.2],[41.2,52.5]], { padding: 36, duration: 700 }));
 }
@@ -1066,6 +1549,8 @@ function updateMap() {
   map.getSource('reported-directions')?.setData(directionCollection());
   applyTerritoryLayers();
   applyVectors();
+  updateTerritoryIcons();
+  refreshOpenTerritoryPanel();
 }
 
 function safeUrl(value) {
@@ -1080,7 +1565,9 @@ function openDetail(title, kicker, body) {
     dialog.addEventListener('click', (event) => { if (event.target === dialog) dialog.close(); });
     document.body.append(dialog);
   }
-  dialog.innerHTML = `<div class="detail-head"><div><p>${escapeHtml(kicker)}</p><h2>${escapeHtml(title)}</h2></div><button aria-label="Закрити">×</button></div><div class="detail-body">${body}</div>`;
+  // id на <h2> — те, на що вказує aria-labelledby діалогу: без нього читач екрана оголошує
+  // модальне вікно без назви території, яку щойно натиснули.
+  dialog.innerHTML = `<div class="detail-head"><div><p>${escapeHtml(kicker)}</p><h2 id="detail-title">${escapeHtml(title)}</h2></div><button aria-label="Закрити">×</button></div><div class="detail-body">${body}</div>`;
   dialog.querySelector('button').addEventListener('click', () => dialog.close());
   dialog.showModal();
   return dialog;
@@ -1311,7 +1798,7 @@ function territoryName(id) {
 }
 
 /**
- * Панель стану території.
+ * Тіло панелі для знімка БЕЗ `territories[]` — старий сервер або частковий деплой.
  *
  * Подія належить території трьома різними способами, і плутати їх не можна:
  *   direct — джерело назвало саме цю територію;
@@ -1323,7 +1810,7 @@ function territoryName(id) {
  * Будується синхронно зі знімка, який уже лежить у памʼяті: панель відкривається за кліком по
  * полігону, і мережевий похід за тим, що вже прийшло потоком, був би затримкою без причини.
  */
-function showTerritoryPanel(locationId) {
+function territoryLegacyHtml(locationId) {
   const alerts = (snapshot?.alerts ?? [])
     .map((alert) => ({ alert, relation: territoryRelation(locationId, alert.location_id) }))
     .filter((row) => row.relation)
@@ -1391,8 +1878,7 @@ function showTerritoryPanel(locationId) {
         <p>Це не означає відсутність загрози. Стежте за офіційними каналами.</p></div>`;
 
   // Плашку показуємо лише під офіційною тривогою: звичайний стан у цьому домі виглядає мовчазним.
-  const dialog = openDetail(territoryName(locationId), 'Територія',
-    `${alertRow ? '<span class="codex-state is-bad">Офіційна тривога</span>' : ''}
+  return `${alertRow ? '<span class="codex-state is-bad">Офіційна тривога</span>' : ''}
      ${alertBlock}
      ${threatRows ? `<ul class="territory-state-list">${threatRows}</ul>` : ''}
      ${consequence}
@@ -1400,37 +1886,227 @@ function showTerritoryPanel(locationId) {
      ${empty}
      <div class="safety-note"><strong>Це не прогноз траєкторії</strong>
        <p>Система показує лише дослівно повідомлену територію або напрямок і не екстраполює маршрут.</p></div>
-     <button class="text-button" data-territory-history>Повна історія території →</button>`);
-  // Обидва переходи, які раніше давав шар підписів подій, лишаються на місці — тепер вони живуть
-  // у рядках панелі, а не в крапці на карті.
-  dialog.querySelectorAll('[data-event]').forEach((row) => row.addEventListener('click', () => void showThreatDetails(row.dataset.event)));
-  dialog.querySelectorAll('[data-assessment]').forEach((row) => row.addEventListener('click', () => void showAssessmentDetails(row.dataset.assessment)));
-  dialog.querySelector('[data-territory-history]')?.addEventListener('click', () => void showLocationHistory(locationId));
+     <button class="text-button" data-territory-history>Повна історія території →</button>`;
 }
 
-async function showLocationHistory(id) {
-  const response = await fetch(`/api/v1/locations/${encodeURIComponent(id)}/timeline?limit=100`);
-  if (!response.ok) return openDetail('Територію не знайдено', 'Помилка', '<p>Не вдалося завантажити історію.</p>');
+// ------------------------------------------------------------------------------------------------
+// Панель стану території
+// ------------------------------------------------------------------------------------------------
+//
+// Будується цілком зі знімка, який уже лежить у памʼяті: мережевий похід за тим, що вже прийшло
+// потоком, був би затримкою без причини. Мережу чіпає лише вкладка «Історія», і лише один раз.
+
+const TERRITORY_COVERAGE_WORDS = {
+  direct: 'названо джерелом',
+  partial: 'тривога або загроза в частині території',
+  unmapped: 'найближча територія з контуром'
+};
+
+// Джерела беремо з тих самих подій знімка, на які вказує eventIds. Без запиту: панель — це зріз
+// стану, а не окрема сторінка.
+function territoryThreatSources(threat) {
+  const byId = new Map((snapshot?.threats ?? []).map((event) => [event.id, event]));
+  const names = [];
+  for (const id of threat.eventIds ?? []) {
+    for (const source of byId.get(id)?.sources ?? []) {
+      if (source?.name && !names.includes(source.name)) names.push(source.name);
+    }
+  }
+  if (!names.length) return 'джерело не вказано';
+  return names.slice(0, 3).map((name) => escapeHtml(name)).join(', ')
+    + (names.length > 3 ? ` та ще ${names.length - 3}` : '');
+}
+
+// `status` — це стан СТАНОМ НА ЗРІЗ, і він завжди один із трьох живих. Панель ніколи не покаже
+// «відкликано» поруч із помаранчевим полігоном: розкрити термінальний підпис раніше за кадр
+// потоку, який його несе, означало б дати ранній відбій.
+function territoryThreatRow(threat) {
+  const label = threatNames[threat.threatType] ?? threat.threatType;
+  const eventId = threat.eventIds?.[0] ?? '';
+  if (!threat.asserted) {
+    return `<li><button type="button" class="territory-threat is-mentioned" data-event="${escapeHtml(eventId)}">
+      <span class="tt-head"><b>${escapeHtml(label)}</b><em>згадано</em></span>
+      <span class="tt-meta">Джерело назвало цю територію, але не повідомило про загрозу саме для неї.</span>
+    </button></li>`;
+  }
+  const tone = threat.consequence ? 'consequence'
+    : CONFIRMING_EVIDENCE.has(threat.evidenceLevel) ? 'confirmed' : 'reported';
+  const count = Number(threat.count) || 0;
+  return `<li><button type="button" class="territory-threat" data-event="${escapeHtml(eventId)}" aria-label="${escapeHtml(iconAriaLabel(threat.threatType, tone))}">
+    <span class="tt-head"><b>${escapeHtml(label)}</b><em>${escapeHtml(statusNames[threat.status] ?? threat.status)} · ${escapeHtml(evidenceNames[threat.evidenceLevel] ?? threat.evidenceLevel)}</em></span>
+    <span class="tt-meta">останнє підтвердження ${escapeHtml(agoOrUnknown(threat.lastConfirmedAt))} · ${count} ${pluralUk(count, 'повідомлення', 'повідомлення', 'повідомлень')}</span>
+    <span class="tt-sources">${territoryThreatSources(threat)}</span>
+    ${threat.directionText ? `<span class="tt-direction">напрямок повідомлено джерелом: «${escapeHtml(threat.directionText)}»</span>` : ''}
+  </button></li>`;
+}
+
+function territoryAssessmentBlock(assessment) {
+  if (!assessment) return '';
+  const percent = assessment.indicativePercent ?? Math.round(Number(assessment.riskScore) * 10);
+  return `<h3>Аналітична оцінка</h3>
+    <button type="button" class="territory-assessment" data-assessment="${escapeHtml(assessment.assessmentId)}">
+      <span class="ta-kicker">Аналітична оцінка, не тривога</span>
+      <span class="ta-score"><strong>${escapeHtml(String(assessment.riskScore))}<small>/10</small></strong><span>${escapeHtml(levelNames[assessment.riskLevel] ?? assessment.riskLevel)} · ${escapeHtml(String(percent))}% індикативно · впевненість ${escapeHtml(confidenceNames[assessment.assessmentConfidence] ?? assessment.assessmentConfidence)}</span></span>
+      <span class="ta-meta">${escapeHtml(threatNames[assessment.threatType] ?? assessment.threatType)} · горизонт до ${escapeHtml(shortTime(assessment.horizonEnd))}</span>
+    </button>`;
+}
+
+function territoryLiveHtml(territory, locationId) {
+  if (!territory) return territoryLegacyHtml(locationId);
+  const asserted = (territory.threats ?? []).filter((threat) => threat.asserted);
+  const mentioned = (territory.threats ?? []).filter((threat) => !threat.asserted);
+  const namedAlert = (territory.alerts ?? [])[0];
+  const alertBlock = territory.alertActive && territory.alertSince
+    ? `<p class="territory-alert">Офіційна тривога з ${escapeHtml(shortTime(territory.alertSince))} · ${escapeHtml(timeAgo(territory.alertSince))}
+        ${namedAlert && namedAlert.locationId !== locationId ? `<small>Джерело назвало: ${escapeHtml(namedAlert.locationName)}</small>` : ''}</p>`
+    : '';
+  const publication = snapshot?.publication ?? null;
+  const held = publication?.mode === 'delayed_15s'
+    ? `<p class="territory-publication">Затриманий режим. Стан на ${escapeHtml(shortTime(publication.cutoffAt))}.</p>`
+    : '';
+  // Тиша — теж стан, і вона мусить бути сказана словами. Порожня панель читалася б як збій.
+  const empty = territory.alertActive || asserted.length || territory.assessment ? ''
+    : `<div class="empty-state"><strong>Активних загроз на цій території немає</strong>
+        <p>Це не означає відсутність загрози. Стежте за офіційними каналами.</p></div>`;
+  return `<p class="territory-state">
+      ${territory.alertActive ? '<span class="codex-state is-bad">Офіційна тривога</span>' : ''}
+      <span class="territory-coverage">${escapeHtml(TERRITORY_COVERAGE_WORDS[territory.coverage] ?? territory.coverage)}</span>
+    </p>
+    ${alertBlock}
+    ${asserted.length ? `<h3>Загрози</h3><ul class="territory-threats">${asserted.map(territoryThreatRow).join('')}</ul>` : ''}
+    ${mentioned.length ? `<h3>Згадано джерелом</h3><ul class="territory-threats territory-threats-mentioned">${mentioned.map(territoryThreatRow).join('')}</ul>` : ''}
+    ${territory.consequences ? '<p class="territory-consequence">Повідомлено про наслідки на території.</p>' : ''}
+    ${territoryAssessmentBlock(territory.assessment)}
+    ${empty}
+    ${held}
+    <div class="safety-note"><strong>Це не прогноз траєкторії</strong>
+      <p>Система показує лише дослівно повідомлену територію або напрямок і не екстраполює маршрут.</p></div>`;
+}
+
+function territoryPanelBody(territory, locationId) {
+  return `<div class="territory-tabs" role="tablist" aria-label="Розділи території">
+      <button type="button" role="tab" id="tt-now" aria-controls="tp-now" aria-selected="true" class="is-active">Стан зараз</button>
+      <button type="button" role="tab" id="tt-log" aria-controls="tp-log" aria-selected="false" tabindex="-1">Історія</button>
+    </div>
+    <div id="tp-now" role="tabpanel" aria-labelledby="tt-now" data-live>${territoryLiveHtml(territory, locationId)}</div>
+    <div id="tp-log" role="tabpanel" aria-labelledby="tt-log" hidden><p class="territory-loading">Завантаження…</p></div>`;
+}
+
+async function showTerritoryPanel(locationId) {
+  const territory = snapshotTerritories().find((item) => item.locationId === locationId);
+  const name = territory?.name ?? territoryName(locationId);
+  openTerritoryId = locationId;
+  const dialog = openDetail(name, 'Територія', territoryPanelBody(territory, locationId));
+  dialog.setAttribute('aria-labelledby', 'detail-title');
+  dialog.addEventListener('close', () => { openTerritoryId = null; }, { once: true });
+  wireTerritoryPanel(dialog, locationId);
+  return dialog;
+}
+
+function wireTerritoryPanel(dialog, locationId) {
+  // Обидва переходи, які раніше давав шар підписів подій, лишаються на місці — тепер вони живуть
+  // у рядках панелі, а не в крапці на карті.
+  dialog.querySelectorAll('[data-event]').forEach((node) => node.addEventListener('click', () => {
+    if (node.dataset.event) void showThreatDetails(node.dataset.event);
+  }));
+  dialog.querySelectorAll('[data-assessment]').forEach((node) => node.addEventListener('click', () =>
+    void showAssessmentDetails(node.dataset.assessment)));
+  dialog.querySelector('[data-territory-history]')?.addEventListener('click', () => void showLocationHistory(locationId));
+
+  // Вкладки живуть ПОЗА [data-live], тож перемальовування «Стану зараз» їх не замінює. Без цього
+  // прапорця кожен тік знімка навішував би на них ще один комплект обробників, і за хвилину
+  // відкритої панелі один клік викликав би select() десятки разів.
+  const tablist = dialog.querySelector('[role="tablist"]');
+  if (!tablist || tablist.dataset.wired) return;
+  tablist.dataset.wired = '1';
+  const tabs = [...tablist.querySelectorAll('[role="tab"]')];
+  const select = (tab) => {
+    tabs.forEach((item) => {
+      const on = item === tab;
+      item.setAttribute('aria-selected', String(on));
+      item.tabIndex = on ? 0 : -1;
+      item.classList.toggle('is-active', on);
+      const panel = dialog.querySelector(`#${item.getAttribute('aria-controls')}`);
+      if (panel) panel.hidden = !on;
+    });
+    if (tab.id === 'tt-log') void loadTerritoryHistory(dialog, locationId);
+  };
+  tabs.forEach((tab, index) => {
+    tab.addEventListener('click', () => select(tab));
+    // Стрілки між вкладками — стандартна клавіатурна поведінка tablist; без неї Tab провалюється
+    // одразу в тіло панелі й до другої вкладки дістатися неможливо.
+    tab.addEventListener('keydown', (event) => {
+      const step = event.key === 'ArrowRight' ? 1 : event.key === 'ArrowLeft' ? -1 : 0;
+      if (!step) return;
+      event.preventDefault();
+      const next = tabs[(index + step + tabs.length) % tabs.length];
+      next.focus(); select(next);
+    });
+  });
+}
+
+async function loadTerritoryHistory(dialog, locationId) {
+  const panel = dialog.querySelector('#tp-log');
+  if (!panel || panel.dataset.loaded) return;
+  panel.dataset.loaded = '1';
+  const response = await fetch(`/api/v1/locations/${encodeURIComponent(locationId)}/timeline?limit=100`).catch(() => null);
+  if (!response?.ok) {
+    delete panel.dataset.loaded;   // друга спроба лишається можливою
+    panel.innerHTML = '<p class="legend-note">Не вдалося завантажити історію.</p>';
+    return;
+  }
   const data = await response.json();
+  panel.innerHTML = territoryHistoryHtml(data, locationId);
+  wireTerritoryHistory(panel);
+}
+
+/**
+ * Панель — це зріз стану, а не окрема сторінка: поки вона відкрита, стан зараз мусить лишатися
+ * станом зараз. Перемальовуємо лише вкладку «Стан зараз» і лише тоді, коли фокус не всередині неї:
+ * заміна innerHTML під пальцем скинула б фокус із кнопки, яку користувач саме читає.
+ */
+function refreshOpenTerritoryPanel() {
+  if (!openTerritoryId) return;
+  const dialog = $('#detail-dialog');
+  const live = dialog?.querySelector('[data-live]');
+  if (!live || live.hidden) return;
+  if (live.contains(document.activeElement)) return;
+  const territory = snapshotTerritories().find((item) => item.locationId === openTerritoryId);
+  live.innerHTML = territoryLiveHtml(territory, openTerritoryId);
+  wireTerritoryPanel(dialog, openTerritoryId);
+}
+
+// Розмітка хронології лишилася тією самою до байта: вкладка «Історія» і окремий діалог показують
+// одне й те саме, бо це одна й та сама відповідь одного й того самого маршруту.
+function territoryHistoryHtml(data, id) {
   const kindNames = { alert: 'офіційна тривога', threat: 'загроза', assessment: 'аналітика' };
   const items = data.items.map((item) => `<article class="territory-entry ${escapeHtml(item.kind)}" data-kind="${escapeHtml(item.kind)}" data-entry-id="${escapeHtml(item.id)}">
     <div><span>${escapeHtml(kindNames[item.kind] ?? item.kind)}</span><time>${new Date(item.happened_at).toLocaleString('uk-UA')}</time></div>
     <h3>${escapeHtml(item.title)}</h3><p>${escapeHtml(item.summary)}</p>
     <footer><b>${escapeHtml(threatNames[item.threat_type] ?? item.threat_type)}</b>${item.risk_score != null ? `<strong>${escapeHtml(item.risk_score)}/10 · ${escapeHtml(levelNames[item.risk_level] ?? item.risk_level)}</strong>` : `<strong>${escapeHtml(item.evidence_level ?? item.status)}</strong>`}</footer>
   </article>`).join('') || '<div class="empty-state"><strong>Історія поки порожня</strong><p>Для цієї території ще немає збережених тривог, загроз або аналітичних попереджень.</p></div>';
-  const dialog = openDetail(data.location.name_uk, 'Історія території',
-    `<div class="territory-summary"><div><strong>${data.counts.alerts}</strong><span>тривоги</span></div><div><strong>${data.counts.threats}</strong><span>загрози</span></div><div><strong>${data.counts.assessments}</strong><span>оцінки</span></div></div>
+  return `<div class="territory-summary"><div><strong>${data.counts.alerts}</strong><span>тривоги</span></div><div><strong>${data.counts.threats}</strong><span>загрози</span></div><div><strong>${data.counts.assessments}</strong><span>оцінки</span></div></div>
      <div class="territory-filters"><button class="is-active" data-territory-filter="all">Усе</button><button data-territory-filter="alert">Тривоги</button><button data-territory-filter="threat">Загрози</button><button data-territory-filter="assessment">Аналітика</button></div>
      <div class="territory-timeline">${items}</div>
-     <a class="territory-all" href="/history?location=${encodeURIComponent(id)}" data-route="/history">Відкрити повну хронологію →</a>`);
-  dialog.querySelectorAll('[data-territory-filter]').forEach((button) => button.addEventListener('click', () => {
-    dialog.querySelectorAll('[data-territory-filter]').forEach((item) => item.classList.toggle('is-active', item === button));
-    dialog.querySelectorAll('.territory-entry').forEach((entry) => { entry.hidden = button.dataset.territoryFilter !== 'all' && entry.dataset.kind !== button.dataset.territoryFilter; });
+     <a class="territory-all" href="/history?location=${encodeURIComponent(id)}" data-route="/history">Відкрити повну хронологію →</a>`;
+}
+
+function wireTerritoryHistory(root) {
+  root.querySelectorAll('[data-territory-filter]').forEach((button) => button.addEventListener('click', () => {
+    root.querySelectorAll('[data-territory-filter]').forEach((item) => item.classList.toggle('is-active', item === button));
+    root.querySelectorAll('.territory-entry').forEach((entry) => { entry.hidden = button.dataset.territoryFilter !== 'all' && entry.dataset.kind !== button.dataset.territoryFilter; });
   }));
-  dialog.querySelectorAll('.territory-entry').forEach((entry) => entry.addEventListener('click', () => {
+  root.querySelectorAll('.territory-entry').forEach((entry) => entry.addEventListener('click', () => {
     if (entry.dataset.kind === 'threat') void showThreatDetails(entry.dataset.entryId);
     if (entry.dataset.kind === 'assessment') void showAssessmentDetails(entry.dataset.entryId);
   }));
+}
+
+async function showLocationHistory(id) {
+  const response = await fetch(`/api/v1/locations/${encodeURIComponent(id)}/timeline?limit=100`);
+  if (!response.ok) return openDetail('Територію не знайдено', 'Помилка', '<p>Не вдалося завантажити історію.</p>');
+  const data = await response.json();
+  wireTerritoryHistory(openDetail(data.location.name_uk, 'Історія території', territoryHistoryHtml(data, id)));
 }
 
 function renderEventRail() {
@@ -1450,6 +2126,7 @@ function renderMapPage() {
   if (map && document.body.contains(map.getContainer())) {
     renderEventRail();
     updateMap();
+    updatePublicationChip();
     renderOccupationLegend();
     return;
   }
@@ -1483,6 +2160,9 @@ function renderMapPage() {
     const active = button.classList.contains('is-active');
     // Вигляд кнопки й те, що читає екранна читалка, мусять казати одне й те саме.
     button.setAttribute('aria-pressed', String(active));
+    // Іконки — не пʼятий перемикач: кожен тон іде за своїм сімейством. Перевипускаємо джерело на
+    // КОЖЕН клік, інакше стек іконок і полігони під ним казали б різне.
+    updateTerritoryIcons();
     if (button.dataset.layer === 'occupation') {
       occupationVisible = active;
       applyOccupationVisibility();
@@ -1497,6 +2177,7 @@ function renderMapPage() {
   legend.addEventListener('toggle', () => { occupationLegendOpen = legend.open; });
   renderThreatLegend();
   renderOccupationLegend();
+  updatePublicationChip();
 }
 
 function contentShell(kicker, title, deck) {
@@ -1790,13 +2471,39 @@ function aiRunsEmptyState(codex, settings) {
   </div>`;
 }
 
+// Що саме витратило виклик. `prompt_version` — це транспортний рівень, який кодував функцію лише
+// за домовленістю й уже розійшовся з нею; `surface` називає її прямо, тому він і став заголовком,
+// а версія промпту переїхала в технічний рядок.
+const aiRunSurfaceNames = {
+  narrative: 'Наратив аналітики',
+  digest: 'Нічний дайджест',
+  attacks: 'Аналіз атак',
+  shadow: 'Тіньова класифікація',
+  risk: 'Оцінка ризику'
+};
+const aiRunValidationNames = { passed: 'звірку пройдено', rejected: 'звірку не пройдено', skipped: 'звірка не застосовна' };
+
+function aiRunsUrl() {
+  return `/ops/ai-runs?limit=50${aiRunsSurface ? `&surface=${encodeURIComponent(aiRunsSurface)}` : ''}`;
+}
+
 function aiRunRow(run) {
   const failed = run.status === 'failed';
+  const technical = [
+    new Date(run.created_at).toLocaleString('uk-UA'),
+    promptVersionNames[run.prompt_version] ?? run.prompt_version,
+    run.classifier_version ? `класифікатор ${run.classifier_version}` : null,
+    run.validation_status ? aiRunValidationNames[run.validation_status] ?? run.validation_status : null,
+    `запит ${bytesLabel(run.input_bytes)}`,
+    `відповідь ${bytesLabel(run.output_bytes)}`,
+    run.duration_ms != null ? `${run.duration_ms} мс` : null
+  ].filter(Boolean).map((part) => escapeHtml(String(part))).join(' · ');
   return `<article data-ai-run="${escapeHtml(run.id)}">
     <div>
-      <span>${escapeHtml(promptVersionNames[run.prompt_version] ?? run.prompt_version)}</span>
+      <span>${escapeHtml(aiRunSurfaceNames[run.surface] ?? run.surface ?? 'поверхню не вказано')}</span>
       <h3>${escapeHtml(run.model)}</h3>
-      <p>${new Date(run.created_at).toLocaleString('uk-UA')} · запит ${bytesLabel(run.input_bytes)} · відповідь ${bytesLabel(run.output_bytes)}${run.duration_ms != null ? ` · ${run.duration_ms} мс` : ''}</p>
+      <p>${technical}</p>
+      ${run.fallback_reason ? `<p class="ai-run-error">Детермінований текст: ${escapeHtml(run.fallback_reason)}</p>` : ''}
       ${failed && run.error ? `<p class="ai-run-error">${escapeHtml(run.error)}</p>` : ''}
     </div>
     <div class="ops-channel-actions">
@@ -1818,10 +2525,18 @@ function opsAiRunsSection(data, codex, settings) {
         <div><dt>Останнє</dt><dd>${totals.last_at ? new Date(totals.last_at).toLocaleString('uk-UA') : '—'}</dd></div>
       </dl>`
     : '';
+  const surfaceOptions = [
+    `<option value=""${aiRunsSurface ? '' : ' selected'}>Усі поверхні</option>`,
+    ...Object.entries(aiRunSurfaceNames).map(([value, label]) =>
+      `<option value="${escapeHtml(value)}"${aiRunsSurface === value ? ' selected' : ''}>${escapeHtml(label)}</option>`)
+  ].join('');
   return `<section class="ops-section" id="ai-runs-section">
     <header class="ops-section-head">
       <div><p>Аудит моделі</p><h2>Журнал звернень</h2></div>
-      <button data-ai-runs-refresh>Оновити</button>
+      <div class="ops-channel-actions">
+        <select data-ai-runs-surface aria-label="Поверхня">${surfaceOptions}</select>
+        <button data-ai-runs-refresh>Оновити</button>
+      </div>
     </header>
     ${facts}
     <div class="ops-channel-list ai-run-list">
@@ -1833,7 +2548,7 @@ function opsAiRunsSection(data, codex, settings) {
 
 function wireAiRunsSection(root, codex, settings) {
   const rerender = async () => {
-    const data = await opsFetch('/ops/ai-runs?limit=50').then((r) => r.ok ? r.json() : null).catch(() => null);
+    const data = await opsFetch(aiRunsUrl()).then((r) => r.ok ? r.json() : null).catch(() => null);
     const section = $('#ai-runs-section', root);
     if (!section) return;
     section.outerHTML = opsAiRunsSection(data, codex, settings);
@@ -1841,6 +2556,10 @@ function wireAiRunsSection(root, codex, settings) {
   };
 
   $('[data-ai-runs-refresh]', root)?.addEventListener('click', () => void rerender());
+  $('[data-ai-runs-surface]', root)?.addEventListener('change', (event) => {
+    aiRunsSurface = event.currentTarget.value;
+    void rerender();
+  });
 
   root.querySelectorAll('[data-ai-run-open]').forEach((button) => button.addEventListener('click', async () => {
     const id = button.dataset.aiRunOpen;
@@ -2241,6 +2960,162 @@ function wireCodexSection(root, settings) {
   });
 }
 
+// ------------------------------------------------------------------------------------------------
+// Режим показу і подієвий перерахунок
+// ------------------------------------------------------------------------------------------------
+//
+// Найвпливовіший орган керування на сторінці, тому він стоїть одразу під метриками. Моделі й
+// перемикачів аналітичних функцій тут НЕМАЄ навмисно: вони вже живуть у картці «Codex-аналітика»,
+// а два перемикачі на одне рішення — найзаплутаніший стан, у якому може бути операційна сторінка.
+
+const RUNTIME_FIELD_NAMES = {
+  publication_mode: 'режим показу',
+  analytics_event_driven: 'подієве оновлення аналітики',
+  analytics_debounce_ms: 'пауза перед перерахунком',
+  analytics_max_delay_ms: 'гранична затримка перерахунку',
+  codex_cooldown_ms: 'інтервал між зверненнями до Codex'
+};
+const RUNTIME_MODE_NAMES = { live: 'Наживо', delayed_15s: 'Із затримкою 15 с' };
+
+// min/max приходять із меж, які надіслав сервер, а не переписані тут константою: обмеження
+// живуть у CHECK міграції, і форма мусить дізнаватися їх звідти, а не з чужої копії.
+function runtimeNumberField(field, title, note, bound, value) {
+  const min = bound?.min ?? 0;
+  const max = bound?.max ?? 0;
+  return `<label class="codex-feature">
+    <span class="codex-feature-title">${escapeHtml(title)}</span>
+    <input type="number" data-runtime-field="${escapeHtml(field)}" min="${min}" max="${max}" step="1000" value="${escapeHtml(String(value ?? min))}">
+    <span class="codex-feature-note">${escapeHtml(note)}</span>
+  </label>`;
+}
+
+function runtimeAuditRow(row) {
+  return `<article>
+    <div>
+      <span>${escapeHtml(new Date(row.changedAt).toLocaleString('uk-UA'))} · ${escapeHtml(row.changedBy)} · ${escapeHtml(row.source)}</span>
+      <h3>${escapeHtml(RUNTIME_FIELD_NAMES[row.field] ?? row.field)}</h3>
+      <p>${escapeHtml(row.previousValue ?? '—')} → ${escapeHtml(row.newValue)}</p>
+    </div>
+  </article>`;
+}
+
+function opsRuntimeSection(data) {
+  if (!data) {
+    return '<section class="ops-section" id="runtime-section"><header class="ops-section-head"><div><p>Публікація та аналітика</p><h2>Режим показу і подієвий перерахунок</h2></div></header><p class="legend-note">Налаштування середовища недоступні.</p></section>';
+  }
+  const settings = data.settings ?? {};
+  const bounds = data.bounds ?? {};
+  const effective = data.effective ?? null;
+  const delayed = settings.publicationMode === 'delayed_15s';
+  // Тон — не прикраса: звичайний режим лишається беззвучним, колір зʼявляється лише тоді, коли
+  // оператор мусить памʼятати, що показ затримано.
+  const pill = `<span class="codex-state${delayed ? ' is-warn' : ''}">${delayed ? 'Затримка 15 с' : 'Наживо'}</span>`;
+  const options = Object.entries(RUNTIME_MODE_NAMES)
+    .map(([value, label]) => `<option value="${value}"${settings.publicationMode === value ? ' selected' : ''}>${escapeHtml(label)}</option>`)
+    .join('');
+  const effectiveFacts = effective
+    ? `<dl class="codex-facts">
+        <div><dt>Затримка</dt><dd>${escapeHtml(String(effective.delaySeconds ?? 0))} с</dd></div>
+        <div><dt>Зріз</dt><dd>${effective.cutoffAt ? escapeHtml(new Date(effective.cutoffAt).toLocaleString('uk-UA')) : '—'}</dd></div>
+        <div><dt>Версія зрізу</dt><dd>${escapeHtml(String(effective.cutoffVersion ?? '—'))}</dd></div>
+        <div><dt>Остання опублікована подія</dt><dd>${effective.lastPublishedEventAt ? escapeHtml(new Date(effective.lastPublishedEventAt).toLocaleString('uk-UA')) : 'подій ще не було'}</dd></div>
+        <div><dt>Утримано подій</dt><dd>${escapeHtml(String(effective.backlogEvents ?? 0))}</dd></div>
+        <div><dt>Відставання</dt><dd>${escapeHtml(String(effective.behindSeconds ?? 0))} с</dd></div>
+      </dl>`
+    : '';
+  return `<section class="ops-section" id="runtime-section">
+    <header class="ops-section-head">
+      <div><p>Публікація та аналітика</p><h2>Режим показу і подієвий перерахунок</h2></div>
+      <div class="ops-channel-actions">${pill}<button type="button" data-analytics-recalculate>Оновити зараз</button></div>
+    </header>
+    <label class="codex-model">Режим показу<select data-runtime-mode>${options}</select></label>
+    ${delayed ? '<p class="legend-note">Публікація затримана на 15 с. Затримка не стосується Telegram-сповіщень.</p>' : ''}
+    <div class="codex-features">
+      <label class="codex-feature">
+        <input type="checkbox" data-runtime-field="analyticsEventDriven"${settings.analyticsEventDriven ? ' checked' : ''}>
+        <span><strong>Подієве оновлення аналітики</strong>Перерахунок після кожної релевантної події, а не лише за таймером.</span>
+      </label>
+      ${runtimeNumberField('analyticsDebounceMs', 'Пауза перед перерахунком, мс', 'Скільки чекати після останньої події.', bounds.analyticsDebounceMs, settings.analyticsDebounceMs)}
+      ${runtimeNumberField('analyticsMaxDelayMs', 'Гранична затримка перерахунку, мс', 'Максимум, на скільки безперервний потік подій може відкласти перерахунок.', bounds.analyticsMaxDelayMs, settings.analyticsMaxDelayMs)}
+      ${runtimeNumberField('codexCooldownMs', 'Мінімальний інтервал між зверненнями до Codex, мс', '0 — без обмеження.', bounds.codexCooldownMs, settings.codexCooldownMs)}
+    </div>
+    ${effectiveFacts}
+    <div class="ops-channel-actions">
+      <button type="button" data-runtime-save>Зберегти</button>
+      <output id="runtime-status"></output>
+    </div>
+    <output id="analytics-recalculate-status"></output>
+    <p class="legend-note">Модель і доступні аналітичні функції — у картці «Codex-аналітика» нижче.</p>
+    <div class="ops-channel-list">${(data.audit ?? []).map(runtimeAuditRow).join('')}</div>
+    <div class="safety-note">
+      <strong>Затримка не стосується Telegram-сповіщень.</strong>
+      <p>${escapeHtml(data.notice ?? '')}</p>
+    </div>
+  </section>`;
+}
+
+const RECOMPUTE_SKIP_TEXT = {
+  overlap: 'Перерахунок уже виконується.',
+  disabled: 'Подієве оновлення вимкнено.',
+  cooldown: 'Попередній перерахунок був щойно. Спробуйте за хвилину.'
+};
+const RECOMPUTE_CODEX_TEXT = {
+  used: 'модель оновила текст',
+  cooldown: 'інтервал ще не минув',
+  disabled: 'вимкнено',
+  failed: 'модель недоступна, текст детермінований'
+};
+
+function wireRuntimeSection(root, onSaved) {
+  const section = $('#runtime-section', root);
+  if (!section) return;
+  // Секція має стабільний id саме заради цього: перемалювати можна тільки її, і тоді обробники
+  // треба навісити наново — рекурсивно, тим самим викликом.
+  const rerender = async () => {
+    const data = await opsFetch('/ops/api/runtime').then((result) => result.ok ? result.json() : null).catch(() => null);
+    const current = $('#runtime-section', root);
+    if (!current) return;
+    current.outerHTML = opsRuntimeSection(data);
+    wireRuntimeSection(root, onSaved);
+  };
+  const refresh = onSaved ?? rerender;
+
+  $('[data-runtime-save]', section)?.addEventListener('click', async () => {
+    const status = $('#runtime-status', section);
+    const body = { publicationMode: $('[data-runtime-mode]', section)?.value };
+    section.querySelectorAll('[data-runtime-field]').forEach((input) => {
+      body[input.dataset.runtimeField] = input.type === 'checkbox' ? input.checked : Number(input.value);
+    });
+    status.textContent = 'Зберігаємо…';
+    const result = await opsFetch('/ops/api/runtime', {
+      method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body)
+    }).catch(() => null);
+    if (!result?.ok) { status.textContent = 'Не вдалося зберегти.'; return; }
+    status.textContent = 'Збережено.';
+    // Повний перемалюнок: режим змінює підказки й в інших картках, тож показувати новий стан лише
+    // в одному місці означало б показати два різні стани поруч.
+    await refresh();
+  });
+
+  $('[data-analytics-recalculate]', section)?.addEventListener('click', async (event) => {
+    const button = event.currentTarget;
+    const output = $('#analytics-recalculate-status', section);
+    button.disabled = true; button.textContent = 'Рахуємо…';
+    try {
+      const result = await opsFetch('/ops/api/analytics/recalculate', { method: 'POST' });
+      const payload = result.ok ? await result.json().catch(() => null) : null;
+      if (!payload) { output.textContent = 'Не вдалося оновити.'; return; }
+      output.textContent = payload.skipped
+        ? (RECOMPUTE_SKIP_TEXT[payload.skipped] ?? 'Не вдалося оновити.')
+        : `Оновлено о ${shortTime(payload.recomputedAt)} · Codex: ${RECOMPUTE_CODEX_TEXT[payload.codex] ?? payload.codex}`;
+    } catch {
+      output.textContent = 'Не вдалося оновити.';
+    } finally {
+      button.disabled = false; button.textContent = 'Оновити зараз';
+    }
+  });
+}
+
 async function renderOps() {
   clearInterval(codexPollTimer);
   const root = contentShell('Закритий контур', 'Операційна консоль', 'Стан системи та керування каталогом рекомендованих Telegram-каналів.');
@@ -2264,16 +3139,18 @@ async function renderOps() {
   // Стан входу приходить у складі налаштувань, а не окремим запитом: перемикач «увімкнено» поруч
   // із мертвою сесією — найзаплутаніший стан цієї функції, і показати їх із двох різних моментів
   // означало б зробити його ще заплутанішим.
-  const [vectorOps, codexSettings, aiRuns, shadow, sourceTrust] = await Promise.all([
+  const [vectorOps, codexSettings, aiRuns, shadow, sourceTrust, runtime] = await Promise.all([
     opsFetch('/ops/vectors').then((result) => result.ok ? result.json() : null).catch(() => null),
     opsFetch('/ops/codex/settings').then((result) => result.ok ? result.json() : null).catch(() => null),
-    opsFetch('/ops/ai-runs?limit=50').then((result) => result.ok ? result.json() : null).catch(() => null),
+    opsFetch(aiRunsUrl()).then((result) => result.ok ? result.json() : null).catch(() => null),
     opsFetch('/ops/shadow-classifier?hours=24').then((result) => result.ok ? result.json() : null).catch(() => null),
-    opsFetch('/ops/api/source-trust').then((result) => result.ok ? result.json() : null).catch(() => null)
+    opsFetch('/ops/api/source-trust').then((result) => result.ok ? result.json() : null).catch(() => null),
+    opsFetch('/ops/api/runtime').then((result) => result.ok ? result.json() : null).catch(() => null)
   ]);
   const codex = codexSettings?.status ?? null;
   const queued = data.outbox.reduce((sum, item) => sum + Number(item.count), 0);
   root.innerHTML = `<div class="ops-metrics"><article><span>Джерела</span><strong>${data.sources.length}</strong></article><article><span>Черга</span><strong>${queued}</strong></article><article><span>Канали</span><strong>${data.channels.filter((item) => item.active).length}</strong></article><article><span>PostgreSQL</span><strong>${escapeHtml(data.database.size)}</strong></article></div>
+    ${opsRuntimeSection(runtime)}
     <section class="ops-section"><header class="ops-section-head"><div><p>Каталог для користувачів</p><h2>Додати Telegram-канал</h2></div><button id="ops-logout">Вийти</button></header>
       <form id="channel-form" class="channel-form">
         <label>Назва<input required name="title" maxlength="120" placeholder="Повітряні Сили ЗС України"></label>
@@ -2298,6 +3175,7 @@ async function renderOps() {
     </div>
     ${opsVectorSection(vectorOps)}
     <details class="ops-raw"><summary>Технічний стан і журнали</summary><pre class="ops-json">${escapeHtml(JSON.stringify({ sources: data.sources, outbox: data.outbox, aiRuns: data.aiRuns, database: data.database }, null, 2))}</pre></details>`;
+  wireRuntimeSection(root, () => renderOps());
   wireCodexSection(root, codexSettings?.settings ?? null);
   wireCodexSettingsSection(root, () => renderOps());
   wireShadowSection(root, codexSettings?.settings ?? null);
@@ -2373,6 +3251,9 @@ async function boot() {
   void loadRaionBoundaries(); // районна геометрія важка й не мусить затримувати першу картинку
   void loadOccupation(); // довідковий шар вантажиться окремо й не блокує старт карти
   await loadSnapshot(); connectStream();
+  // Пасок на випадок тиші: у затриманому режимі «фактична свіжість» і смуга «ЗАТРИМКА 15 С» не
+  // мають права застигнути в очікуванні кадру потоку, якого на спокійній системі просто не буде.
+  setInterval(() => void loadSnapshot().catch(markOffline), 60000);
   setInterval(() => void loadOccupation(), 900000);
 }
 boot().catch(markOffline);

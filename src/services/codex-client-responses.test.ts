@@ -50,6 +50,7 @@ function completedEvent(text: string): unknown {
 
 const request = {
   promptVersion: 'test-v1',
+  surface: 'narrative' as const,
   system: 'system prompt',
   user: '{"facts":1}',
   json: true

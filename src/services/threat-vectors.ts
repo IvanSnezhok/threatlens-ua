@@ -532,19 +532,28 @@ export async function reportedVectorForEvent(eventId: string): Promise<ReportedV
 /**
  * Chains for the events the map is currently drawing.
  *
- * The window matches `liveThreats()` exactly — same statuses, same twelve hours — so the map never
- * receives a chain for an event whose marker is not on it.
+ * The window must mirror `liveThreats(cutoff)` exactly — the same statuses, the same twelve hours
+ * AND the same publication cutoff — or the map draws an observation chain for a threat it is not
+ * showing, which is the one way this overlay can assert something no marker backs.
  */
-export async function reportedVectorsForLiveEvents(): Promise<ReportedVector[]> {
+export async function reportedVectorsForLiveEvents(cutoff: Date): Promise<ReportedVector[]> {
   const live = await pool.query<{ id: string }>(
     `SELECT id FROM threat_events
-      WHERE status IN ('observed','confirmed','active') AND last_observed_at > now() - interval '12 hours'
-      ORDER BY last_observed_at DESC LIMIT 200`
+      WHERE last_observed_at > now() - interval '12 hours'
+        AND created_at <= $1
+        AND ( status IN ('observed','confirmed','active')
+           OR ( status IN ('expired','withdrawn','corrected')
+                AND ended_at > $1 AND updated_at > now() - interval '1 hour' ) )
+      ORDER BY last_observed_at DESC LIMIT 200`, [cutoff]
   );
   return reportedVectorsForEvents(live.rows.map((row) => row.id));
 }
 
-export async function threatEventExists(eventId: string): Promise<boolean> {
-  const result = await pool.query(`SELECT 1 FROM threat_events WHERE id=$1`, [eventId]);
+/** Visibility, not existence: an event created after the cutoff is not yet a fact a public reader
+ *  may learn, so it answers exactly as an event that never existed. */
+export async function threatEventExists(eventId: string, cutoff: Date): Promise<boolean> {
+  const result = await pool.query(
+    `SELECT 1 FROM threat_events WHERE id=$1 AND created_at <= $2`, [eventId, cutoff]
+  );
   return Boolean(result.rowCount);
 }

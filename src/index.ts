@@ -6,6 +6,7 @@ import { migrate } from './db/migrate.js';
 import { pool } from './db/pool.js';
 import { seedDemoData, startIngestionScheduler } from './services/ingestion.js';
 import { startAnalyticsScheduler } from './services/analytics.js';
+import { startAnalyticsRecomputeScheduler } from './services/analytics-scheduler.js';
 import { startRiskScheduler } from './services/risk.js';
 import { startOperationsScheduler } from './services/operations.js';
 import { startNightlyDigestScheduler } from './services/nightly-digest.js';
@@ -19,6 +20,9 @@ await migrate();
 const app = await buildServer();
 await seedDemoData();
 eventHub.start();
+// After eventHub.start(): the recompute worker's only input is the hub's 'internal-event' emission,
+// and a listener attached to a hub that is not polling would simply never fire.
+const stopAnalyticsRecompute = startAnalyticsRecomputeScheduler(app.log);
 const stopAnalytics = startAnalyticsScheduler(app.log);
 const stopIngestion = startIngestionScheduler(app.log);
 const stopRisk = startRiskScheduler(app.log);
@@ -52,7 +56,10 @@ await app.listen({ port: config.PORT, host: '0.0.0.0' });
 
 async function shutdown(signal: string) {
   app.log.info({ signal }, 'shutting down');
-  stopIngestion(); stopRisk(); stopOperations(); stopNightlyDigests(); stopLocationCatalog(); stopOccupation(); stopSourceTrust(); stopAnalytics(); stopNotifications(); eventHub.stop();
+  // `stopAnalyticsRecompute()` runs BEFORE `eventHub.stop()`: it detaches the listener while the hub
+  // is still the thing that would call it, and bumps the generation token so an in-flight floor
+  // callback cannot re-arm itself against a pool this function is about to end.
+  stopIngestion(); stopRisk(); stopOperations(); stopNightlyDigests(); stopLocationCatalog(); stopOccupation(); stopSourceTrust(); stopAnalytics(); stopAnalyticsRecompute(); stopNotifications(); eventHub.stop();
   bot?.stop();
   await stopCollector?.();
   await app.close();

@@ -1,8 +1,33 @@
 import { createHash } from 'node:crypto';
 import type { PoolClient } from 'pg';
 import { CLASSIFIER_VERSION } from '../domain/classifier.js';
+import type { TerritoryNode } from '../domain/territory-state.js';
 import { pool } from '../db/pool.js';
 import type { ClassifiedMessage, EvidenceLevel, LiveEvent, NormalizedMessage } from '../types.js';
+
+/**
+ * ================================================================================================
+ * The publication cutoff, and what it means for every read below
+ * ================================================================================================
+ *
+ * Every public read function in this file takes `cutoff: Date` as its **second** parameter, before
+ * any optional one — `locationTimeline` already had an optional `limit`, and a required parameter
+ * after an optional one is TS1016 and does not compile. Taking it as a parameter rather than reading
+ * it here is what keeps one slice per request: `src/api/server.ts` computes it once and threads it
+ * through, so the rows, the `version` and the `generatedAt` a reader is served all describe the same
+ * instant.
+ *
+ * **Status is reported AS OF THE CUTOFF.** In `delayed_15s` two of these queries deliberately return
+ * rows whose *current* status is terminal, because they were live at the cutoff, and
+ * `alert_periods.status` / `threat_events.status` are the status as of **now**. Returning them raw
+ * would put «відкликано» / «втратила чинність» next to an orange «активна загроза» polygon, and
+ * revealing a terminal state before the SSE frame that carries it is an early all-clear — the one
+ * direction `docs/ARCHITECTURE.md` §Consistency rules calls unrecoverable. Both functions therefore
+ * project the status and keep the raw value in a second column no public presentation surface reads.
+ *
+ * In `live` mode the cutoff is Postgres `now()`, every second branch is empty, every CASE is a
+ * no-op, and each statement degenerates to the one that was here before.
+ */
 
 // ------------------------------------------------------------------------------------------------
 // Location hierarchy
@@ -676,13 +701,26 @@ export async function ingestThreat(
   }
 }
 
-export async function liveThreats(): Promise<LiveEvent[]> {
+export async function liveThreats(cutoff: Date): Promise<LiveEvent[]> {
   const result = await pool.query(
+    // `e.*` still expands first and the projected `status` is selected AFTER it: node-pg builds a
+    // row by assigning field by field in order (`Result.parseRow`), so the later column of a
+    // duplicate name is the one the mapper below reads. `actual_status` carries the raw value for
+    // /ops and for tests; nothing on the public map reads it.
     `SELECT e.*,
+      CASE WHEN e.status IN ('expired','withdrawn','corrected') AND e.ended_at > $1
+           THEN 'active' ELSE e.status END                                  AS status,
+      e.status                                                              AS actual_status,
+      -- A district attached to an already-published event by a later merge is held for the same
+      -- fifteen seconds as a brand-new event. Under the territory model that district IS a polygon
+      -- and an icon stack — the most perceivable output the map has — so "a difference nobody can
+      -- perceive" stopped being true the moment territories were drawn. The event always keeps at
+      -- least one location: the first is written in the same transaction, so its created_at
+      -- equals the event's own.
       COALESCE(jsonb_agg(DISTINCT jsonb_build_object(
         'id',l.id,'name',l.name_uk,'relationType',el.relation_type,
         'latitude',l.latitude,'longitude',l.longitude
-      )) FILTER (WHERE l.id IS NOT NULL),'[]') AS locations,
+      )) FILTER (WHERE l.id IS NOT NULL AND el.created_at <= $1),'[]') AS locations,
       COALESCE(jsonb_agg(DISTINCT jsonb_build_object(
         'name',s.name,'url',s.public_url,'publishedAt',sm.published_at
       )) FILTER (WHERE s.id IS NOT NULL),'[]') AS sources
@@ -692,9 +730,13 @@ export async function liveThreats(): Promise<LiveEvent[]> {
      LEFT JOIN event_evidence ee ON ee.event_id=e.id
      LEFT JOIN source_messages sm ON sm.id=ee.source_message_id
      LEFT JOIN sources s ON s.id=sm.source_id
-     WHERE e.status IN ('observed','confirmed','active')
-       AND e.last_observed_at > now() - interval '12 hours'
-     GROUP BY e.id ORDER BY e.last_observed_at DESC`
+     WHERE e.last_observed_at > now() - interval '12 hours'
+       AND e.created_at <= $1
+       AND ( e.status IN ('observed','confirmed','active')
+          OR ( e.status IN ('expired','withdrawn','corrected')
+               AND e.ended_at > $1 AND e.updated_at > now() - interval '1 hour' ) )
+     GROUP BY e.id ORDER BY e.last_observed_at DESC`,
+    [cutoff]
   );
   return result.rows.map((row) => ({
     id: row.id,
@@ -714,8 +756,11 @@ export async function liveThreats(): Promise<LiveEvent[]> {
   }));
 }
 
-export async function threatDetails(id: string) {
+export async function threatDetails(id: string, cutoff: Date) {
   const event = await pool.query(
+    // An event created after the cutoff does not exist yet as far as a public reader is concerned;
+    // the `null` return is already the route's 404, so the hold and "no such event" are answered
+    // identically and a probe cannot distinguish them.
     `SELECT e.*,
       COALESCE(jsonb_agg(DISTINCT jsonb_build_object(
         'id',l.id,'name',l.name_uk,'relationType',el.relation_type,
@@ -724,7 +769,7 @@ export async function threatDetails(id: string) {
      FROM threat_events e
      LEFT JOIN threat_event_locations el ON el.event_id=e.id
      LEFT JOIN locations l ON l.id=el.location_id
-     WHERE e.id=$1 GROUP BY e.id`, [id]
+     WHERE e.id=$1 AND e.created_at <= $2 GROUP BY e.id`, [id, cutoff]
   );
   if (!event.rowCount) return null;
   const [evidence, updates] = await Promise.all([
@@ -742,10 +787,11 @@ export async function threatDetails(id: string) {
   return { ...event.rows[0], evidence: evidence.rows, updates: updates.rows };
 }
 
-export async function assessmentDetails(id: string) {
+export async function assessmentDetails(id: string, cutoff: Date) {
   const assessment = await pool.query(
     `SELECT a.*,l.name_uk AS location_name,l.latitude,l.longitude
-     FROM risk_assessments a JOIN locations l ON l.id=a.location_id WHERE a.id=$1`, [id]
+     FROM risk_assessments a JOIN locations l ON l.id=a.location_id
+     WHERE a.id=$1 AND a.generated_at <= $2`, [id, cutoff]
   );
   if (!assessment.rowCount) return null;
   // `source_trust` is the publisher's current measured trust (`migrations/021_source_trust.sql`),
@@ -766,27 +812,112 @@ export async function assessmentDetails(id: string) {
   return { ...assessment.rows[0], signals: signals.rows };
 }
 
-export async function activeAlerts() {
+/**
+ * The alerts a public reader may see, as of the cutoff.
+ *
+ * The second branch of the `WHERE` is the all-clear asymmetry made mechanical. A period that ended
+ * *after* the cutoff was still running at the cutoff, so the delayed view must keep showing it —
+ * otherwise the public snapshot announces «Офіційний відбій» before the SSE frame that carries it,
+ * which is the one failure `migrations/008` and `docs/ARCHITECTURE.md` call unrecoverable. The
+ * `updated_at > now() - interval '1 hour'` bound is what keeps that branch from scanning every
+ * period the installation has ever recorded, and `alert_periods_recent_idx (updated_at DESC)`
+ * serves it.
+ *
+ * Filtering on `started_at` was rejected: it is `min(provider_started_at)`, the provider's
+ * *declared* start, routinely older than the moment we learned of the alert — a provider that
+ * back-dates would leak the alert instantly past any cutoff. `published_at` is when the period
+ * became publicly true.
+ *
+ * With the `mode_changed_at` clamp on the cutoff, branch 2 also cannot RESURRECT an alert that was
+ * already cleared from the public map: at the flip instant the cutoff is `mode_changed_at`, so
+ * `ended_at > cutoff` is false for anything that ended before the flip. Without the clamp an
+ * «Відбій» published at 10:00:00 and a flip at 10:00:05 would have put the red polygon back for nine
+ * seconds — a false alert produced by a control-plane action alone.
+ */
+export async function activeAlerts(cutoff: Date) {
   const result = await pool.query(
     `SELECT a.id,a.location_id,l.name_uk AS location_name,l.latitude,l.longitude,
-            a.alert_type,a.status,a.started_at,a.updated_at
+            a.alert_type,
+            -- Status as of the cutoff. Branch 2 below returns periods that ended AFTER the cutoff:
+            -- at the cutoff instant they were running, and that instant is what this whole response
+            -- describes. \`actual_status\` carries the truth for /ops and for tests; the map reads
+            -- presence, not status, and now that is a decision rather than luck.
+            CASE WHEN a.status='ended' AND a.ended_at > $1 THEN 'active' ELSE a.status END AS status,
+            a.status AS actual_status,
+            a.started_at,a.updated_at
      FROM alert_periods a JOIN locations l ON l.id=a.location_id
-     WHERE a.status='active' ORDER BY a.started_at DESC`
+     WHERE (a.status='active' AND a.published_at <= $1)
+        OR (a.status='ended'  AND a.published_at <= $1 AND a.ended_at > $1
+            AND a.updated_at > now() - interval '1 hour')
+     ORDER BY a.started_at DESC`,
+    [cutoff]
   );
   return result.rows;
 }
 
-export async function currentAssessments() {
+/**
+ * The `LEFT JOIN` on the superseding row is what makes "superseded" a fact **as of the cutoff**
+ * rather than a fact as of now: an assessment replaced two seconds ago was still the current one at
+ * the cutoff, and dropping it would blank the analytic contour for the length of the hold.
+ */
+export async function currentAssessments(cutoff: Date) {
   const result = await pool.query(
     `SELECT a.*,l.name_uk AS location_name,l.latitude,l.longitude
-     FROM risk_assessments a JOIN locations l ON l.id=a.location_id
-     WHERE a.published=true AND a.expires_at > now() AND a.superseded_by IS NULL
-     ORDER BY a.risk_score DESC`
+     FROM risk_assessments a
+     JOIN locations l ON l.id=a.location_id
+     LEFT JOIN risk_assessments sup ON sup.id=a.superseded_by
+     WHERE a.published=true
+       AND a.generated_at <= $1
+       AND a.expires_at   >  $1
+       AND (a.superseded_by IS NULL OR sup.generated_at > $1)
+     ORDER BY a.risk_score DESC`,
+    [cutoff]
   );
   return result.rows;
 }
 
-export async function locationTimeline(locationId: string, limit = 100) {
+/**
+ * The ancestry closure of the given location ids, capped at {@link LOCATION_HIERARCHY_MAX_DEPTH} and
+ * cycle-guarded.
+ *
+ * Exists so `composeTerritoryStates()` can climb from a named city to the oblast that carries its
+ * polygon without this process ever holding the whole catalogue: `SELECT id,parent_id,type FROM
+ * locations` is tens of thousands of rows after the KATOTTG import, and the snapshot runs on every
+ * page load. Walking upwards from only the referenced ids costs one index probe per edge.
+ *
+ * `TerritoryNode` is declared in `src/domain/territory-state.ts` and imported here, not the other
+ * way round: the fold's unit tests are required to run without a database, and declaring the type
+ * here would drag `pg` into them.
+ */
+export async function territoryAncestry(locationIds: string[]): Promise<TerritoryNode[]> {
+  if (!locationIds.length) return [];
+  const result = await pool.query<{ id: string; parent_id: string | null; type: string; name_uk: string }>(
+    `WITH RECURSIVE seed AS (
+       SELECT id, parent_id, type, name_uk, 0 AS depth, ARRAY[id] AS path
+       FROM locations WHERE id = ANY($1::text[])
+       UNION ALL
+       SELECT l.id, l.parent_id, l.type, l.name_uk, s.depth+1, s.path || l.id
+       FROM seed s JOIN locations l ON l.id = s.parent_id
+       WHERE s.depth < ${LOCATION_HIERARCHY_MAX_DEPTH} AND NOT l.id = ANY(s.path)
+     )
+     SELECT DISTINCT id, parent_id, type, name_uk FROM seed`,
+    [locationIds]
+  );
+  return result.rows.map((row) => ({
+    id: row.id, parentId: row.parent_id, type: row.type, nameUk: row.name_uk
+  }));
+}
+
+/**
+ * `cutoff` is the SECOND parameter, before the optional `limit`. Appending it after would be TS1016
+ * («A required parameter cannot follow an optional parameter») and would not compile — which is
+ * exactly the property wanted here, because the compiler then enumerates every call site instead of
+ * silently binding `undefined` and turning every `<= $n` into NULL.
+ *
+ * The three item queries and the three matching count queries all carry the predicate, so the counts
+ * can never disagree with the items a reader is shown.
+ */
+export async function locationTimeline(locationId: string, cutoff: Date, limit = 100) {
   const location = (await pool.query(
     `SELECT id,parent_id,type,name_uk,latitude,longitude FROM locations WHERE id=$1`, [locationId]
   )).rows[0];
@@ -802,7 +933,8 @@ export async function locationTimeline(locationId: string, limit = 100) {
               e.threat_type,e.evidence_level,e.valid_until,NULL::numeric AS risk_score,NULL::text AS risk_level
        FROM threat_events e JOIN threat_event_locations el ON el.event_id=e.id
        JOIN locations target ON target.id=el.location_id WHERE ${applies}
-       ORDER BY e.started_at DESC LIMIT $2`, [related, limit]
+         AND e.created_at <= $3
+       ORDER BY e.started_at DESC LIMIT $2`, [related, limit, cutoff]
     ),
     pool.query(
       `SELECT a.id,'alert' AS kind,a.started_at AS happened_at,
@@ -811,7 +943,8 @@ export async function locationTimeline(locationId: string, limit = 100) {
               a.status,a.alert_type AS threat_type,'official' AS evidence_level,a.ended_at AS valid_until,
               NULL::numeric AS risk_score,NULL::text AS risk_level
        FROM alert_periods a JOIN locations target ON target.id=a.location_id WHERE ${applies}
-       ORDER BY a.started_at DESC LIMIT $2`, [related, limit]
+         AND a.published_at <= $3
+       ORDER BY a.started_at DESC LIMIT $2`, [related, limit, cutoff]
     ),
     pool.query(
       `SELECT a.id,'assessment' AS kind,a.generated_at AS happened_at,'Аналітичне попередження' AS title,
@@ -819,14 +952,19 @@ export async function locationTimeline(locationId: string, limit = 100) {
               CASE WHEN a.superseded_by IS NULL AND a.expires_at>now() THEN 'active' ELSE 'expired' END AS status,
               a.threat_type,NULL::text AS evidence_level,a.horizon_end AS valid_until,a.risk_score,a.risk_level
        FROM risk_assessments a JOIN locations target ON target.id=a.location_id WHERE a.published=true AND ${applies}
-       ORDER BY a.generated_at DESC LIMIT $2`, [related, limit]
+         AND a.generated_at <= $3
+       ORDER BY a.generated_at DESC LIMIT $2`, [related, limit, cutoff]
     ),
+    // The counts take the cutoff as `$2`: an unreferenced bind parameter is a bind-message error in
+    // PostgreSQL, so `limit` cannot simply be carried along to keep the numbering uniform.
     pool.query(`SELECT count(DISTINCT e.id)::integer AS count FROM threat_events e
-      JOIN threat_event_locations el ON el.event_id=e.id JOIN locations target ON target.id=el.location_id WHERE ${applies}`, [related]),
+      JOIN threat_event_locations el ON el.event_id=e.id JOIN locations target ON target.id=el.location_id
+      WHERE ${applies} AND e.created_at <= $2`, [related, cutoff]),
     pool.query(`SELECT count(*)::integer AS count FROM alert_periods a
-      JOIN locations target ON target.id=a.location_id WHERE ${applies}`, [related]),
+      JOIN locations target ON target.id=a.location_id WHERE ${applies} AND a.published_at <= $2`, [related, cutoff]),
     pool.query(`SELECT count(*)::integer AS count FROM risk_assessments a
-      JOIN locations target ON target.id=a.location_id WHERE a.published=true AND ${applies}`, [related])
+      JOIN locations target ON target.id=a.location_id
+      WHERE a.published=true AND ${applies} AND a.generated_at <= $2`, [related, cutoff])
   ]);
   const items = [...threats.rows, ...alerts.rows, ...assessments.rows]
     .sort((left, right) => new Date(right.happened_at).getTime() - new Date(left.happened_at).getTime())

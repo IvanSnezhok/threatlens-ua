@@ -75,6 +75,18 @@ export type CodexChatResult = CodexChatSuccess | CodexChatFailure;
 export interface CodexChatRequest {
   /** Goes into `ai_runs.prompt_version`; it is what tells three callers apart in the audit log. */
   promptVersion: string;
+  /**
+   * Which feature spent this call.
+   *
+   * Required, not optional, on purpose. `prompt_version` is the transport-level discriminator and
+   * has already drifted from the feature it names, and a nullable column filled in by three of four
+   * writers is precisely the bug shape this file's header warns about: the fourth writer is the one
+   * an operator goes looking for. Making the field required means every construction site moves in
+   * the same commit or the build does not pass.
+   */
+  surface: 'narrative' | 'digest' | 'attacks' | 'shadow' | 'risk';
+  /** Recorded as `ai_runs.classifier_version` when the caller knows which rules produced its input. */
+  classifierVersion?: string;
   system: string;
   user: string;
   /** Ask for a JSON object back. Callers that parse the reply should always set this. */
@@ -115,6 +127,15 @@ export interface AiRunRecord {
   status: 'success' | 'failed';
   error: string | null;
   durationMs: number;
+  /** The feature that spent the call, from {@link CodexChatRequest.surface}. */
+  surface: string;
+  classifierVersion: string | null;
+  /**
+   * `'skipped'` on every row this module writes: a transport makes no claim about whether the
+   * answer's numbers were grounded. The caller writes its own `'rejected'` row when it refuses one.
+   */
+  validationStatus: 'passed' | 'rejected' | 'skipped' | null;
+  fallbackReason: string | null;
 }
 
 /**
@@ -126,12 +147,14 @@ export interface AiRunRecord {
  */
 async function writeAiRun(row: AiRunRecord): Promise<void> {
   await pool.query(
-    `INSERT INTO ai_runs(model,prompt_version,input,output,status,error,duration_ms)
-     VALUES ($1,$2,$3,$4,$5,$6,$7)`,
+    `INSERT INTO ai_runs(model,prompt_version,input,output,status,error,duration_ms,
+                         surface,classifier_version,validation_status,fallback_reason)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`,
     [
       row.model, row.promptVersion, JSON.stringify(row.input),
       row.output == null ? null : JSON.stringify(row.output),
-      row.status, row.error == null ? null : row.error.slice(0, 800), row.durationMs
+      row.status, row.error == null ? null : row.error.slice(0, 800), row.durationMs,
+      row.surface, row.classifierVersion, row.validationStatus, row.fallbackReason
     ]
   ).catch(() => undefined);
 }
@@ -248,7 +271,11 @@ export async function codexChat(request: CodexChatRequest, deps: CodexClientDeps
     const durationMs = Date.now() - started;
     await audit({
       model: model ?? 'unconfigured', promptVersion: request.promptVersion, input: auditInput,
-      output: null, status: 'failed', error: `${reason}: ${detail}`, durationMs
+      output: null, status: 'failed', error: `${reason}: ${detail}`, durationMs,
+      surface: request.surface, classifierVersion: request.classifierVersion ?? null,
+      // The same string the `error` column already carries, now in a column an operator can filter
+      // on: «покажи все, що впало через таймаут» is a WHERE clause or it is a text search.
+      validationStatus: 'skipped', fallbackReason: `${reason}: ${detail}`
     }).catch(() => undefined);
     return { ok: false, reason, detail, model, durationMs };
   };
@@ -348,7 +375,9 @@ export async function codexChat(request: CodexChatRequest, deps: CodexClientDeps
   const durationMs = Date.now() - started;
   await audit({
     model, promptVersion: request.promptVersion, input: auditInput, output: { content },
-    status: 'success', error: null, durationMs
+    status: 'success', error: null, durationMs,
+    surface: request.surface, classifierVersion: request.classifierVersion ?? null,
+    validationStatus: 'skipped', fallbackReason: null
   }).catch(() => undefined);
   return { ok: true, content, model, durationMs };
 }

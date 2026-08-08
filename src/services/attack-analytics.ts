@@ -1,5 +1,6 @@
 import { config } from '../config.js';
 import { pool } from '../db/pool.js';
+import type { PublicationMode } from '../types.js';
 
 /**
  * Public attack analytics: what was reported over a day, a week or a month, and what repeats in it.
@@ -918,20 +919,27 @@ export function composeAttackAnalytics(
  */
 export const ATTACK_CACHE_TTL_MS = 120_000;
 
-const cache = new Map<AttackPeriod, { at: number; value: AttackAnalytics }>();
+const cache = new Map<string, { at: number; value: AttackAnalytics }>();
 
 /** Test seam: the memo would otherwise carry one test's fixture into the next. */
 export function resetAttackAnalyticsCache(): void {
   cache.clear();
 }
 
-export async function attackAnalytics(period: AttackPeriod, now: Date = new Date()): Promise<AttackAnalytics> {
-  const cached = cache.get(period);
+export async function attackAnalytics(
+  period: AttackPeriod, now: Date = new Date(), mode: PublicationMode = 'live'
+): Promise<AttackAnalytics> {
+  // The publication mode is in the KEY, not only in the window. A flip moves the window end by the
+  // hold length, and a memo keyed on the period alone would serve the other mode's answer for up to
+  // two minutes after the operator changed their mind — the hold simply would not take effect on
+  // this surface.
+  const key = `${period}|${mode}`;
+  const cached = cache.get(key);
   if (cached && now.getTime() - cached.at < ATTACK_CACHE_TTL_MS) return cached.value;
 
   const window = resolveAttackWindow(period, now);
   const [rows, points] = await Promise.all([dimensions(window), timeline(window)]);
   const value = composeAttackAnalytics(window, rows, points, now);
-  cache.set(period, { at: now.getTime(), value });
+  cache.set(key, { at: now.getTime(), value });
   return value;
 }

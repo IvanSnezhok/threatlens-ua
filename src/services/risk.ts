@@ -1,7 +1,7 @@
 import { z } from 'zod';
 import { config } from '../config.js';
 import { pool } from '../db/pool.js';
-import { riskLevel } from '../domain/classifier.js';
+import { CLASSIFIER_VERSION, riskLevel } from '../domain/classifier.js';
 import { trustModifier } from './source-trust.js';
 
 const modelAssessmentSchema = z.object({
@@ -215,8 +215,11 @@ export function clampAssessment(candidate: ModelAssessment, signals: RiskSignalR
 
 async function recordFailedRun(input: unknown, error: unknown): Promise<void> {
   await pool.query(
-    `INSERT INTO ai_runs(model,prompt_version,input,status,error) VALUES ($1,'v2',$2,'failed',$3)`,
-    [config.AI_MODEL || 'rule-fallback-v2', JSON.stringify(input), String(error).slice(0, 800)]
+    `INSERT INTO ai_runs(model,prompt_version,input,status,error,surface,classifier_version,
+                         validation_status,fallback_reason)
+     VALUES ($1,'v2',$2,'failed',$3,'risk',$4,'skipped',$3)`,
+    [config.AI_MODEL || 'rule-fallback-v2', JSON.stringify(input), String(error).slice(0, 800),
+      CLASSIFIER_VERSION]
   );
 }
 
@@ -266,9 +269,16 @@ async function callModel(location: { id: string; name_uk: string }, threatType: 
     const content = body.choices?.[0]?.message?.content;
     if (!content) throw new Error('AI endpoint returned empty content');
     const parsed = modelAssessmentSchema.parse(JSON.parse(content));
+    // `validation_status` is `'skipped'` rather than `'passed'`: the risk path has no grounding
+    // check to pass. `clampAssessment` bounds the score afterwards, which is a policy, not a
+    // verdict on the model's arithmetic, and claiming `'passed'` here would make a filter over the
+    // column mean two different things depending on the writer.
     await pool.query(
-      `INSERT INTO ai_runs(model,prompt_version,input,output,status,duration_ms) VALUES ($1,'v2',$2,$3,'success',$4)`,
-      [config.AI_MODEL, JSON.stringify(input), JSON.stringify(parsed), Date.now() - started]
+      `INSERT INTO ai_runs(model,prompt_version,input,output,status,duration_ms,surface,
+                           classifier_version,validation_status,fallback_reason)
+       VALUES ($1,'v2',$2,$3,'success',$4,'risk',$5,'skipped',NULL)`,
+      [config.AI_MODEL, JSON.stringify(input), JSON.stringify(parsed), Date.now() - started,
+        CLASSIFIER_VERSION]
     );
     return parsed;
   } catch (error) {
@@ -277,7 +287,54 @@ async function callModel(location: { id: string; name_uk: string }, threatType: 
   }
 }
 
+/**
+ * One risk pass at a time, per process.
+ *
+ * {@link runRiskAssessmentsPass} expires, regroups, re-scores and supersedes; two passes interleaved
+ * would supersede each other's rows and could publish an older score last. Three writers exist now —
+ * `startRiskScheduler`, `POST /ops/run-assessment` and the event-driven recompute — and until this
+ * flag the first two already raced with no guard at all outside the scheduler's own closure.
+ *
+ * In memory and not in the database, for the reason `shadow-classifier.ts` states about its budget:
+ * single replica is the deployed shape, and a guard that needs a round trip to decide whether to do
+ * work is not a guard.
+ */
+let riskRunInFlight = false;
+
+export interface RiskRunOutcome {
+  published: number;
+  /** True when another writer held the pass and this call did nothing. */
+  skipped: boolean;
+}
+
+/**
+ * The guarded entry point. It exists separately from {@link runRiskAssessments} because the
+ * analytics scheduler has to count a blocked leg
+ * (`threatlens_analytics_recompute_total{outcome="skipped_overlap"}`) and
+ * `Promise<number>` cannot express "blocked" — while changing that signature would move
+ * `POST /ops/run-assessment`, and importing the scheduler's counter here would close a cycle.
+ */
+export async function runRiskAssessmentsGuarded(): Promise<RiskRunOutcome> {
+  if (riskRunInFlight) return { published: 0, skipped: true };
+  riskRunInFlight = true;
+  try {
+    return { published: await runRiskAssessmentsPass(), skipped: false };
+  } finally {
+    riskRunInFlight = false;
+  }
+}
+
+/** Unchanged signature: `POST /ops/run-assessment` and `startRiskScheduler` still call this. */
 export async function runRiskAssessments(): Promise<number> {
+  return (await runRiskAssessmentsGuarded()).published;
+}
+
+/** Test seam: a suite that aborts mid-pass must not leave the next file's first call blocked. */
+export function resetRiskRunGuard(): void {
+  riskRunInFlight = false;
+}
+
+async function runRiskAssessmentsPass(): Promise<number> {
   const modelVersion = config.AI_MODEL || 'rule-fallback-v2';
   await pool.query(
     `UPDATE risk_assessments SET expires_at=now()

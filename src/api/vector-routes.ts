@@ -1,4 +1,5 @@
 import type { FastifyPluginAsync } from 'fastify';
+import { publicationSlice } from '../services/publication.js';
 import {
   REPORTED_VECTOR_DISCLAIMER,
   reportedVectorForEvent,
@@ -26,7 +27,9 @@ const vectorRoutes: FastifyPluginAsync = async (app) => {
   /** Every live chain, in one request. This is what the map layer consumes. */
   app.get('/api/v1/vectors', async (request, reply) => {
     try {
-      const items = await reportedVectorsForLiveEvents();
+      // Inside the try on purpose: a failed slice must degrade to "no chains" exactly as a failed
+      // chain query does, never to a 500 the map has to special-case.
+      const items = await reportedVectorsForLiveEvents((await publicationSlice()).cutoffAt);
       return { generatedAt: new Date().toISOString(), disclaimer: REPORTED_VECTOR_DISCLAIMER, items };
     } catch (error) {
       // The chain is an explanatory overlay on top of markers the map already draws. A failure here
@@ -39,23 +42,27 @@ const vectorRoutes: FastifyPluginAsync = async (app) => {
 
   app.get<{ Params: { id: string } }>('/api/v1/threats/:id/vector', async (request, reply) => {
     if (!uuidPattern.test(request.params.id)) return reply.code(400).send({ error: 'invalid_id' });
+    // Visibility is decided FIRST, before any chain is computed. An event created after the cutoff
+    // must 404 exactly as `/api/v1/threats/:id` does, and computing its chain before deciding that
+    // would be work done only to throw away — on the same pool the snapshot is competing for.
+    const slice = await publicationSlice();
+    if (!(await threatEventExists(request.params.id, slice.cutoffAt))) {
+      return reply.code(404).send({ error: 'not_found' });
+    }
     const vector = await reportedVectorForEvent(request.params.id);
     if (vector) return vector;
     // "This event has no chain" and "this event does not exist" are different answers, and the
     // client renders them differently: the first is an ordinary single-message threat.
-    if (await threatEventExists(request.params.id)) {
-      return reply.send({
-        eventId: request.params.id,
-        kind: 'reported_observation_chain',
-        disclaimer: REPORTED_VECTOR_DISCLAIMER,
-        nodes: [], segments: [],
-        span: {
-          from: null, to: null, elapsedSeconds: 0, sourceCount: 0,
-          independenceGroupCount: 0, drawableSegments: 0, strongestBasis: null
-        }
-      });
-    }
-    return reply.code(404).send({ error: 'not_found' });
+    return reply.send({
+      eventId: request.params.id,
+      kind: 'reported_observation_chain',
+      disclaimer: REPORTED_VECTOR_DISCLAIMER,
+      nodes: [], segments: [],
+      span: {
+        from: null, to: null, elapsedSeconds: 0, sourceCount: 0,
+        independenceGroupCount: 0, drawableSegments: 0, strongestBasis: null
+      }
+    });
   });
 };
 
