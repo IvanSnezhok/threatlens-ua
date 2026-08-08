@@ -748,13 +748,19 @@ export async function assessmentDetails(id: string) {
      FROM risk_assessments a JOIN locations l ON l.id=a.location_id WHERE a.id=$1`, [id]
   );
   if (!assessment.rowCount) return null;
+  // `source_trust` is the publisher's current measured trust (`migrations/021_source_trust.sql`),
+  // not the trust that was current when the assessment was generated: the number is a month-wide
+  // rolling measurement and the card answers "how much do we trust this channel", not "how much did
+  // we trust it at 03:14". NULL when the nightly worker has never scored the source, which the API
+  // layer turns into no label at all rather than into a reassuring default.
   const signals = await pool.query(
     `SELECT rs.id,rs.signal_type,rs.threat_type,rs.source_tier,rs.reliability,
             rs.geographic_relevance,rs.observed_at,rs.expires_at,ras.contribution,ras.explanation,
-            s.name AS source_name,s.public_url
+            s.name AS source_name,s.public_url,t.trust AS source_trust
      FROM risk_assessment_signals ras JOIN risk_signals rs ON rs.id=ras.signal_id
      LEFT JOIN source_messages sm ON sm.id=rs.source_message_id
      LEFT JOIN sources s ON s.id=sm.source_id
+     LEFT JOIN source_trust_current t ON t.source_id=sm.source_id
      WHERE ras.assessment_id=$1 ORDER BY ras.contribution DESC`, [id]
   );
   return { ...assessment.rows[0], signals: signals.rows };

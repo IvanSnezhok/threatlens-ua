@@ -884,6 +884,21 @@ function influenceWord(contribution) {
   return 'слабкий вплив';
 }
 
+// Слово, а не число. Читач картки вирішує, чи йти в укриття, і «0.63» тут не допомагає нікому:
+// число натякає на точність, якої місячний вимір не має. Сирі числа лишаються нижче, у згорнутих
+// техдеталях, де їх перевіряють, а не читають під час тривоги.
+//
+// Порядок навмисно від найобережнішого слова до найспокійнішого: якщо в групі є і знижене джерело,
+// і високе, першим має стояти застереження, а не похвала.
+const trustWordOrder = ['знижена', 'звичайна', 'висока'];
+
+function groupTrustNote(group) {
+  const words = [...(group.trust ?? [])].sort((a, b) => trustWordOrder.indexOf(a) - trustWordOrder.indexOf(b));
+  if (!words.length) return '';
+  const noun = words.length === 1 && group.sources.size <= 1 ? 'джерела' : 'джерел';
+  return ` · довіра ${noun}: ${words.map((word) => escapeHtml(word)).join(', ')}`;
+}
+
 // Три повідомлення про той самий напрямок — це один аргумент, повторений тричі, а не три аргументи.
 // Групування прибирає з картки саме ту «плутанину з факторів», через яку її неможливо було читати.
 function groupAssessmentSignals(signals = []) {
@@ -891,13 +906,17 @@ function groupAssessmentSignals(signals = []) {
   for (const signal of signals) {
     const key = signal.signal_type ?? 'unknown';
     const group = groups.get(key) ?? {
-      key, label: signalTypeName(key), count: 0, weight: 0, latest: 0, sources: new Set(), tiers: new Set()
+      key, label: signalTypeName(key), count: 0, weight: 0, latest: 0, sources: new Set(), tiers: new Set(), trust: new Set()
     };
     group.count += 1;
     group.weight += Number(signal.contribution) || 0;
     group.latest = Math.max(group.latest, new Date(signal.observed_at).getTime() || 0);
     if (signal.source_name) group.sources.add(signal.source_name);
     if (signal.source_tier) group.tiers.add(signal.source_tier);
+    // Слово приходить із сервера (`trustLabel` у src/services/source-trust.ts), щоб межа «високої»
+    // довіри мала одне визначення на всі поверхні. Джерела без нічного розрахунку не додають нічого:
+    // «невідомо» в цьому рядку читалося б як застереження, хоча означає лише відсутність виміру.
+    if (signal.source_trust_label) group.trust.add(signal.source_trust_label);
     groups.set(key, group);
   }
   return [...groups.values()].sort((a, b) => b.weight - a.weight);
@@ -969,14 +988,20 @@ async function showAssessmentDetails(id) {
       : 'джерело не вказано';
     return `<li class="signal-group"><strong>${escapeHtml(group.label)}</strong>
       <span>${group.count} ${pluralUk(group.count, 'повідомлення', 'повідомлення', 'повідомлень')} · ${escapeHtml(influenceWord(group.weight))}</span>
-      <small>найсвіжіше ${escapeHtml(agoOrUnknown(group.latest))} · ${sourceLine}</small></li>`;
+      <small>найсвіжіше ${escapeHtml(agoOrUnknown(group.latest))} · ${sourceLine}${groupTrustNote(group)}</small></li>`;
   }).join('') || '<li class="signal-group"><strong>Сигналів не залишилося</strong><small>Повідомлення, з яких зроблено оцінку, втратили чинність.</small></li>';
 
   // Сирі числа нікуди не зникають — вони переїжджають під <details>. Тут вони перевіряються, а не
   // читаються: людині під час тривоги не потрібні ні версія методології, ні георелевантність 0.65.
   const technical = item.signals.map((signal) => `<li><span>${escapeHtml(signal.signal_type)}</span>
-    <span>${escapeHtml(tierName(signal.source_tier))} · внесок ${Number(signal.contribution).toFixed(2)} · надійність ${Number(signal.reliability).toFixed(2)} · георелевантність ${Number(signal.geographic_relevance).toFixed(2)}</span>
+    <span>${escapeHtml(tierName(signal.source_tier))} · внесок ${Number(signal.contribution).toFixed(2)} · надійність ${Number(signal.reliability).toFixed(2)} · георелевантність ${Number(signal.geographic_relevance).toFixed(2)}${signal.source_trust == null ? '' : ` · довіра джерела ${Number(signal.source_trust).toFixed(2)}`}</span>
     <time>${escapeHtml(new Date(signal.observed_at).toLocaleString('uk-UA'))}</time></li>`).join('');
+
+  // Пояснення до числа довіри показуємо лише тоді, коли саме число десь є: інакше це абзац про
+  // механізм, який на цій картці не спрацював жодного разу.
+  const trustNote = item.signals.some((signal) => signal.source_trust != null)
+    ? '<p class="legend-note">Довіра — це виміряна за 30 днів поведінка каналу: відкликані твердження, підтвердження іншими незалежними групами, першість повідомлень і читабельність. Вона не змінює рівень джерела і не знімає обмежень індексу за рівнями — лише модулює внесок сигналу в межах від 0.6 до 1.2. Без виміру внесок береться повністю.</p>'
+    : '';
 
   openDetail(`${item.location_name}: ${threat}`, 'Аналітична оцінка, не тривога',
     `<div class="detail-score"><strong>${escapeHtml(item.risk_score)}<small>/10</small></strong><span>${escapeHtml(level)} рівень<br>впевненість ${escapeHtml(confidenceNames[item.assessment_confidence] ?? item.assessment_confidence)}</span></div>
@@ -994,6 +1019,7 @@ async function showAssessmentDetails(id) {
        <div><dt>Індикативний рівень</dt><dd>${escapeHtml(String(item.indicative_percent ?? Math.round(item.risk_score * 10)))}% за шкалою індексу</dd></div>
        <div><dt>Методологія · модель</dt><dd>${escapeHtml(item.methodology_version)} · ${escapeHtml(item.model_version)}</dd></div></dl>
        ${technical ? `<ul class="tech-signals">${technical}</ul>` : ''}
+       ${trustNote}
      </details>
      <div class="safety-note"><strong>Не статистична ймовірність</strong><p>${escapeHtml(explanation.caveat || 'Це відносний індекс публічних повідомлень, а не ймовірність удару. Низький рівень не означає безпеку.')}</p></div>`);
 }
@@ -1462,6 +1488,93 @@ function codexFact(term, value) {
 // `settings` — те, що оператор обрав нижче в цій же групі. Без нього підказки читалися б як брехня:
 // відколи модель і три перемикачі живуть у /ops, порожній `CODEX_MODEL` більше не означає «моделі
 // немає», а `ANALYTICS_NARRATIVE_ENABLED=false` більше не означає «наративу не буде».
+// ------------------------------------------------------------------------------------------------
+// Довіра до джерел
+// ------------------------------------------------------------------------------------------------
+//
+// Тут — із розкладкою, бо оператор має мати змогу посперечатися з числом. Оцінка без компонентів —
+// це оракул, а з оракулом не сперечаються. На публічній карті лишається саме слово.
+
+function trustPercent(value) {
+  if (value == null || !Number.isFinite(Number(value))) return '—';
+  return `${Math.round(Number(value) * 100)}%`;
+}
+
+// Числа з `components` приходять із jsonb, тобто з бази, а не з константи в коді. Розкладка нікому
+// не допоможе, якщо в неї можна щось вписати, тож жодне значення звідти не потрапляє в розмітку
+// сирим: або число, або нуль.
+function trustCount(value) {
+  const number = Number(value);
+  return Number.isFinite(number) ? Math.trunc(number) : 0;
+}
+
+function trustLagLabel(seconds) {
+  if (seconds == null) return 'нікого не наздоганяв';
+  const value = Number(seconds);
+  if (!Number.isFinite(value)) return 'не виміряно';
+  return value >= 60 ? `${Math.round(value / 60)} хв` : `${Math.round(value)} с`;
+}
+
+function sourceTrustRow(source) {
+  const components = source.components ?? {};
+  // Тон — не прикраса, як і в решті ops-консолі: звичайне й нейтральне джерело лишається беззвучним,
+  // бо жодної дії не вимагає, і саме тому знижена довіра помітна. Якби «звичайна» світилася
+  // застережним тоном, то світився б увесь каталог — а список, у якому все жовте, не вирізняє нічого.
+  const state = source.trust == null ? { label: 'не виміряно', tone: 'off' }
+    : source.neutral ? { label: 'нейтрально', tone: 'off' }
+      : source.label === 'висока' ? { label: 'висока', tone: 'ok' }
+        : source.label === 'знижена' ? { label: 'знижена', tone: 'bad' }
+          : { label: 'звичайна', tone: 'off' };
+  return `<article>
+    <div>
+      <span>TIER ${escapeHtml(source.tier)}${source.official ? ' · офіційне' : ''} · група ${escapeHtml(source.independenceGroup)}</span>
+      <h3>${escapeHtml(source.name)}</h3>
+      <p>${source.trust == null ? 'Нічного розрахунку для цього джерела ще не було.' : `довіра ${Number(source.trust).toFixed(2)} · модифікатор внеску ×${Number(source.modifier).toFixed(2)}`}</p>
+      <dl class="codex-facts">
+        <div><dt>Відкликано тверджень</dt><dd>${trustPercent(components.withdrawnShare)}</dd></div>
+        <div><dt>Підтверджено іншими</dt><dd>${trustPercent(components.corroboratedShare)}</dd></div>
+        <div><dt>Першим повідомив</dt><dd>${trustCount(components.firstReports)} подій</dd></div>
+        <div><dt>Медіанний лаг</dt><dd>${escapeHtml(trustLagLabel(components.lagMedianSeconds))}</dd></div>
+        <div><dt>Не вдалося прочитати</dt><dd>${trustPercent(components.unreadableShare)}</dd></div>
+        <div><dt>Обсяг вибірки</dt><dd>${trustCount(components.sampleSize)} подій</dd></div>
+      </dl>
+    </div>
+    <div class="ops-channel-actions"><span class="codex-state is-${state.tone}">${escapeHtml(state.label)}</span></div>
+  </article>`;
+}
+
+function opsSourceTrustSection(data) {
+  if (!data) return '<section class="ops-section" id="source-trust-section"><header class="ops-section-head"><div><p>Джерела</p><h2>Довіра до джерел</h2></div></header><p class="legend-note">Розрахунок довіри недоступний.</p></section>';
+  const methodology = data.methodology ?? {};
+  return `<section class="ops-section" id="source-trust-section">
+    <header class="ops-section-head">
+      <div><p>Джерела · вікно ${trustCount(methodology.windowDays)} днів</p><h2>Довіра до джерел</h2></div>
+      <button data-source-trust-recalculate>Перерахувати</button>
+    </header>
+    <dl class="codex-facts">
+      <div><dt>Методологія</dt><dd>${escapeHtml(methodology.version ?? '—')}</dd></div>
+      <div><dt>Останній розрахунок</dt><dd>${data.measuredAt ? escapeHtml(new Date(data.measuredAt).toLocaleString('uk-UA')) : 'ще не було'}</dd></div>
+      <div><dt>Період напіврозпаду</dt><dd>${trustCount(methodology.halfLifeDays)} днів</dd></div>
+      <div><dt>Нейтральний старт до</dt><dd>${trustCount(methodology.minSampleSize)} подій</dd></div>
+    </dl>
+    <div class="safety-note"><strong>Довіра не змінює рівень джерела</strong><p>${escapeHtml(methodology.notice ?? '')}</p></div>
+    <div class="ops-channel-list">${(data.sources ?? []).map(sourceTrustRow).join('')}</div>
+  </section>`;
+}
+
+function wireSourceTrustSection(root) {
+  $('[data-source-trust-recalculate]', root)?.addEventListener('click', async (event) => {
+    const button = event.currentTarget;
+    button.disabled = true; button.textContent = 'Рахуємо…';
+    await opsFetch('/ops/api/source-trust/recalculate', { method: 'POST' }).catch(() => null);
+    const data = await opsFetch('/ops/api/source-trust').then((r) => r.ok ? r.json() : null).catch(() => null);
+    const section = $('#source-trust-section', root);
+    if (!section) return;
+    section.outerHTML = opsSourceTrustSection(data);
+    wireSourceTrustSection(root);
+  });
+}
+
 function codexPreconditions(status, settings) {
   const rows = [];
   const featureOn = settings ? Object.values(settings.features).some(Boolean) : false;
@@ -1759,11 +1872,12 @@ async function renderOps() {
   // Стан входу приходить у складі налаштувань, а не окремим запитом: перемикач «увімкнено» поруч
   // із мертвою сесією — найзаплутаніший стан цієї функції, і показати їх із двох різних моментів
   // означало б зробити його ще заплутанішим.
-  const [vectorOps, codexSettings, aiRuns, shadow] = await Promise.all([
+  const [vectorOps, codexSettings, aiRuns, shadow, sourceTrust] = await Promise.all([
     opsFetch('/ops/vectors').then((result) => result.ok ? result.json() : null).catch(() => null),
     opsFetch('/ops/codex/settings').then((result) => result.ok ? result.json() : null).catch(() => null),
     opsFetch('/ops/ai-runs?limit=50').then((result) => result.ok ? result.json() : null).catch(() => null),
-    opsFetch('/ops/shadow-classifier?hours=24').then((result) => result.ok ? result.json() : null).catch(() => null)
+    opsFetch('/ops/shadow-classifier?hours=24').then((result) => result.ok ? result.json() : null).catch(() => null),
+    opsFetch('/ops/api/source-trust').then((result) => result.ok ? result.json() : null).catch(() => null)
   ]);
   const codex = codexSettings?.status ?? null;
   const queued = data.outbox.reduce((sum, item) => sum + Number(item.count), 0);
@@ -1781,6 +1895,7 @@ async function renderOps() {
       </form>
       <div class="ops-channel-list">${data.channels.map((channel) => `<article class="${channel.active ? '' : 'is-disabled'}"><div><span>${channel.verified ? '✓ перевірено' : escapeHtml(channel.category)}</span><h3>${escapeHtml(channel.title)}</h3><p>@${escapeHtml(channel.username)}${channel.location_name ? ` · ${escapeHtml(channel.location_name)}` : ''}</p></div><div class="ops-channel-actions"><a href="${escapeHtml(channel.url)}" target="_blank" rel="noreferrer">Відкрити ↗</a><button data-channel-toggle="verified" data-id="${channel.id}" data-value="${channel.verified}">${channel.verified ? 'Зняти перевірку' : 'Перевірити'}</button><button data-channel-toggle="active" data-id="${channel.id}" data-value="${channel.active}">${channel.active ? 'Приховати' : 'Активувати'}</button></div></article>`).join('')}</div>
     </section>
+    ${opsSourceTrustSection(sourceTrust)}
     <div class="ops-group" id="codex-group">
       <header class="ops-group-head"><p>Модель в аналітиці</p><h2>Codex-аналітика</h2>
         <p>Вхід, вибір моделі, чотири перемикачі, звірка з правилами й журнал усіх звернень — усе, що визначає, коли систему пише машина, і що саме вона написала.</p></header>
@@ -1795,6 +1910,7 @@ async function renderOps() {
   wireCodexSettingsSection(root, () => renderOps());
   wireShadowSection(root, codexSettings?.settings ?? null);
   wireAiRunsSection(root, codex, codexSettings?.settings ?? null);
+  wireSourceTrustSection(root);
   root.querySelectorAll('[data-project-vector]').forEach((button) => button.addEventListener('click', async () => {
     const output = $(`#projection-${button.dataset.projectVector}`, root);
     output.textContent = 'Рахуємо…';

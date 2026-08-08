@@ -14,9 +14,11 @@ import attackAnalyticsRoutes from './attack-analytics-routes.js';
 import occupationRoutes from './occupation-routes.js';
 import opsAiRunsRoutes from './ops-ai-runs-routes.js';
 import opsCodexRoutes from './ops-codex-routes.js';
+import opsSourceTrustRoutes from './ops-source-trust-routes.js';
 import opsVectorRoutes from './ops-vector-routes.js';
 import vectorRoutes from './vector-routes.js';
 import { runRiskAssessments } from '../services/risk.js';
+import { TRUST_MODIFIER_CEILING, TRUST_MODIFIER_FLOOR, trustLabel } from '../services/source-trust.js';
 import { createChannelSchema, createRecommendedChannel, listRecommendedChannels, updateChannelSchema, updateRecommendedChannel } from '../services/recommended-channels.js';
 
 const registry = new Registry();
@@ -84,7 +86,7 @@ export async function buildServer() {
   app.get('/health/live', async () => ({ status: 'ok', version: process.env.npm_package_version ?? 'dev' }));
   app.get('/health/ready', async (_request, reply) => {
     try {
-      const migration = await pool.query(`SELECT 1 FROM schema_migrations WHERE filename='017_codex_oauth.sql'`);
+      const migration = await pool.query(`SELECT 1 FROM schema_migrations WHERE filename='021_source_trust.sql'`);
       if (!migration.rowCount) return reply.code(503).send({ status: 'not_ready', reason: 'migrations_pending' });
       return { status: 'ready' };
     }
@@ -111,6 +113,7 @@ export async function buildServer() {
   await app.register(opsVectorRoutes);
   await app.register(opsCodexRoutes);
   await app.register(opsAiRunsRoutes);
+  await app.register(opsSourceTrustRoutes);
 
   app.get('/api/v1/config', async () => ({
     mapStyleUrl: config.MAP_STYLE_URL,
@@ -131,7 +134,11 @@ export async function buildServer() {
     guardrails: {
       onlyTierCMaximum: 3.9, withoutTierAMaximum: 5.9,
       highConfidenceRequiresTierA: true, independentGroupsForConfidence: 2,
-      signalHalfLifeHours: 2
+      signalHalfLifeHours: 2,
+      // Trust modulates a signal's contribution and nothing else. Published here because a reader
+      // who is told "довіра джерела: знижена" on a card is entitled to know how much that changed —
+      // and the honest answer is "at most a fifth up, at most two fifths down, and never the tier".
+      sourceTrustModifier: { floor: TRUST_MODIFIER_FLOOR, ceiling: TRUST_MODIFIER_CEILING, withoutMeasurement: 1 }
     },
     caveats: [
       'Індикативний відсоток є шкалою індексу, а не статистичною ймовірністю.',
@@ -174,10 +181,26 @@ export async function buildServer() {
       ? (await threatDetails(request.params.id)) ?? reply.code(404).send({ error: 'not_found' })
       : reply.code(400).send({ error: 'invalid_id' }));
   app.get('/api/v1/assessments', async () => currentAssessments());
-  app.get<{ Params: { id: string } }>('/api/v1/assessments/:id', async (request, reply) =>
-    uuidPattern.test(request.params.id)
-      ? (await assessmentDetails(request.params.id)) ?? reply.code(404).send({ error: 'not_found' })
-      : reply.code(400).send({ error: 'invalid_id' }));
+  /**
+   * The signals behind one assessment, each carrying the word for its publisher's trust.
+   *
+   * The word is attached here rather than in the repository or in the browser so that there is one
+   * definition of where «висока» starts — `trustLabel` in `src/services/source-trust.ts`, the same
+   * function the ops API uses. `source_trust` stays on the row for the collapsed technical block the
+   * map dialog renders; the main flow of the card shows only the word.
+   */
+  app.get<{ Params: { id: string } }>('/api/v1/assessments/:id', async (request, reply) => {
+    if (!uuidPattern.test(request.params.id)) return reply.code(400).send({ error: 'invalid_id' });
+    const item = await assessmentDetails(request.params.id);
+    if (!item) return reply.code(404).send({ error: 'not_found' });
+    return {
+      ...item,
+      signals: item.signals.map((signal: Record<string, unknown>) => ({
+        ...signal,
+        source_trust_label: trustLabel(signal.source_trust as number | null)
+      }))
+    };
+  });
   app.get<{ Querystring: { limit?: string; offset?: string; location?: string; threatType?: string; evidence?: string; from?: string; to?: string } }>('/api/v1/history', async (request, reply) => {
     const limit = Math.min(200, Math.max(1, Number(request.query.limit ?? 50)));
     const offset = Math.max(0, Number(request.query.offset ?? 0));

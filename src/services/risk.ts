@@ -2,6 +2,7 @@ import { z } from 'zod';
 import { config } from '../config.js';
 import { pool } from '../db/pool.js';
 import { riskLevel } from '../domain/classifier.js';
+import { trustModifier } from './source-trust.js';
 
 const modelAssessmentSchema = z.object({
   locationId: z.string(),
@@ -27,6 +28,13 @@ export interface RiskSignalRow {
   geographic_relevance: number | string;
   contribution: number | string;
   observed_at: Date;
+  /**
+   * Current measured trust of the publisher behind this signal, 0..1, from `source_trust_current`.
+   * `null`/absent means the nightly worker in `./source-trust.ts` has never scored it — which is a
+   * normal state, not a defect, and is worth exactly a modifier of 1.0.
+   */
+  source_trust?: number | string | null;
+  source_id?: string | null;
   effective_contribution?: number;
 }
 
@@ -94,10 +102,26 @@ function groupSignals(signals: RiskSignalRow[]): SignalGroup[] {
   return [...groups.values()].sort((a, b) => b.weight - a.weight);
 }
 
+/**
+ * What one signal is worth right now: its own weight, the reliability recorded when it was ingested,
+ * a two-hour half-life on its age, and how much the publisher has earned the benefit of the doubt.
+ *
+ * The trust term is a *modifier*, bounded to [0.6, 1.2] by {@link trustModifier}, and the bounds are
+ * the whole design. The assessment has to stay complete and correct without the trust layer: before
+ * this feature there was no `source_trust` row anywhere, the modifier was effectively 1.0, and every
+ * index the system published was a real index. A floor of 0.6 keeps that true in the bad direction —
+ * a source with a poor month is discounted, never silenced, because a threat reported only by an
+ * imperfect channel must still reach the map. A ceiling of 1.2 keeps it true in the good direction —
+ * a well-behaved channel is amplified by a fifth at most, so trust can never carry a location on its
+ * own, and the tier guardrails in {@link clampAssessment} still decide what the index may reach.
+ *
+ * Anything wider would make the measurement the assessment. Trust modulates; it does not dominate.
+ */
 export function effectiveContribution(signal: RiskSignalRow, now = Date.now()): number {
   const ageHours = Math.max(0, (now - new Date(signal.observed_at).getTime()) / 3_600_000);
   const freshnessDecay = 2 ** (-ageHours / 2);
-  return Number(signal.contribution) * Number(signal.reliability) * freshnessDecay;
+  const trust = signal.source_trust == null ? null : Number(signal.source_trust);
+  return Number(signal.contribution) * Number(signal.reliability) * freshnessDecay * trustModifier(trust);
 }
 
 const threatLabels: Record<string, string> = {
@@ -210,6 +234,9 @@ async function callModel(location: { id: string; name_uk: string }, threatType: 
       tier: signal.source_tier,
       reliability: Number(signal.reliability),
       geographicRelevance: Number(signal.geographic_relevance),
+      // Already folded into `effectiveContribution`; shown separately so the audit log in `ai_runs`
+      // records what the model was told rather than only what it was given.
+      sourceTrust: signal.source_trust == null ? null : Number(signal.source_trust),
       effectiveContribution: signal.effective_contribution,
       observedAt: signal.observed_at
     }))
@@ -269,8 +296,15 @@ export async function runRiskAssessments(): Promise<number> {
       `SELECT id,name_uk FROM locations WHERE id=$1`, [group.location_id]
     )).rows[0];
     if (!location) continue;
+    // The trust join is LEFT twice over — a signal may have no source message (the demo source), and
+    // a source may have no trust row yet. Both cases arrive as NULL and are read as "no measurement",
+    // which `effectiveContribution` scores as a modifier of exactly 1.0.
     const rawSignals = (await pool.query<RiskSignalRow>(
-      `SELECT * FROM risk_signals WHERE id=ANY($1::uuid[]) ORDER BY observed_at DESC`, [group.signal_ids]
+      `SELECT rs.*, sm.source_id, t.trust AS source_trust
+       FROM risk_signals rs
+       LEFT JOIN source_messages sm ON sm.id=rs.source_message_id
+       LEFT JOIN source_trust_current t ON t.source_id=sm.source_id
+       WHERE rs.id=ANY($1::uuid[]) ORDER BY rs.observed_at DESC`, [group.signal_ids]
     )).rows;
     const signals = rawSignals.map((signal) => ({ ...signal, effective_contribution: effectiveContribution(signal) }));
     try {
