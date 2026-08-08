@@ -56,7 +56,7 @@ export const evidenceStatements: Record<string, string> = {
   official: 'Офіційне повідомлення',
   confirmed: 'Підтверджено кількома джерелами',
   monitoring: 'Повідомляють моніторингові канали, підтвердження неповне',
-  unverified: 'Непідтверджене повідомлення — поставтеся обережно'
+  unverified: 'Непідтверджене повідомлення — поставтеся до нього обережно'
 };
 
 /** The same four levels as a *filter threshold*, which is a different sentence: it describes what a
@@ -82,7 +82,9 @@ export function levelLabel(value: unknown): string {
 
 export function evidenceStatement(value: unknown): string {
   const key = String(value ?? '');
-  return evidenceStatements[key] ?? 'Джерело повідомлення не класифіковане';
+  // Never echoes the unknown key back: an enum the dictionary has not learned yet would reach the
+  // reader as the English word this whole module exists to keep out of the message.
+  return evidenceStatements[key] ?? 'Рівень доказовості не визначено';
 }
 
 export function confidenceLabel(value: unknown): string {
@@ -104,13 +106,22 @@ export function toDate(value: unknown): Date | null {
   return Number.isNaN(parsed.getTime()) ? null : parsed;
 }
 
-/** «03:38» for today, «8 серпня о 03:38» otherwise — a bare time on another day reads as *this* day. */
+/**
+ * «03:38» for today, «8 серпня о 03:38» otherwise — a bare time on another day reads as *this* day.
+ *
+ * The year is spelled out only when it differs from the current one. It almost never does for a live
+ * warning, but `/status` will happily show a stale `valid_until`, and "8 серпня" for a timestamp from
+ * last year is the same lie the bare time tells about the day.
+ */
 export function humanMoment(value: unknown, now: Date = new Date()): string | null {
   const date = toDate(value);
   if (!date) return null;
   const time = clockFormat.format(date);
-  if (calendarDayFormat.format(date) === calendarDayFormat.format(now)) return time;
-  return `${dayFormat.format(date)} о ${time}`;
+  const day = calendarDayFormat.format(date);
+  const today = calendarDayFormat.format(now);
+  if (day === today) return time;
+  const year = day.slice(0, 4) === today.slice(0, 4) ? '' : ` ${day.slice(0, 4)} року`;
+  return `${dayFormat.format(date)}${year} о ${time}`;
 }
 
 /**
@@ -142,7 +153,12 @@ export function validUntilLine(value: unknown, now: Date = new Date()): string |
 // Written as an alternation rather than one character class on purpose: an emoji is a sequence
 // (base + variation selector, or two bases joined by a zero-width joiner), and a class would match
 // its halves independently and could cut a sequence in the middle.
-const leadingDecoration = /^(?:\p{Extended_Pictographic}|\p{So}|️|‍|[\s•·*|>\-–—])+/u;
+//
+// `Regional_Indicator` is listed separately because flag emoji — "🇷🇺 Зліт МіГ-31К" is a routine
+// opening for these channels — are *not* `Extended_Pictographic`. The broader `\p{So}` would cover
+// them, but it also swallows ordinary typography: `№` is `So`, so "№5 борт зафіксовано" lost its
+// number sign and started a sentence with a bare digit.
+const leadingDecoration = /^(?:\p{Extended_Pictographic}|\p{Regional_Indicator}|️|‍|[\s•·*|>\-–—])+/u;
 
 /**
  * Source summaries arrive exactly as a channel typed them: trailing "..", doubled emoji, ragged
@@ -170,6 +186,8 @@ export function cleanSummary(value: unknown): string {
     .replace(/\.{3,}/g, '…')
     .replace(/\.{2}/g, '.')
     .replace(/([!?])\1+/g, '$1')
-    .replace(/\s+([,.!?;:…])/g, '$1')
+    // Horizontal whitespace only. `\s` here would eat the newline too, welding "Ціль зникла" and
+    // "… далі буде" into one line and destroying the separation the channel put between two claims.
+    .replace(/[^\S\n]+([,.!?;:…])/g, '$1')
     .trim();
 }

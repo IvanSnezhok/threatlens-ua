@@ -134,7 +134,14 @@ describe('humanised wording helpers', () => {
       expect(evidenceStatement(level)).toMatch(/[а-яїієґ]/i);
       expect(evidenceStatement(level)).not.toBe(level);
     }
-    expect(evidenceStatement('щось нове')).toBe('Джерело повідомлення не класифіковане');
+    // An enum the dictionary has not learned yet must not surface as its English key.
+    expect(evidenceStatement('щось нове')).toBe('Рівень доказовості не визначено');
+    expect(evidenceStatement(null)).not.toMatch(/[a-z]/i);
+  });
+
+  it('names the year only when the timestamp is not from the current one', () => {
+    expect(humanMoment('2025-08-08T00:38:46.000Z', now)).toBe('8 серпня 2025 року о 03:38');
+    expect(humanMoment('2026-08-09T05:00:00.000Z', now)).not.toContain('року');
   });
 
   it('softly cleans a summary without rewriting its wording', () => {
@@ -142,5 +149,15 @@ describe('humanised wording helpers', () => {
       .toBe('Шахеди курсом на Полтавщину.\n\nСтежте за повідомленнями!');
     expect(cleanSummary('Ціль зникла з радарів...')).toBe('Ціль зникла з радарів…');
     expect(cleanSummary(null)).toBe('');
+  });
+
+  it('strips a leading flag emoji but keeps ordinary typography', () => {
+    // Flags are not Extended_Pictographic, and the wider property that does cover them also eats «№».
+    expect(cleanSummary('🇷🇺 Зліт МіГ-31К')).toBe('Зліт МіГ-31К');
+    expect(cleanSummary('№5 борт зафіксовано')).toBe('№5 борт зафіксовано');
+  });
+
+  it('keeps the channel line break instead of welding two claims together', () => {
+    expect(cleanSummary('Ціль зникла\n... далі буде')).toBe('Ціль зникла\n… далі буде');
   });
 });
