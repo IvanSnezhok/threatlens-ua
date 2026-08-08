@@ -6,8 +6,8 @@
   "description": "Evidence-first alerts, threats and risk assessments for Ukraine",
   "scripts": {
     "dev": "tsx watch src/index.ts",
-    "dev:web": "esbuild web/app.js --bundle --sourcemap --outfile=public/assets/app.js --loader:.css=css --watch",
-    "build:web": "esbuild web/app.js --bundle --minify --outfile=public/assets/app.js --loader:.css=css",
+    "dev:web": "esbuild web/app.js --bundle --sourcemap --outfile=public/assets/app.js --loader:.css=css --external:/assets/fonts/* --watch",
+    "build:web": "esbuild web/app.js --bundle --minify --outfile=public/assets/app.js --loader:.css=css --external:/assets/fonts/*",
     "build": "npm run build:web && tsc -p tsconfig.json",
     "start": "node dist/index.js",
     "migrate": "tsx src/db/migrate.ts",

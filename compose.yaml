@@ -24,6 +24,10 @@ services:
       - "3000"
     ports:
       - "127.0.0.1:${APP_HTTP_PORT:-13000}:3000"
+      # Codex sign-in returns to http://localhost:1455/auth/callback, which is the only redirect the
+      # Codex OAuth client accepts. Loopback on the host only: this port carries an authorisation
+      # code, and it is open for the seconds between pressing the button and the browser coming back.
+      - "127.0.0.1:${CODEX_OAUTH_REDIRECT_PORT:-1455}:${CODEX_OAUTH_REDIRECT_PORT:-1455}"
     depends_on:
       postgres:
         condition: service_healthy

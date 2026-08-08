@@ -68,6 +68,7 @@ let occupationFetchedAt = null;
 let vectors = [];
 let vectorLegendOpen = null;
 let opsAuthorization = '';
+let codexPollTimer = null;
 let lastReceived = null;
 let refreshTimer = null;
 let backendStatus = 'current';
@@ -443,7 +444,7 @@ function addVectorLayers() {
   map.addLayer({ id: 'threat-vector-order', type: 'symbol', source: 'threat-vector-points', minzoom: 5.6, layout: {
     'text-field': ['get','order'], 'text-size': 10, 'text-offset': [0,-1.3], 'text-anchor': 'bottom',
     'text-font': ['Noto Sans Regular'], 'text-allow-overlap': true
-  }, paint: { 'text-color': '#ffd9c9', 'text-halo-color': '#09100f', 'text-halo-width': 1.5 } }, anchor);
+  }, paint: { 'text-color': '#ffd9c9', 'text-halo-color': '#06080c', 'text-halo-width': 1.5 } }, anchor);
 }
 
 function vectorLegendElement() {
@@ -682,7 +683,7 @@ function initMap() {
       'line-width': ['case',['==',['get','sovereignty'],'crimea-ukraine'],1.5,.55], 'line-opacity': .62
     } });
     map.addLayer({ id: 'ukraine-state-border', type: 'line', source: 'ukraine-country', paint: {
-      'line-color': '#b7ef56', 'line-width': ['interpolate',['linear'],['zoom'],4,1.8,8,3.4], 'line-opacity': .95
+      'line-color': '#e9e7e0', 'line-width': ['interpolate',['linear'],['zoom'],4,1.8,8,3.4], 'line-opacity': .95
     } });
     // Заливки тривоги йдуть під ukraine-sovereignty-fill і додаються ПЕРЕД addOccupationLayers(),
     // тож окупаційні шари вставляються поверх них і лишаються читабельними, як і раніше.
@@ -722,38 +723,38 @@ function initMap() {
     } }, 'ukraine-region-lines');
     map.addLayer({ id: 'city-hit', type: 'circle', source: 'ukraine-cities', minzoom: 5.7, paint: {
       'circle-radius': ['interpolate',['linear'],['zoom'],5.7,3,9,6], 'circle-color': '#72d6ca',
-      'circle-opacity': .82, 'circle-stroke-color': '#09100f', 'circle-stroke-width': 1.5
+      'circle-opacity': .82, 'circle-stroke-color': '#06080c', 'circle-stroke-width': 1.5
     } });
     map.addLayer({ id: 'city-labels', type: 'symbol', source: 'ukraine-cities', minzoom: 7.2, layout: {
       'text-field': ['get','nameUk'], 'text-size': 10, 'text-offset': [0,1.15], 'text-anchor': 'top', 'text-font': ['Noto Sans Regular']
-    }, paint: { 'text-color': '#d8e7df', 'text-halo-color': '#09100f', 'text-halo-width': 1.4 } });
+    }, paint: { 'text-color': '#b6bbc2', 'text-halo-color': '#06080c', 'text-halo-width': 1.4 } });
     // text-allow-overlap гарантує, що підпис суверенітету намалюється завжди, хоч би скільки шарів лягло під ним;
     // text-ignore-placement лишається вимкненим, тож він, навпаки, відштовхує підписи тривог.
     // Ореол посилено до 2.6 px: під підписом тепер може лежати ще й заливка тривоги.
     map.addLayer({ id: 'crimea-ukraine-label', type: 'symbol', source: 'sovereignty-labels', minzoom: 4.2, layout: {
       'text-field': ['get','label'], 'text-size': ['interpolate',['linear'],['zoom'],4.2,10,7,14],
       'text-letter-spacing': .12, 'text-font': ['Noto Sans Regular'], 'text-allow-overlap': true, 'text-padding': 12
-    }, paint: { 'text-color': '#f3efd9', 'text-halo-color': '#09100f', 'text-halo-width': 2.6 } });
+    }, paint: { 'text-color': '#e9e7e0', 'text-halo-color': '#06080c', 'text-halo-width': 2.6 } });
     // Підписи тривог лягають під підпис суверенітету; районний — над обласним,
     // щоб на великому масштабі точніша назва вигравала конкуренцію за місце.
     map.addLayer({ id: 'alert-oblast-label', type: 'symbol', source: 'alert-labels', filter: ['==',['get','level'],'oblast'], layout: {
       'text-field': ['get','label'], 'text-size': ['interpolate',['linear'],['zoom'],4.5,11,8,14],
       'text-transform': 'uppercase', 'text-letter-spacing': .05, 'text-max-width': 7, 'text-padding': 6,
       'text-offset': [0,-1.4], 'text-font': ['Noto Sans Regular']
-    }, paint: { 'text-color': '#ffe1d8', 'text-halo-color': '#09100f', 'text-halo-width': 1.9,
+    }, paint: { 'text-color': '#ffe1d8', 'text-halo-color': '#06080c', 'text-halo-width': 1.9,
       'text-opacity': ['interpolate',['linear'],['zoom'],
         RAION_ZOOM_MIN, ['case', fadingLabel, .8, 1],
         RAION_ZOOM_FULL, ['case', fadingLabel, 0, 1]] } }, 'crimea-ukraine-label');
     map.addLayer({ id: 'alert-raion-label', type: 'symbol', source: 'alert-labels', filter: ['==',['get','level'],'raion'], minzoom: RAION_ZOOM_MIN, layout: {
       'text-field': ['get','label'], 'text-size': 11, 'text-max-width': 8, 'text-padding': 4, 'text-font': ['Noto Sans Regular']
-    }, paint: { 'text-color': '#ffd2c6', 'text-halo-color': '#09100f', 'text-halo-width': 1.7,
+    }, paint: { 'text-color': '#ffd2c6', 'text-halo-color': '#06080c', 'text-halo-width': 1.7,
       'text-opacity': ['interpolate',['linear'],['zoom'],
         RAION_ZOOM_MIN, 0,
         RAION_ZOOM_FULL, ['case', fadingLabel, .8, 1]] } }, 'crimea-ukraine-label');
     map.addSource('live-events', { type: 'geojson', data: markerCollection(), promoteId: 'id' });
     map.addLayer({ id: 'assessment-halo', type: 'circle', source: 'live-events', filter: ['==',['get','kind'],'assessment'], paint: { 'circle-radius': ['+', 12, ['*', ['coalesce',['get','score'],0], 2]], 'circle-color': '#e3b341', 'circle-opacity': .10, 'circle-stroke-width': 1, 'circle-stroke-color': '#e3b341', 'circle-stroke-opacity': .6 } });
     map.addLayer({ id: 'threat-pulse', type: 'circle', source: 'live-events', filter: ['==',['get','kind'],'threat'], paint: { 'circle-radius': 13, 'circle-color': '#ff7a4d', 'circle-opacity': .18, 'circle-stroke-width': 2, 'circle-stroke-color': '#ff7a4d' } });
-    map.addLayer({ id: 'event-labels', type: 'symbol', source: 'live-events', layout: { 'text-field': ['get','title'], 'text-size': 11, 'text-offset': [0, 2.1], 'text-anchor': 'top', 'text-font': ['Noto Sans Regular'] }, paint: { 'text-color': '#f4f0df', 'text-halo-color': '#09100f', 'text-halo-width': 1.5 } });
+    map.addLayer({ id: 'event-labels', type: 'symbol', source: 'live-events', layout: { 'text-field': ['get','title'], 'text-size': 11, 'text-offset': [0, 2.1], 'text-anchor': 'top', 'text-font': ['Noto Sans Regular'] }, paint: { 'text-color': '#e9e7e0', 'text-halo-color': '#06080c', 'text-halo-width': 1.5 } });
     map.addSource('reported-directions', { type: 'geojson', data: directionCollection() });
     map.addLayer({ id: 'direction-lines', type: 'line', source: 'reported-directions', paint: { 'line-color': '#ff7a4d', 'line-width': 3, 'line-dasharray': [2,2], 'line-opacity': .8 } });
     addVectorLayers();
@@ -1012,7 +1013,221 @@ function opsVectorSection(payload) {
     <div class="ops-channel-list">${events}</div></section>`;
 }
 
+// ------------------------------------------------------------------------------------------------
+// Журнал моделі: що саме її просили і що вона відповіла
+// ------------------------------------------------------------------------------------------------
+//
+// ai_runs — єдине місце, де записано дослівний запит і дослівну відповідь. Три різні шари пишуть
+// сюди, і саме prompt_version, а не model, каже, який це був шар: модель може бути та сама.
+const promptVersionNames = {
+  'v2': 'Оцінка ризику',
+  'analytics-narrative-v1': 'Наратив аналітики',
+  'vector-narrative-v1': 'Формулювання екстраполяції'
+};
+
+function bytesLabel(value) {
+  const bytes = Number(value ?? 0);
+  if (!bytes) return '—';
+  return bytes < 1024 ? `${bytes} Б` : `${(bytes / 1024).toFixed(1)} КБ`;
+}
+
+// Порожній журнал — не помилка й не «ще не встигло». Це стан «жодна модель ніколи не викликалася»,
+// і його треба назвати вголос, інакше порожня таблиця читається як поломка панелі.
+function aiRunsEmptyState(codex) {
+  const off = [];
+  if (codex && !codex.narrativeEnabled) off.push('<code>ANALYTICS_NARRATIVE_ENABLED=false</code>');
+  if (codex && !codex.baseUrlConfigured) off.push('<code>CODEX_BASE_URL</code> порожній');
+  if (codex && !codex.modelConfigured) off.push('<code>CODEX_MODEL</code> порожній');
+  return `<div class="empty-state">
+    <strong>Жодного звернення до моделі</strong>
+    <p>Таблиця <code>ai_runs</code> порожня: за всю історію цієї бази модель не викликали жодного разу.
+    Оцінки ризику рахує детермінований набір правил і підписує їх як <code>rule-fallback</code>,
+    класифікація повідомлень моделі не використовує взагалі.
+    ${off.length ? `Вимкнено: ${off.join(', ')}.` : ''}</p>
+  </div>`;
+}
+
+function aiRunRow(run) {
+  const failed = run.status === 'failed';
+  return `<article data-ai-run="${escapeHtml(run.id)}">
+    <div>
+      <span>${escapeHtml(promptVersionNames[run.prompt_version] ?? run.prompt_version)}</span>
+      <h3>${escapeHtml(run.model)}</h3>
+      <p>${new Date(run.created_at).toLocaleString('uk-UA')} · запит ${bytesLabel(run.input_bytes)} · відповідь ${bytesLabel(run.output_bytes)}${run.duration_ms != null ? ` · ${run.duration_ms} мс` : ''}</p>
+      ${failed && run.error ? `<p class="ai-run-error">${escapeHtml(run.error)}</p>` : ''}
+    </div>
+    <div class="ops-channel-actions">
+      <span class="evidence ${failed ? 'unverified' : 'confirmed'}">${failed ? 'помилка' : 'успіх'}</span>
+      <button data-ai-run-open="${escapeHtml(run.id)}">Запит і відповідь</button>
+    </div>
+    <div class="ai-run-detail" id="ai-run-${escapeHtml(run.id)}"></div>
+  </article>`;
+}
+
+function opsAiRunsSection(data, codex) {
+  if (!data) return `<section class="ops-section"><header class="ops-section-head"><div><p>Аудит моделі</p><h2>Журнал звернень</h2></div></header><p class="legend-note">Журнал недоступний.</p></section>`;
+  const totals = data.totals ?? {};
+  const facts = Number(totals.total)
+    ? `<dl class="codex-facts">
+        <div><dt>Усього звернень</dt><dd>${totals.total}</dd></div>
+        <div><dt>З них невдалих</dt><dd>${totals.failed}</dd></div>
+        <div><dt>Перше</dt><dd>${totals.first_at ? new Date(totals.first_at).toLocaleString('uk-UA') : '—'}</dd></div>
+        <div><dt>Останнє</dt><dd>${totals.last_at ? new Date(totals.last_at).toLocaleString('uk-UA') : '—'}</dd></div>
+      </dl>`
+    : '';
+  return `<section class="ops-section" id="ai-runs-section">
+    <header class="ops-section-head">
+      <div><p>Аудит моделі</p><h2>Журнал звернень</h2></div>
+      <button data-ai-runs-refresh>Оновити</button>
+    </header>
+    ${facts}
+    <div class="ops-channel-list ai-run-list">
+      ${data.items?.length ? data.items.map(aiRunRow).join('') : aiRunsEmptyState(codex)}
+    </div>
+    ${data.items?.length === data.limit ? `<p class="legend-note">Показано останні ${data.limit} — журнал довший.</p>` : ''}
+  </section>`;
+}
+
+function wireAiRunsSection(root, codex) {
+  const rerender = async () => {
+    const data = await opsFetch('/ops/ai-runs?limit=50').then((r) => r.ok ? r.json() : null).catch(() => null);
+    const section = $('#ai-runs-section', root);
+    if (!section) return;
+    section.outerHTML = opsAiRunsSection(data, codex);
+    wireAiRunsSection(root, codex);
+  };
+
+  $('[data-ai-runs-refresh]', root)?.addEventListener('click', () => void rerender());
+
+  root.querySelectorAll('[data-ai-run-open]').forEach((button) => button.addEventListener('click', async () => {
+    const id = button.dataset.aiRunOpen;
+    const output = $(`#ai-run-${id}`, root);
+    // Друге натискання згортає: розгорнутий запит оцінки ризику — це кількасот рядків,
+    // і залишати їх на екрані назавжди означає зробити список нечитабельним.
+    if (output.innerHTML) { output.innerHTML = ''; button.textContent = 'Запит і відповідь'; return; }
+    output.textContent = 'Завантажуємо…';
+    const run = await opsFetch(`/ops/ai-runs/${encodeURIComponent(id)}`).then((r) => r.ok ? r.json() : null).catch(() => null);
+    if (!run) { output.innerHTML = '<p class="legend-note">Не вдалося завантажити запис.</p>'; return; }
+    button.textContent = 'Згорнути';
+    output.innerHTML = `
+      <h3>Запит до моделі</h3>
+      <pre class="ops-json">${escapeHtml(JSON.stringify(run.input, null, 2))}</pre>
+      <h3>Відповідь моделі</h3>
+      ${run.output == null
+        ? `<p class="legend-note">Відповіді немає — звернення завершилося помилкою.</p>`
+        : `<pre class="ops-json">${escapeHtml(JSON.stringify(run.output, null, 2))}</pre>`}
+      ${run.error ? `<h3>Помилка</h3><p class="legend-warning">${escapeHtml(run.error)}</p>` : ''}`;
+  }));
+}
+
+// ------------------------------------------------------------------------------------------------
+// Codex: вхід через ChatGPT
+// ------------------------------------------------------------------------------------------------
+//
+// Кнопка живе тут, а не на публічній сторінці, бо вона розпоряджається обліковим записом установки,
+// а не користувача. Токен ніколи не приходить у браузер: /ops/codex віддає лише те, що оператор
+// мусить знати, аби вирішити, чи тиснути кнопку, — чий акаунт, доки дійсний і чого бракує.
+
+function codexFact(term, value) {
+  return `<div><dt>${escapeHtml(term)}</dt><dd>${escapeHtml(value)}</dd></div>`;
+}
+
+// Умови, за яких збережена сесія нічого не змінить. Їх показуємо ЗАВЖДИ, а не лише коли підключення
+// вже є: «підключено, але тиша» — найгірший стан, і він має бути пояснений до, а не після входу.
+function codexPreconditions(status) {
+  const rows = [];
+  if (!status.narrativeEnabled) rows.push('<code>ANALYTICS_NARRATIVE_ENABLED=false</code> — токен збережеться, але наратив не запитуватиметься. Аналітика лишається повною й без моделі.');
+  if (!status.baseUrlConfigured) rows.push('<code>CODEX_BASE_URL</code> не задано — вхід дає токен, але не адресу, куди його слати.');
+  if (!status.modelConfigured) rows.push('<code>CODEX_MODEL</code> не задано — модель не обрано.');
+  if (status.envTokenConfigured) rows.push('У <code>.env</code> лишається <code>CODEX_API_KEY</code>. Збережена сесія має пріоритет — змінна тепер лише запасний варіант.');
+  return rows.length ? `<ul class="codex-preconditions">${rows.map((row) => `<li>${row}</li>`).join('')}</ul>` : '';
+}
+
+function opsCodexSection(status) {
+  if (!status) return '<section class="ops-section"><header class="ops-section-head"><div><p>Модель для наративів</p><h2>Codex / ChatGPT</h2></div></header><p class="legend-note">Стан входу недоступний.</p></section>';
+  const state = !status.connected ? { label: 'не підключено', tone: 'off' }
+    : status.expired && !status.canRefresh ? { label: 'сесія завершилася', tone: 'bad' }
+      : status.expired ? { label: 'потребує оновлення', tone: 'warn' }
+        : { label: 'підключено', tone: 'ok' };
+  const facts = [
+    codexFact('Акаунт ChatGPT', status.accountId ?? 'не повідомлено'),
+    codexFact('Токен дійсний до', status.expiresAt ? new Date(status.expiresAt).toLocaleString('uk-UA') : 'невідомо'),
+    codexFact('Автооновлення', status.canRefresh ? 'є refresh-токен' : 'немає — знадобиться повторний вхід'),
+    codexFact('Адреса повернення', status.redirectUri)
+  ].join('');
+  return `<section class="ops-section" id="codex-section">
+    <header class="ops-section-head">
+      <div><p>Модель для аналітичних наративів</p><h2>Codex / ChatGPT</h2></div>
+      <span class="codex-state is-${state.tone}">${escapeHtml(state.label)}</span>
+    </header>
+    <dl class="codex-facts">${facts}</dl>
+    ${codexPreconditions(status)}
+    ${status.lastError ? `<p class="legend-warning">Остання помилка: ${escapeHtml(status.lastError)}</p>` : ''}
+    ${status.pendingLogin ? `<p class="legend-warning">Вхід триває. Сеанс дійсний до ${escapeHtml(new Date(status.pendingLogin.expiresAt).toLocaleTimeString('uk-UA'))}.</p>` : ''}
+    <div class="ops-channel-actions codex-actions">
+      <button data-codex-login>${status.connected ? 'Увійти заново' : 'Увійти через ChatGPT'}</button>
+      ${status.connected ? '<button data-codex-disconnect>Відключити</button>' : ''}
+      <button data-codex-refresh>Оновити стан</button>
+    </div>
+    <div id="codex-login-hint"></div>
+    <div class="safety-note">
+      <strong>Повернення можливе лише на localhost</strong>
+      <p>Клієнт Codex приймає єдину адресу повернення — <code>${escapeHtml(status.redirectUri)}</code>. Вхід завершиться тільки тоді, коли браузер і застосунок бачать один і той самий <code>localhost</code>: на вашій машині так, на віддаленому сервері за Caddy — ні. Крім того, вхід Codex призначено для клієнта Codex, а не для стороннього сервера, який працює цілодобово; ризик санкцій до облікового запису лишається на вас.</p>
+    </div>
+  </section>`;
+}
+
+function wireCodexSection(root) {
+  const rerender = async () => {
+    const status = await opsFetch('/ops/codex').then((r) => r.ok ? r.json() : null).catch(() => null);
+    const section = $('#codex-section', root);
+    if (!section) return null;
+    section.outerHTML = opsCodexSection(status);
+    wireCodexSection(root);
+    return status;
+  };
+
+  $('[data-codex-refresh]', root)?.addEventListener('click', () => void rerender());
+
+  $('[data-codex-login]', root)?.addEventListener('click', async (event) => {
+    // Вкладку відкриваємо СИНХРОННО, всередині обробника кліку: якби ми чекали на відповідь
+    // сервера, браузер уже не вважав би відкриття наслідком дії користувача й заблокував би його.
+    const tab = window.open('', '_blank');
+    const hint = $('#codex-login-hint', root);
+    hint.textContent = 'Готуємо сеанс входу…';
+    const result = await opsFetch('/ops/codex/login', { method: 'POST' });
+    const payload = await result.json().catch(() => null);
+    if (!result.ok) {
+      tab?.close();
+      hint.innerHTML = `<p class="legend-warning">Не вдалося почати вхід: ${escapeHtml(payload?.reason ?? 'невідома причина')}</p>`;
+      return;
+    }
+    const url = safeUrl(payload.authorizeUrl);
+    if (!url) { tab?.close(); hint.innerHTML = '<p class="legend-warning">Сервер повернув некоректну адресу входу.</p>'; return; }
+    if (tab) tab.location = url;
+    // Посилання лишаємо в будь-якому разі: спливні вікна можуть бути заблоковані, а ще оператор
+    // може захотіти відкрити вхід в іншому профілі браузера.
+    hint.innerHTML = `<p class="legend-note">Завершіть вхід у вкладці ChatGPT. Після повернення стан оновиться сам.</p>
+      <a class="territory-all" href="${escapeHtml(url)}" target="_blank" rel="noreferrer">Відкрити сторінку входу ChatGPT ↗</a>`;
+    // Опитуємо стан, поки сеанс входу живий: інакше оператор мусив би здогадатися натиснути «оновити».
+    clearInterval(codexPollTimer);
+    const stopAt = Date.parse(payload.expiresAt);
+    codexPollTimer = setInterval(async () => {
+      const status = await rerender();
+      if (!status || status.connected || !status.pendingLogin || Date.now() > stopAt) clearInterval(codexPollTimer);
+    }, 4000);
+    event.preventDefault();
+  });
+
+  $('[data-codex-disconnect]', root)?.addEventListener('click', async () => {
+    await opsFetch('/ops/codex', { method: 'DELETE' });
+    clearInterval(codexPollTimer);
+    void rerender();
+  });
+}
+
 async function renderOps() {
+  clearInterval(codexPollTimer);
   const root = contentShell('Закритий контур', 'Операційна консоль', 'Стан системи та керування каталогом рекомендованих Telegram-каналів.');
   const response = await opsFetch('/ops/api');
   if (response.status === 401) {
@@ -1031,7 +1246,11 @@ async function renderOps() {
   const data = await response.json();
   // Екстраполяція живе тільки тут. Запит іде на окремий ендпоінт за тим самим Basic-логіном; жоден
   // публічний маршрут її не віддає, і жоден інший екран цієї функції не викликає.
-  const vectorOps = await opsFetch('/ops/vectors').then((result) => result.ok ? result.json() : null).catch(() => null);
+  const [vectorOps, codex, aiRuns] = await Promise.all([
+    opsFetch('/ops/vectors').then((result) => result.ok ? result.json() : null).catch(() => null),
+    opsFetch('/ops/codex').then((result) => result.ok ? result.json() : null).catch(() => null),
+    opsFetch('/ops/ai-runs?limit=50').then((result) => result.ok ? result.json() : null).catch(() => null)
+  ]);
   const queued = data.outbox.reduce((sum, item) => sum + Number(item.count), 0);
   root.innerHTML = `<div class="ops-metrics"><article><span>Джерела</span><strong>${data.sources.length}</strong></article><article><span>Черга</span><strong>${queued}</strong></article><article><span>Канали</span><strong>${data.channels.filter((item) => item.active).length}</strong></article><article><span>PostgreSQL</span><strong>${escapeHtml(data.database.size)}</strong></article></div>
     <section class="ops-section"><header class="ops-section-head"><div><p>Каталог для користувачів</p><h2>Додати Telegram-канал</h2></div><button id="ops-logout">Вийти</button></header>
@@ -1047,8 +1266,12 @@ async function renderOps() {
       </form>
       <div class="ops-channel-list">${data.channels.map((channel) => `<article class="${channel.active ? '' : 'is-disabled'}"><div><span>${channel.verified ? '✓ перевірено' : escapeHtml(channel.category)}</span><h3>${escapeHtml(channel.title)}</h3><p>@${escapeHtml(channel.username)}${channel.location_name ? ` · ${escapeHtml(channel.location_name)}` : ''}</p></div><div class="ops-channel-actions"><a href="${escapeHtml(channel.url)}" target="_blank" rel="noreferrer">Відкрити ↗</a><button data-channel-toggle="verified" data-id="${channel.id}" data-value="${channel.verified}">${channel.verified ? 'Зняти перевірку' : 'Перевірити'}</button><button data-channel-toggle="active" data-id="${channel.id}" data-value="${channel.active}">${channel.active ? 'Приховати' : 'Активувати'}</button></div></article>`).join('')}</div>
     </section>
+    ${opsCodexSection(codex)}
+    ${opsAiRunsSection(aiRuns, codex)}
     ${opsVectorSection(vectorOps)}
     <details class="ops-raw"><summary>Технічний стан і журнали</summary><pre class="ops-json">${escapeHtml(JSON.stringify({ sources: data.sources, outbox: data.outbox, aiRuns: data.aiRuns, database: data.database }, null, 2))}</pre></details>`;
+  wireCodexSection(root);
+  wireAiRunsSection(root, codex);
   root.querySelectorAll('[data-project-vector]').forEach((button) => button.addEventListener('click', async () => {
     const output = $(`#projection-${button.dataset.projectVector}`, root);
     output.textContent = 'Рахуємо…';
@@ -1085,6 +1308,8 @@ function renderCurrentRoute() {
   const route = activePage();
   // Карту знімаємо лише коли справді йдемо з маршруту карти — на місці вона переживає оновлення знімка.
   if (map && route !== '/') { map.remove(); map = null; mapLayersReady = false; }
+  // Опитування стану входу Codex прив'язане до вузла, якого поза консоллю вже немає.
+  if (route !== '/ops') clearInterval(codexPollTimer);
   if (route === '/') renderMapPage();
   else if (route === '/history') void renderHistory();
   else if (route === '/analytics') void renderAnalytics();

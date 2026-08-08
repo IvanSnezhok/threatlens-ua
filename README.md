@@ -17,6 +17,10 @@ Evidence-first situational awareness for Ukraine: a Telegram bot, responsive sta
 - Explicit internationally recognized Ukraine boundary overlay including the Autonomous Republic of Crimea and Sevastopol; oblast/city clicks open territorial history.
 - Temporarily occupied territories layer sourced from DeepStateMap, filtered by a fail-safe status allowlist and clipped to the recognized border of Ukraine. Reference context only — it never affects alerts or risk scores.
 - Operator-managed catalog of recommended Telegram channels, exposed on the site and through the bot.
+- Codex sign-in from the operations console: an OAuth (PKCE) button instead of a token pasted into
+  `.env`, with the session stored in PostgreSQL and refreshed automatically. The callback is
+  loopback-only, so it works where the browser and the app share one `localhost`; the manual
+  `CODEX_API_KEY` remains as a fallback and the narrative still degrades to deterministic text.
 - Automatic official KATOTTG import covering 461 cities in the 07.07.2026 release.
 - PostgreSQL migrations, monthly materialized summaries, Prometheus metrics, health checks, Caddy, Docker Compose, and verified daily local backups.
 

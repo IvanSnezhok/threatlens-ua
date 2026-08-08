@@ -11,6 +11,8 @@ import { registerAlertChannelMetrics } from '../services/ingestion.js';
 import { hasValidOpsAuth, safeEqual } from './ops-auth.js';
 import analyticsRoutes from './analytics-routes.js';
 import occupationRoutes from './occupation-routes.js';
+import opsAiRunsRoutes from './ops-ai-runs-routes.js';
+import opsCodexRoutes from './ops-codex-routes.js';
 import opsVectorRoutes from './ops-vector-routes.js';
 import vectorRoutes from './vector-routes.js';
 import { runRiskAssessments } from '../services/risk.js';
@@ -81,7 +83,7 @@ export async function buildServer() {
   app.get('/health/live', async () => ({ status: 'ok', version: process.env.npm_package_version ?? 'dev' }));
   app.get('/health/ready', async (_request, reply) => {
     try {
-      const migration = await pool.query(`SELECT 1 FROM schema_migrations WHERE filename='016_threat_vectors.sql'`);
+      const migration = await pool.query(`SELECT 1 FROM schema_migrations WHERE filename='017_codex_oauth.sql'`);
       if (!migration.rowCount) return reply.code(503).send({ status: 'not_ready', reason: 'migrations_pending' });
       return { status: 'ready' };
     }
@@ -103,6 +105,8 @@ export async function buildServer() {
   await app.register(analyticsRoutes);
   await app.register(vectorRoutes);
   await app.register(opsVectorRoutes);
+  await app.register(opsCodexRoutes);
+  await app.register(opsAiRunsRoutes);
 
   app.get('/api/v1/config', async () => ({
     mapStyleUrl: config.MAP_STYLE_URL,

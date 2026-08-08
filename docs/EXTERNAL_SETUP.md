@@ -172,15 +172,66 @@ Three caveats, all of them real:
    `POST {CODEX_BASE_URL}/chat/completions`, because no credentials were available to test against
    the live service. Codex actually speaks the **Responses API**, a different request shape. Point
    `CODEX_BASE_URL` at a compatible proxy, or the `/responses` shape has to be implemented.
-2. **There is no token refresh.** The access token expires and nothing renews it. The narrative
-   falls back to deterministic text — nothing breaks, but nothing works either.
+2. **The OAuth client and endpoints are the Codex CLI's, not ours.** `CODEX_OAUTH_CLIENT_ID` and
+   `CODEX_OAUTH_ISSUER` carry the values that client publishes. Both are overridable. The sign-in
+   itself *has* been exercised against the live service (2026-08-07): the authorisation, the
+   loopback callback and the code-for-token exchange all completed and stored a session with a
+   refresh token. That says nothing about caveat 1 — obtaining a credential and being able to spend
+   it at an endpoint are separate questions.
 3. **It is outside what that authorisation is for.** Codex sign-in is meant for the Codex client, not
    for a third-party server running around the clock. The risk is account action.
 
-If you still want it: install the Codex CLI, run `codex login`, and read the access token and account
-id out of `~/.codex/auth.json`.
+### Signing in from the operations console
 
-With `CODEX_*` empty the narrative falls back to `AI_*`, and then to no model at all.
+Open `/ops`, find **Codex / ChatGPT** and press **Увійти через ChatGPT**. The browser goes to
+ChatGPT, comes back to `http://localhost:1455/auth/callback`, and the session is stored in
+PostgreSQL and refreshed from then on. Nothing is written to `.env` and no restart is needed.
+
+Two things still have to be set by hand, because signing in supplies a credential and not an
+endpoint:
+
+```env
+CODEX_BASE_URL=
+CODEX_MODEL=
+ANALYTICS_NARRATIVE_ENABLED=true
+```
+
+The console states which of the three is missing, so "connected but silent" is never a mystery.
+
+**The callback is loopback, and that is a hard limit.** The Codex OAuth client accepts exactly one
+redirect — `http://localhost:<port>/auth/callback` — and we have no client of our own registered
+with OpenAI. So the browser finishing the sign-in and this app have to agree on what `localhost`
+means:
+
+| Where the app runs | Sign-in |
+|---|---|
+| `docker compose` on your own machine | works — compose publishes `127.0.0.1:1455` |
+| `npm run dev` on your own machine | works |
+| a remote host behind Caddy, browser elsewhere | **never completes** — the callback goes to *your* machine, where nothing is listening |
+
+For the third case, tunnel the port to the server (`ssh -L 1455:localhost:1455 …`) before pressing
+the button, or keep using the manual token below.
+
+If port 1455 is busy — the Codex CLI holds it while it is running — the console says so rather than
+handing out a URL whose answer would be dropped.
+
+### The manual token, still supported
+
+Install the Codex CLI, run `codex login`, and read the access token and account id out of
+`~/.codex/auth.json` into `CODEX_API_KEY` and `CODEX_ACCOUNT_ID`. That token **does not refresh**;
+when it expires the narrative falls back to deterministic text until you paste a new one. A session
+stored through the button always takes precedence over these two variables.
+
+### What is stored, and how to revoke it
+
+`codex_credentials` holds one row with an access token and a refresh token in plaintext — the same
+exposure `TELEGRAM_SESSION` already carries in `.env`, and it is not encrypted because the key
+would have to live beside the data. The token never leaves the server: `/ops/codex` returns the
+account id and the expiry, never the credential. To revoke, press **Відключити** in the console —
+or, if the database is out of reach, remove the session in **ChatGPT → Settings → Connected apps**.
+
+With `CODEX_*` empty and no stored session the narrative falls back to `AI_*`, and then to no model
+at all.
 
 ---
 

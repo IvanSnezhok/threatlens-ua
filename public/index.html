@@ -3,16 +3,26 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
-  <meta name="theme-color" content="#09100f">
+  <meta name="theme-color" content="#0a0c10">
+  <meta name="color-scheme" content="dark">
   <meta name="description" content="ThreatLens UA — перевірені тривоги, загрози та пояснювана аналітика для України.">
   <title>ThreatLens UA — ситуаційна карта</title>
+
+  <!-- Кириличні накреслення тримають увесь хром: навігацію, стрічку стану й підписи шарів.
+       Латинське накреслення моноширинного — це цифри годинника й лічильники, тобто перше,
+       що змінюється на екрані. Решта підвантажується через font-display: swap. -->
+  <link rel="preload" as="font" type="font/woff2" href="/assets/fonts/commissioner-cyrillic.woff2" crossorigin>
+  <link rel="preload" as="font" type="font/woff2" href="/assets/fonts/jetbrains-mono-cyrillic.woff2" crossorigin>
+  <link rel="preload" as="font" type="font/woff2" href="/assets/fonts/jetbrains-mono-latin.woff2" crossorigin>
   <link rel="stylesheet" href="/assets/app.css">
 </head>
 <body>
   <div class="noise" aria-hidden="true"></div>
+  <a class="skip-link" href="#app">Перейти до вмісту</a>
+
   <header class="masthead">
     <a class="brand" href="/" aria-label="ThreatLens UA, головна">
-      <span class="brand-mark">TL</span>
+      <span class="brand-mark" aria-hidden="true">TL</span>
       <span><strong>ThreatLens</strong><small>Україна / оперативна картина</small></span>
     </a>
     <nav class="nav" aria-label="Основна навігація">
@@ -26,7 +36,7 @@
   </header>
 
   <div class="system-strip" id="system-strip" role="status">
-    <span class="status-dot"></span>
+    <span class="status-dot" aria-hidden="true"></span>
     <strong id="system-state">Підключення…</strong>
     <span id="last-update">очікуємо дані</span>
     <span class="strip-spacer"></span>
@@ -34,6 +44,14 @@
   </div>
 
   <main id="app" tabindex="-1"></main>
+
+  <noscript>
+    <div class="noscript-note">
+      <strong>Потрібен JavaScript</strong>
+      <p>Карта, потік подій і хронологія будуються в браузері. Це не система оповіщення — під час
+        офіційної тривоги виконуйте вказівки Повітряних сил, ДСНС і місцевої влади.</p>
+    </div>
+  </noscript>
 
   <template id="map-page">
     <section class="situation-layout">

@@ -1,6 +1,7 @@
 import { z } from 'zod';
 import { config } from '../config.js';
 import { pool } from '../db/pool.js';
+import { codexCredentials } from './codex-auth.js';
 import type { StrategicOverview } from './analytics-archive.js';
 
 /**
@@ -303,20 +304,36 @@ interface NarrativeProvider {
 /**
  * Which endpoint, if any, is allowed to write the narrative.
  *
- * `CODEX_*` wins when it is complete, then `AI_*`, then nothing. The gate is
+ * Codex wins when it is complete, then `AI_*`, then nothing. The gate is
  * `ANALYTICS_NARRATIVE_ENABLED`, checked first and separately: sharing credentials with the risk
  * engine must not mean that configuring the risk engine silently switches on a second model call on
  * a different code path.
+ *
+ * Within Codex the *stored* OAuth session outranks `CODEX_API_KEY`. Both are bearer tokens for the
+ * same account and nothing downstream can tell them apart, but only one of them can be renewed
+ * without a human editing `.env` and restarting the container. When an operator has signed in
+ * through `/ops`, that session is the live credential and the environment value is the stale copy
+ * of an older one — so preferring the environment would mean going quiet at the first expiry the
+ * refresh path was built to survive.
+ *
+ * Async for the same reason: obtaining the token may involve refreshing it. Failure there returns
+ * null rather than raising, which lands on the deterministic narrative — the baseline that the
+ * analytics are contractually complete without.
  */
-export function narrativeProvider(): NarrativeProvider | null {
+export async function narrativeProvider(): Promise<NarrativeProvider | null> {
   if (!config.ANALYTICS_NARRATIVE_ENABLED) return null;
-  if (config.CODEX_BASE_URL && config.CODEX_API_KEY && config.CODEX_MODEL) {
-    const headers: Record<string, string> = {
-      Authorization: `Bearer ${config.CODEX_API_KEY}`,
-      'Content-Type': 'application/json'
-    };
-    if (config.CODEX_ACCOUNT_ID) headers['ChatGPT-Account-Id'] = config.CODEX_ACCOUNT_ID;
-    return { baseUrl: config.CODEX_BASE_URL, model: config.CODEX_MODEL, headers };
+  if (config.CODEX_BASE_URL && config.CODEX_MODEL) {
+    const session = await codexCredentials().catch(() => null);
+    const token = session?.accessToken || config.CODEX_API_KEY;
+    if (token) {
+      const headers: Record<string, string> = {
+        Authorization: `Bearer ${token}`,
+        'Content-Type': 'application/json'
+      };
+      const accountId = session?.accountId || config.CODEX_ACCOUNT_ID;
+      if (accountId) headers['ChatGPT-Account-Id'] = accountId;
+      return { baseUrl: config.CODEX_BASE_URL, model: config.CODEX_MODEL, headers };
+    }
   }
   if (config.AI_BASE_URL && config.AI_API_KEY && config.AI_MODEL) {
     return {
@@ -370,7 +387,7 @@ export async function narrateOverview(
   overview: StrategicOverview, options: NarrateOptions = {}
 ): Promise<AnalyticsNarrative> {
   const facts = narrativeFacts(overview);
-  const provider = narrativeProvider();
+  const provider = await narrativeProvider();
   if (!provider) {
     return { ...describe(facts), generatedBy: 'deterministic', model: null, rejectionReason: null, facts };
   }

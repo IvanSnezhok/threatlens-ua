@@ -117,7 +117,33 @@ const envSchema = z.object({
   CODEX_BASE_URL: z.string().default(''),
   CODEX_API_KEY: z.string().default(''),
   CODEX_MODEL: z.string().default(''),
-  CODEX_ACCOUNT_ID: z.string().default('')
+  CODEX_ACCOUNT_ID: z.string().default(''),
+
+  // ---- Codex sign-in over OAuth ----------------------------------------------------------------
+  // The operator presses a button in `/ops` instead of copying a token out of `~/.codex/auth.json`.
+  // Everything here describes *where* the browser is sent and *where it comes back to*; whether a
+  // model is called at all is still `ANALYTICS_NARRATIVE_ENABLED`, unchanged.
+  //
+  // The client id and issuer below are the ones the public Codex CLI uses. They are not ours.
+  // The sign-in they drive was exercised end to end against the live service on 2026-08-07 and
+  // returned a session with a refresh token; the *transport* to the model remains the unverified
+  // part, as `docs/EXTERNAL_SETUP.md` records. Override both if the values move.
+  //
+  // The redirect is loopback by necessity, not by preference: that client only accepts
+  // `http://localhost:<port>/auth/callback`, so the browser completing the sign-in and the server
+  // receiving the code must resolve the same `localhost`. Behind Caddy on a remote host they do not,
+  // and the callback will never arrive. `/ops/codex` reports that as a precondition, not as a bug.
+  CODEX_OAUTH_ISSUER: z.string().url().default('https://auth.openai.com'),
+  CODEX_OAUTH_CLIENT_ID: z.string().default('app_EMoamEEZ73f0CkXaXp7hrann'),
+  CODEX_OAUTH_SCOPE: z.string().default('openid profile email offline_access'),
+  CODEX_OAUTH_REDIRECT_PORT: z.coerce.number().int().min(1).max(65535).default(1455),
+  // What the *browser* is told to return to. Must match the registered redirect exactly.
+  CODEX_OAUTH_REDIRECT_HOST: z.string().default('localhost'),
+  // What the *server* listens on. Inside a container the published port arrives on the bridge
+  // interface, so binding to loopback there would drop the callback on the floor.
+  CODEX_OAUTH_BIND_ADDRESS: z.string().default('0.0.0.0'),
+  // How long a started sign-in stays valid before the listener closes itself.
+  CODEX_OAUTH_LOGIN_TIMEOUT_SECONDS: z.coerce.number().int().min(30).max(1800).default(300)
 }).superRefine((env, ctx) => {
   if (env.NODE_ENV !== 'production') return;
   if (env.OPS_PASSWORD === 'change-me' || env.OPS_PASSWORD.length < 16) {
