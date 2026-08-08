@@ -151,7 +151,12 @@ export function formatMessage(row: any): string {
       return `<b>${html(assessment.locationName)}</b> — ${html(threatLabels[assessment.threatType] ?? assessment.threatType)}\n${html(levelLabels[assessment.level] ?? assessment.level)} · ${html(assessment.indicativePercent)}% індикативного рівня · ${html(assessment.score)}/10${factor ? `\n↳ ${html(factor)}` : ''}`;
     });
     const omitted = p.omitted ? `\n\nЩе оцінок: ${html(p.omitted)} — перегляньте на сайті.` : '';
-    return `🌙 <b>Оновлення аналітики станом на ${html(p.generatedTime)}</b>\n\n${lines.join('\n\n')}${omitted}\n\nРівень сформовано з публічних сигналів на горизонт до 6 годин. Це не статистична ймовірність, не прогноз цілі та не офіційна тривога. У разі тривоги перейдіть до визначеного укриття.\n\n<a href="${html(p.mapUrl)}">Карта й пояснення</a>`;
+    // Рядок від моделі підписано вголос і поставлено ПІСЛЯ переліку. Оцінки — це те, заради чого
+    // надіслано повідомлення, і машинне речення не має ставати першим, що читає людина вночі.
+    const aiSummary = p.aiGenerated && p.aiSummary
+      ? `\n\n<i>Стисло (написала мовна модель за цими ж оцінками): ${html(p.aiSummary)}</i>`
+      : '';
+    return `🌙 <b>Оновлення аналітики станом на ${html(p.generatedTime)}</b>\n\n${lines.join('\n\n')}${omitted}${aiSummary}\n\nРівень сформовано з публічних сигналів на горизонт до 6 годин. Це не статистична ймовірність, не прогноз цілі та не офіційна тривога. У разі тривоги перейдіть до визначеного укриття.\n\n<a href="${html(p.mapUrl)}">Карта й пояснення</a>`;
   }
   return `⚠️ <b>${html(p.locationName)}</b>\n${html(threatLabels[p.threatType] ?? p.threatType)}\nРівень доказовості: ${html(p.evidenceLevel)}\n\n${html(p.summary)}\n\nДані дійсні до: ${html(p.validUntil ?? 'не вказано')}\n<a href="${html(p.mapUrl)}">Карта та джерела</a>`;
 }
