@@ -126,7 +126,11 @@ export function fallbackAssessment(
   const groups = groupSignals(signals);
   const raisingFactors = groups.slice(0, 3).map((group) => {
     const messages = `${group.count} ${plural(group.count, 'повідомлення', 'повідомлення', 'повідомлень')}`;
-    return `Джерела повідомляють про це: ${signalTypeLabel(group.signalType)} — ${messages} за останні години.`;
+    // Назва сигналу відкриває речення, бо саме вона є твердженням: «Пряма загроза цій території —
+    // 3 повідомлення за останні години». Обгортка на кшталт «Джерела повідомляють про це:» додавала
+    // займенник без антецедента і робила фразу нечитабельною саме там, де вона мусить читатися з ходу.
+    const label = signalTypeLabel(group.signalType);
+    return `${label.charAt(0).toUpperCase()}${label.slice(1)} — ${messages} за останні години.`;
   });
   if (tiers.has('A')) raisingFactors.push('Серед джерел є офіційне повідомлення.');
   if (independent >= 2) raisingFactors.push('Повідомлення надійшли щонайменше з двох незалежних груп джерел.');

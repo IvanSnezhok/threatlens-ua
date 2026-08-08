@@ -1110,7 +1110,7 @@ body { overflow-x: hidden; }
 .detail-body dt { color: var(--bone-4); font: 400 9px/1.3 var(--mono); letter-spacing: .1em; text-transform: uppercase; }
 .detail-body dd { margin: 7px 0 0; font-size: 12.5px; line-height: 1.5; }
 
-.evidence-row, .signal-row {
+.evidence-row {
   display: grid;
   gap: 8px;
   padding: 15px 0;
@@ -1119,7 +1119,7 @@ body { overflow-x: hidden; }
 /* Рівень джерела й назва — один підпис у два рядки, а не два краї колонки:
    у вузькому аркуші space-between відкидав назву джерела за 400 px від його тиру. */
 .evidence-row > div { display: grid; gap: 5px; justify-items: start; }
-.evidence-row span, .evidence-row time, .signal-row span, .signal-row small {
+.evidence-row span, .evidence-row time {
   color: var(--bone-4);
   font: 400 9px/1.4 var(--mono);
   letter-spacing: .07em;
@@ -1137,10 +1137,6 @@ body { overflow-x: hidden; }
   transition: color .16s var(--ease), border-color .16s var(--ease);
 }
 .evidence-row a:hover { color: var(--bone); border-color: var(--bone); }
-
-.signal-row { grid-template-columns: 1fr auto; align-items: baseline; }
-.signal-row strong { font: 500 12px/1.3 var(--mono); letter-spacing: .02em; }
-.signal-row small { grid-column: 1 / -1; }
 
 /* Деталі аналітичної оцінки.
    Раніше тут стояли два голі списки «чинників» — вони виглядали як витяг із бази й читалися так само.

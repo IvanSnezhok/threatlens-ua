@@ -69,7 +69,7 @@ describe('пояснення оцінки читається людиною', ()
       signal({ id: 'b', signal_type: 'reported_direction' }),
       signal({ id: 'c', signal_type: 'reported_direction' })
     ]);
-    const grouped = result.raisingFactors.filter((factor) => factor.includes('ціль рухається в цьому напрямку'));
+    const grouped = result.raisingFactors.filter((factor) => factor.startsWith('Ціль рухається в цьому напрямку —'));
     expect(grouped).toHaveLength(1);
     expect(grouped[0]).toContain('3 повідомлення');
   });
