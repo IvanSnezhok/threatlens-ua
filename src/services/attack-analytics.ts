@@ -175,12 +175,21 @@ export interface DirectionRow {
   previousMessages: number;
 }
 
-/** One point of the activity timeline. `threatType` is `null` on the row that counts messages once. */
+/**
+ * One point of the activity timeline. `threatType` is `null` on the row that counts messages once.
+ *
+ * `firstAt`/`lastAt` are the real timestamps of the earliest and latest message inside the bucket,
+ * carried only on those spine rows. They exist so wave boundaries are measured between messages
+ * rather than between bucket edges — see {@link clusterWaves}. Optional because every fixture and
+ * every caller that has only bucket starts is still a valid input.
+ */
 export interface TimelinePoint {
   at: string;
   threatType: string | null;
   messages: number;
   eventsRaised: number;
+  firstAt?: string | null;
+  lastAt?: string | null;
 }
 
 export interface AttackWave {
@@ -324,8 +333,13 @@ export interface ClusterOptions {
  * split matters because a message matching two classes must be counted once towards the wave's size
  * and twice towards its composition, and a single row shape cannot do both.
  *
- * A gap is measured from the *end* of one bucket to the start of the next, so the answer does not
- * change when the caller picks a coarser resolution for a longer period.
+ * A gap is measured between the *messages* on either side of it — the last one before the silence and
+ * the first one after — which is why the spine carries `firstAt`/`lastAt` and not only a bucket
+ * start. Measuring between bucket edges instead looked equivalent and is not: with a 30-minute bucket
+ * the arithmetic can understate a silence by most of an hour, so the same night genuinely came out as
+ * three waves under «Доба» and two under «Місяць». How many waves a night contained must not depend
+ * on which tab the reader has open. Bucket edges remain the fallback for inputs that carry no exact
+ * timestamps, where they are the best available estimate.
  *
  * Clusters below `minMessages` are dropped rather than shown as one-report waves: a lone message is
  * an incident report, and drawing it as a wave would make a quiet week look structured.
@@ -335,9 +349,23 @@ export function clusterWaves(timeline: TimelinePoint[], options: ClusterOptions)
   const gapMs = (options.gapMinutes ?? WAVE_GAP_MINUTES) * 60_000;
   const minMessages = options.minMessages ?? WAVE_MIN_MESSAGES;
 
+  const instant = (value: string | null | undefined, fallback: number): number => {
+    const parsed = value == null ? NaN : Date.parse(value);
+    return Number.isFinite(parsed) ? parsed : fallback;
+  };
+
   const spine = timeline
     .filter((point) => point.threatType === null)
-    .map((point) => ({ at: Date.parse(point.at), messages: point.messages, eventsRaised: point.eventsRaised }))
+    .map((point) => {
+      const at = Date.parse(point.at);
+      return {
+        at,
+        first: instant(point.firstAt, at),
+        last: instant(point.lastAt, at + bucketMs),
+        messages: point.messages,
+        eventsRaised: point.eventsRaised
+      };
+    })
     .filter((point) => Number.isFinite(point.at) && point.messages > 0)
     .sort((a, b) => a.at - b.at);
   if (!spine.length) return [];
@@ -352,12 +380,15 @@ export function clusterWaves(timeline: TimelinePoint[], options: ClusterOptions)
     typed.set(at, list);
   }
 
+  // `quietSince` is the running maximum rather than the previous point's own `last`, because a bucket
+  // that reported nothing new still cannot lengthen a silence that an earlier one already ended.
   const groups: Array<typeof spine> = [[spine[0]!]];
+  let quietSince = spine[0]!.last;
   for (let index = 1; index < spine.length; index += 1) {
     const point = spine[index]!;
-    const previous = groups[groups.length - 1]![groups[groups.length - 1]!.length - 1]!;
-    if (point.at - (previous.at + bucketMs) > gapMs) groups.push([point]);
+    if (point.first - quietSince > gapMs) groups.push([point]);
     else groups[groups.length - 1]!.push(point);
+    quietSince = Math.max(quietSince, point.last);
   }
 
   return groups
@@ -368,8 +399,8 @@ export function clusterWaves(timeline: TimelinePoint[], options: ClusterOptions)
           composition.set(entry.threatType, (composition.get(entry.threatType) ?? 0) + entry.messages);
         }
       }
-      const startedAt = group[0]!.at;
-      const endedAt = group[group.length - 1]!.at + bucketMs;
+      const startedAt = group[0]!.first;
+      const endedAt = group.reduce((latest, point) => Math.max(latest, point.last), startedAt);
       return {
         startedAt: new Date(startedAt).toISOString(),
         endedAt: new Date(endedAt).toISOString(),
@@ -426,6 +457,39 @@ export function repeatedCombinations(waves: AttackWave[], minWaves = 2): Combina
 
 const PERIOD_NAMES: Record<AttackPeriod, string> = { day: 'добу', week: 'тиждень', month: 'місяць' };
 
+/**
+ * «за останню добу», але «за останній тиждень».
+ *
+ * Kept as three whole phrases rather than one template plus {@link PERIOD_NAMES}, because the
+ * adjective has to agree in gender with the noun and Ukrainian gives no way to interpolate that.
+ * A page that says «за останню тиждень» to a civilian reader has already told them nobody proofread
+ * it, and everything else it claims is read with that in mind.
+ */
+const LAST_PERIOD_PHRASES_CAPITALISED: Record<AttackPeriod, string> = {
+  day: 'За останню добу',
+  week: 'За останній тиждень',
+  month: 'За останній місяць'
+};
+
+/**
+ * Ukrainian numeric agreement: one / few / many.
+ *
+ * Needed because every sentence here is built around a count, and «1 повідомлень» or «2 хвиль» is
+ * the exact register this project cannot afford — the whole argument of the page is that the numbers
+ * were assembled carefully.
+ */
+export function plural(count: number, one: string, few: string, many: string): string {
+  const absolute = Math.abs(count) % 100;
+  if (absolute > 10 && absolute < 20) return many;
+  const last = absolute % 10;
+  if (last === 1) return one;
+  if (last >= 2 && last <= 4) return few;
+  return many;
+}
+
+const messagesWord = (count: number) => plural(count, 'повідомлення', 'повідомлення', 'повідомлень');
+const eventsWord = (count: number) => plural(count, 'подія', 'події', 'подій');
+
 function hourLabel(hour: number): string {
   return `${String(hour).padStart(2, '0')}:00`;
 }
@@ -474,7 +538,7 @@ export function describeAttacks(input: DescribeInput): AttackPatterns {
   const leading = input.means[0];
   if (leading) {
     findings.push(
-      `Найчастіше повідомляли про ${leading.label}: ${leading.messages} повідомлень `
+      `Найчастіше повідомляли про ${leading.label}: ${leading.messages} ${messagesWord(leading.messages)} `
       + `(${round(leading.share * 100, 1)}% усіх згадок засобів).`
     );
   }
@@ -484,7 +548,7 @@ export function describeAttacks(input: DescribeInput): AttackPatterns {
     const night = nightShare(input.hours);
     findings.push(
       `Пік повідомлень припадає на ${hourLabel(peak.hour)}–${hourLabel((peak.hour + 1) % 24)} `
-      + `за київським часом (${peak.messages} повідомлень). `
+      + `за київським часом (${peak.messages} ${messagesWord(peak.messages)}). `
       + `На нічні години 22:00–06:00 припадає ${round(night * 100)}% усіх повідомлень.`
     );
   }
@@ -493,7 +557,8 @@ export function describeAttacks(input: DescribeInput): AttackPatterns {
     const durations = input.waves.map((wave) => wave.durationMinutes);
     const middle = median(durations);
     findings.push(
-      `Активність згрупувалася у ${input.waves.length} хвиль${input.waves.length === 1 ? 'ю' : ''} `
+      `Активність згрупувалася у ${input.waves.length} `
+      + `${plural(input.waves.length, 'хвилю', 'хвилі', 'хвиль')} `
       + `(проміжок тиші від ${WAVE_GAP_MINUTES} хв розділяє хвилі)`
       + (middle == null ? '.' : `, типова тривалість хвилі — ${Math.round(middle)} хв.`)
     );
@@ -503,37 +568,53 @@ export function describeAttacks(input: DescribeInput): AttackPatterns {
   if (combination) {
     findings.push(
       `Повторювана комбінація: ${combination.labels[0]} і ${combination.labels[1]} в одній хвилі — `
-      + `${combination.waves} з ${input.waves.length} хвиль.`
+      + `${combination.waves} з ${input.waves.length} ${plural(input.waves.length, 'хвилі', 'хвиль', 'хвиль')}.`
     );
   }
 
-  const rising = input.targets.filter((row) => row.trend === 'rising' || row.trend === 'new')[0];
-  const falling = [...input.targets].filter((row) => row.trend === 'falling' || row.trend === 'gone')
-    .sort((a, b) => (a.messages - a.previousMessages) - (b.messages - b.previousMessages))[0];
-  if (rising) {
+  // A shift needs something to have shifted *from*. When the previous window is empty — a fresh
+  // archive, or a backfill that has not reached that far — every oblast is formally «new», and
+  // calling the busiest of them «зміщення фокусу» would report an artefact of the data's age as a
+  // change in what is being struck.
+  const hasBaseline = input.totals.previousMessages > 0;
+  const rising = hasBaseline ? input.targets.filter((row) => row.trend === 'rising' || row.trend === 'new')[0] : undefined;
+  const falling = hasBaseline
+    ? [...input.targets].filter((row) => row.trend === 'falling' || row.trend === 'gone')
+        .sort((a, b) => (a.messages - a.previousMessages) - (b.messages - b.previousMessages))[0]
+    : undefined;
+  const leadingTarget = input.targets[0];
+  if (!hasBaseline && leadingTarget) {
+    findings.push(
+      `Найчастіше в повідомленнях називали: ${leadingTarget.oblastName} — ${leadingTarget.messages} `
+      + `${messagesWord(leadingTarget.messages)} (${round(leadingTarget.share * 100)}% усіх згадок територій). `
+      + 'Порівняти з попереднім періодом немає з чим: у ньому таких повідомлень не було.'
+    );
+  } else if (rising) {
     findings.push(
       `Фокус повідомлень зміщується до області: ${rising.oblastName} — `
-      + `${rising.previousMessages} → ${rising.messages} повідомлень за ${periodName}`
+      + `${rising.previousMessages} → ${rising.messages} ${messagesWord(rising.messages)} за ${periodName}`
       + (falling ? `, тоді як ${falling.oblastName} — ${falling.previousMessages} → ${falling.messages}.` : '.')
     );
   } else if (falling) {
     findings.push(
-      `Помітне зниження: ${falling.oblastName} — ${falling.previousMessages} → ${falling.messages} повідомлень.`
+      `Помітне зниження: ${falling.oblastName} — ${falling.previousMessages} → ${falling.messages} `
+      + `${messagesWord(falling.messages)}.`
     );
   }
 
   const route = input.directions[0];
   if (route) {
     findings.push(
-      `Найчастіше повторюване формулювання напрямку: «${route.direction}» — ${route.messages} разів. `
+      `Найчастіше повторюване формулювання напрямку: «${route.direction}» — ${route.messages} `
+      + `${plural(route.messages, 'раз', 'рази', 'разів')}. `
       + 'Це дослівна цитата з повідомлень, а не розрахований маршрут.'
     );
   }
 
   if (!findings.length) {
     findings.push(
-      `За останню ${periodName} у відкритих джерелах не було повідомлень, які система розпізнала б `
-      + 'як загрозу. Це не означає, що нічого не відбувалося.'
+      `${LAST_PERIOD_PHRASES_CAPITALISED[input.window.period]} у відкритих джерелах не було `
+      + 'повідомлень, які система розпізнала б як загрозу. Це не означає, що нічого не відбувалося.'
     );
   }
 
@@ -546,13 +627,21 @@ export function describeAttacks(input: DescribeInput): AttackPatterns {
     );
   }
 
+  // Without a previous window there is no comparison to word, and the fallthrough said the worst
+  // possible thing: «103 повідомлення — приблизно стільки ж, скільки попереднього періоду (0)».
+  // Saying plainly that the baseline is missing costs a clause and keeps the page believable.
   const trendWord = input.totals.trend === 'rising' ? 'більше, ніж попереднього'
-    : input.totals.trend === 'falling' ? 'менше, ніж попереднього'
+    : input.totals.trend === 'falling' || input.totals.trend === 'gone' ? 'менше, ніж попереднього'
       : 'приблизно стільки ж, скільки попереднього';
+  const comparison = input.totals.previousMessages > 0
+    ? `${trendWord} періоду (${input.totals.previousMessages})`
+    : input.totals.messages > 0
+      ? 'за попередній такий самий період у нас таких повідомлень немає, тож порівняння тут не буде'
+      : 'як і попереднього періоду, жодного';
   return {
-    headline: `За ${periodName}: ${input.totals.messages} повідомлень про загрозу, `
-      + `${input.totals.eventsRaised} окремих подій — ${trendWord} періоду `
-      + `(${input.totals.previousMessages}).`,
+    headline: `За ${periodName}: ${input.totals.messages} ${messagesWord(input.totals.messages)} про загрозу, `
+      + `${input.totals.eventsRaised} ${plural(input.totals.eventsRaised, 'окрема', 'окремі', 'окремих')} `
+      + `${eventsWord(input.totals.eventsRaised)} — ${comparison}.`,
     findings,
     caveats
   };
@@ -685,30 +774,38 @@ ORDER BY 1, 4 DESC, 2`;
 async function timeline(window: AttackWindow): Promise<TimelinePoint[]> {
   const sql = `
 WITH bucketed AS (
-  SELECT mc.id, mc.created_event,
+  SELECT mc.id, mc.created_event, mc.published_at,
          to_timestamp(floor(EXTRACT(EPOCH FROM mc.published_at) / $3::double precision) * $3::double precision) AS at,
          ${TYPES_EXPRESSION} AS types
   FROM message_classifications mc
   WHERE mc.published_at >= $1 AND mc.published_at < $2 AND mc.decision = ANY($4::text[])
 )
+-- The spine carries the real first and last instant in each bucket, so wave boundaries are measured
+-- between messages instead of between bucket edges; see clusterWaves(). The per-class rows only
+-- describe composition and never decide a boundary, so they carry no timestamps.
 SELECT at, NULL::text AS threat_type,
        count(*)::int AS messages,
-       count(*) FILTER (WHERE created_event)::int AS events_raised
+       count(*) FILTER (WHERE created_event)::int AS events_raised,
+       min(published_at) AS first_at, max(published_at) AS last_at
 FROM bucketed GROUP BY 1
 UNION ALL
-SELECT b.at, t, count(*)::int, count(*) FILTER (WHERE b.created_event)::int
+SELECT b.at, t, count(*)::int, count(*) FILTER (WHERE b.created_event)::int,
+       NULL::timestamptz, NULL::timestamptz
 FROM bucketed b CROSS JOIN LATERAL unnest(b.types) AS t
 GROUP BY 1,2
 ORDER BY 1, 2 NULLS FIRST`;
 
-  const rows = (await pool.query<{ at: Date; threat_type: string | null; messages: number; events_raised: number }>(
-    sql, [window.from, window.to, window.bucketMinutes * 60, ASSERTING_DECISIONS]
-  )).rows;
+  const rows = (await pool.query<{
+    at: Date; threat_type: string | null; messages: number; events_raised: number;
+    first_at: Date | null; last_at: Date | null;
+  }>(sql, [window.from, window.to, window.bucketMinutes * 60, ASSERTING_DECISIONS])).rows;
   return rows.map((row) => ({
     at: row.at.toISOString(),
     threatType: row.threat_type,
     messages: row.messages,
-    eventsRaised: row.events_raised
+    eventsRaised: row.events_raised,
+    firstAt: row.first_at?.toISOString() ?? null,
+    lastAt: row.last_at?.toISOString() ?? null
   }));
 }
 

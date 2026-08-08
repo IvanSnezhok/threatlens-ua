@@ -975,6 +975,20 @@ async function renderAnalytics() {
 // підключення бібліотеки заради прямокутника коштувало б більше, ніж уся сторінка важить зараз.
 
 const attackPeriodNames = { day: 'Доба', week: 'Тиждень', month: 'Місяць' };
+
+// Українське узгодження з числівником. Дзеркало plural() із src/services/attack-analytics.ts —
+// цифри на цій сторінці приходять із сервера вже в реченнях, але підписи під ними складає браузер,
+// і «1 подій» під акуратно порахованим числом знецінює саме число.
+function attackPlural(count, one, few, many) {
+  const absolute = Math.abs(count) % 100;
+  if (absolute > 10 && absolute < 20) return many;
+  const last = absolute % 10;
+  if (last === 1) return one;
+  if (last >= 2 && last <= 4) return few;
+  return many;
+}
+const attackMessagesWord = (count) => attackPlural(count, 'повідомлення', 'повідомлення', 'повідомлень');
+const attackEventsWord = (count) => attackPlural(count, 'подія', 'події', 'подій');
 const attackTrendMarks = { rising: '▲', falling: '▼', steady: '·', new: '+', gone: '—' };
 
 function attackDelta(row) {
@@ -1017,7 +1031,7 @@ function attackWaveList(waves) {
       · ${shortTime(wave.startedAt)}–${shortTime(wave.endedAt)}</time>
     <span class="bar-track"><i style="width:${Math.max(2, (wave.messages / peak) * 100)}%"></i></span>
     <b>${wave.messages}</b>
-    <p>${wave.durationMinutes} хв · ${wave.eventsRaised} подій${wave.threatTypes.length
+    <p>${wave.durationMinutes} хв · ${wave.eventsRaised} ${attackEventsWord(wave.eventsRaised)}${wave.threatTypes.length
       ? ` · ${wave.threatTypes.map((entry) => escapeHtml(entry.label)).join(' + ')}`
       : ''}</p></article>`).join('')}</div>`;
 }
@@ -1029,11 +1043,11 @@ function attackSummary(data) {
   const total = data.hours.reduce((sum, row) => sum + row.messages, 0);
   return `<div class="metric-grid">
     <div><span>Повідомлень про загрозу</span><strong>${data.totals.messages}</strong>
-      <small>${data.totals.eventsRaised} окремих подій · було ${data.totals.previousMessages}</small></div>
+      <small>${data.totals.eventsRaised} ${attackPlural(data.totals.eventsRaised, 'окрема', 'окремі', 'окремих')} ${attackEventsWord(data.totals.eventsRaised)} · було ${data.totals.previousMessages}</small></div>
     <div><span>Найбільше згадок</span><strong class="metric-word">${escapeHtml(topTarget?.oblastName ?? '—')}</strong>
-      <small>${topTarget ? `${topTarget.messages} повідомлень · ${Math.round(topTarget.share * 100)}% усіх` : 'немає даних'}</small></div>
+      <small>${topTarget ? `${topTarget.messages} ${attackMessagesWord(topTarget.messages)} · ${Math.round(topTarget.share * 100)}% усіх` : 'немає даних'}</small></div>
     <div><span>Пікова година</span><strong>${peak && peak.messages ? `${String(peak.hour).padStart(2, '0')}:00` : '—'}</strong>
-      <small>${total ? `${peak.messages} повідомлень · вночі ${Math.round((night / total) * 100)}%` : 'немає даних'}</small></div>
+      <small>${total ? `${peak.messages} ${attackMessagesWord(peak.messages)} · вночі ${Math.round((night / total) * 100)}%` : 'немає даних'}</small></div>
   </div>`;
 }
 
@@ -1081,13 +1095,15 @@ async function renderAttacks() {
         <p class="chart-foot">Одне повідомлення про комбінований удар потрапляє в кілька рядків — воно згадує кілька типів.</p></section>
       <section class="chart-block"><header><p>Час</p><h2>Розподіл за годинами доби</h2></header>
         ${attackHourChart(data.hours)}</section>
-      <section class="chart-block"><header><p>Території</p><h2>Області, які згадують найчастіше</h2></header>
+      <!-- «Території», а не «Області»: повідомлення про загрозу для всієї країни підіймається до
+           рядка «Україна», і назвати його областю було б неправдою просто в заголовку. -->
+      <section class="chart-block"><header><p>Території</p><h2>Території, які згадують найчастіше</h2></header>
         ${targets.length ? attackBars(targets, (row) => row.oblastName) : '<p class="chart-foot">Жодна територія не названа.</p>'}
         <p class="chart-foot">Згадка області ≠ влучання по ній: це територія, названа в повідомленні про загрозу.</p></section>
       <section class="chart-block"><header><p>Групування</p><h2>Хвилі атак</h2></header>
         ${attackWaveList(data.waves)}
         ${data.combinations.length ? `<p class="chart-foot">Повторювані поєднання в одній хвилі: ${data.combinations
-    .map((pair) => `${escapeHtml(pair.labels[0])} + ${escapeHtml(pair.labels[1])} (${pair.waves} хвиль)`).join('; ')}.</p>` : ''}</section>
+    .map((pair) => `${escapeHtml(pair.labels[0])} + ${escapeHtml(pair.labels[1])} (${pair.waves} ${attackPlural(pair.waves, 'хвиля', 'хвилі', 'хвиль')})`).join('; ')}.</p>` : ''}</section>
       ${data.directions.length ? `<section class="chart-block"><header><p>Напрямки</p><h2>Формулювання напрямку, які повторюються</h2></header>
         <div class="bar-rows">${data.directions.map((row) => `<div class="bar-row">
           <span class="bar-label bar-label-wide">«${escapeHtml(row.direction)}»</span>

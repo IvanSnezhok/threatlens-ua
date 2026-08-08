@@ -7,6 +7,7 @@ import {
   median,
   nightShare,
   peakHour,
+  plural,
   repeatedCombinations,
   resolveAttackWindow,
   trendOf,
@@ -117,6 +118,41 @@ describe('clusterWaves', () => {
     );
     expect(fine).toHaveLength(2);
     expect(coarse).toHaveLength(2);
+  });
+
+  it('measures the silence between the messages, not between the bucket edges', () => {
+    // Regression. Two messages 100 minutes apart are two waves at any resolution. Off bucket starts
+    // alone a 30-minute bucket subtracts its own width from the gap, reads it as 70 minutes and
+    // merges the pair — which is how one night came out as three waves under «Доба» and two under
+    // «Місяць» on the project's own archive.
+    const exact = (minutesFromStart: number, messages: number): TimelinePoint[] => {
+      const at = new Date(Date.UTC(2026, 1, 10, 20, 0, 0) + minutesFromStart * 60_000);
+      return [{
+        at: at.toISOString(), threatType: null, messages, eventsRaised: 1,
+        firstAt: at.toISOString(), lastAt: at.toISOString()
+      }, { at: at.toISOString(), threatType: 'uav', messages, eventsRaised: 0 }];
+    };
+    const night = [...exact(0, 4), ...exact(100, 4)];
+    for (const bucketMinutes of [5, 15, 30]) {
+      expect(clusterWaves(night, { bucketMinutes })).toHaveLength(2);
+    }
+    // And a silence shorter than the threshold still joins, at every resolution.
+    const joined = [...exact(0, 4), ...exact(80, 4)];
+    for (const bucketMinutes of [5, 15, 30]) {
+      expect(clusterWaves(joined, { bucketMinutes })).toHaveLength(1);
+    }
+  });
+
+  it('spans a wave from its first message to its last', () => {
+    const at = (minutes: number) => new Date(Date.UTC(2026, 1, 10, 20, 0, 0) + minutes * 60_000).toISOString();
+    const waves = clusterWaves([
+      { at: at(0), threatType: null, messages: 3, eventsRaised: 1, firstAt: at(2), lastAt: at(4) },
+      { at: at(30), threatType: null, messages: 3, eventsRaised: 1, firstAt: at(31), lastAt: at(47) }
+    ], { bucketMinutes: 30 });
+    expect(waves).toHaveLength(1);
+    expect(waves[0]!.startedAt).toBe(at(2));
+    expect(waves[0]!.endedAt).toBe(at(47));
+    expect(waves[0]!.durationMinutes).toBe(45);
   });
 
   it('returns nothing for an empty window', () => {
@@ -311,4 +347,80 @@ describe('describeAttacks headline', () => {
     expect(patterns.headline).toContain('За добу');
     expect(patterns.headline).toContain('менше, ніж попереднього');
   });
+});
+
+describe('a window with nothing behind it', () => {
+  // Regression, from the endpoint's own output against the project archive: the classifier had run
+  // for a day and the previous day was empty, so the page announced «103 повідомлення про загрозу —
+  // приблизно стільки ж, скільки попереднього періоду (0)». A page that says that has disproved
+  // itself in its first sentence.
+  const withoutBaseline = rows.map((row) => ({ ...row, previous_messages: 0, previous_events: 0 }));
+  const analytics = composeAttackAnalytics(
+    window, withoutBaseline, points, new Date('2026-02-11T12:00:00.000Z')
+  );
+
+  it('never calls an appearance from nothing a comparable quantity', () => {
+    expect(analytics.totals.trend).toBe('new');
+    expect(analytics.patterns.headline).not.toContain('приблизно стільки ж');
+    expect(analytics.patterns.headline).toContain('порівняння тут не буде');
+  });
+
+  it('does not present the busiest oblast as a shift of focus', () => {
+    const text = analytics.patterns.findings.join(' ');
+    expect(text).not.toContain('зміщується');
+    expect(text).toContain('Найчастіше в повідомленнях називали: Полтавська область');
+  });
+
+  it('still words an empty window against an empty one', () => {
+    const empty = composeAttackAnalytics(window, [], [], new Date('2026-02-11T12:00:00.000Z'));
+    expect(empty.patterns.headline).toContain('як і попереднього періоду, жодного');
+  });
+
+  it('reports a disappearance as a fall, not as a standstill', () => {
+    const gone = describeAttacks({
+      window: analytics.window,
+      totals: { messages: 0, eventsRaised: 0, previousMessages: 30, previousEventsRaised: 9, deltaPercent: -100, trend: 'gone' },
+      means: [], targets: [], hours: [], directions: [], waves: [], combinations: [], classifierVersions: ['v1']
+    });
+    expect(gone.headline).toContain('менше, ніж попереднього періоду (30)');
+  });
+});
+
+describe('numeric agreement', () => {
+  it('picks the form the numeral requires, including the teens exception', () => {
+    expect(plural(1, 'хвиля', 'хвилі', 'хвиль')).toBe('хвиля');
+    expect(plural(2, 'хвиля', 'хвилі', 'хвиль')).toBe('хвилі');
+    expect(plural(5, 'хвиля', 'хвилі', 'хвиль')).toBe('хвиль');
+    // 11–14 take the many form even though they end in 1–4, which is the rule a naive
+    // `count === 1 ? … : …` gets wrong and the reason this function exists.
+    expect(plural(11, 'хвиля', 'хвилі', 'хвиль')).toBe('хвиль');
+    expect(plural(12, 'хвиля', 'хвилі', 'хвиль')).toBe('хвиль');
+    expect(plural(21, 'хвиля', 'хвилі', 'хвиль')).toBe('хвиля');
+    expect(plural(22, 'хвиля', 'хвилі', 'хвиль')).toBe('хвилі');
+    expect(plural(0, 'хвиля', 'хвилі', 'хвиль')).toBe('хвиль');
+  });
+
+  it('agrees the noun with the count in the conclusion itself', () => {
+    const twoWaves = composeAttackAnalytics(window, rows, points, new Date('2026-02-11T12:00:00.000Z'));
+    expect(twoWaves.patterns.findings.join(' ')).toContain('у 2 хвилі');
+    expect(twoWaves.patterns.headline).toContain('40 повідомлень');
+    expect(twoWaves.patterns.headline).toContain('12 окремих подій');
+  });
+});
+
+describe('the empty-window sentence', () => {
+  // «За останню тиждень» is the mistake this asserts against: the adjective has to agree in gender
+  // with the period noun, and the three periods do not share one.
+  const phrases: Array<[Parameters<typeof resolveAttackWindow>[0], string]> = [
+    ['day', 'За останню добу'], ['week', 'За останній тиждень'], ['month', 'За останній місяць']
+  ];
+  for (const [period, expected] of phrases) {
+    it(`names the ${period} window in the right gender`, () => {
+      const empty = composeAttackAnalytics(
+        resolveAttackWindow(period, new Date('2026-02-11T12:00:00.000Z')), [], [],
+        new Date('2026-02-11T12:00:00.000Z')
+      );
+      expect(empty.patterns.findings[0]).toContain(expected);
+    });
+  }
 });
