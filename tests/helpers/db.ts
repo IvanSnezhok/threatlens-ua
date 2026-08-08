@@ -46,7 +46,7 @@ export async function count(table: string, where = 'true', params: unknown[] = [
 
 /** Tables holding per-test state. Reference data seeded by the migrations is preserved. */
 const VOLATILE_TABLES = [
-  'notification_deliveries', 'notification_outbox', 'nightly_digest_runs',
+  'notification_deliveries', 'notification_outbox', 'notification_state', 'nightly_digest_runs',
   'risk_assessment_signals', 'risk_assessments', 'risk_signals',
   'event_updates', 'event_evidence', 'threat_event_locations', 'threat_events',
   'alert_source_states', 'alert_periods',
@@ -215,31 +215,50 @@ export async function runFanout(): Promise<void> {
 }
 
 export interface FakeBotCall { chatId: string; text: string; options: Record<string, unknown> }
+export interface FakeBotEdit { chatId: string; messageId: number; text: string }
 
 export interface FakeBot {
   calls: FakeBotCall[];
+  edits: FakeBotEdit[];
   warnings: Array<Record<string, unknown>>;
   bot: unknown;
 }
 
+export interface FakeBotBehaviour {
+  onSend?: (call: FakeBotCall) => void;
+  onEdit?: (edit: FakeBotEdit) => void;
+}
+
 /**
- * Minimal stand-in for the grammy bot. `sendMessage` either records the call or throws a
- * Telegram-shaped error so the outbox retry/failure branches can be exercised.
+ * Minimal stand-in for the grammy bot. `sendMessage` and `editMessageText` either record the call or
+ * throw a Telegram-shaped error, so the outbox retry, failure and edit-fallback branches can all be
+ * exercised without a network.
  */
-export function fakeBot(behaviour: (call: FakeBotCall) => void = () => undefined): FakeBot {
+export function fakeBot(
+  behaviour: ((call: FakeBotCall) => void) | FakeBotBehaviour = () => undefined
+): FakeBot {
+  const hooks: FakeBotBehaviour = typeof behaviour === 'function' ? { onSend: behaviour } : behaviour;
   const calls: FakeBotCall[] = [];
+  const edits: FakeBotEdit[] = [];
   const warnings: Array<Record<string, unknown>> = [];
   let messageId = 1;
   return {
     calls,
+    edits,
     warnings,
     bot: {
       api: {
         async sendMessage(chatId: string, text: string, options: Record<string, unknown>) {
           const call = { chatId, text, options };
           calls.push(call);
-          behaviour(call);
+          hooks.onSend?.(call);
           return { message_id: messageId++ };
+        },
+        async editMessageText(chatId: string, editedMessageId: number, text: string) {
+          const edit = { chatId, messageId: editedMessageId, text };
+          edits.push(edit);
+          hooks.onEdit?.(edit);
+          return { message_id: editedMessageId };
         }
       }
     }

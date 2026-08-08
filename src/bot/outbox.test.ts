@@ -1,6 +1,9 @@
 import { describe, expect, it } from 'vitest';
 import { formatMessage } from './outbox.js';
-import { cleanSummary, evidenceStatement, humanMoment, validUntilLine } from './humanize.js';
+import {
+  cleanSummary, evidenceRaisedLine, evidenceStatement, extensionLine, geographyChangedLine,
+  humanMoment, riskLevelChangedLine, threatTypeChangedLine, validUntilLine
+} from './humanize.js';
 
 // 2026-08-08T00:13:46Z is 03:13 in Kyiv (UTC+3 in summer), which is the whole point of the fixture:
 // a naive formatter would print 00:13 and send people to a shelter an hour off.
@@ -109,6 +112,107 @@ describe('Telegram notification formatting', () => {
   });
 });
 
+describe('threat updates that follow an earlier message', () => {
+  const standing = {
+    locationName: 'Київська область', threatType: 'uav', evidenceLevel: 'monitoring',
+    summary: 'Ударні БпЛА курсом на північ області.', validUntil: '2026-08-08T00:38:46.000Z'
+  };
+
+  it('gives the whole picture in the first message about a threat', () => {
+    const text = formatMessage({ notification_type: 'threat_update', payload: {
+      ...standing, updateKind: 'initial', changes: ['initial']
+    } }, now);
+    expect(text).toContain('Ударні БпЛА курсом на північ області.');
+    expect(text).toContain('Повідомляють моніторингові канали');
+    expect(text).toContain('Актуально до 03:38');
+    expect(text).not.toContain('оновлення');
+  });
+
+  it('says what changed instead of repeating the warning when evidence is raised', () => {
+    const text = formatMessage({ notification_type: 'threat_update', payload: {
+      ...standing, evidenceLevel: 'confirmed', updateKind: 'escalation',
+      changes: ['evidence_raised'], previousEvidenceLevel: 'monitoring'
+    } }, now);
+    expect(text).toContain('⬆️ Доказовість підвищено — підтверджено кількома джерелами');
+    // The original summary is what makes a repeat read as a repeat; an update must not carry it.
+    expect(text).not.toContain('Ударні БпЛА курсом на північ області.');
+    // Neither may it repeat the instruction the person already followed.
+    expect(text).not.toContain('перейдіть до укриття');
+  });
+
+  it('states the new deadline and the time left when a threat is extended', () => {
+    const text = formatMessage({ notification_type: 'threat_update', payload: {
+      ...standing, validUntil: '2026-08-08T02:23:46.000Z', updateKind: 'soft',
+      changes: ['validity_extended']
+    } }, now);
+    expect(text).toContain('⏱ Загрозу продовжено до 05:23 (ще ~2 год 10 хв)');
+  });
+
+  it('names both threat types when the classification is corrected', () => {
+    const text = formatMessage({ notification_type: 'threat_update', payload: {
+      ...standing, threatType: 'cruise_missile', updateKind: 'change',
+      changes: ['threat_type_changed', 'geography_changed'], previousThreatType: 'uav'
+    } }, now);
+    expect(text).toContain('🔀 Характер загрози уточнено: ударні БпЛА → крилаті ракети');
+    expect(text).toContain('📍 Оновлено перелік напрямків: Київська область');
+  });
+
+  it('escapes source-controlled names inside a delta line', () => {
+    const text = formatMessage({ notification_type: 'threat_update', payload: {
+      ...standing, locationName: '<i>Київ</i>', updateKind: 'change', changes: ['geography_changed']
+    } }, now);
+    expect(text).not.toContain('<i>');
+    expect(text).toContain('&lt;i&gt;Київ&lt;/i&gt;');
+  });
+
+  it('falls back to the validity line when an update carries no recognised change', () => {
+    const text = formatMessage({ notification_type: 'threat_update', payload: {
+      ...standing, updateKind: 'soft', changes: []
+    } }, now);
+    expect(text).toContain('Актуально до 03:38');
+  });
+
+  it('keeps the link to the first source in an update', () => {
+    const text = formatMessage({ notification_type: 'threat_update', payload: {
+      ...standing, updateKind: 'escalation', changes: ['evidence_raised'],
+      sourceUrl: 'https://t.me/monitor/1234', sourceName: 'Моніторинг'
+    } }, now);
+    expect(text).toContain('<a href="https://t.me/monitor/1234">Першоджерело: Моніторинг</a>');
+  });
+
+  it('never routes an official alert through the delta path', () => {
+    // Alerts carry no `updateKind` of their own, but a payload that somehow grew one must not be
+    // able to turn «Повітряна тривога» into a one-line update: the alert branches sit above it.
+    for (const type of ['alert_start', 'alert_end']) {
+      const text = formatMessage({ notification_type: type, payload: {
+        locationName: 'Київ', startedAt: now.toISOString(), endedAt: now.toISOString(),
+        updateKind: 'soft', changes: ['validity_extended']
+      } }, now);
+      expect(text).toContain('Офіційне сповіщення');
+      expect(text).not.toContain('— оновлення');
+    }
+  });
+
+  it('spells out the direction of an analytics level change', () => {
+    const text = formatMessage({ notification_type: 'assessment_update', payload: {
+      locationName: 'Полтава', threatType: 'uav', level: 'elevated', score: '3.0',
+      indicativePercent: 30, confidence: 'low', explanation: {}, updateKind: 'deescalation',
+      previousLevel: 'significant', previousScore: 5
+    } }, now);
+    expect(text).toContain('🔽 Рівень знижено: значний → підвищений');
+  });
+
+  it('does not claim a level change when only the index drifted', () => {
+    const text = formatMessage({ notification_type: 'assessment_update', payload: {
+      locationName: 'Полтава', threatType: 'uav', level: 'elevated', score: '4.0',
+      indicativePercent: 40, confidence: 'low', explanation: {}, updateKind: 'drift',
+      previousLevel: 'elevated', previousScore: 3
+    } }, now);
+    expect(text).not.toContain('Рівень знижено');
+    expect(text).not.toContain('Рівень підвищено');
+  });
+});
+
 describe('humanised wording helpers', () => {
   it('formats a Kyiv time without a date for today and with a spelled-out date otherwise', () => {
     expect(humanMoment('2026-08-08T00:38:46.000Z', now)).toBe('03:38');
@@ -159,6 +263,36 @@ describe('humanised wording helpers', () => {
 
   it('keeps the channel line break instead of welding two claims together', () => {
     expect(cleanSummary('Ціль зникла\n... далі буде')).toBe('Ціль зникла\n… далі буде');
+  });
+
+  it('builds the extension line an update message is made of', () => {
+    expect(extensionLine('2026-08-08T00:38:46.000Z', now)).toBe('⏱ Загрозу продовжено до 03:38 (ще ~25 хв)');
+    // A window that has already closed is stated without a countdown rather than with a negative one.
+    expect(extensionLine('2026-08-08T00:00:00.000Z', now)).toBe('⏱ Загрозу продовжено до 03:00');
+    expect(extensionLine(null, now)).toBeNull();
+  });
+
+  it('folds a full-sentence evidence phrase into the escalation line', () => {
+    // The dictionary entry is capitalised because a first message shows it standing alone; after a
+    // dash the same words are a clause, and a capital there would read as two welded sentences.
+    expect(evidenceRaisedLine('official')).toBe('⬆️ Доказовість підвищено — офіційне повідомлення');
+    expect(evidenceRaisedLine('confirmed')).toBe('⬆️ Доказовість підвищено — підтверджено кількома джерелами');
+  });
+
+  it('names both sides of a corrected classification and of a moved risk level', () => {
+    expect(threatTypeChangedLine('uav', 'cruise_missile'))
+      .toBe('🔀 Характер загрози уточнено: ударні БпЛА → крилаті ракети');
+    expect(riskLevelChangedLine('significant', 'elevated', 'down'))
+      .toBe('🔽 Рівень знижено: значний → підвищений');
+    expect(riskLevelChangedLine('elevated', 'high', 'up'))
+      .toBe('⬆️ Рівень підвищено: підвищений → високий');
+  });
+
+  it('states the whole current geography, not only what was added', () => {
+    // A reader who sees only this line must end up with the same picture as one who read the first
+    // message, so the label is the threat's full list of directions.
+    expect(geographyChangedLine('Київська область, Біла Церква'))
+      .toBe('📍 Оновлено перелік напрямків: Київська область, Біла Церква');
   });
 });
 
