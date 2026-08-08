@@ -202,7 +202,7 @@ they are now defaults rather than the decision. The console states which precond
 `/ops` → **Codex-аналітика** → **Модель і функції**. The model list is fetched from the service on
 every read, falling back to a static list (`gpt-5.2`, `gpt-5.2-codex`, `o5`, `o5-mini`, plus
 `CODEX_MODEL`) and saying so when the service will not answer. Leaving the dropdown on «за
-змовчуванням» defers to `CODEX_MODEL`.
+замовчуванням» defers to `CODEX_MODEL`.
 
 Three switches, all off until somebody turns them on, because the cost of a bad sentence differs by
 three orders of magnitude between them:

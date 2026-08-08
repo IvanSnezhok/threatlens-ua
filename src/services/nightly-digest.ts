@@ -34,8 +34,8 @@ function kyivParts(now: Date): { date: string; minutes: number; time: string } {
 // ------------------------------------------------------------------------------------------------
 //
 // Що читає людина о 23:20 — це список оцінок, який згенерував детермінований рушій ризику. Модель
-// не бере участі в жодному числі з цього списку; вона лише може додати один рядок згори, який
-// стисло каже, на що дивитися першим. Вимкнена — дайджест точно такий, яким був завжди.
+// не бере участі в жодному числі з цього списку; вона лише може додати один підсумковий рядок
+// під переліком, який стисло каже, на що дивитися першим. Вимкнена — дайджест точно такий, яким був завжди.
 
 export interface DigestFacts {
   time: string;
@@ -76,6 +76,11 @@ export interface DigestSummary {
 
 const NO_SUMMARY: DigestSummary = { text: null, aiGenerated: false, rejectionReason: null };
 
+export interface DigestSummaryDeps extends CodexClientDeps {
+  /** Перевірка перемикача. Підмінюється в тестах, щоб не тягнути базу в юніт-тест. */
+  featureEnabled?: () => Promise<boolean>;
+}
+
 /**
  * Один рядок від моделі — або нічого.
  *
@@ -84,11 +89,6 @@ const NO_SUMMARY: DigestSummary = { text: null, aiGenerated: false, rejectionRea
  * написала, перевіряються тим самим механізмом, що й наратив аналітики: одне негрунтоване число
  * відкидає весь рядок, бо читач не має способу відрізнити вигадану цифру від справжньої.
  */
-export interface DigestSummaryDeps extends CodexClientDeps {
-  /** Перевірка перемикача. Підмінюється в тестах, щоб не тягнути базу в юніт-тест. */
-  featureEnabled?: () => Promise<boolean>;
-}
-
 export async function digestSummary(facts: DigestFacts, deps: DigestSummaryDeps = {}): Promise<DigestSummary> {
   if (!facts.locations.length) return NO_SUMMARY;
   const enabled = await (deps.featureEnabled ?? (() => codexFeatureEnabled('digest')))();
@@ -141,6 +141,16 @@ export async function enqueueNightlyDigests(now = new Date()): Promise<number> {
     rows.push(assessment); grouped.set(assessment.chat_id, rows);
   }
 
+  // Кому дайджест уже надіслано сьогодні — з'ясовуємо ДО циклу, а не всередині транзакції.
+  // Планувальник будить цю функцію щопівхвилини аж до півночі, тож після першого успішного прогону
+  // всі підписники вже claimed і робота зводиться до `ON CONFLICT DO NOTHING`. Без цього списку
+  // модель питали б заново на кожному тику — десятки разів за ніч, за дані, які нікуди не підуть.
+  // Вставка з ON CONFLICT нижче лишається справжнім захистом від гонки; це — лише економія.
+  const alreadySent = await pool.query<{ chat_id: string }>(
+    'SELECT chat_id::text FROM nightly_digest_runs WHERE digest_date=$1', [current.date]
+  );
+  const sent = new Set(alreadySent.rows.map((row) => row.chat_id));
+
   let queued = 0;
   // Один виклик моделі на КОМБІНАЦІЮ оцінок, а не на підписника. Тисяча людей, підписаних на Київ,
   // отримує той самий перелік, і питати модель тисячу разів про однакові дані означало б витратити
@@ -148,6 +158,7 @@ export async function enqueueNightlyDigests(now = new Date()): Promise<number> {
   const summaries = new Map<string, DigestSummary>();
 
   for (const [chatId, rows] of grouped) {
+    if (sent.has(chatId)) continue;
     const selected = rows.slice(0, 12);
     const facts = digestFacts(selected, Math.max(0, rows.length - selected.length), current.time);
     const key = JSON.stringify(facts);

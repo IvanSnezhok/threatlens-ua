@@ -27,7 +27,7 @@
 --     prose about numbers that already exist, and the prose is rejected wholesale if it invents a
 --     digit.
 --   * `digest`    — the nightly digest is a list of assessments the risk engine produced. The model
---     adds one summarising sentence above it, or it adds nothing.
+--     adds one summarising sentence beneath it, or it adds nothing.
 --   * `attacks`   — the operator-only vector extrapolation is arithmetic. The model rewords the
 --     accompanying note, under the same number-faithfulness check.
 --

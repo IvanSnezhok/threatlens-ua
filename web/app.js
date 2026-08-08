@@ -1138,16 +1138,20 @@ function codexFact(term, value) {
 
 // Умови, за яких збережена сесія нічого не змінить. Їх показуємо ЗАВЖДИ, а не лише коли підключення
 // вже є: «підключено, але тиша» — найгірший стан, і він має бути пояснений до, а не після входу.
-function codexPreconditions(status) {
+// `settings` — те, що оператор обрав нижче в цій же групі. Без нього підказки читалися б як брехня:
+// відколи модель і три перемикачі живуть у /ops, порожній `CODEX_MODEL` більше не означає «моделі
+// немає», а `ANALYTICS_NARRATIVE_ENABLED=false` більше не означає «наративу не буде».
+function codexPreconditions(status, settings) {
   const rows = [];
-  if (!status.narrativeEnabled) rows.push('<code>ANALYTICS_NARRATIVE_ENABLED=false</code> — токен збережеться, але наратив не запитуватиметься. Аналітика лишається повною й без моделі.');
+  const featureOn = settings ? Object.values(settings.features).some(Boolean) : false;
+  if (!status.narrativeEnabled && !featureOn) rows.push('<code>ANALYTICS_NARRATIVE_ENABLED=false</code>, і жоден перемикач нижче не ввімкнено — токен збережеться, але модель не запитуватимуть. Аналітика лишається повною й без неї.');
   if (!status.baseUrlConfigured) rows.push('<code>CODEX_BASE_URL</code> не задано — вхід дає токен, але не адресу, куди його слати.');
-  if (!status.modelConfigured) rows.push('<code>CODEX_MODEL</code> не задано — модель не обрано.');
+  if (settings ? !settings.effectiveModel : !status.modelConfigured) rows.push('Модель не обрано: ні в списку нижче, ні в <code>CODEX_MODEL</code>.');
   if (status.envTokenConfigured) rows.push('У <code>.env</code> лишається <code>CODEX_API_KEY</code>. Збережена сесія має пріоритет — змінна тепер лише запасний варіант.');
   return rows.length ? `<ul class="codex-preconditions">${rows.map((row) => `<li>${row}</li>`).join('')}</ul>` : '';
 }
 
-function opsCodexSection(status) {
+function opsCodexSection(status, settings) {
   if (!status) return '<section class="ops-section"><header class="ops-section-head"><div><p>Модель для наративів</p><h2>Codex / ChatGPT</h2></div></header><p class="legend-note">Стан входу недоступний.</p></section>';
   const state = !status.connected ? { label: 'не підключено', tone: 'off' }
     : status.expired && !status.canRefresh ? { label: 'сесія завершилася', tone: 'bad' }
@@ -1165,7 +1169,7 @@ function opsCodexSection(status) {
       <span class="codex-state is-${state.tone}">${escapeHtml(state.label)}</span>
     </header>
     <dl class="codex-facts">${facts}</dl>
-    ${codexPreconditions(status)}
+    ${codexPreconditions(status, settings)}
     ${status.lastError ? `<p class="legend-warning">Остання помилка: ${escapeHtml(status.lastError)}</p>` : ''}
     ${status.pendingLogin ? `<p class="legend-warning">Вхід триває. Сеанс дійсний до ${escapeHtml(new Date(status.pendingLogin.expiresAt).toLocaleTimeString('uk-UA'))}.</p>` : ''}
     <div class="ops-channel-actions codex-actions">
@@ -1198,7 +1202,7 @@ const codexFeatureLabels = {
   },
   digest: {
     title: 'Нічний дайджест',
-    note: 'Один рядок над переліком оцінок у Telegram. Іде людям, підписаним на аналітику, з явною позначкою, що його написала модель. Самі оцінки модель не змінює.'
+    note: 'Один підсумковий рядок під переліком оцінок у Telegram. Іде людям, підписаним на аналітику, з явною позначкою, що його написала модель. Самі оцінки модель не змінює.'
   },
   attacks: {
     title: 'Аналіз атак',
@@ -1223,7 +1227,7 @@ function opsCodexSettingsSection(payload) {
   // Порожній варіант — це справжній вибір, а не «нічого не вибрано»: він означає «беріть те, що
   // задано в CODEX_MODEL», і саме так поводиться свіжовстановлена система.
   const options = [
-    `<option value=""${settings.model ? '' : ' selected'}>За змовчуванням${payload.status?.modelConfigured ? ' — CODEX_MODEL' : ' (CODEX_MODEL порожній)'}</option>`,
+    `<option value=""${settings.model ? '' : ' selected'}>За замовчуванням${payload.status?.modelConfigured ? ' — CODEX_MODEL' : ' (CODEX_MODEL порожній)'}</option>`,
     ...models.map((model) => `<option value="${escapeHtml(model)}"${settings.model === model ? ' selected' : ''}>${escapeHtml(model)}</option>`)
   ].join('');
   const source = payload.modelsSource === 'api'
@@ -1273,13 +1277,13 @@ function wireCodexSettingsSection(root, onSaved) {
   });
 }
 
-function wireCodexSection(root) {
+function wireCodexSection(root, settings) {
   const rerender = async () => {
     const status = await opsFetch('/ops/codex').then((r) => r.ok ? r.json() : null).catch(() => null);
     const section = $('#codex-section', root);
     if (!section) return null;
-    section.outerHTML = opsCodexSection(status);
-    wireCodexSection(root);
+    section.outerHTML = opsCodexSection(status, settings);
+    wireCodexSection(root, settings);
     return status;
   };
 
@@ -1369,13 +1373,13 @@ async function renderOps() {
     <div class="ops-group" id="codex-group">
       <header class="ops-group-head"><p>Модель в аналітиці</p><h2>Codex-аналітика</h2>
         <p>Вхід, вибір моделі, три перемикачі й журнал усіх звернень — усе, що визначає, коли систему пише машина, і що саме вона написала.</p></header>
-      ${opsCodexSection(codex)}
+      ${opsCodexSection(codex, codexSettings?.settings ?? null)}
       ${opsCodexSettingsSection(codexSettings)}
       ${opsAiRunsSection(aiRuns, codex, codexSettings?.settings ?? null)}
     </div>
     ${opsVectorSection(vectorOps)}
     <details class="ops-raw"><summary>Технічний стан і журнали</summary><pre class="ops-json">${escapeHtml(JSON.stringify({ sources: data.sources, outbox: data.outbox, aiRuns: data.aiRuns, database: data.database }, null, 2))}</pre></details>`;
-  wireCodexSection(root);
+  wireCodexSection(root, codexSettings?.settings ?? null);
   wireCodexSettingsSection(root, () => renderOps());
   wireAiRunsSection(root, codex, codexSettings?.settings ?? null);
   root.querySelectorAll('[data-project-vector]').forEach((button) => button.addEventListener('click', async () => {
