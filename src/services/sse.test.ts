@@ -191,6 +191,7 @@ function settingsRow(mode: string) {
     analytics_event_driven: true,
     analytics_debounce_ms: 20_000,
     analytics_max_delay_ms: 120_000,
+    analytics_min_pass_interval_ms: 60_000,
     codex_cooldown_ms: 900_000,
     updated_at: new Date('2026-08-08T09:00:00.000Z'),
     updated_by: 'operator'

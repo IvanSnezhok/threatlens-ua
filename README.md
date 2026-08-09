@@ -21,8 +21,8 @@ Evidence-first situational awareness for Ukraine: a Telegram bot, responsive sta
   weapon-class glyphs stacked three to a territory with a `+N` badge for the rest. A polygon is lit
   only for a territory a source named, or for the nearest territory with an outline when the named
   place has none; an icon is a claim that a weapon class is *here*, so it is emitted only where that
-  claim was actually made. An oblast lit because one raion inside it was named stays muted and
-  carries no icon.
+  claim was actually made. An oblast is *not* lit because one raion inside it was named: that raion
+  is lit instead, at every zoom, and the rest of the oblast stays dark.
 - Operator-set publication mode. `live` is the default and behaves byte-identically to a build
   without the feature; `delayed_15s` holds the public presentation — snapshot, SSE stream, map, event
   rail and public attack analytics — behind a cutoff computed in PostgreSQL rather than queued in
@@ -405,8 +405,8 @@ Every row is either working today or explicitly not. Nothing here is aspirationa
 
 | | |
 |---|---|
-| **State polygons** | Oblasts and all 136 raions fill by four independent state families — official alert, asserted threat, confirmed consequences, analytical contour — driven by feature-state rather than regenerated geometry. Raions appear from zoom 6.0 and take over at 6.8. |
-| **Per-territory aggregated state** | The snapshot carries one entry per oblast, special city and raion: its alerts, its threats by weapon class with evidence and reported direction, its strongest assessment, and the ranked icon stack. Coverage is stated rather than implied — `direct` (a source named this territory), `unmapped` (a source named a place inside it that has no outline of its own, so no finer layer will ever supersede this one) and `partial` (an ancestor of a named territory that does have its own outline, drawn muted). A national-scope warning produces no territory at all: it is a caption, an event card and a bot message, never 27 lit oblasts. |
+| **State polygons** | Oblasts and all 136 raions fill by four independent state families — official alert, asserted threat, confirmed consequences, analytical contour — driven by feature-state rather than regenerated geometry. A raion polygon is lit at **every** zoom, the country-wide view included: an alert is declared on named raions, so named raions are what the map draws, and the quiet parts of the same oblast stay dark. An oblast fills only when the state was declared on the whole of it, or when a named place inside it has no outline of its own. Zoom changes line widths and label sizes and fades in the neutral raion grid; it never changes what the map asserts. |
+| **Per-territory aggregated state** | The snapshot carries one entry per oblast, special city and raion: its alerts, its threats by weapon class with evidence and reported direction, its strongest assessment, and the ranked icon stack. Coverage is stated rather than implied — `direct` (a source named this territory), `unmapped` (a source named a place inside it that has no outline of its own, so no finer layer will ever supersede this one) and `partial` (an ancestor of a named territory that does have its own outline — recorded in the payload and in the browser's feature-state, named by the territory panel, and drawn by nothing at all: the named child's own polygon is lit instead). A national-scope warning produces no territory at all: it is a caption, an event card and a bot message, never 27 lit oblasts. |
 | **Icon catalogue** | Ten weapon-class glyphs in four tones — consequence, confirmed, reported, analytic — ranked by danger, evidence, relation and freshness; three slots per territory and a `+N` badge for what ranking cut. The stack is a small point source that is re-emitted when it changes, kept separate from the polygon layers so the feature-state claim above stays true of the fills. Icons are never arrows and never a route. |
 | **Sovereignty** | The internationally recognized border renders above every fill; Crimea and Sevastopol are Ukraine and labelled as such. |
 | **Occupation** | A separate reference layer under the border. Temporary factual condition, never a change of border. |
@@ -480,11 +480,20 @@ state. And the nightly trust run reads the same archive to score every source's 
 - `sources.enabled` does not gate the two polled API adapters — they check only for a token.
 - Alerts at hromada level resolve to the parent raion; the catalogue has no hromada tier.
 - Abbreviated administrative forms (`р-н`, `обл.`) resolve to the namesake city rather than the district.
-- The map's live region names at most eight territories and follows the map's own zoom tier: at
-  overview zoom a raion is summarised through its oblast rather than named in its own right. It is a
+- The map's live region names at most eight territories and follows the **icon** tier, which is the
+  one thing on the map that still switches at zoom 6.8: at overview zoom a raion is summarised
+  through its oblast rather than named in its own right, even though its polygon is lit. It is a
   summary of the map, not of the situation — the «Активні події» rail lists every alert, threat and
   assessment as text and remains the canonical screen-reader surface.
-- A threat reported only for a raion carries no icon below zoom 6.8. The raion stack appears only
-  once the raion layer is readable, and the oblast above it is `partial` coverage, which is
-  deliberately never given an icon. Below that zoom the threat is a muted oblast fill, an event card
-  and a territory panel — visible, but not as a weapon-class glyph.
+- A threat reported only for a raion carries no icon below zoom 6.8. The polygon is lit at every
+  zoom; the icon *stacks* switch from oblast anchors to raion anchors only at 6.8, because a glyph is
+  a claim about a weapon class over a point and 136 of them do not survive an overview. Below that
+  zoom the threat is a lit raion polygon, an event card and a territory panel — visible, but not as a
+  weapon-class glyph. The oblast above the raion is `partial` coverage, which is deliberately given
+  neither an icon nor a fill.
+- Clicking the map resolves to the finest territory whose geometry is under the pointer — icon, then
+  city, then raion, then oblast — and `queryRenderedFeatures` sees geometry, not paint, so a quiet
+  raion wins the click just as a lit one does. Now that raion polygons exist at every zoom, the
+  oblast panel is reachable by click only over a special city or before ADM2 has loaded. Everywhere
+  else the click opens a raion. Making the precedence state-aware (prefer the raion only when it
+  carries state) would restore the oblast panel; it is not done yet.

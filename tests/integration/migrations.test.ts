@@ -28,7 +28,8 @@ const MIGRATION_FILES = [
   '024_settlement_catalogue_gaps.sql',
   '025_retrospective_gate.sql',
   '026_renamed_toponym_aliases.sql',
-  '027_aerial_alert_mirror.sql'
+  '027_aerial_alert_mirror.sql',
+  '028_analytics_min_pass_interval.sql'
 ];
 
 describe.skipIf(!integrationDatabaseAvailable)('migration runner against live PostgreSQL', () => {

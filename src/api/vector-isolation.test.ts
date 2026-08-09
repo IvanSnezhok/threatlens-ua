@@ -503,9 +503,9 @@ function* permutations<T>(items: T[]): Generator<T[]> {
 }
 
 /**
- * `liveLayers`, the per-DOM-click flag and `openTerritory`, sliced contiguously out of the raw
- * `style.load` block. They are adjacent and comment-free in the source, which is what lets one
- * slice carry the whole mechanism.
+ * `liveLayers`, `litFeature`, the per-DOM-click flag and `openTerritory`, sliced contiguously out of
+ * the raw `style.load` block. Nothing else is declared between them, which is what lets one slice
+ * carry the whole mechanism.
  */
 function clickResolutionSource(): string {
   const block = styleLoadBlock();
@@ -532,24 +532,33 @@ describe('territory click resolution', () => {
    * `order` is that dispatch order, `present` maps a layer id to the `locationId` its feature would
    * carry under the click, and `existing` is the set of layers that are in the style at all — a
    * canvas failure leaves the four icon layers out of it entirely.
+   *
+   * `lit` is the set of layers whose feature under the point carries feature-state. MapLibre puts
+   * the state on every feature it returns — `{}` for a territory nothing was declared on, because
+   * `applyTerritoryLayers` wipes the source and writes only non-empty sets — and that emptiness is
+   * the whole signal the raion/oblast guard reads. Stubbing every feature without a `state` would
+   * describe a map on which no territory is ever lit.
    */
-  function dispatch(order: string[], present: Map<string, string>, existing: Set<string>): string[] {
+  function dispatch(
+    order: string[], present: Map<string, string>, existing: Set<string>, lit: Set<string>
+  ): string[] {
     const opened: string[] = [];
+    const featureOf = (id: string) => ({
+      layer: { id },
+      properties: { locationId: present.get(id) },
+      state: lit.has(id) ? { alert: true } : {}
+    });
     const map = {
       getLayer: (id: string) => (existing.has(id) ? { id } : undefined),
       queryRenderedFeatures: (_point: unknown, options: { layers: string[] }) => options.layers
         .filter((id) => present.has(id))
-        .map((id) => ({ layer: { id }, properties: { locationId: present.get(id) } }))
+        .map(featureOf)
     };
     const openTerritory = factory()(map, iconLayerIds, raionFillLayerIds, (id: string) => { opened.push(id); });
     const originalEvent = { type: 'click' };
     for (const layerId of order) {
       if (!present.has(layerId)) continue;
-      openTerritory({
-        originalEvent,
-        point: { x: 10, y: 10 },
-        features: [{ layer: { id: layerId }, properties: { locationId: present.get(layerId) } }]
-      });
+      openTerritory({ originalEvent, point: { x: 10, y: 10 }, features: [featureOf(layerId)] });
     }
     return opened;
   }
@@ -566,37 +575,70 @@ describe('territory click resolution', () => {
    */
   const cases = [
     {
-      name: 'an icon stack beats the city, the raion and the oblast under it',
+      name: 'an icon stack beats the city, the lit raion and the oblast under it',
       present: new Map([
         ['territory-icon-slot-0', 'icon'], ['territory-icon-badge', 'icon'],
         ['ukraine-region-fill', 'oblast'], ['alert-raion-fill', 'raion'], ['threat-raion-fill', 'raion'],
         ['city-hit', 'city']
       ]),
+      lit: ['alert-raion-fill', 'threat-raion-fill'],
       hidden: [] as string[],
       opens: ['icon']
     },
     {
-      name: 'a city dot beats the raion and the oblast under it',
+      name: 'a city dot beats the lit raion and the oblast under it',
       present: new Map([
         ['ukraine-region-fill', 'oblast'], ['alert-raion-fill', 'raion'], ['threat-raion-fill', 'raion'],
         ['consequence-raion-fill', 'raion'], ['city-hit', 'city']
       ]),
+      lit: ['alert-raion-fill', 'threat-raion-fill', 'consequence-raion-fill'],
       hidden: [] as string[],
       opens: ['city']
     },
     {
-      name: 'three raion fills over one polygon open the raion once, not the oblast and not thrice',
+      name: 'three raion fills over one lit polygon open the raion once, not the oblast and not thrice',
       present: new Map([
         ['ukraine-region-fill', 'oblast'], ['alert-raion-fill', 'raion'], ['threat-raion-fill', 'raion'],
         ['consequence-raion-fill', 'raion']
       ]),
+      lit: ['alert-raion-fill', 'threat-raion-fill', 'consequence-raion-fill'],
       hidden: [] as string[],
       opens: ['raion']
     },
     {
-      // Нижче RAION_ZOOM_MIN районних заливок під точкою немає взагалі, тож клік завжди обласний.
-      name: 'below the raion zoom the oblast wins because nothing finer is drawn',
+      // Ядро виправлення. Районні заливки існують на кожному масштабі й по всій країні, тож під
+      // будь-яким кліком лежить районний полігон. Той, на якому нічого не оголошено, приходить із
+      // порожнім feature-state — і мусить віддати клік області, інакше тихий район забирав би його
+      // геть усюди, а панель області стала б недосяжною.
+      name: 'a raion with no feature-state defers to the oblast',
+      present: new Map([
+        ['ukraine-region-fill', 'oblast'], ['alert-raion-fill', 'raion'], ['threat-raion-fill', 'raion'],
+        ['consequence-raion-fill', 'raion']
+      ]),
+      lit: [] as string[],
+      opens: ['oblast'],
+      hidden: [] as string[]
+    },
+    {
+      // Друга половина того самого правила: досить ОДНОГО сімейства зі станом. Три заливки лежать
+      // над тим самим полігоном, і стан у них спільний — але запит повертає всі три, тож правило
+      // читає їх як одну заяву про район, а не як три незалежні.
+      name: 'one lit raion fill beside two quiet ones still beats the oblast, once',
+      present: new Map([
+        ['ukraine-region-fill', 'oblast'], ['alert-raion-fill', 'raion'], ['threat-raion-fill', 'raion'],
+        ['consequence-raion-fill', 'raion']
+      ]),
+      lit: ['threat-raion-fill'],
+      opens: ['raion'],
+      hidden: [] as string[]
+    },
+    {
+      // Районні заливки більше не мають minzoom — вони існують на будь-якому масштабі. Порожньою
+      // під точкою районна геометрія лишається доти, доки ADM2 у польоті (або взагалі не приїхав),
+      // і тоді клік обласний: queryRenderedFeatures не знаходить нічого точнішого.
+      name: 'with no raion geometry loaded the oblast wins because nothing finer is drawn',
       present: new Map([['ukraine-region-fill', 'oblast']]),
+      lit: [] as string[],
       hidden: [] as string[],
       opens: ['oblast']
     },
@@ -607,20 +649,31 @@ describe('territory click resolution', () => {
       present: new Map([
         ['ukraine-region-fill', 'oblast'], ['alert-raion-fill', 'raion'], ['threat-raion-fill', 'raion']
       ]),
+      lit: ['alert-raion-fill', 'threat-raion-fill'],
       hidden: iconLayerIds,
       opens: ['raion']
     }
   ];
 
-  it.each(cases)('$name, in every listener order', ({ present, hidden, opens }) => {
+  it.each(cases)('$name, in every listener order', ({ present, hidden, lit, opens }) => {
     const existing = new Set(everyLayer.filter((id) => !hidden.includes(id)));
     const firing = [...present.keys()];
     let orders = 0;
     for (const order of permutations(firing)) {
       orders += 1;
-      expect(dispatch(order, present, existing), `listener order ${order.join(' > ')}`).toEqual(opens);
+      expect(dispatch(order, present, existing, new Set(lit)), `listener order ${order.join(' > ')}`).toEqual(opens);
     }
     expect(orders).toBeGreaterThan(0);
+  });
+
+  it('reads the raion feature-state, not merely the presence of a raion fill', () => {
+    // Скан по тексту: правило легко звести назад до «є районна фіча — район виграв», і тоді
+    // перестановочні випадки вище лишилися б зеленими рівно доти, доки хтось не забув би про
+    // порожній стан. Обидві гілки мусять бути в зрізі дослівно.
+    const body = clickResolutionSource();
+    expect(body).toContain('const litFeature =');
+    expect(body).toContain('.some(litFeature)');
+    expect(body).toContain('raionFillLayerIds.includes(layerId) && !litRaion');
   });
 
   it('claims the DOM click on the listener that opens the panel, not on the first one to run', () => {
@@ -882,5 +935,125 @@ describe('snapshot refresh and the operations console', () => {
       render({ fromSnapshot: true });
       expect(calls, `route ${route}`).toEqual([rendered, rendered]);
     }
+  });
+});
+
+// ------------------------------------------------------------------------------------------------
+// «Не вигадуємо географію» as a zoom rule
+// ------------------------------------------------------------------------------------------------
+
+/**
+ * An alert is declared on named raions, so the country-wide map has to light those raions — not wash
+ * the oblast that contains them and reveal the truth only to whoever thinks to zoom in. Two halves of
+ * one rule, and both are easy to undo by accident:
+ *
+ *  1. **A raion polygon is not a zoom level.** No raion layer carries a `minzoom`, and no state
+ *     opacity is interpolated over `['zoom']` in any family. Zoom may change line *widths* and label
+ *     *sizes* — aesthetics — and it may fade the neutral raion grid in, because that grid is the
+ *     basemap rather than a claim. It may not change what the map asserts.
+ *  2. **Derived coverage paints nothing.** `partial` — an ancestor of a territory that has its own
+ *     outline — is exactly the invented geography the rule forbids: the lit raions inside already
+ *     carry the signal. The key is still written into feature-state, and is still the panel's
+ *     vocabulary, but no paint expression and no label may read it.
+ *
+ * `unmapped` is the deliberate exception and must survive both halves: a named place with no outline
+ * of its own (a city, a hromada) lights the nearest ancestor that has one, because no finer layer
+ * will ever supersede it. That is also what keeps a raion alert on the map while ADM2 is in flight —
+ * `claim()` files it as `unmapped` on the oblast, since the raion has no feature to light yet.
+ */
+describe('raion polygons are a statement, not a zoom level', () => {
+  const RAION_LAYERS = [
+    'threat-raion-fill', 'alert-raion-fill', 'consequence-raion-fill',
+    'analytic-raion-line', 'threat-raion-line', 'alert-raion-line', 'consequence-raion-line',
+    'alert-raion-label'
+  ];
+
+  /** The whole `map.addLayer(…)` call that declares `id`, from the raw `style.load` block. */
+  function layerCall(id: string): string {
+    const block = styleLoadBlock();
+    const marker = block.indexOf(`id: '${id}'`);
+    if (marker === -1) throw new Error(`layer ${id} is no longer declared in the style.load block`);
+    const open = block.lastIndexOf('map.addLayer(', marker);
+    return block.slice(open, balanced(block, block.indexOf('(', open), '(', ')') + 1);
+  }
+
+  const occurrences = (haystack: string, needle: string): number => haystack.split(needle).length - 1;
+
+  it('gives no raion layer a minzoom', () => {
+    for (const id of RAION_LAYERS) {
+      expect(layerCall(id), `${id} hides itself below a zoom`).not.toContain('minzoom');
+    }
+  });
+
+  it('never lets zoom decide how strongly a state is drawn', () => {
+    const block = styleLoadBlock();
+    // Fills and labels: no zoom term at all.
+    expect(occurrences(block, `'fill-opacity': ['interpolate'`)).toBe(0);
+    expect(occurrences(block, `'text-opacity'`)).toBe(0);
+    // Outlines: exactly one, and it is the neutral raion grid on `alert-raion-line` — the basemap
+    // affordance that shows raion borders up close. Its two stops carry the same alert and unmapped
+    // values, so only the default (no state at all) branch moves with zoom.
+    expect(occurrences(block, `'line-opacity': ['interpolate'`)).toBe(1);
+    const grid = layerCall('alert-raion-line');
+    expect(grid).toContain(`6,   ['case', alertFlag, .9, unmappedFlag, .66, 0]`);
+    expect(grid).toContain(`6.8, ['case', alertFlag, .9, unmappedFlag, .66, .22]`);
+  });
+
+  it('reads no derived coverage in any paint expression', () => {
+    // Одна перевірка на всі чотири сімейства: жодна фарба не має права назвати похідне покриття.
+    expect(styleLoadBlock()).not.toMatch(/[Pp]artial/);
+  });
+
+  it('still writes the derived coverage into feature-state', () => {
+    // Ключ лишається — його пише той самий один прохід, що й решту одинадцяти, і він є машинно
+    // читаним записом про те, що всередині області названо конкретну територію.
+    const body = bodyOf('territoryStateOf');
+    for (const key of [`'partial'`, `'threatPartial'`, `'consequencePartial'`, `'analyticPartial'`]) {
+      expect(body, `territoryStateOf stopped writing ${key}`).toContain(key);
+    }
+  });
+
+  it('leaves the raion labels to the collision engine', () => {
+    // Підпис із allow-overlap на оглядовому масштабі перетворив би пів країни на суцільний текст;
+    // саме колізія MapLibre проріджує назви там, де тривога охопила багато районів.
+    const label = layerCall('alert-raion-label');
+    expect(label).not.toContain('allow-overlap');
+    expect(label).not.toContain('ignore-placement');
+  });
+
+  it('labels a directly named raion and an outline-less place, and never a derived ancestor', () => {
+    const alertLabelCollection = evaluateSlice<(fam: unknown) => { features: { properties: Record<string, string> }[] }>(
+      `function alertLabelCollection(fam) ${bodyOf('alertLabelCollection')}`,
+      'alertLabelCollection',
+      {
+        locationIndexes: () => ({ names: new Map([
+          ['ua-3222', 'Бориспільський район'], ['ua-32', 'Київська область'], ['ua-51', 'Одеська область']
+        ]) }),
+        regionCentroid: () => [30, 50],
+        regionFeatures: new Map(),
+        oblastIds: new Set(['ua-32', 'ua-51'])
+      }
+    );
+    // ua-3222: the raion the source named. ua-51: an oblast holding a named city, so no finer layer
+    // will ever supersede it. ua-32: the oblast above ua-3222 — its lit raion says everything.
+    const features = alertLabelCollection({
+      direct: new Set(['ua-3222']),
+      covered: new Set(['ua-32', 'ua-51']),
+      unmapped: new Set(['ua-51'])
+    }).features;
+    expect(features.map((feature) => feature.properties.locationId).sort()).toEqual(['ua-3222', 'ua-51']);
+    expect(features.map((feature) => feature.properties.tone).sort()).toEqual(['direct', 'unmapped']);
+    expect(features.find((feature) => feature.properties.locationId === 'ua-3222')?.properties)
+      .toMatchObject({ level: 'raion', label: 'Бориспільський' });
+  });
+
+  it('keeps the icon tier as the map\'s only remaining zoom threshold', () => {
+    // Свідома асиметрія: полігони більше не залежать від масштабу, стеки іконок — залежать. Гліф
+    // стверджує клас зброї над точкою, і 136 таких заяв оглядовий масштаб не витримує.
+    expect(APP_SOURCE).toContain('const ICON_TIER_ZOOM = 6.8;');
+    expect(APP_SOURCE).not.toContain('RAION_ZOOM_MIN');
+    expect(APP_SOURCE).not.toContain('RAION_ZOOM_FULL');
+    // Рівно два пороги, обидва — перемикач рівня стеків: у zoomend і при першій побудові шарів.
+    expect(occurrences(APP_SOURCE, '>= ICON_TIER_ZOOM')).toBe(2);
   });
 });

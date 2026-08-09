@@ -42,14 +42,23 @@ vi.mock('./analytics-narrative.js', async (importOriginal) => ({
   }
 }));
 import {
-  ANALYTICS_MIN_PASS_INTERVAL_MS, ANALYTICS_RECOMPUTE_FLOOR_MS, ANALYTICS_TRIGGER_EVENTS,
+  ANALYTICS_RECOMPUTE_FLOOR_MS, ANALYTICS_TRIGGER_EVENTS,
   recomputeAnalytics, resetAnalyticsScheduler, runManualRecompute,
-  startAnalyticsRecomputeScheduler, type AnalyticsSchedulerDeps, type RecomputeResult,
-  type RecomputeTrigger
+  startAnalyticsRecomputeScheduler, type AnalyticsSchedulerDeps, type AnalyticsTimerKind,
+  type RecomputeResult, type RecomputeTrigger
 } from './analytics-scheduler.js';
 import { withinCodexCooldown } from './analytics-narrative.js';
 import { RUNTIME_SETTINGS_DEFAULTS, type RuntimeSettings } from './runtime-settings.js';
 import type { SystemEvent } from './sse.js';
+
+/**
+ * The interval a deployment that has never touched /ops runs with.
+ *
+ * It used to be a constant exported from the scheduler itself. Migration 028 moved
+ * the number into `runtime_settings.analytics_min_pass_interval_ms` and the constant went with it,
+ * so the default now comes from the same place a failed settings read falls back to.
+ */
+const MIN_PASS_INTERVAL_MS = RUNTIME_SETTINGS_DEFAULTS.analyticsMinPassIntervalMs;
 
 /**
  * The debounce, and the four ways it can silently stop recomputing.
@@ -69,9 +78,9 @@ import type { SystemEvent } from './sse.js';
 // Harness
 // ------------------------------------------------------------------------------------------------
 
-interface ArmedTimer { id: number; fn: () => void; ms: number; cleared: boolean }
+interface ArmedTimer { id: number; fn: () => void; ms: number; kind: AnalyticsTimerKind; cleared: boolean }
 
-function harness(overrides: Partial<RuntimeSettings> = {}) {
+function harness(overrides: Partial<RuntimeSettings> = {}, schedulerDeps: AnalyticsSchedulerDeps = {}) {
   let clock = 1_000_000;                        // never 0: a zero clock reads as "no pass ever ran"
   const armed: ArmedTimer[] = [];
   let nextId = 1;
@@ -110,8 +119,8 @@ function harness(overrides: Partial<RuntimeSettings> = {}) {
   const deps: AnalyticsSchedulerDeps = {
     now: () => clock,
     timers: {
-      set(fn, ms) {
-        const handle: ArmedTimer = { id: nextId++, fn, ms, cleared: false };
+      set(fn, ms, kind) {
+        const handle: ArmedTimer = { id: nextId++, fn, ms, kind, cleared: false };
         armed.push(handle);
         return handle;
       },
@@ -124,32 +133,47 @@ function harness(overrides: Partial<RuntimeSettings> = {}) {
       if (!holdNext) return result(trigger);
       holdNext = false;
       return new Promise<RecomputeResult>((resolve) => { pending = { resolve: () => resolve(result(trigger)) }; });
-    }
+    },
+    ...schedulerDeps
   };
 
-  /** Every live (not cleared) window whose delay is the debounce rather than the floor. */
-  const liveWindows = () => armed.filter((entry) => !entry.cleared && entry.ms !== ANALYTICS_RECOMPUTE_FLOOR_MS);
-  const liveFloors = () => armed.filter((entry) => !entry.cleared && entry.ms === ANALYTICS_RECOMPUTE_FLOOR_MS);
+  /**
+   * Live (not cleared) timers, by which of the scheduler's three slots they were armed for.
+   *
+   * The `kind` label is the reason the scheduler's timer seam takes a third argument: filtering by
+   * delay used to be good enough, and stopped being so the moment a retry could legitimately be
+   * armed for the same number of milliseconds as a debounce window.
+   */
+  const live = (kind: AnalyticsTimerKind) => armed.filter((entry) => !entry.cleared && entry.kind === kind);
+  const liveWindows = () => live('debounce');
+  const liveFloors = () => live('floor');
+  const liveRetries = () => live('interval-retry');
+
+  const fireOne = (kind: AnalyticsTimerKind) => {
+    const handle = live(kind).at(-1);
+    if (!handle) throw new Error(`no ${kind} timer is armed`);
+    handle.cleared = true;
+    handle.fn();
+  };
 
   return {
     deps, events, settings, calls, armed,
-    liveWindows, liveFloors,
+    liveWindows, liveFloors, liveRetries,
     advance(ms: number) { clock += ms; },
     at: () => clock,
     holdNextPass() { holdNext = true; },
     releasePass() { pending?.resolve({} as RecomputeResult); pending = null; },
     /** Fires the newest still-armed debounce window, exactly as a real timer would. */
-    fireWindow() {
-      const window = liveWindows().at(-1);
-      if (!window) throw new Error('no debounce window is armed');
-      window.cleared = true;
-      window.fn();
-    },
-    fireFloor() {
-      const floor = liveFloors().at(-1);
-      if (!floor) throw new Error('no floor is armed');
-      floor.cleared = true;
-      floor.fn();
+    fireWindow() { fireOne('debounce'); },
+    fireFloor() { fireOne('floor'); },
+    /** Fires the retry the minimum-interval guard armed. Advances the clock to its expiry first,
+     *  because a real timer cannot run before its delay has elapsed and the guard re-checks. */
+    fireRetry() {
+      const retry = liveRetries().at(-1);
+      if (!retry) throw new Error('no interval retry is armed');
+      clock += retry.ms;
+      retry.cleared = true;
+      retry.fn();
     }
   };
 }
@@ -236,7 +260,7 @@ describe('the debounce window', () => {
     for (const type of ['source.stale', 'source.recovered', 'publication.changed', 'analytics.updated']) {
       await emit(h, type);
     }
-    expect(h.armed.filter((entry) => entry.ms !== ANALYTICS_RECOMPUTE_FLOOR_MS)).toEqual([]);
+    expect(h.armed.filter((entry) => entry.kind !== 'floor')).toEqual([]);
     expect(h.calls).toEqual([]);
   });
 
@@ -302,6 +326,9 @@ describe('the overlap guard', () => {
     h.releasePass();
     await settle();
     expect(h.liveWindows()).toHaveLength(1);
+    // The pass that just completed stamped the completed-pass clock, so the re-armed window is
+    // inside the minimum interval; this test is about the re-arm, not about that guard.
+    h.advance(MIN_PASS_INTERVAL_MS);
     h.fireWindow();
     await settle();
     expect(h.calls).toEqual(['event', 'event']);
@@ -328,6 +355,7 @@ describe('the overlap guard', () => {
     // `execute()`, `rearm` would never be drained and the whole burst would be swallowed until the
     // fifteen-minute floor.
     expect(h.liveWindows()).toHaveLength(1);
+    h.advance(MIN_PASS_INTERVAL_MS);              // the manual pass completed; clear its interval
     h.fireWindow();
     await settle();
     expect(h.calls).toEqual(['manual', 'event']);
@@ -453,16 +481,187 @@ describe('start and stop', () => {
 });
 
 // ------------------------------------------------------------------------------------------------
+// The minimum interval: an operator's number, and the retry it now owes a refused burst
+// ------------------------------------------------------------------------------------------------
+
+describe('the minimum interval between completed passes', () => {
+  it('serves a burst that lands just after a pass at interval expiry, not at the floor', async () => {
+    // The gap docs/OPERATIONS.md used to document as "not an incident": the burst's debounce window
+    // opened and closed normally, the pass it fired was refused for being too early, and by then
+    // there was nothing left to re-arm — so the next trigger was a further event or the
+    // FIFTEEN-MINUTE floor. That is exactly the «аналітика відстає» an operator reaches for the
+    // debounce to fix, and lowering the debounce made it more likely, not less.
+    const h = harness();                                  // debounce 20 s, interval 60 s
+    startAnalyticsRecomputeScheduler(log, h.deps);
+
+    await emit(h, 'threat.created', 1);
+    h.fireWindow();
+    await settle();
+    expect(h.calls).toEqual(['event']);
+    const completedAt = h.at();
+
+    // The burst lands three seconds later; its window closes well inside the interval.
+    h.advance(3_000);
+    await emit(h, 'threat.created', 2);
+    h.advance(20_000);
+    h.fireWindow();
+    await settle();
+
+    expect(h.calls).toEqual(['event']);                   // refused, as before
+    expect(h.liveRetries()).toHaveLength(1);              // but no longer dropped
+    expect(h.at() + h.liveRetries()[0]!.ms).toBe(completedAt + MIN_PASS_INTERVAL_MS);
+    expect(h.liveRetries()[0]!.ms).toBeLessThan(ANALYTICS_RECOMPUTE_FLOOR_MS);
+
+    h.fireRetry();
+    await settle();
+    expect(h.calls).toEqual(['event', 'event']);
+    expect(h.liveRetries()).toEqual([]);                  // and it does not re-arm itself
+  });
+
+  it('coalesces every fire inside the interval into ONE retry and one pass', async () => {
+    // `waitMs` is always measured from `lastCompletedAt`, which does not move while no pass
+    // completes, so ten fires re-arm the same absolute instant rather than stacking ten timers —
+    // and none of them reaches `skipped_interval`, which the runbook reads as "events are arriving
+    // faster than one pass per interval" rather than "one burst was refused ten times".
+    const h = harness({ analyticsDebounceMs: 0 });
+    startAnalyticsRecomputeScheduler(log, h.deps);
+
+    await emit(h, 'threat.created', 1);
+    h.fireWindow();
+    await settle();
+    const completedAt = h.at();
+
+    for (let index = 0; index < 10; index += 1) {
+      h.advance(1_000);
+      await emit(h, 'threat.created', index + 2);
+      h.fireWindow();
+      await settle();
+    }
+
+    expect(h.calls).toEqual(['event']);
+    expect(h.liveRetries()).toHaveLength(1);
+    expect(h.at() + h.liveRetries()[0]!.ms).toBe(completedAt + MIN_PASS_INTERVAL_MS);
+
+    h.fireRetry();
+    await settle();
+    expect(h.calls).toEqual(['event', 'event']);
+  });
+
+  it('honours a five-second interval beside a zero debounce', async () => {
+    // The наживо combination the product owner asked for and migration 028 made storable. A zero
+    // debounce arms a zero-delay window — the next macrotask, not "never" — and the interval, not
+    // the debounce floor, is what keeps the passes apart.
+    const h = harness({ analyticsDebounceMs: 0, analyticsMinPassIntervalMs: 5_000 });
+    startAnalyticsRecomputeScheduler(log, h.deps);
+
+    await emit(h, 'threat.created', 1);
+    expect(h.liveWindows()[0]!.ms).toBe(0);
+    h.fireWindow();
+    await settle();
+    expect(h.calls).toEqual(['event']);
+
+    await emit(h, 'threat.created', 2);
+    h.fireWindow();
+    await settle();
+    expect(h.calls).toEqual(['event']);
+    expect(h.liveRetries()[0]!.ms).toBe(5_000);
+
+    h.fireRetry();
+    await settle();
+    expect(h.calls).toEqual(['event', 'event']);
+  });
+
+  it('applies a new interval from the settings row without a restart', async () => {
+    // It is read through the same memoised `resolveRuntimeSettings()` the debounce comes from, on
+    // every event, so an operator's PUT takes effect at the next event rather than at the next
+    // deploy. This is the whole point of moving it out of the compiler.
+    const h = harness();
+    startAnalyticsRecomputeScheduler(log, h.deps);
+
+    await emit(h, 'threat.created', 1);
+    h.fireWindow();
+    await settle();
+    expect(h.calls).toEqual(['event']);
+
+    h.settings.analyticsMinPassIntervalMs = 5_000;        // the operator saves a shorter interval
+    await emit(h, 'threat.created', 2);
+    h.fireWindow();
+    await settle();
+
+    expect(h.liveRetries()[0]!.ms).toBe(5_000);           // not the 60 000 the process started with
+    h.fireRetry();
+    await settle();
+    expect(h.calls).toEqual(['event', 'event']);
+  });
+
+  it('leaves no timer armed when the scheduler stops with a retry pending', async () => {
+    const h = harness();
+    const stop = startAnalyticsRecomputeScheduler(log, h.deps);
+
+    await emit(h, 'threat.created', 1);
+    h.fireWindow();
+    await settle();
+    await emit(h, 'threat.created', 2);
+    h.fireWindow();
+    await settle();
+    const stale = h.liveRetries()[0]!;
+    expect(stale).toBeDefined();
+
+    stop();
+    // Every slot, not only the two `stop()` knew about before: a retry that outlived the scheduler
+    // would call `recomputeAnalytics` against a pool `src/index.ts` has already `pool.end()`ed.
+    expect(h.armed.filter((entry) => !entry.cleared)).toEqual([]);
+
+    // A stale handle that fires anyway does nothing and re-arms nothing — the generation token.
+    h.advance(MIN_PASS_INTERVAL_MS);
+    stale.fn();
+    await settle();
+    expect(h.calls).toEqual(['event']);
+    expect(h.armed.filter((entry) => !entry.cleared)).toEqual([]);
+  });
+
+  it('answers a manual pass inside the interval with cooldown while the armed retry survives', async () => {
+    // The REAL `recomputeAnalytics`, not the harness spy: `fire()`'s pre-check means the scheduler
+    // path never reaches the guard inside it, so the 'cooldown' an operator is shown is produced
+    // here and nowhere else. `runManualRecompute` deliberately does not become a queued request —
+    // the operator is told the truth — but the burst's retry must not be collateral damage.
+    const h = harness();
+    startAnalyticsRecomputeScheduler(log, { ...h.deps, recompute: undefined });
+
+    await emit(h, 'threat.created', 1);
+    h.fireWindow();
+    await settle();
+    expect(legs.risk).toBe(1);
+
+    h.advance(3_000);
+    await emit(h, 'threat.created', 2);
+    h.fireWindow();
+    await settle();
+    expect(legs.risk).toBe(1);
+    expect(h.liveRetries()).toHaveLength(1);
+
+    const manual = await runManualRecompute();
+    expect(manual).toMatchObject({ trigger: 'manual', skipped: 'cooldown', durationMs: 0 });
+    expect(legs.risk).toBe(1);
+
+    expect(h.liveRetries()).toHaveLength(1);
+    h.fireRetry();
+    await settle();
+    expect(legs.risk).toBe(2);
+  });
+});
+
+// ------------------------------------------------------------------------------------------------
 // `recomputeAnalytics` guards, without a database
 // ------------------------------------------------------------------------------------------------
 
 describe('the guards inside one pass', () => {
-  it('refuses a pass inside ANALYTICS_MIN_PASS_INTERVAL_MS', async () => {
+  it('refuses a pass inside the minimum interval', async () => {
     // `lastCompletedAt` is 0 after a reset, so a clock reading below the minimum interval is the
     // "a pass completed a moment ago" state — and the refusal must happen before any database work.
     let settingsRead = 0;
     const result = await recomputeAnalytics('event', {
-      now: () => ANALYTICS_MIN_PASS_INTERVAL_MS - 1,
+      now: () => MIN_PASS_INTERVAL_MS - 1,
       settings: async () => { settingsRead += 1; return RUNTIME_SETTINGS_DEFAULTS; }
     });
     expect(result).toMatchObject({
@@ -476,11 +675,11 @@ describe('the guards inside one pass', () => {
     // than start a second `REFRESH MATERIALIZED VIEW` on top of it.
     let settingsRead = 0;
     const parked = recomputeAnalytics('event', {
-      now: () => ANALYTICS_MIN_PASS_INTERVAL_MS * 10,
+      now: () => MIN_PASS_INTERVAL_MS * 10,
       settings: () => new Promise<RuntimeSettings>(() => undefined)
     });
     const second = await recomputeAnalytics('manual', {
-      now: () => ANALYTICS_MIN_PASS_INTERVAL_MS * 10,
+      now: () => MIN_PASS_INTERVAL_MS * 10,
       settings: async () => { settingsRead += 1; return RUNTIME_SETTINGS_DEFAULTS; }
     });
     expect(second).toMatchObject({ trigger: 'manual', skipped: 'overlap', durationMs: 0 });
@@ -492,14 +691,14 @@ describe('the guards inside one pass', () => {
   it('a disabled operator switch skips an event pass but never a manual one', async () => {
     const disabled = { ...RUNTIME_SETTINGS_DEFAULTS, analyticsEventDriven: false };
     const skipped = await recomputeAnalytics('event', {
-      now: () => ANALYTICS_MIN_PASS_INTERVAL_MS * 10, settings: async () => disabled
+      now: () => MIN_PASS_INTERVAL_MS * 10, settings: async () => disabled
     });
     expect(skipped).toMatchObject({ skipped: 'disabled', codex: 'not_attempted' });
     expect([legs.refresh, legs.risk, legs.warm]).toEqual([0, 0, 0]);
 
     // An operator who pressed «Оновити зараз» has already overridden the switch by pressing it.
     const manual = await recomputeAnalytics('manual', {
-      now: () => ANALYTICS_MIN_PASS_INTERVAL_MS * 20, settings: async () => disabled
+      now: () => MIN_PASS_INTERVAL_MS * 20, settings: async () => disabled
     });
     expect(manual).toMatchObject({ skipped: null, published: 3 });
     expect(legs.risk).toBe(1);
@@ -512,7 +711,7 @@ describe('the guards inside one pass', () => {
     // switch is off. The operator who then flips the switch back, or presses «Оновити зараз», is
     // told «попередній перерахунок був щойно» about a pass that never happened.
     const disabled = { ...RUNTIME_SETTINGS_DEFAULTS, analyticsEventDriven: false };
-    const at = ANALYTICS_MIN_PASS_INTERVAL_MS * 10;
+    const at = MIN_PASS_INTERVAL_MS * 10;
 
     const floorPass = await recomputeAnalytics('schedule', { now: () => at, settings: async () => disabled });
     expect(floorPass).toMatchObject({ skipped: 'disabled' });
@@ -524,13 +723,13 @@ describe('the guards inside one pass', () => {
   });
 
   it('refreshes the materialised views at floor cadence, not per pass', async () => {
-    let clock = ANALYTICS_MIN_PASS_INTERVAL_MS * 100;
+    let clock = MIN_PASS_INTERVAL_MS * 100;
     for (let index = 0; index < 3; index += 1) {
       const result = await recomputeAnalytics('event', {
         now: () => clock, settings: async () => RUNTIME_SETTINGS_DEFAULTS
       });
       expect(result.skipped).toBeNull();
-      clock += ANALYTICS_MIN_PASS_INTERVAL_MS + 1_000;
+      clock += MIN_PASS_INTERVAL_MS + 1_000;
     }
     // A month bucket does not move inside a debounce window, and two
     // REFRESH MATERIALIZED VIEW CONCURRENTLY statements every minute would compete with the 1 s hub
@@ -549,7 +748,7 @@ describe('the guards inside one pass', () => {
     legs.refreshError = new Error('canceling statement due to statement timeout');
 
     const result = await recomputeAnalytics('event', {
-      now: () => ANALYTICS_MIN_PASS_INTERVAL_MS * 300, settings: async () => RUNTIME_SETTINGS_DEFAULTS
+      now: () => MIN_PASS_INTERVAL_MS * 300, settings: async () => RUNTIME_SETTINGS_DEFAULTS
     });
 
     expect(result).toMatchObject({ skipped: null, published: 3, codex: 'disabled', fallback: false });
@@ -562,13 +761,13 @@ describe('the guards inside one pass', () => {
     // so a refresh that keeps timing out re-satisfied the test on every single pass and burned a
     // connection and up to fifteen seconds of `statement_timeout` every minute, for ever.
     legs.refreshError = new Error('canceling statement due to statement timeout');
-    let clock = ANALYTICS_MIN_PASS_INTERVAL_MS * 400;
+    let clock = MIN_PASS_INTERVAL_MS * 400;
     for (let index = 0; index < 3; index += 1) {
       const result = await recomputeAnalytics('event', {
         now: () => clock, settings: async () => RUNTIME_SETTINGS_DEFAULTS
       });
       expect(result.skipped).toBeNull();
-      clock += ANALYTICS_MIN_PASS_INTERVAL_MS + 1_000;
+      clock += MIN_PASS_INTERVAL_MS + 1_000;
     }
     expect(legs.refresh).toBe(1);
     expect(legs.risk).toBe(3);
@@ -580,11 +779,11 @@ describe('the guards inside one pass', () => {
     // from a fifteen-minute timer onto a once-a-minute recompute multiplied model spend with no ops
     // knob covering it. Every pass still re-scores every group — through the deterministic scorer,
     // which is the default deployment path — so nothing the map draws goes stale in between.
-    let clock = ANALYTICS_MIN_PASS_INTERVAL_MS * 500;
+    let clock = MIN_PASS_INTERVAL_MS * 500;
     const base = clock;
     for (let index = 0; index < 3; index += 1) {
       await recomputeAnalytics('event', { now: () => clock, settings: async () => RUNTIME_SETTINGS_DEFAULTS });
-      clock += ANALYTICS_MIN_PASS_INTERVAL_MS + 1_000;
+      clock += MIN_PASS_INTERVAL_MS + 1_000;
     }
     expect(legs.risk).toBe(3);
     expect(legs.riskModel).toEqual([true, false, false]);
@@ -599,17 +798,17 @@ describe('the guards inside one pass', () => {
   it('the operator button always spends the model', async () => {
     // «Оновити зараз» is a person asking for the best answer available, and it is rate-limited by a
     // human pressing it plus the minimum-interval guard.
-    const base = ANALYTICS_MIN_PASS_INTERVAL_MS * 600;
+    const base = MIN_PASS_INTERVAL_MS * 600;
     await recomputeAnalytics('event', { now: () => base, settings: async () => RUNTIME_SETTINGS_DEFAULTS });
     await recomputeAnalytics('manual', {
-      now: () => base + ANALYTICS_MIN_PASS_INTERVAL_MS + 1_000, settings: async () => RUNTIME_SETTINGS_DEFAULTS
+      now: () => base + MIN_PASS_INTERVAL_MS + 1_000, settings: async () => RUNTIME_SETTINGS_DEFAULTS
     });
     expect(legs.riskModel).toEqual([true, true]);
   });
 
   it('writes one analytics.updated row per completed pass and nothing on a skip', async () => {
     const ok = await recomputeAnalytics('schedule', {
-      now: () => ANALYTICS_MIN_PASS_INTERVAL_MS * 200, settings: async () => RUNTIME_SETTINGS_DEFAULTS
+      now: () => MIN_PASS_INTERVAL_MS * 200, settings: async () => RUNTIME_SETTINGS_DEFAULTS
     });
     expect(ok).toMatchObject({ trigger: 'schedule', skipped: null, codex: 'disabled', published: 3 });
     expect(legs.eventRows).toHaveLength(1);
@@ -620,7 +819,7 @@ describe('the guards inside one pass', () => {
 
     // Immediately again: refused by the minimum interval, and nothing is appended to the log.
     const refused = await recomputeAnalytics('schedule', {
-      now: () => ANALYTICS_MIN_PASS_INTERVAL_MS * 200 + 1, settings: async () => RUNTIME_SETTINGS_DEFAULTS
+      now: () => MIN_PASS_INTERVAL_MS * 200 + 1, settings: async () => RUNTIME_SETTINGS_DEFAULTS
     });
     expect(refused.skipped).toBe('cooldown');
     expect(legs.eventRows).toHaveLength(1);

@@ -68,9 +68,11 @@ Reading it:
   («за добу») is measured on; the hold is applied to `classified_at`, the instant we recorded the
   classification. So a message an hour old that we only just ingested still waits out the full hold
   before it appears in the aggregate — that is the intended behaviour, not a lagging query.
-- **A 400 with `issues` is the API refusing an impossible pair, not a fault.**
-  `analyticsMaxDelayMs` below `analyticsDebounceMs` is rejected inside the row lock, so two
-  concurrent PUTs both get a 400 naming the field rather than one getting a 500.
+- **A 400 with `issues` is the API refusing an impossible value or pair, not a fault.** Every
+  numeric field is checked against the range `GET /ops/api/runtime` publishes in `bounds`, and
+  `analyticsMaxDelayMs` below `analyticsDebounceMs` is rejected inside the row lock as well, so two
+  concurrent PUTs both get a 400 naming the field rather than one getting a 500. `issues` always
+  carries the camelCase field name; `bounds` carries its `{ min, max }`.
 - **`publication.mode` is never itself held.** The public snapshot reports the mode in force right
   now, so the page cannot claim to be live while data is being held back. That is also why
   `GET /api/v1/analytics/attacks` drops its shared cache header while the hold is on: a body cached
@@ -104,6 +106,12 @@ curl -fsS -u "$OPS_USER:$OPS_PASSWORD" -X PUT -H 'Content-Type: application/json
   -d '{"analyticsDebounceMs":60000,"analyticsMaxDelayMs":300000}' \
   http://localhost:3000/ops/api/runtime
 
+# Наживо: no wait at all after an event, and one completed pass every five seconds at most.
+# The debounce may be 0; the minimum interval may NOT — see the two bullets below.
+curl -fsS -u "$OPS_USER:$OPS_PASSWORD" -X PUT -H 'Content-Type: application/json' \
+  -d '{"analyticsDebounceMs":0,"analyticsMinPassIntervalMs":5000}' \
+  http://localhost:3000/ops/api/runtime
+
 # Stop event-driven recompute, keeping the fifteen-minute floor.
 curl -fsS -u "$OPS_USER:$OPS_PASSWORD" -X PUT -H 'Content-Type: application/json' \
   -d '{"analyticsEventDriven":false}' http://localhost:3000/ops/api/runtime
@@ -116,15 +124,27 @@ curl -fsS -u "$OPS_USER:$OPS_PASSWORD" -X POST \
 Reading it:
 
 - **A skip is an answer, not a failure.** `skipped: 'overlap'` means a pass was already running,
-  `'disabled'` that the switch is off, `'cooldown'` that the previous pass completed less than a
-  minute ago. Each has its own `threatlens_analytics_recompute_total{outcome=…}` series, so «нічого
-  не перерахувалося» is always attributable.
-- **The debounce is not the only bound.** `ANALYTICS_MIN_PASS_INTERVAL_MS` (60 s) is the minimum gap
-  between two *completed* passes and it is compiled in, not settable. Lowering the debounce to two
-  seconds does not produce a pass every two seconds; it produces `skipped_interval`.
+  `'disabled'` that the switch is off, `'cooldown'` that the previous pass completed less than
+  `analyticsMinPassIntervalMs` ago. Each has its own
+  `threatlens_analytics_recompute_total{outcome=…}` series, so «нічого не перерахувалося» is always
+  attributable.
+- **The debounce is not the only bound, and it is not the one that protects the database.**
+  `analyticsMinPassIntervalMs` (default 60 s, range 5 s … 15 min) is the minimum gap between two
+  *completed* passes. It, and not the debounce, is what stops a sustained event stream from becoming
+  a standing pair of `REFRESH MATERIALIZED VIEW CONCURRENTLY` statements plus a full risk pass.
+  Setting `analyticsDebounceMs` to 0 therefore does **not** produce a pass per event; it produces a
+  pass as soon as the interval allows one. Both numbers live in `runtime_settings` and are settable
+  from `/ops`; before migration 028 the interval was compiled in at sixty seconds and the debounce
+  carried a 5 s floor in its place, which is why «поставив усі затримки на 0» used to fail.
 - **`analyticsMaxDelayMs` is the guarantee, `analyticsDebounceMs` is the wait.** Under a continuous
   stream the debounce window is re-armed indefinitely; the max delay is what fires anyway. The API
-  refuses a max delay below the debounce, because that pair has no meaning.
+  refuses a max delay below the debounce, because that pair has no meaning. A debounce of 0 is legal
+  beside every legal maximum — the maximum keeps its own floor of five seconds.
+- **A pass the interval refuses is not lost.** The worker arms one retry at the instant the interval
+  expires, and every further event inside that window coalesces into the same retry rather than
+  stacking timers or re-refusing. So a burst landing one second after a completed pass is recomputed
+  `analyticsMinPassIntervalMs` after that pass, not at the fifteen-minute floor. The floor is a
+  backstop for genuinely quiet periods and for what a restart dropped; nothing routine depends on it.
 - **The manual button always runs**, whatever the switch says — an operator who pressed it has
   overridden the switch by pressing it — but it is subject to the same overlap and interval guards.
 - **`ANALYTICS_EVENT_DRIVEN_ENABLED=false` in `.env` is a bigger hammer than the switch.** The worker
@@ -140,9 +160,11 @@ Reading it:
   oblast for six hours. A recompute is therefore allowed to spend it **at most once per
   `ANALYTICS_RECOMPUTE_FLOOR_MS` (15 min), plus every press of «Оновити зараз»**; the passes in
   between still re-score every group, through the deterministic scorer that is the default wherever
-  `AI_*` is unset. Model spend on this path is otherwise governed by the same three levers as
-  database load — `analyticsDebounceMs`, `analyticsMaxDelayMs`, `analyticsEventDriven` — plus the
-  legacy fifteen-minute `startRiskScheduler` timer, which is unaffected by any of them.
+  `AI_*` is unset. That bound is deliberately independent of the cadence knobs, so lowering the
+  debounce to zero does not multiply model spend. Database load on this path is governed by
+  `analyticsMinPassIntervalMs` first, then `analyticsDebounceMs`, `analyticsMaxDelayMs` and
+  `analyticsEventDriven` — plus the legacy fifteen-minute `startRiskScheduler` timer, which is
+  unaffected by any of them.
 - **A failing materialised-view refresh costs the pass its views and nothing else.** It is counted as
   `outcome="view_refresh_failed"`, logged with the pg error, and the risk leg, the Codex leg and the
   `analytics.updated` row still run. The refresh is then retried at floor cadence, not on the next
@@ -870,12 +892,15 @@ Production backups must additionally be encrypted and copied to independent obje
     | grep threatlens_analytics_recompute_total
   ```
 
-  - `outcome="ok"` rising at more than one per minute is impossible; the interval guard forbids it.
-    If it looks that way, two application replicas are running, each with its own in-process
-    debounce. That is the documented single-replica boundary, not a tuning problem.
-  - `outcome="skipped_interval"` rising is **the guard working, not a defect**. Events are arriving
-    faster than one completed pass per minute and the surplus is being refused. Rising
-    `skipped_interval` with a healthy `ok` series is a busy night, and the correct response is none.
+  - `outcome="ok"` rising faster than one per `analyticsMinPassIntervalMs` is impossible; the
+    interval guard forbids it. If it looks that way, either the interval was lowered in `/ops` (check
+    `runtime_settings_audit`) or two application replicas are running, each with its own in-process
+    debounce. The second is the documented single-replica boundary, not a tuning problem.
+  - `outcome="skipped_interval"` rising is **the guard working, not a defect**, and it is now rare:
+    the scheduler no longer starts a pass the interval would refuse, it arms one retry at the
+    interval's expiry instead. What still lands here is the manual «Оновити зараз» pressed too soon
+    and any direct caller. If this series climbs steadily, somebody or something is polling the
+    recalculate endpoint.
   - `outcome="failed"` rising means the passes themselves are dying — look at the `statement_timeout`
     and at the risk leg before touching cadence. A pass counted here wrote no `analytics.updated`
     row, so the map's аналітична оцінка is standing still on this path and only the legacy
@@ -886,33 +911,44 @@ Production backups must additionally be encrypted and copied to independent obje
     is a stale month bucket in the archive, not a stale map. Look at the `statement_timeout` and at
     `refreshMonthlyAnalytics`; the pg error is on the log line beside the counter. The retry is at
     floor cadence, so this can rise at most four times an hour per trigger.
-  - `outcome="skipped_overlap"` rising means passes are taking longer than the window they are armed
-    in; raise `analyticsDebounceMs`, do not lower it.
+  - `outcome="skipped_overlap"` rising means passes are taking longer than the interval they are
+    allowed to complete in; raise `analyticsMinPassIntervalMs`, do not lower it. Raising the debounce
+    alone will not help here — the overlap is between two passes, not between two bursts.
 
-  Response: raise `analyticsDebounceMs` (and `analyticsMaxDelayMs` with it — the API refuses a max
-  delay below the debounce), or switch `analyticsEventDriven` off and let the fifteen-minute floor
-  carry the load. `ANALYTICS_EVENT_DRIVEN_ENABLED=false` in `.env` is the deployment-level version of
-  the same decision, for when the database is the thing that is unwell.
+  Response: **raise `analyticsMinPassIntervalMs` first** — it is the number that bounds how much
+  database work this worker may do, and it is the one the map's freshness is actually paid for with.
+  Raising `analyticsDebounceMs` (and `analyticsMaxDelayMs` with it — the API refuses a max delay
+  below the debounce) reduces how often a burst *asks* for a pass, which helps a chatty feed and does
+  nothing at all for a saturated one. Failing both, switch `analyticsEventDriven` off and let the
+  fifteen-minute floor carry the load. `ANALYTICS_EVENT_DRIVEN_ENABLED=false` in `.env` is the
+  deployment-level version of the same decision, for when the database is the thing that is unwell.
 
-  **Lowering the debounce is the wrong instinct and the guard is why it is survivable.**
-  `ANALYTICS_MIN_PASS_INTERVAL_MS` is compiled in at 60 seconds and is not settable from `/ops`
-  precisely so that an operator responding to «аналітика відстає» cannot convert one PUT into a
-  standing pair of concurrent view refreshes plus a full risk pass every few seconds. Sixty seconds
-  is still fifteen times faster than the timer this replaced.
+  **Which knob does what, since migration 028 made all of them settable.** The debounce is a
+  *coalescing* window: it decides how much of a burst is folded into one pass, and it may be 0, which
+  means «наживо» — the next event is acted on immediately. The minimum interval is the *rate limit*:
+  it decides how often a pass may actually complete, it may not go below five seconds, and it is the
+  only one of the two that protects the pool. An operator who lowers the debounce to zero and leaves
+  the interval at sixty seconds has asked for «react instantly, but no more than once a minute», and
+  that is exactly what they get.
 
-  A related report that is not an incident at all: **a burst that lands shortly after a completed
-  pass arms no retry.** Its debounce window opens and closes normally, but the pass it fires would
-  start less than a minute after the previous one finished, so the interval guard refuses it and
-  counts `skipped_interval`. By then the window has been consumed and there is nothing left to
-  re-arm: the next trigger is a further event, or the fifteen-minute floor. With the default
-  twenty-second debounce that is any burst whose last event lands inside roughly the first forty
-  seconds. A refused pass deliberately does **not** stamp the completed-pass clock — otherwise a
-  steady stream one debounce apart would refuse itself forever — so the guard cannot compound.
+  **A burst that lands shortly after a completed pass is retried, not dropped.** Until migration 028
+  it *was* dropped: the burst's debounce window opened and closed normally, the pass it fired was
+  refused for starting less than a minute after the previous one finished, and by then the window had
+  been consumed — so the next trigger was a further event or the fifteen-minute floor. With the
+  default twenty-second debounce that was any burst whose last event landed inside roughly the first
+  forty seconds, and it was the most common cause of a genuine «аналітика відстає» report. The
+  scheduler now arms one retry at the instant the interval expires, generation-guarded and cleared by
+  `stop()` like every other timer it owns, and any further event inside the window coalesces into
+  that same retry. A refused pass still deliberately does **not** stamp the completed-pass clock —
+  otherwise a steady stream one debounce apart would refuse itself forever — so the guard cannot
+  compound and the retry cannot slide.
 
-  An operator seeing «аналітика відстає» within a minute of a pass is therefore watching the
-  minimum-interval guard do its job, not a defect. Nothing on the alerting path waits with it: alerts,
-  threat events, the map and the notifications are unaffected, and only the analytical assessment is
-  a minute behind what a debounce alone would have produced.
+  So «аналітика відстає» within one interval of a pass is now worth reading rather than dismissing.
+  The honest statement is narrower than the old one: the assessment is at most one
+  `analyticsMinPassIntervalMs` behind what an unbounded recompute would have produced, and the
+  operator can lower that number to five seconds if the deployment can afford it. Nothing on the
+  alerting path waits with it in any case: alerts, threat events, the map and the notifications are
+  unaffected.
 - **`threatlens_publication_settings_read_failures_total > 0`.** The runtime settings row could not be
   read, or it contained a `publication_mode` this build does not recognise. Both fail **open to
   `live`**, which is the safe direction — a failure that quietly held the public view back would be

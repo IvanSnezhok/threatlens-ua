@@ -18,12 +18,15 @@ const query = vi.fn();
 vi.mock('../db/pool.js', () => ({ pool: { query: (...args: unknown[]) => query(...args), connect: vi.fn() } }));
 
 const {
+  RUNTIME_SETTINGS_BOUNDS,
   RUNTIME_SETTINGS_DEFAULTS,
+  RuntimeSettingsRangeError,
   applyRuntimeSettingsPatch,
   resetRuntimeSettingsCache,
   resolveRuntimeSettings,
   resolveRuntimeSettingsWithStatus,
-  runtimeSettingsDiff
+  runtimeSettingsDiff,
+  validateRuntimeSettings
 } = await import('./runtime-settings.js');
 
 type RuntimeSettings = typeof RUNTIME_SETTINGS_DEFAULTS;
@@ -34,6 +37,7 @@ const stored: RuntimeSettings = {
   analyticsEventDriven: true,
   analyticsDebounceMs: 20_000,
   analyticsMaxDelayMs: 120_000,
+  analyticsMinPassIntervalMs: 60_000,
   codexCooldownMs: 900_000,
   updatedAt: '2026-08-08T09:00:00.000Z',
   updatedBy: 'operator'
@@ -46,11 +50,23 @@ function settingsRow(overrides: Record<string, unknown> = {}) {
     analytics_event_driven: true,
     analytics_debounce_ms: 20_000,
     analytics_max_delay_ms: 120_000,
+    analytics_min_pass_interval_ms: 60_000,
     codex_cooldown_ms: 900_000,
     updated_at: new Date('2026-08-08T09:00:00.000Z'),
     updated_by: 'operator',
     ...overrides
   };
+}
+
+/** The field the console renders, and the name a 400 has to carry back to it. */
+function rejects(patch: Partial<RuntimeSettings>, field: string): void {
+  const next = applyRuntimeSettingsPatch(stored, patch);
+  expect(() => validateRuntimeSettings(next)).toThrow(RuntimeSettingsRangeError);
+  try {
+    validateRuntimeSettings(next);
+  } catch (error) {
+    expect((error as InstanceType<typeof RuntimeSettingsRangeError>).field).toBe(field);
+  }
 }
 
 beforeEach(() => {
@@ -70,9 +86,15 @@ describe('applying an operator patch', () => {
   it('sets only the fields present', () => {
     const next = applyRuntimeSettingsPatch(stored, { publicationMode: 'delayed_15s' });
     expect(next.publicationMode).toBe('delayed_15s');
-    expect([next.analyticsDebounceMs, next.analyticsMaxDelayMs, next.codexCooldownMs])
-      .toEqual([20_000, 120_000, 900_000]);
+    expect([next.analyticsDebounceMs, next.analyticsMaxDelayMs, next.analyticsMinPassIntervalMs,
+      next.codexCooldownMs]).toEqual([20_000, 120_000, 60_000, 900_000]);
     expect(next.analyticsEventDriven).toBe(true);
+  });
+
+  it('sets the minimum pass interval on its own without disturbing the delays', () => {
+    const next = applyRuntimeSettingsPatch(stored, { analyticsMinPassIntervalMs: 5_000 });
+    expect(next.analyticsMinPassIntervalMs).toBe(5_000);
+    expect([next.analyticsDebounceMs, next.analyticsMaxDelayMs]).toEqual([20_000, 120_000]);
   });
 
   it('treats false as a value, not as absent', () => {
@@ -80,6 +102,13 @@ describe('applying an operator patch', () => {
     // silently ignores every request that switches the recompute off.
     expect(applyRuntimeSettingsPatch(stored, { analyticsEventDriven: false }).analyticsEventDriven)
       .toBe(false);
+  });
+
+  it('treats a debounce of zero as a value, not as absent', () => {
+    // The same `||` trap with a number, and the reported bug's shape: since migration 028 zero is
+    // the legal «наживо» setting, and `||` would silently keep the stored twenty seconds — a save
+    // that reports success and changes nothing.
+    expect(applyRuntimeSettingsPatch(stored, { analyticsDebounceMs: 0 }).analyticsDebounceMs).toBe(0);
   });
 
   it('never lets a patch move modeChangedAt', () => {
@@ -112,6 +141,71 @@ describe('the audit diff', () => {
   it('ignores modeChangedAt so a mode change is not counted twice', () => {
     const after = { ...stored, modeChangedAt: '2026-08-08T10:00:00.000Z' };
     expect(runtimeSettingsDiff(stored, after)).toEqual([]);
+  });
+
+  it('records the minimum pass interval under its SQL name', () => {
+    // The field migration 028 moved out of the compiler. An operator asking «хто зробив аналітику
+    // повільнішою» reads `runtime_settings_audit`, so it has to be in the trail like the rest.
+    const after = { ...stored, analyticsMinPassIntervalMs: 5_000 };
+    expect(runtimeSettingsDiff(stored, after)).toEqual([
+      { field: 'analytics_min_pass_interval_ms', previousValue: '60000', newValue: '5000' }
+    ]);
+  });
+
+  it('records a debounce lowered to zero rather than reading it as no change', () => {
+    const after = { ...stored, analyticsDebounceMs: 0 };
+    expect(runtimeSettingsDiff(stored, after)).toEqual([
+      { field: 'analytics_debounce_ms', previousValue: '20000', newValue: '0' }
+    ]);
+  });
+});
+
+describe('the range check that names the field', () => {
+  it('accepts the наживо combination the product owner asked for', () => {
+    // «Для наживо режиму затримки мають бути мінімальні»: debounce 0, and the storm guard turned
+    // down to its own floor. This is the exact save the /ops card used to refuse without saying why.
+    const next = applyRuntimeSettingsPatch(stored, {
+      analyticsDebounceMs: 0, analyticsMinPassIntervalMs: 5_000
+    });
+    expect(() => validateRuntimeSettings(next)).not.toThrow();
+  });
+
+  it('refuses a minimum pass interval below its floor, naming it', () => {
+    // 0 is legal for the debounce and illegal here on purpose: at zero the overlap guard would be
+    // the only thing between a sustained stream and back-to-back view refreshes plus a risk pass.
+    rejects({ analyticsMinPassIntervalMs: 0 }, 'analyticsMinPassIntervalMs');
+    rejects({ analyticsMinPassIntervalMs: 4_999 }, 'analyticsMinPassIntervalMs');
+  });
+
+  it('refuses a minimum pass interval above the quiet-period floor, naming it', () => {
+    // Longer than ANALYTICS_RECOMPUTE_FLOOR_MS would mean the floor's own pass is refused by the
+    // interval and the analytics have no cadence at all.
+    rejects({ analyticsMinPassIntervalMs: 900_001 }, 'analyticsMinPassIntervalMs');
+  });
+
+  it('refuses a negative debounce while allowing zero', () => {
+    rejects({ analyticsDebounceMs: -1 }, 'analyticsDebounceMs');
+    expect(() => validateRuntimeSettings(applyRuntimeSettingsPatch(stored, { analyticsDebounceMs: 0 })))
+      .not.toThrow();
+  });
+
+  it('still refuses a maximum delay below the debounce, naming the maximum', () => {
+    // The cross-field rule of migration 022 (`runtime_settings_delay_order`), unchanged by 028 and
+    // still satisfiable with a debounce of zero: the maximum keeps its own floor of five seconds.
+    rejects({ analyticsDebounceMs: 60_000, analyticsMaxDelayMs: 30_000 }, 'analyticsMaxDelayMs');
+    expect(() => validateRuntimeSettings(applyRuntimeSettingsPatch(stored, {
+      analyticsDebounceMs: 0, analyticsMaxDelayMs: 5_000
+    }))).not.toThrow();
+  });
+
+  it('publishes a range for every numeric field the console renders', () => {
+    // The bug was a refusal with no bounds to show. `GET /ops/api/runtime` ships this object, so a
+    // field missing from it is a field whose input has no min/max.
+    expect(Object.keys(RUNTIME_SETTINGS_BOUNDS).sort()).toEqual([
+      'analyticsDebounceMs', 'analyticsMaxDelayMs', 'analyticsMinPassIntervalMs', 'codexCooldownMs'
+    ]);
+    expect(RUNTIME_SETTINGS_BOUNDS.analyticsDebounceMs.min).toBe(0);
+    expect(RUNTIME_SETTINGS_BOUNDS.analyticsMinPassIntervalMs).toEqual({ min: 5_000, max: 900_000 });
   });
 });
 

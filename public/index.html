@@ -57,7 +57,11 @@
   <template id="map-page">
     <section class="situation-layout">
       <div class="map-stage">
-        <div id="map" aria-label="Інтерактивна карта України"></div>
+        <!-- Опис карти — статичний вузол #map-legend-text, який будує ensureMapOverlays(). Він несе
+             кодування станів словами; живий #map-aria лишається списком територій. Розділені
+             навмисно: опис читають на вимогу, живий регіон перечитується сам, і постійне правило
+             в ньому оголошувалося б на кожну подію потоку. -->
+        <div id="map" aria-label="Інтерактивна карта України" aria-describedby="map-legend-text"></div>
         <div class="map-vignette" aria-hidden="true"></div>
         <div class="map-panels">
           <div class="map-tools" role="group" aria-label="Шари карти">
@@ -67,18 +71,18 @@
             <button class="layer-toggle is-active" data-layer="assessments"  aria-pressed="true"><i class="swatch analytic"></i>Аналітика</button>
             <button class="layer-toggle is-active" data-layer="occupation"   aria-pressed="true" hidden><i class="swatch occupation"></i>Окупація</button>
           </div>
-          <div class="sovereignty-badge"><strong>Крим — Україна</strong><span>Міжнародно визнані кордони</span></div>
+          <!-- Порядок у стосі задає CSS (`order`), а не розмітка: дві з трьох легенд створює скрипт
+               і вставляє їх відносно цього рядка, тож візуальна послідовність не може залежати від
+               того, яка з них цього разу існує. -->
+          <p class="sovereignty-badge"><strong>Крим — Україна</strong><span>міжнародно визнані кордони</span></p>
           <details class="occupation-legend" id="occupation-legend" hidden></details>
         </div>
-        <div class="map-caption">
-          <!-- Перші чотири речення дослівно збігаються з рядками легенди #threat-legend: підпис
-               ховається нижче 980 px, і два формулювання одного кодування — це два кодування. -->
-          <span>Офіційна тривога — щільна червона заливка й контур.
-            Активна загроза — помаранчева заливка, слабша за тривогу.
-            Підтверджена атака або наслідки — штрихування.
-            Аналітична оцінка — сірий пунктирний контур без заливки. Це не тривога.
-            Приглушений відтінок означає, що стан стосується лише частини території: наблизьте карту, щоб побачити райони.
-            Клікніть територію, щоб побачити її стан. Напрямки не є прогнозом траєкторії.</span>
+        <!-- Від колишнього .map-caption лишилося одне речення — те, яке НЕ є кодуванням легенди, а
+             є обіцянкою продукту, і тому мусить бути видимим завжди, а не за розгорнутою легендою.
+             Решта шести речень переїхала в #threat-legend і в опис карти: два формулювання одного
+             кодування — це два кодування. -->
+        <div class="map-footnote">
+          <p>Напрямки не є прогнозом траєкторії</p>
           <button id="fit-ukraine">Показати всю Україну</button>
         </div>
       </div>

@@ -104,7 +104,8 @@ export async function resetDatabase(): Promise<void> {
   // delayed-mode assertion in the suite to "no hold at all" and the tests would pass for the
   // wrong reason. An hour is longer than any window a test backdates into.
   await sql(`UPDATE runtime_settings SET publication_mode='live', analytics_event_driven=true,
-             analytics_debounce_ms=20000, analytics_max_delay_ms=120000, codex_cooldown_ms=900000,
+             analytics_debounce_ms=20000, analytics_max_delay_ms=120000,
+             analytics_min_pass_interval_ms=60000, codex_cooldown_ms=900000,
              mode_changed_at=now() - interval '1 hour',
              updated_at=now(), updated_by='system'`);
   // Same argument as `runtime_settings`: the row is seeded by migration 023 and a read must never

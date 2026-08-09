@@ -771,11 +771,23 @@ Coverage is stated rather than implied, per state family independently:
 | Coverage | What it means |
 | --- | --- |
 | `direct` | a source literally named this territory, or the catalogue resolved a named place to it |
-| `unmapped` | this is the nearest territory *with an outline* above a named place that has none — a city or hromada. It does not fade at raion zoom, because no finer layer will ever supersede it |
-| `partial` | this territory is an ancestor of a named territory that has its own outline. Derived coverage of an explicitly named child, drawn muted, never an assertion about the whole |
+| `unmapped` | this is the nearest territory *with an outline* above a named place that has none — a city or hromada. It is drawn, because no finer layer will ever supersede it |
+| `partial` | this territory is an ancestor of a named territory that has its own outline. Derived coverage of an explicitly named child: carried in the payload, written into the browser's feature-state, and named by the territory panel — but drawn by nothing. The child has its own polygon and is lit at every zoom, so lighting the ancestor too would assert the whole |
 
-An **icon** is a stronger statement than a polygon: a glyph says a weapon class is *here*, a muted
-fill says "somewhere inside". The difference is the whole no-invented-geography rule, so icons are
+The browser mirrors that table in paint. `web/app.js` writes all twelve feature-state keys in
+one pass (`territoryStateOf`), and the four `*Partial` keys have no reader among the paint
+expressions by design: an oblast whose raions are alerted gets neither fill nor outline, and
+`alertLabelCollection()` does not even emit a label feature for it — a label at opacity zero would
+still take a slot in the symbol collision grid and push a real raion name off the map. Raion layers
+carry no `minzoom` and no zoom-interpolated state opacity in any of the four families. Zoom moves
+line widths, label sizes and the neutral raion grid; it does not move what is asserted. The one
+surviving threshold is `ICON_TIER_ZOOM` (6.8), which switches icon stacks between oblast and raion
+anchors — see «What the map asserts» in `docs/METHODOLOGY.md` for why the glyph keeps a tier the
+polygon does not.
+
+An **icon** is a stronger statement than a polygon: a glyph says a weapon class is *here*, a fill
+says "this territory, or somewhere inside it that has no outline". The difference is the whole
+no-invented-geography rule, so icons are
 emitted only for `direct` and `unmapped` territories and are additionally withheld in three cases.
 A location whose relation is `mentioned` or `official_alert` produces a panel row and no icon —
 `relationFor()` assigns `mentioned` to transit («повз Миколаїв») and as the fall-through for any
@@ -944,8 +956,9 @@ flowchart LR
   module in the assessment path reads it back.
 - An icon is emitted only for a territory a source literally named, or for the nearest
   polygon-bearing ancestor of one when the named place has no outline of its own. An ancestor that
-  merely contains a named territory keeps its muted polygon and gets no icon, because a glyph asserts
-  a weapon class for everything under it and no source said that.
+  merely contains a named territory gets neither a polygon nor an icon: the named territory has its
+  own outline and is lit itself, and a glyph on the ancestor would assert a weapon class for
+  everything under it, which no source said.
 
 ## Scale boundary
 

@@ -53,13 +53,15 @@ The displayed percentage is the score multiplied by ten. It is explicitly called
 
 ## What the map asserts
 
-A polygon and a glyph are different claims and are governed separately. A muted fill says the state
-concerns some part of this territory; a weapon-class glyph says that class is *here*. Only the second
-is strong enough to be worth restricting, so it is restricted:
+A polygon and a glyph are different claims and are governed separately. A fill says the state
+concerns this territory or something inside it that has no outline of its own; a weapon-class glyph
+says that class is *here*. Only the second is strong enough to be worth restricting, so it is
+restricted:
 
 - An icon is emitted only for a territory a source literally named, or for the nearest territory with
   an outline above a named place that has none. An ancestor lit merely because a territory inside it
-  was named keeps its muted polygon and gets no icon.
+  was named is no longer lit at all — the named territory has its own outline and carries the state
+  itself — and it never gets an icon.
 - A location the classifier related as `mentioned` — which is what it assigns to transit («повз
   Миколаїв») and as the fall-through for any name found in the text — appears in the territory panel
   and produces no icon.
@@ -87,19 +89,24 @@ is strong enough to be worth restricting, so it is restricted:
   low-relevance posture signal, and twenty-seven grey glyphs would be geography invented from a
   warning nobody localised.
 
-One consequence of the zoom model is worth stating plainly: **a threat reported only for a raion
-carries no icon below zoom 6.8.** The raion stack appears only once the raion layer is readable, and
-the oblast above it is an ancestor of a named territory, which never receives an icon. Below that
-zoom the threat is a muted oblast fill, a card in the event list and a territory panel — visible, but
-not as a weapon-class glyph.
+Polygons carry no zoom model at all: a raion that a source named is lit at every zoom, the
+country-wide view included, and the quiet raions of the same oblast stay dark. The **icons** do carry
+one, and the asymmetry is worth stating plainly: **a threat reported only for a raion carries no icon
+below zoom 6.8.** The stacks anchor to oblasts below that zoom and to raions above it, because a
+glyph is a claim about a weapon class over a point and 136 such claims do not survive an overview.
+Below 6.8 the threat is a lit raion polygon, a card in the event list and a territory panel —
+visible, but not as a weapon-class glyph. The oblast above the raion is an ancestor of a named
+territory, which receives neither an icon nor a fill: the lit raion inside it has already said
+everything the source said, and filling the oblast would say more.
 
 ## Publication
 
 Assessments are recomputed when something they describe actually changes: a relevant recorded event
 arms a pass behind an operator-set debounce, bounded by a maximum delay so a continuous stream cannot
-postpone it indefinitely, and by a minimum interval of one minute between completed passes. The
-fifteen-minute timer remains as the floor beneath all of it, so a quiet period is still reassessed
-and a restart loses nothing but a pending window. A public update is generated when the level
+postpone it indefinitely, and by an operator-set minimum interval between completed passes (five
+seconds to fifteen minutes, one minute by default). A pass the interval refuses is retried when the
+interval expires rather than dropped. The fifteen-minute timer remains as the floor beneath all of
+it, so a quiet period is still reassessed and a restart loses nothing but a pending window. A public update is generated when the level
 changes, the score moves by at least 0.5, or the methodology/model version changes. Superseded
 assessments remain auditable. A digest is queued after 23:20 Europe/Kyiv once per user and date.
 

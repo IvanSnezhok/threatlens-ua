@@ -98,8 +98,10 @@ Douglas-Peucker at **180 m**, coordinates rounded to 5 decimals. The full-resolu
 10.50 MB over 528 977 vertices; the shipped file is **1.05 MB over 51 318 vertices**, 0.31 MB gzipped
 — and Caddy serves `/data/` with `encode zstd gzip`, so 0.31 MB is what a phone actually downloads.
 
-180 m is a maximum deviation of 0.89 px at zoom 9, the deepest zoom the raion layer is designed for
-(it fades in at zoom 6). `--report` prints the whole curve:
+180 m is a maximum deviation of 0.89 px at zoom 9, the deepest zoom the raion layer is designed for.
+The layer is drawn at every zoom — a raion a source named is lit on the country-wide view too — and
+error shrinks as the map zooms out, so the shallow end costs nothing: 0.11 px at zoom 6, less than
+half of that at the map's opening zoom of 5.1. `--report` prints the whole curve:
 
 | tolerance | vertices | raw | gzip | max error @z6 | @z9 | @z11 |
 |---:|---:|---:|---:|---:|---:|---:|

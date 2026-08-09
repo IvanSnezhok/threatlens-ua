@@ -69,19 +69,44 @@ const TRIGGER_SET = new Set<string>(ANALYTICS_TRIGGER_EVENTS);
 export const ANALYTICS_RECOMPUTE_FLOOR_MS = 15 * 60_000;
 
 /**
- * Minimum wall-clock gap between two completed passes, independent of the debounce.
+ * ================================================================================================
+ * The minimum interval between two completed passes — an operator's number since migration 028
+ * ================================================================================================
  *
  * `execute()`'s re-arm starts a fresh window the moment the previous pass ends, so under sustained
- * events the passes are back to back with only `analyticsDebounceMs` between them. An operator
- * responding to «аналітика відстає» by lowering the debounce would turn one ops PUT into a standing
- * pair of REFRESH MATERIALIZED VIEW CONCURRENTLY statements plus a full risk pass every few seconds,
- * on the pool the 15 s ingestion tick and every snapshot share, under a 15 s statement_timeout — and
- * a refresh that exceeds the timeout dies, counts as `failed`, and the next pass retries immediately.
- * Sixty seconds is still fifteen times faster than the timer this replaces.
+ * events the passes would be back to back with only `analyticsDebounceMs` between them. Without a
+ * second bound an operator responding to «аналітика відстає» by lowering the debounce turns one ops
+ * PUT into a standing pair of REFRESH MATERIALIZED VIEW CONCURRENTLY statements plus a full risk
+ * pass every few seconds, on the pool the 15 s ingestion tick and every snapshot share, under a 15 s
+ * statement_timeout — and a refresh that exceeds the timeout dies, counts as `failed`, and the next
+ * pass retries immediately.
+ *
+ * That bound used to be a compiled 60 000 here. It is now `runtime_settings.
+ * analytics_min_pass_interval_ms`, read through the same memoised `resolveRuntimeSettings()` as the
+ * debounce, because it is the number that decides how live «наживо» can be and the person who needs
+ * to decide that is looking at /ops, not at a rebuild. `RUNTIME_SETTINGS_DEFAULTS` carries the same
+ * 60 000 the constant did, for the read that fails and for the pass that runs before any read.
+ *
+ * Two behaviours make the move safe, and both are new:
+ *
+ *  1. **A refusal arms a retry.** `fire()` will not start a pass the interval would refuse; it arms
+ *     ONE timer at the instant the interval expires, and any later event fire coalesces into that
+ *     same instant. Before this, a burst landing just after a completed pass consumed its debounce
+ *     window on a refusal and then waited for the fifteen-minute floor — which is precisely the
+ *     complaint an operator reaches for the debounce to fix.
+ *  2. **The floor is only the backstop it was always described as.** Nothing routine depends on it.
  */
-export const ANALYTICS_MIN_PASS_INTERVAL_MS = 60_000;
 
 export type RecomputeTrigger = 'event' | 'manual' | 'schedule';
+
+/**
+ * Which of the three module-level timer slots a `timers.set()` call is filling.
+ *
+ * Production ignores it — `setTimeout` has no use for a label. It exists so the unit harness can
+ * tell a debounce window from the interval retry from the floor without guessing at the delay, which
+ * is what makes «no timer leak on stop» an assertion rather than a hope.
+ */
+export type AnalyticsTimerKind = 'debounce' | 'interval-retry' | 'floor';
 
 export interface RecomputeResult {
   /** ISO, when the pass started. */
@@ -108,7 +133,10 @@ export interface AnalyticsSchedulerDeps {
   /** Injected clock. Defaults to `Date.now`. */
   now?: () => number;
   /** Timer seam; the handle is opaque. Defaults to `setTimeout`/`clearTimeout` with `.unref()`. */
-  timers?: { set(fn: () => void, ms: number): unknown; clear(handle: unknown): void };
+  timers?: {
+    set(fn: () => void, ms: number, kind: AnalyticsTimerKind): unknown;
+    clear(handle: unknown): void;
+  };
   /** The event source. Defaults to `eventHub`. */
   events?: {
     on(name: string, fn: (event: SystemEvent) => void): unknown;
@@ -119,10 +147,13 @@ export interface AnalyticsSchedulerDeps {
   /** Defaults to {@link recomputeAnalytics}; injected so the debounce can be tested without a database. */
   recompute?: (trigger: RecomputeTrigger) => Promise<RecomputeResult>;
   /**
-   * Overrides {@link ANALYTICS_MIN_PASS_INTERVAL_MS}. A test seam and nothing else: an integration
-   * case that has to observe two passes cannot wait a real minute, and shortening the *debounce*
+   * Overrides `runtime_settings.analytics_min_pass_interval_ms` for the whole scheduler. A test
+   * seam and nothing else: an integration case that has to observe two passes cannot wait a real
+   * minute, the stored column has a CHECK floor of five seconds, and shortening the *debounce*
    * instead would leave the interval guard refusing the second pass — which is what the guard is
-   * for. Production never passes it.
+   * for. Production never passes it, and the settings row is authoritative when it is absent.
+   *
+   * `0` is accepted here and nowhere else: it disables the guard, which the row cannot express.
    */
   minPassIntervalMs?: number;
 }
@@ -169,6 +200,7 @@ export function registerAnalyticsSchedulerMetrics(registry: Registry): void {
 // ------------------------------------------------------------------------------------------------
 
 let timer: unknown = null;              // the debounce window
+let intervalTimer: unknown = null;      // the retry armed when the minimum interval refused a pass
 let floorTimer: unknown = null;         // the quiet-period floor
 let firstPendingAt: number | null = null;
 let rearm = false;
@@ -209,7 +241,7 @@ let executeGrant = false;
 // an injected clock without any of the functions below taking a parameter they would then have to
 // thread through the timer callbacks.
 const defaultTimers = {
-  set(fn: () => void, ms: number): unknown {
+  set(fn: () => void, ms: number, _kind: AnalyticsTimerKind): unknown {
     const handle = setTimeout(fn, ms);
     handle.unref();
     return handle;
@@ -229,11 +261,28 @@ let timers = defaultTimers;
 let events: NonNullable<AnalyticsSchedulerDeps['events']> = eventHub;
 let readSettings: () => Promise<RuntimeSettings> = resolveRuntimeSettings;
 let recompute: (trigger: RecomputeTrigger) => Promise<RecomputeResult> = defaultRecompute;
-let minPassInterval = ANALYTICS_MIN_PASS_INTERVAL_MS;
+/**
+ * `null` means «the settings row decides». Only the deps bag ever sets it, and only tests ever pass
+ * the deps bag, so production reads {@link currentMinPassInterval} straight off the last settings
+ * read — which is the same memoised read the debounce comes from.
+ */
+let minPassIntervalOverride: number | null = null;
 let log: { info: Function; error: Function } = { info: () => undefined, error: () => undefined };
 
-function setTimer(fn: () => void, ms: number): unknown {
-  return timers.set(fn, ms);
+/**
+ * The interval in force right now.
+ *
+ * `lastSettings` is written by every settings read this module performs — `onEvent`'s (once per
+ * event, behind the 2 s promise memo) and `recomputeAnalytics`'s own. So an operator's PUT reaches
+ * this within a memo TTL and without a restart, exactly like `analyticsDebounceMs`. Before the first
+ * read it is `RUNTIME_SETTINGS_DEFAULTS`, i.e. the sixty seconds this used to be compiled at.
+ */
+function currentMinPassInterval(): number {
+  return minPassIntervalOverride ?? lastSettings.analyticsMinPassIntervalMs;
+}
+
+function setTimer(fn: () => void, ms: number, kind: AnalyticsTimerKind): unknown {
+  return timers.set(fn, ms, kind);
 }
 
 function clearTimer(handle: unknown): void {
@@ -249,8 +298,10 @@ export function resetAnalyticsScheduler(): void {
   // closure does not leave a listener on the real hub for every later test file to be surprised by.
   currentStop?.();
   clearTimer(timer);
+  clearTimer(intervalTimer);
   clearTimer(floorTimer);
   timer = null;
+  intervalTimer = null;
   floorTimer = null;
   firstPendingAt = null;
   rearm = false;
@@ -269,7 +320,7 @@ export function resetAnalyticsScheduler(): void {
   events = eventHub;
   readSettings = resolveRuntimeSettings;
   recompute = defaultRecompute;
-  minPassInterval = ANALYTICS_MIN_PASS_INTERVAL_MS;
+  minPassIntervalOverride = null;
   log = { info: () => undefined, error: () => undefined };
 }
 
@@ -295,7 +346,36 @@ async function onEvent(event: SystemEvent): Promise<void> {
   if (at - firstPendingAt >= settings.analyticsMaxDelayMs) { fire('event'); return; }
 
   clearTimer(timer);
-  timer = setTimer(() => fire('event'), settings.analyticsDebounceMs);
+  // Zero is legal since migration 028 and means «наживо»: the next macrotask, not "never". A
+  // `setTimeout(fn, 0)` still yields, so a burst is still coalesced by the event loop rather than
+  // starting a pass per event — and the minimum interval below is what actually bounds the passes.
+  timer = setTimer(() => fire('event'), settings.analyticsDebounceMs, 'debounce');
+}
+
+/**
+ * The retry the minimum interval owes the burst it refused.
+ *
+ * ONE slot, cleared before it is written, so there is never more than one live retry. Generation
+ * token for the same three reasons `armFloor` carries one: a stop that lands between the arming and
+ * the firing must not leave a callback that reaches a `pool.end()`ed pool, a second `start()` must
+ * not orphan the first chain's handle, and `stop()` must be able to kill every timer this module
+ * ever created by clearing three slots.
+ *
+ * Coalescing is a property of the arithmetic, not of a special case: `waitMs` is always measured
+ * from `lastCompletedAt`, which does not move while no pass completes, so every later event fire
+ * re-arms this at the SAME absolute instant. Ten events inside the interval produce one pass.
+ */
+function armIntervalRetry(waitMs: number, trigger: RecomputeTrigger, myGeneration: number): void {
+  if (stopped || myGeneration !== generation) return;
+  clearTimer(intervalTimer);
+  intervalTimer = setTimer(() => {
+    // Generation check BEFORE the slot is nulled: after a stop-and-restart the slot belongs to the
+    // new scheduler, and a stale callback that nulled it would drop a live handle on the floor —
+    // the same leak `armFloor`'s token exists to prevent, one slot over.
+    if (stopped || myGeneration !== generation) return;
+    intervalTimer = null;
+    fire(trigger);
+  }, waitMs, 'interval-retry');
 }
 
 function fire(trigger: RecomputeTrigger): void {
@@ -304,6 +384,17 @@ function fire(trigger: RecomputeTrigger): void {
   // Overlap guard. `running` is owned by `execute()` and is set synchronously before its first
   // `await`, which is what makes this check-then-act safe on a single-threaded loop.
   if (running) { rearm = true; return; }
+  // Minimum-interval guard, hoisted out of `recomputeAnalytics` to where the pending work still
+  // exists. Starting a pass the guard would refuse used to CONSUME the debounce window — the window
+  // had already been cleared above, `execute()` drains `firstPendingAt` whatever the outcome, and
+  // nothing was left armed, so a burst landing just after a completed pass waited for the
+  // fifteen-minute floor. Arming the retry here instead keeps the burst alive, and keeps the refusal
+  // off `skipped_interval`, which the runbook reads as "events are arriving faster than one pass per
+  // interval" rather than "the same burst was refused two hundred times".
+  const wait = lastCompletedAt + currentMinPassInterval() - now();
+  if (wait > 0) { armIntervalRetry(wait, trigger, generation); return; }
+  clearTimer(intervalTimer);
+  intervalTimer = null;
   void execute(trigger);
 }
 
@@ -323,6 +414,7 @@ async function execute(trigger: RecomputeTrigger): Promise<void> {
   // Owned HERE, so an injected `recompute` spy in a unit test still exercises the overlap guard.
   running = true;
   let completed = false;
+  let refusedByInterval = false;
   try {
     const result = await recompute(trigger);       // never throws; see recomputeAnalytics
     lastResult = result;
@@ -331,6 +423,11 @@ async function execute(trigger: RecomputeTrigger): Promise<void> {
     // debounce apart would refuse itself for ever and the analytics would only ever move on the
     // fifteen-minute floor — the opposite of what this worker is for.
     completed = result.skipped === null;
+    // `'cooldown'` is returned by exactly one branch: the minimum-interval guard inside
+    // `recomputeAnalytics`. `fire()` already refuses to start such a pass, so in practice this is
+    // the manual button and any direct caller — the belt to that fast path's braces, and the reason
+    // «Оновити зараз» inside the interval still leaves a retry behind instead of nothing.
+    refusedByInterval = result.skipped === 'cooldown';
     log.info({ ...result }, 'analytics recompute finished');
   } catch (error) {
     // Belt to `recomputeAnalytics`'s braces: a bug in the swallowing must not become an unhandled
@@ -344,16 +441,29 @@ async function execute(trigger: RecomputeTrigger): Promise<void> {
     log.error({ error }, 'analytics recompute failed');
   } finally {
     running = false;
-    if (completed) lastCompletedAt = now();
+    if (completed) {
+      lastCompletedAt = now();
+      // A completed pass IS what an armed retry was waiting to produce. Leaving the handle alive
+      // would fire a second pass one interval later for a burst that has already been served.
+      clearTimer(intervalTimer);
+      intervalTimer = null;
+    }
     // ALWAYS reset, not only when fire() starts a pass: a stale origin must never cross a pass.
     firstPendingAt = null;
     if (rearm && !stopped && myGeneration === generation) {
       rearm = false;
       firstPendingAt = now();
       clearTimer(timer);
-      timer = setTimer(() => fire('event'), lastSettings.analyticsDebounceMs);
+      timer = setTimer(() => fire('event'), lastSettings.analyticsDebounceMs, 'debounce');
     } else {
       rearm = false;
+      // Nothing is pending in the debounce, and the pass that just ran was refused for being too
+      // early. The work it stood for is still undone, so it is owed a retry at expiry — otherwise a
+      // manual press inside the interval is simply lost.
+      if (refusedByInterval) {
+        const wait = lastCompletedAt + currentMinPassInterval() - now();
+        if (wait > 0) armIntervalRetry(wait, 'event', myGeneration);
+      }
     }
   }
 }
@@ -388,7 +498,7 @@ export async function runManualRecompute(): Promise<RecomputeResult> {
 
 function armFloor(myGeneration: number): void {
   if (stopped || myGeneration !== generation) return;
-  floorTimer = setTimer(() => { void onFloor(myGeneration); }, ANALYTICS_RECOMPUTE_FLOOR_MS);
+  floorTimer = setTimer(() => { void onFloor(myGeneration); }, ANALYTICS_RECOMPUTE_FLOOR_MS, 'floor');
 }
 
 async function onFloor(myGeneration: number): Promise<void> {
@@ -434,7 +544,7 @@ export function startAnalyticsRecomputeScheduler(
   events = deps.events ?? eventHub;
   readSettings = deps.settings ?? resolveRuntimeSettings;
   recompute = deps.recompute ?? defaultRecompute;
-  minPassInterval = deps.minPassIntervalMs ?? ANALYTICS_MIN_PASS_INTERVAL_MS;
+  minPassIntervalOverride = deps.minPassIntervalMs ?? null;   // `?? `, not `||`: 0 disables the guard
 
   generation += 1;
   stopped = false;
@@ -444,14 +554,18 @@ export function startAnalyticsRecomputeScheduler(
   events.on('internal-event', handler);
   armFloor(myGeneration);
   currentStop = () => {
-    // All four halves matter. `buildServer()` and this scheduler are started and torn down
+    // All five halves matter. `buildServer()` and this scheduler are started and torn down
     // repeatedly by the integration suite; a stop closure that forgot `off` would accumulate one
     // live listener per test file and every later test would see other tests' recomputes, and one
     // that forgot the generation bump would let an in-flight `onFloor` re-arm itself afterwards.
+    // The three timer slots below are every timer this module can create — `armIntervalRetry` and
+    // `armFloor` both refuse to arm once `stopped` is true or the generation has moved, so nothing
+    // can appear in a slot after this runs.
     stopped = true;
     generation += 1;
     events.off('internal-event', handler);
     clearTimer(timer); timer = null;
+    clearTimer(intervalTimer); intervalTimer = null;
     clearTimer(floorTimer); floorTimer = null;
     currentStop = null;
   };
@@ -486,9 +600,11 @@ export async function recomputeAnalytics(
     recomputeTotal.inc({ trigger, outcome: 'skipped_overlap' });
     return { ...skeleton, durationMs: 0, codex: 'not_attempted', fallback: false, skipped: 'overlap' };
   }
-  // Minimum interval between two completed passes, independent of the debounce. See
-  // ANALYTICS_MIN_PASS_INTERVAL_MS above for why the debounce alone is not a bound.
-  if (startedAt - lastCompletedAt < (deps.minPassIntervalMs ?? minPassInterval)) {
+  // Minimum interval between two completed passes, independent of the debounce. See the header
+  // above for why the debounce alone is not a bound. This is checked BEFORE the settings read on
+  // purpose — a refusal must not cost a statement — so the interval it uses is the one the last
+  // read observed, which for a scheduler that has processed any event is at most a memo TTL old.
+  if (startedAt - lastCompletedAt < (deps.minPassIntervalMs ?? currentMinPassInterval())) {
     recomputeTotal.inc({ trigger, outcome: 'skipped_interval' });
     return { ...skeleton, durationMs: 0, codex: 'not_attempted', fallback: false, skipped: 'cooldown' };
   }
@@ -506,6 +622,11 @@ export async function recomputeAnalytics(
   let attempted = false;
   try {
     const settings = await (deps.settings ?? readSettings)();
+    // Every settings read this module performs feeds `lastSettings`, which is what `execute()`'s
+    // re-arm and `currentMinPassInterval()` read. A manual pass is often the FIRST read after an
+    // operator's PUT — «Оновити зараз» right after saving a new cadence — and without this line the
+    // new interval would not be in force until the next event arrived.
+    lastSettings = settings;
     // A manual «Оновити зараз» always runs: an operator who pressed the button has already
     // overridden the switch by pressing it. Event and floor passes obey it.
     if (trigger !== 'manual' && !settings.analyticsEventDriven) {

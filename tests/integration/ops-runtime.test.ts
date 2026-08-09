@@ -51,6 +51,7 @@ interface StoredSettings {
   analytics_event_driven: boolean;
   analytics_debounce_ms: number;
   analytics_max_delay_ms: number;
+  analytics_min_pass_interval_ms: number;
   codex_cooldown_ms: number;
   updated_by: string;
 }
@@ -58,7 +59,8 @@ interface StoredSettings {
 async function storedSettings(): Promise<StoredSettings> {
   const result = await sql<StoredSettings>(
     `SELECT publication_mode,analytics_event_driven,analytics_debounce_ms,analytics_max_delay_ms,
-            codex_cooldown_ms,updated_by FROM runtime_settings WHERE singleton`
+            analytics_min_pass_interval_ms,codex_cooldown_ms,updated_by
+       FROM runtime_settings WHERE singleton`
   );
   return result.rows[0]!;
 }
@@ -121,16 +123,27 @@ describe.skipIf(!integrationDatabaseAvailable)('ops runtime settings', () => {
       expect(Object.keys(body).sort()).toEqual(['audit', 'bounds', 'effective', 'notice', 'settings']);
       expect(body.settings).toMatchObject({
         publicationMode: 'live', analyticsEventDriven: true,
-        analyticsDebounceMs: 20_000, analyticsMaxDelayMs: 120_000, codexCooldownMs: 900_000
+        analyticsDebounceMs: 20_000, analyticsMaxDelayMs: 120_000,
+        analyticsMinPassIntervalMs: 60_000, codexCooldownMs: 900_000
       });
       // `modeChangedAt` is the clamp every public cutoff is taken against; a form that could not
       // show it would leave «чому карта не відстає» unanswerable.
       expect(Date.parse(body.settings.modeChangedAt)).not.toBeNaN();
       expect(body.effective).toMatchObject({ delaySeconds: 0, behindSeconds: 0, backlogEvents: 0 });
       expect(Date.parse(body.effective.cutoffAt)).not.toBeNaN();
-      expect(body.bounds.analyticsDebounceMs).toEqual({ min: 5000, max: 600_000 });
+      // Every numeric field the PUT accepts carries a range, which is the reported bug's fix on the
+      // API side: the console can render «мін … макс» beside each input instead of discovering the
+      // bounds from a 400 that names nothing. `analyticsDebounceMs.min` is 0 since migration 028.
+      expect(body.bounds.analyticsDebounceMs).toEqual({ min: 0, max: 600_000 });
       expect(body.bounds.analyticsMaxDelayMs).toEqual({ min: 5000, max: 1_800_000 });
+      expect(body.bounds.analyticsMinPassIntervalMs).toEqual({ min: 5000, max: 900_000 });
       expect(body.bounds.codexCooldownMs).toEqual({ min: 0, max: 86_400_000 });
+      // A range for every settings field the form has an input for, and nothing extra beyond the
+      // deployment constant the notice quotes.
+      expect(Object.keys(body.bounds).sort()).toEqual([
+        'analyticsDebounceMs', 'analyticsMaxDelayMs', 'analyticsMinPassIntervalMs',
+        'codexCooldownMs', 'publicationDelaySeconds'
+      ]);
       expect(body.bounds.publicationDelaySeconds).toBe(15);
       expect(body.audit).toEqual([]);
       expect(body.notice).toBe(NOTICE);
@@ -152,6 +165,69 @@ describe.skipIf(!integrationDatabaseAvailable)('ops runtime settings', () => {
 
       const stored = await storedSettings();
       expect([stored.analytics_debounce_ms, stored.analytics_max_delay_ms]).toEqual([20_000, 120_000]);
+      expect(await count('runtime_settings_audit')).toBe(0);
+    } finally {
+      await app.close();
+    }
+  });
+
+  it('saves the наживо combination: a zero debounce beside a five-second minimum interval', async () => {
+    // The reported complaint, end to end. Before migration 028 this PUT was refused by the CHECK
+    // floor on `analytics_debounce_ms` and the console said only «не зберігається».
+    const app = await buildApp();
+    try {
+      const response = await put(app, { analyticsDebounceMs: 0, analyticsMinPassIntervalMs: 5000 });
+      expect(response.statusCode).toBe(200);
+      expect(response.json().settings).toMatchObject({
+        analyticsDebounceMs: 0, analyticsMinPassIntervalMs: 5000,
+        // Untouched, and still above the debounce: `runtime_settings_delay_order` is satisfiable
+        // with a zero debounce because the maximum keeps its own floor of five seconds.
+        analyticsMaxDelayMs: 120_000
+      });
+
+      const stored = await storedSettings();
+      expect([stored.analytics_debounce_ms, stored.analytics_min_pass_interval_ms])
+        .toEqual([0, 5000]);
+
+      // One audit row per changed field, under the SQL names an operator reads in the table.
+      const rows = await auditRows();
+      expect(rows.map((row) => row.field).sort())
+        .toEqual(['analytics_debounce_ms', 'analytics_min_pass_interval_ms']);
+      expect(rows.find((row) => row.field === 'analytics_debounce_ms'))
+        .toMatchObject({ previous_value: '20000', new_value: '0', changed_by: 'operator', source: 'ops_api' });
+      expect(rows.find((row) => row.field === 'analytics_min_pass_interval_ms'))
+        .toMatchObject({ previous_value: '60000', new_value: '5000', changed_by: 'operator', source: 'ops_api' });
+    } finally {
+      await app.close();
+    }
+  });
+
+  it('names the field when a value is below its floor, instead of refusing anonymously', async () => {
+    const app = await buildApp();
+    try {
+      // The one field that may NOT go to zero: at zero the overlap guard would be the only thing
+      // between a sustained stream and back-to-back view refreshes plus a full risk pass.
+      const zeroInterval = await put(app, { analyticsMinPassIntervalMs: 0 });
+      expect([zeroInterval.statusCode, zeroInterval.json()])
+        .toEqual([400, { error: 'invalid_settings', issues: ['analyticsMinPassIntervalMs'] }]);
+
+      const belowFloor = await put(app, { analyticsMinPassIntervalMs: 4999 });
+      expect([belowFloor.statusCode, belowFloor.json()])
+        .toEqual([400, { error: 'invalid_settings', issues: ['analyticsMinPassIntervalMs'] }]);
+
+      // Above the quiet-period floor: the floor's own pass would be refused by the interval.
+      const aboveCeiling = await put(app, { analyticsMinPassIntervalMs: 900_001 });
+      expect([aboveCeiling.statusCode, aboveCeiling.json()])
+        .toEqual([400, { error: 'invalid_settings', issues: ['analyticsMinPassIntervalMs'] }]);
+
+      // A debounce below its NEW floor of zero is still refused, and named.
+      const negative = await put(app, { analyticsDebounceMs: -1 });
+      expect([negative.statusCode, negative.json()])
+        .toEqual([400, { error: 'invalid_settings', issues: ['analyticsDebounceMs'] }]);
+
+      const stored = await storedSettings();
+      expect([stored.analytics_debounce_ms, stored.analytics_min_pass_interval_ms])
+        .toEqual([20_000, 60_000]);
       expect(await count('runtime_settings_audit')).toBe(0);
     } finally {
       await app.close();
@@ -226,6 +302,7 @@ describe.skipIf(!integrationDatabaseAvailable)('ops runtime settings', () => {
         analyticsEventDriven: current.analyticsEventDriven,
         analyticsDebounceMs: current.analyticsDebounceMs,
         analyticsMaxDelayMs: current.analyticsMaxDelayMs,
+        analyticsMinPassIntervalMs: current.analyticsMinPassIntervalMs,
         codexCooldownMs: current.codexCooldownMs
       });
 
@@ -324,8 +401,8 @@ describe.skipIf(!integrationDatabaseAvailable)('ops runtime settings', () => {
     const app = await buildApp();
     try {
       expect((await put(app, {
-        analyticsEventDriven: false, analyticsDebounceMs: 33_000,
-        analyticsMaxDelayMs: 333_000, codexCooldownMs: 3000
+        analyticsEventDriven: false, analyticsDebounceMs: 0,
+        analyticsMaxDelayMs: 333_000, analyticsMinPassIntervalMs: 7000, codexCooldownMs: 3000
       })).statusCode).toBe(200);
 
       const response = await put(app, { publicationMode: 'delayed_15s' });
@@ -334,12 +411,16 @@ describe.skipIf(!integrationDatabaseAvailable)('ops runtime settings', () => {
         publicationMode: 'delayed_15s',
         // `false` is a value, not an absence: `??` and never `||` in `applyRuntimeSettingsPatch`.
         analyticsEventDriven: false,
-        analyticsDebounceMs: 33_000, analyticsMaxDelayMs: 333_000, codexCooldownMs: 3000
+        // And so is `0`, which is the same trap with a number and the shape of the reported bug: a
+        // patch that omits the debounce must keep the stored zero rather than "restore" 20 000.
+        analyticsDebounceMs: 0, analyticsMaxDelayMs: 333_000,
+        analyticsMinPassIntervalMs: 7000, codexCooldownMs: 3000
       });
       const stored = await storedSettings();
       expect(stored.analytics_event_driven).toBe(false);
-      expect([stored.analytics_debounce_ms, stored.analytics_max_delay_ms, stored.codex_cooldown_ms])
-        .toEqual([33_000, 333_000, 3000]);
+      expect([stored.analytics_debounce_ms, stored.analytics_max_delay_ms,
+        stored.analytics_min_pass_interval_ms, stored.codex_cooldown_ms])
+        .toEqual([0, 333_000, 7000, 3000]);
     } finally {
       await app.close();
     }

@@ -4,11 +4,13 @@ import { config } from '../config.js';
 import { PUBLICATION_MODES } from '../types.js';
 import { publicationSlice, sliceMeta, type PublicationSlice } from '../services/publication.js';
 import {
+  RUNTIME_SETTINGS_BOUNDS,
   RuntimeSettingsRangeError,
   applyRuntimeSettingsPatch,
   readRuntimeSettings,
   readRuntimeSettingsAudit,
-  saveRuntimeSettings
+  saveRuntimeSettings,
+  validateRuntimeSettings
 } from '../services/runtime-settings.js';
 import { hasValidOpsAuth } from './ops-auth.js';
 
@@ -29,13 +31,20 @@ const NOTICE = 'Затримка стосується лише публічни�
   + 'Збір, класифікація, аудит, /ops, метрики та Telegram-сповіщення не затримуються.';
 
 /**
- * The same bounds the CHECK constraints in migration 022 enforce, sent to the form so the numeric
- * inputs carry their own `min`/`max` instead of the browser learning them from a 400.
+ * The bounds the CHECK constraints in migrations 022 and 028 enforce, sent to the form so the
+ * numeric inputs carry their own `min`/`max` instead of the browser learning them from a 400.
+ *
+ * This is the reported bug's fix on the API side: «поставив усі затримки на 0 — не зберігається, і
+ * не сказано, яке поле і які межі». Every numeric field the PUT accepts appears here with a range —
+ * four of them — so the console can render «мін … макс» beside each input and can refuse locally
+ * before a round trip. `publicationDelaySeconds` is deliberately NOT a range: it is a deployment
+ * constant from `.env`, shown so the form can say what `delayed_15s` will actually cost.
+ *
+ * The four ranges are re-exported from `runtime-settings.ts` rather than restated, because a second
+ * copy of a CHECK constraint is a copy that drifts.
  */
 const BOUNDS = {
-  analyticsDebounceMs: { min: 5000, max: 600_000 },
-  analyticsMaxDelayMs: { min: 5000, max: 1_800_000 },
-  codexCooldownMs: { min: 0, max: 86_400_000 },
+  ...RUNTIME_SETTINGS_BOUNDS,
   publicationDelaySeconds: config.PUBLICATION_DELAY_SECONDS
 } as const;
 
@@ -64,12 +73,18 @@ function effectiveOf(slice: PublicationSlice, now: Date) {
  * about. `.strict()` because a typo'd key ("publicationModes") silently doing nothing is the failure
  * mode an operator discovers by watching the map not change.
  */
+const bounded = (field: keyof typeof RUNTIME_SETTINGS_BOUNDS) => {
+  const { min, max } = RUNTIME_SETTINGS_BOUNDS[field];
+  return z.coerce.number().int().min(min).max(max).optional();
+};
+
 const runtimeSettingsBody = z.object({
   publicationMode: z.enum(PUBLICATION_MODES).optional(),
   analyticsEventDriven: z.boolean().optional(),
-  analyticsDebounceMs: z.coerce.number().int().min(5000).max(600_000).optional(),
-  analyticsMaxDelayMs: z.coerce.number().int().min(5000).max(1_800_000).optional(),
-  codexCooldownMs: z.coerce.number().int().min(0).max(86_400_000).optional()
+  analyticsDebounceMs: bounded('analyticsDebounceMs'),
+  analyticsMaxDelayMs: bounded('analyticsMaxDelayMs'),
+  analyticsMinPassIntervalMs: bounded('analyticsMinPassIntervalMs'),
+  codexCooldownMs: bounded('codexCooldownMs')
 }).strict();
 
 /**
@@ -115,8 +130,13 @@ const opsRuntimeRoutes: FastifyPluginAsync = async (app) => {
     // this branch exists to prevent, with no `issues` array to act on.
     const current = await readRuntimeSettings();
     const next = applyRuntimeSettingsPatch(current, parsed.data);
-    if (next.analyticsMaxDelayMs < next.analyticsDebounceMs) {
-      return reply.code(400).send({ error: 'invalid_settings', issues: ['analyticsMaxDelayMs'] });
+    try {
+      validateRuntimeSettings(next);
+    } catch (error) {
+      if (error instanceof RuntimeSettingsRangeError) {
+        return reply.code(400).send({ error: 'invalid_settings', issues: [error.field] });
+      }
+      throw error;
     }
     let settings;
     try {

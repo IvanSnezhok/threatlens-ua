@@ -352,26 +352,36 @@ body { overflow-x: hidden; }
   background: linear-gradient(90deg, rgba(10, 12, 16, .5), transparent 26%);
 }
 
+/* Ліва колонка карти — ПОКАЖЧИК, а не документ.
+   Усі три легенди згорнуті за замовчуванням і читаються як стос однакових рейок заввишки 30 px:
+   назва ліворуч, головний факт праворуч приглушеним моно. Згорнутий стос віддає карті ту саму
+   площу, яку раніше з'їдали три розгорнуті панелі, а розгортається рівно те, що зараз потрібно.
+   Порядок задано `order`, а не розміткою: дві легенди створює скрипт у різні моменти. */
 .map-panels {
   position: absolute;
   left: var(--gutter); top: var(--gutter);
   z-index: 3;
-  width: 336px;
+  width: 320px;
   max-width: calc(100% - var(--gutter) * 2);
   max-height: calc(100% - 96px);
   display: flex;
   flex-direction: column;
-  align-items: flex-start;
-  gap: 8px;
-  /* Три розгорнуті легенди на невисокому екрані вищі за max-height. Без цього рядка стос просто
+  align-items: stretch;
+  gap: 6px;
+  /* Розгорнута легенда на невисокому екрані вища за max-height. Без цього рядка стос просто
      виливався б за межі карти й нижня легенда ставала недосяжною. */
   overflow-y: auto;
   pointer-events: none;
 }
 .map-panels > * { pointer-events: auto; }
+.map-tools         { order: 0; }
+#threat-legend     { order: 1; }
+#occupation-legend { order: 2; }
+#vector-legend     { order: 3; }
+.sovereignty-badge { order: 4; }
 
 /* Спільна оболонка для всього, що лежить поверх карти. */
-.map-tools, .occupation-legend, .sovereignty-badge, .map-caption span, .map-caption button {
+.map-tools, .occupation-legend, .sovereignty-badge, .map-footnote p, .map-footnote button {
   background: rgba(10, 12, 16, .88);
   border: 1px solid var(--rule-2);
   backdrop-filter: blur(14px);
@@ -383,12 +393,12 @@ body { overflow-x: hidden; }
   display: flex;
   flex-wrap: wrap;
   gap: 2px;
-  padding: 4px;
+  padding: 3px;
 }
 .layer-toggle {
   display: flex;
   align-items: center;
-  padding: 8px 11px;
+  padding: 7px 9px;
   border: 0;
   background: transparent;
   color: var(--bone-4);
@@ -442,29 +452,42 @@ body { overflow-x: hidden; }
   background: repeating-linear-gradient(45deg, rgba(255,122,77,.8) 0 1.5px, rgba(255,122,77,.14) 1.5px 4.5px);
 }
 
+/* Стала обставина, а не подія: суверенітет не змінюється від тіку потоку, тож він не має права
+   важити на екрані стільки ж, скільки жива тривога. Був блок на дві сходинки заввишки 46 px —
+   став рядок заввишки 24 px, який читається як виноска до карти. Золота риска ліворуч лишається
+   тим самим кодуванням, що й золотий контур Криму на самій карті. */
 .sovereignty-badge {
-  display: grid;
-  gap: 5px;
-  padding: 11px 13px;
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  margin: 0;
+  padding: 6px 10px;
   border-left: 2px solid var(--risk);
   pointer-events: none;
 }
 .sovereignty-badge strong {
+  flex: 0 0 auto;
   color: var(--bone);
-  font: 700 14px/1.1 var(--display);
-  letter-spacing: -.02em;
+  font: 500 10px/1.4 var(--mono);
+  letter-spacing: .04em;
+  text-transform: uppercase;
 }
 .sovereignty-badge span {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
   color: var(--bone-4);
-  font: 400 8px/1 var(--mono);
-  letter-spacing: .1em;
+  font: 400 8.5px/1.5 var(--mono);
+  letter-spacing: .07em;
+  text-overflow: ellipsis;
   text-transform: uppercase;
+  white-space: nowrap;
 }
 
 /* ---- 7. Легенди карти ------------------------------------------------------------------------- */
 
 .occupation-legend {
-  width: 320px;
+  width: 100%;
   max-width: 100%;
   transition: opacity .2s var(--ease), border-color .2s var(--ease);
 }
@@ -476,21 +499,39 @@ body { overflow-x: hidden; }
 .occupation-legend > summary {
   display: flex;
   align-items: center;
-  gap: 9px;
-  padding: 10px 12px;
+  gap: 8px;
+  padding: 8px 10px;
   color: var(--bone);
-  font: 500 10px/1 var(--mono);
-  letter-spacing: .07em;
+  font: 500 9.5px/1.3 var(--mono);
+  letter-spacing: .06em;
   text-transform: uppercase;
   list-style: none;
   cursor: pointer;
+  transition: background-color .16s var(--ease);
 }
+.occupation-legend > summary:hover { background: rgba(233, 231, 224, .05); }
 .occupation-legend > summary::-webkit-details-marker { display: none; }
 .occupation-legend[open] > summary { border-bottom: 1px solid var(--rule); }
 
-.legend-title { flex: 1 1 auto; min-width: 0; }
+.legend-title { flex: 0 0 auto; }
+/* Сам зміст легенди одним рядком, поки її не розгорнули: «4 стани · 10 типів», «12 контурів ·
+   станом на 18.03». Згорнутий стос має відповідати на питання «чи треба це розгортати», а не
+   лише називати себе. Приглушений тон і вирівнювання праворуч тримають ієрархію: назва — темою,
+   факт — довідкою. */
+.legend-sum {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  color: var(--bone-4);
+  font-weight: 400;
+  letter-spacing: .05em;
+  text-align: right;
+  text-overflow: ellipsis;
+  text-transform: none;
+  white-space: nowrap;
+}
 .legend-caret {
-  margin-left: auto;
+  flex: 0 0 auto;
   color: var(--bone-4);
   transition: transform .2s var(--ease);
 }
@@ -498,22 +539,14 @@ body { overflow-x: hidden; }
 
 .legend-body {
   display: grid;
-  gap: 10px;
-  padding: 12px;
-  max-height: min(46vh, 350px);
+  gap: 9px;
+  padding: 10px;
+  max-height: min(46vh, 340px);
   overflow-y: auto;
 }
-.legend-meta {
-  margin: 0;
-  display: flex;
-  align-items: center;
-  flex-wrap: wrap;
-  gap: 8px;
-  color: var(--bone-4);
-  font: 400 9px/1.4 var(--mono);
-  letter-spacing: .07em;
-  text-transform: uppercase;
-}
+/* .legend-meta більше немає: єдиний рядок метаданих кожної легенди переїхав у її ж <summary>
+   (.legend-sum), бо саме згорнутий стан тепер типовий, і факт, схований за розгортанням,
+   не допомагає вирішити, чи варто розгортати. */
 .legend-stale {
   margin-left: 6px;
   padding: 2px 6px;
@@ -533,14 +566,31 @@ body { overflow-x: hidden; }
 }
 .legend-warning b { color: var(--risk); font-weight: 600; }
 
-.legend-rows { margin: 0; padding: 0; list-style: none; display: grid; gap: 8px; }
+.legend-rows { margin: 0; padding: 0; list-style: none; display: grid; gap: 7px; }
 .legend-rows li {
   display: flex;
-  gap: 10px;
+  gap: 9px;
   align-items: flex-start;
   color: var(--bone-2);
-  font-size: 11.5px;
+  font-size: 11px;
   line-height: 1.4;
+}
+/* Стан і його опис — дві сходинки, а не одне речення: ім'я стану читається сканом згори вниз,
+   опис лишається під ним меншим і приглушеним. Раніше все було одним рядком body-кеглем, і
+   чотири стани виглядали як абзац тексту, у якому треба шукати потрібне слово. */
+.legend-states li { align-items: center; }
+.legend-states span {
+  display: grid;
+  gap: 1px;
+  color: var(--bone-3);
+  font-size: 10.5px;
+  line-height: 1.45;
+}
+.legend-states b {
+  color: var(--bone);
+  font: 500 10px/1.3 var(--mono);
+  letter-spacing: .05em;
+  text-transform: uppercase;
 }
 .legend-swatch {
   flex: 0 0 auto;
@@ -548,6 +598,7 @@ body { overflow-x: hidden; }
   margin-top: 2px;
   border: 1px solid currentColor;
 }
+.legend-states .legend-swatch { margin-top: 0; }
 .legend-swatch.occupied {
   color: rgba(255, 122, 77, .7);
   background: repeating-linear-gradient(45deg, rgba(255,122,77,.8) 0 1.5px, rgba(255,122,77,.16) 1.5px 4.5px);
@@ -566,13 +617,28 @@ body { overflow-x: hidden; }
 /* Гліф типу загрози в легенді: інлайновий SVG, тонований через currentColor. */
 .legend-icon {
   flex: 0 0 auto;
-  width: 15px; height: 15px;
+  width: 14px; height: 14px;
   color: var(--threat);
 }
 .legend-icon svg { display: block; width: 100%; height: 100%; }
-/* Дві колонки на будь-якій ширині: десять рядків в один стовпчик — це вже не легенда, а список. */
-.legend-icons { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 7px 10px; }
-.legend-icons li { font-size: 11px; }
+/* Рівно 2×5: десять рядків в один стовпчик — це вже не легенда, а список, а три колонки не
+   лишають місця навіть короткому підпису. Клітинки однакової висоти, бо підписи короткі й не
+   переносяться; повна назва живе в title і в aria-label. */
+.legend-icons {
+  padding-top: 9px;
+  border-top: 1px solid var(--rule);
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 6px 10px;
+}
+.legend-icons li {
+  gap: 7px;
+  align-items: center;
+  color: var(--bone-3);
+  font-size: 10.5px;
+  line-height: 1.2;
+  white-space: nowrap;
+}
 
 /* Текст лише для допоміжних технологій: живий регіон карти не має жодного візуального місця,
    але без нього карта для читача з екранної читалки лишається порожнім прямокутником. */
@@ -586,36 +652,49 @@ body { overflow-x: hidden; }
   border: 0;
 }
 
-.legend-empty, .legend-note { margin: 0; color: var(--bone-4); font-size: 10.5px; line-height: 1.55; }
-.legend-note { padding-top: 10px; border-top: 1px solid var(--rule); }
+.legend-empty, .legend-note { margin: 0; color: var(--bone-4); font-size: 10px; line-height: 1.5; }
+.legend-note { padding-top: 9px; border-top: 1px solid var(--rule); }
+.legend-icons + .legend-note { padding-top: 0; border-top: 0; }
 .legend-source { margin: 0; color: var(--bone-4); font: 400 9px/1.4 var(--mono); letter-spacing: .06em; text-transform: uppercase; }
 .legend-source a { color: var(--bone-2); text-decoration: none; border-bottom: 1px solid var(--rule-2); }
 .legend-source a:hover { color: var(--bone); }
 
-.map-caption {
+/* Те, що лишилося від підпису під картою: одна обіцянка продукту й одна дія.
+   Шість речень кодування переїхали в легенду (візуально) і в #map-legend-text (для читача
+   екрана); тут стоїть рівно те, що НЕ є кодуванням і тому мусить бути видимим завжди — зокрема
+   на телефоні, де попередній підпис ховався зовсім. */
+.map-footnote {
   position: absolute;
   left: var(--gutter); right: var(--gutter); bottom: 42px;
+  z-index: 2;
   display: flex;
-  align-items: stretch;
-  gap: 12px;
-  color: var(--bone-2);
-  font: 400 10px/1.5 var(--mono);
+  align-items: center;
+  gap: 10px;
+  color: var(--bone-3);
+  font: 400 9.5px/1 var(--mono);
   pointer-events: none;
 }
-.map-caption span { padding: 10px 13px; max-width: 720px; }
-.map-caption button {
+.map-footnote p {
+  margin: 0;
+  padding: 8px 11px;
+  border-left-width: 2px;
+  border-left-color: var(--rule-3);
+  letter-spacing: .06em;
+  text-transform: uppercase;
+}
+.map-footnote button {
   pointer-events: auto;
   margin-left: auto;
-  padding: 10px 14px;
+  padding: 9px 13px;
   color: var(--bone);
-  font: 500 10px/1 var(--mono);
+  font: 500 9.5px/1 var(--mono);
   letter-spacing: .08em;
   text-transform: uppercase;
   white-space: nowrap;
   cursor: pointer;
   transition: background-color .16s var(--ease);
 }
-.map-caption button:hover { background: rgba(233, 231, 224, .1); }
+.map-footnote button:hover { background: rgba(233, 231, 224, .1); }
 
 /* Плашка режиму публікації. Стоїть над підписом карти, бо підпис ховається нижче 980 px, а те, що
    показ затримано, мусить лишатися видимим на телефоні теж. Тон — той самий пісочний, що й у
@@ -1274,7 +1353,7 @@ body { overflow-x: hidden; }
 }
 .filter-bar select:hover, .filter-bar input:hover { border-color: var(--rule-3); }
 
-.filter-bar button, .text-button, .map-caption button, .territory-filters button {
+.filter-bar button, .text-button, .map-footnote button, .territory-filters button {
   font-family: var(--mono);
 }
 .filter-bar button {
@@ -1880,6 +1959,214 @@ body { overflow-x: hidden; }
 }
 .ops-channel-actions a:hover, .ops-channel-actions button:hover { color: var(--bone); border-color: var(--bone); background: transparent; }
 
+/* ---- Довіра до джерел: реєстр -----------------------------------------------------------------
+
+   Сімдесят каналів — це не список карток, це відомість. Тому таблиця, а не стос: рядок заввишки
+   в один рядок, числа моноширинним із табличними цифрами, і єдина пропорційна річ у рядку —
+   назва джерела. Через це всі сім числових колонок стоять під одна одною й читаються скануванням
+   згори вниз, а не порівнянням на пам'ять.
+
+   Колір тут один і має рівно одне значення: смуга довіри. Знижена — тон тривоги, висока —
+   бірюза суверенітету, звичайна й нейтральна — кістяний. Відомість, у якій світиться кожен
+   рядок, не вирізняє жодного. */
+
+.trust-controls {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  gap: 12px;
+  margin-top: 24px;
+}
+.trust-controls label {
+  display: grid;
+  gap: 7px;
+  color: var(--bone-4);
+  font: 400 9px/1 var(--mono);
+  letter-spacing: .12em;
+  text-transform: uppercase;
+}
+.trust-filter { flex: 1 1 260px; }
+.trust-order { flex: 0 1 250px; }
+.trust-controls input, .trust-controls select { width: 100%; }
+.trust-count {
+  flex: 0 0 auto;
+  margin-left: auto;
+  padding-bottom: 11px;
+  color: var(--bone-4);
+  font: 400 10px/1 var(--mono);
+  font-variant-numeric: tabular-nums;
+  letter-spacing: .06em;
+}
+
+/* Відомість — власна панель прокрутки, а не частина потоку сторінки.
+   Через це методологія й органи керування лишаються на екрані, поки оператор гортає сімдесят
+   рядків, а `position: sticky` заголовка справді має до чого липнути: без обмеженої висоти
+   контейнера з `overflow` липкий заголовок не рухається взагалі, бо всередині немає прокрутки. */
+.trust-table-wrap {
+  margin-top: 14px;
+  max-height: min(72vh, 720px);
+  border: 1px solid var(--rule-2);
+  overflow: auto;
+  overscroll-behavior: contain;
+}
+.trust-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-variant-numeric: tabular-nums;
+}
+/* Колонка без підпису — це стовпчик чисел, який доводиться зіставляти з памʼяттю про те, що вгорі. */
+.trust-table thead th {
+  position: sticky;
+  top: 0;
+  z-index: 2;
+  padding: 10px 8px 9px;
+  background: var(--surface-2);
+  border-bottom: 1px solid var(--rule-2);
+  color: var(--bone-4);
+  font: 500 8.5px/1 var(--mono);
+  letter-spacing: .1em;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+.trust-table th.th-name { text-align: left; width: 34%; }
+.trust-table th.th-num { text-align: right; }
+.trust-table th.th-trust { text-align: left; }
+.trust-table abbr { text-decoration: none; border-bottom: 1px dotted var(--rule-3); cursor: help; }
+
+.trust-row > td {
+  padding: 0;
+  border-bottom: 1px solid var(--rule);
+  vertical-align: middle;
+}
+.trust-row:hover > td { background: rgba(233, 231, 224, .035); }
+.trust-row.is-open > td { background: rgba(233, 231, 224, .05); }
+.trust-row td.td-num {
+  padding: 9px 8px;
+  color: var(--bone-2);
+  font: 400 11px/1.2 var(--mono);
+  text-align: right;
+  white-space: nowrap;
+}
+
+/* Назва — єдиний фокусований орган у рядку. Клікати сам <tr> було б зручно мишею й неможливо
+   з клавіатури, а розгортання, доступне лише вказівнику, — це розгортання, якого немає. */
+.trust-name {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  width: 100%;
+  padding: 9px 10px;
+  border: 0;
+  background: transparent;
+  color: var(--bone);
+  font: 500 13px/1.3 var(--body);
+  letter-spacing: -.01em;
+  text-align: left;
+  cursor: pointer;
+}
+.trust-name:focus-visible { outline: 1px solid var(--bone-2); outline-offset: -1px; }
+.trust-caret {
+  flex: 0 0 auto;
+  color: var(--bone-4);
+  font-size: 9px;
+  transition: transform .16s var(--ease);
+}
+.trust-row.is-open .trust-caret { transform: rotate(90deg); }
+.trust-title { flex: 0 1 auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.trust-chips { flex: 0 0 auto; display: flex; gap: 4px; }
+.trust-chip {
+  padding: 2px 5px;
+  border: 1px solid var(--rule-2);
+  color: var(--bone-3);
+  font: 400 8.5px/1.35 var(--mono);
+  font-style: normal;
+  letter-spacing: .08em;
+  text-transform: uppercase;
+}
+.trust-chip.is-muted { border-color: transparent; color: var(--bone-4); }
+.trust-chip.is-official { border-color: var(--rule-3); color: var(--bone-2); }
+
+/* Довіра: смуга, число, слово. Смуга дає порядок величини боковим зором, число — точність,
+   слово — межу, за якою система змінює поведінку. Три кодування одного факту навмисні: саме
+   за цим числом оператор ухвалює рішення. */
+.trust-row td.td-trust {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  text-align: left;
+}
+.trust-bar {
+  flex: 0 0 auto;
+  position: relative;
+  width: 52px; height: 5px;
+  background: rgba(233, 231, 224, .09);
+}
+.trust-bar i { display: block; height: 100%; background: var(--bone-3); }
+.trust-bar.is-ok  i { background: var(--sov); }
+.trust-bar.is-bad i { background: var(--alert); }
+.trust-row td.td-trust b { font-weight: 500; color: var(--bone); }
+.trust-row td.td-trust b.is-ok  { color: var(--sov); }
+.trust-row td.td-trust b.is-bad { color: #ff9a86; }
+.trust-word {
+  color: var(--bone-4);
+  font-size: 8.5px;
+  letter-spacing: .1em;
+  text-transform: uppercase;
+}
+
+.trust-detail > td { padding: 0; border-bottom: 1px solid var(--rule-2); background: var(--surface-2); }
+.trust-detail-body { padding: 4px 14px 18px; }
+.trust-detail-body > .legend-note { padding: 14px 0 0; border: 0; }
+.trust-detail-body .codex-facts { margin-top: 14px; }
+.trust-history { margin-top: 16px; }
+.trust-history h4 {
+  margin: 0 0 10px;
+  color: var(--bone-4);
+  font: 500 9px/1 var(--mono);
+  letter-spacing: .14em;
+  text-transform: uppercase;
+}
+.trust-history-list { margin: 0; padding: 0; list-style: none; display: grid; gap: 5px; }
+.trust-history-list li {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  color: var(--bone-3);
+  font: 400 11px/1.3 var(--mono);
+  font-variant-numeric: tabular-nums;
+}
+.trust-history-list time { flex: 0 0 72px; color: var(--bone-4); }
+.trust-history-list b { flex: 0 0 34px; color: var(--bone-2); font-weight: 500; }
+.trust-history-list small { color: var(--bone-4); font-size: 10px; }
+
+/* Нейтральні джерела не зникають, але й не розбавляють порівняння: у них немає числа, з яким
+   можна зіставити чуже. Згорнутий кластер із лічильником каже, скільки їх, і не бере місця. */
+.trust-neutral { margin-top: 18px; border-top: 1px solid var(--rule-2); }
+.trust-neutral > summary {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 14px 0 12px;
+  color: var(--bone-3);
+  font: 500 9.5px/1 var(--mono);
+  letter-spacing: .12em;
+  text-transform: uppercase;
+  list-style: none;
+  cursor: pointer;
+}
+.trust-neutral > summary::-webkit-details-marker { display: none; }
+.trust-neutral > summary:hover { color: var(--bone); }
+.trust-neutral > summary b {
+  padding: 2px 7px;
+  border: 1px solid var(--rule-2);
+  color: var(--bone-2);
+  font-weight: 400;
+  font-variant-numeric: tabular-nums;
+}
+.trust-neutral > summary .legend-caret { margin-left: auto; }
+.trust-neutral[open] > summary .legend-caret { transform: rotate(180deg); }
+.trust-neutral > .legend-note { padding: 0 0 12px; border: 0; max-width: 74ch; }
+
 .ops-projection { grid-column: 1 / -1; }
 .ops-projection:not(:empty) { margin-top: 16px; padding-top: 16px; border-top: 1px solid var(--rule); }
 .ops-projection h3 {
@@ -2030,6 +2317,53 @@ body { overflow-x: hidden; }
   color: var(--bone);
   font: 400 13px/1 var(--mono);
 }
+/* Числове поле разом із власними межами. Межа тут не примітка під полем, а частина самого поля:
+   рядок «від 0 до 600 000 мс» стоїть впритул до інпута, обидва числа натискні, і саме вони
+   підставляються в поле. Показати межу й не дати її виконати — це змусити оператора набирати
+   число, яке система вже знає. */
+.runtime-field { cursor: auto; }
+.runtime-bounds {
+  flex: 1 1 100%;
+  margin: 7px 0 0;
+  color: var(--bone-4);
+  font: 400 10px/1.5 var(--mono);
+  font-variant-numeric: tabular-nums;
+  letter-spacing: .04em;
+}
+.bound-pick {
+  padding: 1px 5px;
+  border: 0;
+  border-bottom: 1px dashed var(--rule-3);
+  background: transparent;
+  color: var(--bone-2);
+  font: inherit;
+  cursor: pointer;
+  transition: color .16s var(--ease), background-color .16s var(--ease), border-color .16s var(--ease);
+}
+.bound-pick:hover { background: rgba(233, 231, 224, .08); border-bottom-color: var(--bone-2); color: var(--bone); }
+.bound-pick:focus-visible { outline: 1px solid var(--bone-2); outline-offset: 1px; }
+
+/* Помилка поля стоїть біля поля. Тон тривоги тут доречний саме тому, що решта форми беззвучна:
+   світиться рівно те, що заважає зберегти. */
+.runtime-field.is-invalid { box-shadow: inset 2px 0 0 var(--alert); }
+.runtime-field.is-invalid input[type="number"] { border-color: rgba(255, 71, 71, .55); }
+.runtime-field-error {
+  flex: 1 1 100%;
+  margin: 8px 0 0;
+  color: #ff9a86;
+  font-size: 11.5px;
+  line-height: 1.5;
+}
+.runtime-actions { flex-wrap: wrap; }
+/* Пресет — дія другого ряду: він не зберігає, він заповнює. Тому обведення, а не заливка,
+   на відміну від «Зберегти». */
+.runtime-actions [data-runtime-minimums] {
+  border: 1px solid var(--rule-2);
+  background: transparent;
+  color: var(--bone-2);
+}
+.runtime-actions [data-runtime-minimums]:hover { border-color: var(--bone); color: var(--bone); background: transparent; }
+
 #runtime-section .codex-model { margin-top: 18px; }
 #runtime-section .codex-facts { margin-top: 20px; }
 #runtime-section .ops-channel-list { margin-top: 20px; }
@@ -2191,10 +2525,12 @@ code {
   .map-panels { left: 10px; right: 10px; top: 10px; width: auto; max-width: none; max-height: calc(100% - 24px); }
   .map-tools, .occupation-legend { width: 100%; }
   .legend-body { max-height: 30vh; }
-  .map-caption { display: none; }
-  /* Підпису карти тут немає, тож плашка лишається єдиним місцем, де сказано про затримку. Вона
-     стоїть над рейкою подій і не має права накрити перемикачі шарів угорі. */
-  .map-chip { left: 10px; right: 10px; bottom: calc(38vh + 16px); max-width: none; font-size: 10px; }
+  /* Обіцянка про напрямки лишається й тут — раніше вона зникала разом із підписом. Три смуги
+     над рейкою подій стоять сходинками й не мають права накрити одна одну: виноска нижче,
+     плашка режиму показу вище, перемикачі шарів угорі екрана. */
+  .map-footnote { left: 10px; right: 10px; bottom: calc(38vh + 14px); font-size: 9px; }
+  .map-footnote p { padding: 7px 9px; }
+  .map-chip { left: 10px; right: 10px; bottom: calc(38vh + 50px); max-width: none; font-size: 10px; }
 
   .content-shell { padding: 40px 18px 90px; background-image: linear-gradient(180deg, var(--surface) 0, var(--ink) 380px); }
   .content-heading { margin-bottom: 32px; padding-bottom: 20px; }
@@ -2206,6 +2542,44 @@ code {
   .ops-channel-list article { display: grid; }
   .ops-channel-actions { overflow-x: auto; }
   .channel-description { grid-column: 1 / -1; }
+
+  /* Відомість на телефоні розкладається в картки з тим самим порядком і тим самим фільтром:
+     сортування й пошук працюють по DOM, тож вони не помічають, що колонки стали рядками.
+     Підпис колонки, який на десктопі був у шапці, тут стає видимим підписом у самій комірці —
+     нічого не втрачено, змінився лише носій підпису (data-label, одне джерело з заголовком). */
+  .trust-table-wrap { max-height: none; overflow: visible; border: 0; }
+  .trust-table, .trust-table tbody, .trust-table tr, .trust-table td { display: block; width: auto; }
+  .trust-table thead { display: none; }
+  .trust-controls { display: grid; }
+  .trust-count { margin-left: 0; padding-bottom: 0; }
+
+  .trust-row {
+    margin-bottom: 8px;
+    border: 1px solid var(--rule-2);
+    background: var(--surface-2);
+  }
+  .trust-row > td { border-bottom: 1px solid var(--rule); }
+  .trust-row > td:last-child { border-bottom: 0; }
+  .trust-row td.td-num {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 12px;
+    text-align: right;
+  }
+  .trust-row td.td-num::before {
+    content: attr(data-label);
+    color: var(--bone-4);
+    font-size: 9px;
+    letter-spacing: .1em;
+    text-align: left;
+    text-transform: uppercase;
+  }
+  .trust-row td.td-trust::before { content: attr(data-label); }
+  .trust-row td.td-trust { justify-content: flex-start; flex-wrap: wrap; }
+  .trust-name { flex-wrap: wrap; padding: 12px 10px; }
+  .trust-detail > td { border: 0; }
+  .trust-detail-body { padding: 0 10px 14px; }
 }
 
 @media (max-width: 720px) {
@@ -2273,8 +2647,12 @@ body.tv-mode .map-panels { width: 430px; }
 body.tv-mode .occupation-legend { width: 100%; }
 body.tv-mode .occupation-legend > summary { font-size: 12px; }
 body.tv-mode .legend-rows li, body.tv-mode .legend-warning { font-size: 13px; }
+body.tv-mode .legend-states span, body.tv-mode .legend-states b { font-size: 12px; }
 body.tv-mode .legend-empty, body.tv-mode .legend-note { font-size: 12px; }
-body.tv-mode .map-caption { font-size: 12px; }
+body.tv-mode .sovereignty-badge strong { font-size: 12px; }
+body.tv-mode .sovereignty-badge span { font-size: 10px; }
+body.tv-mode .map-footnote { font-size: 12px; }
+body.tv-mode .map-footnote button { font-size: 12px; }
 
 /* ---- 18. Зменшений рух ------------------------------------------------------------------------ */
 

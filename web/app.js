@@ -40,6 +40,15 @@ const threatIconAria = {
 };
 // Підпис іконки — це та сама назва класу, яку вже показує картка події. Окрема копія розійшлася б.
 const threatIconLabels = threatNames;
+// Короткі підписи ЛИШЕ для сітки легенди 2×5. «Мінометний обстріл» у колонці завширшки 130 px
+// переноситься в три рядки й розвалює сітку, а легенда з десятьма різновисокими клітинками
+// перестає читатися одним поглядом. Повна назва нікуди не дівається: вона лишається в aria-label
+// і в title кожного рядка, тобто доступна і читачеві екрана, і курсору.
+const threatIconShortLabels = {
+  uav: 'БпЛА', ballistic_missile: 'Балістика', cruise_missile: 'Крилаті', guided_air_bomb: 'КАБ',
+  aviation: 'Авіація', mlrs: 'РСЗВ', artillery: 'Артилерія', mortar: 'Міномети',
+  combined: 'Комбінована', unknown: 'Невизначена'
+};
 const iconTones = ['consequence', 'confirmed', 'reported', 'analytic'];
 // #ff4747 тут не зʼявляється ніколи: червоне зарезервоване за офіційною тривогою, а тривога —
 // це заливка полігона, а не іконка. Іконка, що позичила б колір тривоги, дала б повідомленню
@@ -146,35 +155,40 @@ const analyticLayerIds    = ['analytic-raion-line','analytic-oblast-line'];
 // Районний полігон під курсором шукаємо в усіх районних заливках, а не лише в тривожній:
 // вимкнений перемикач «Тривоги» не має відбирати можливість клікнути район.
 const raionFillLayerIds   = ['alert-raion-fill','threat-raion-fill','consequence-raion-fill'];
-// 136 районів на оглядовому масштабі зливаються в кашу й перебивають обласну картину, заради якої карту й відкривають.
-// Тому районний шар починає проявлятися з RAION_ZOOM_MIN і набирає повну силу на RAION_ZOOM_FULL —
-// там одна область займає майже весь кадр, а район читається як окрема пляма й лишається клікабельним і на телефоні.
-const RAION_ZOOM_MIN = 6;
-const RAION_ZOOM_FULL = 6.8;
+// Район світиться на БУДЬ-ЯКОМУ масштабі, разом із областю й нарівні з нею. Тривогу оголошують на
+// конкретні райони, і карта країни мусить показувати саме їх: залити цілу область через один її
+// район означало б намалювати географію, якої джерело не називало. Тихі райони тієї самої області
+// лишаються темними. Масштаб керує лише товщиною ліній і кеглем підписів — естетикою, а не складом
+// того, що на карті стверджується.
+//
+// ICON_TIER_ZOOM лишився ЄДИНИМ порогом масштабу на карті: нижче за нього стеки іконок обласні,
+// вище — районні. Це свідома асиметрія з полігонами, а не забутий залишок: гліф — заява про клас
+// зброї над конкретною точкою, і 136 таких заяв оглядовий масштаб не витримує.
+const ICON_TIER_ZOOM = 6.8;
 // alert — тривогу оголошено дослівно на цю територію.
-// unmapped — тривога в її частині, для якої контуру немає взагалі, тож детальнішої картинки не буде;
-//            такий регіон не гасне на великому масштабі, інакше тривога просто зникла б із карти.
-// partial — тривога в її частині, яка має власний контур; тут область поступається районові.
+// unmapped — тривога в її частині, для якої контуру немає взагалі (місто, громада), тож детальнішої
+//            картинки не буде; такий регіон світиться сам, інакше тривога зникла б із карти зовсім.
+// partial — тривога лише в тій частині території, яка МАЄ власний контур. Цей стан більше не малює
+//            нічого й ніде: за нього говорять засвічені районні полігони всередині. Ключі *Partial
+//            далі пишуться у feature-state (див. territoryStateOf) — це машинно читаний запис про
+//            похідне покриття, — але жоден вираз фарби їх не читає.
 const alertFlag = ['boolean', ['feature-state', 'alert'], false];
 const unmappedFlag = ['boolean', ['feature-state', 'unmapped'], false];
-const partialFlag = ['boolean', ['feature-state', 'partial'], false];
-// Ті самі три ролі, помножені на три нові сімейства станів. Назви ключів тривоги лишаються
-// історичними (unmapped / partial без префікса) саме тому, що вирази шести тривожних шарів мусять
-// лишитися незмінними до байта.
+// Ті самі дві ролі, помножені на три інші сімейства станів. Назви ключів тривоги лишаються
+// історичними (unmapped без префікса) саме тому, що вирази тривожних шарів мусять лишатися
+// впізнаваними при читанні поруч із рештою.
 const threatFlag            = ['boolean', ['feature-state', 'threat'], false];
 const threatUnmappedFlag    = ['boolean', ['feature-state', 'threatUnmapped'], false];
-const threatPartialFlag     = ['boolean', ['feature-state', 'threatPartial'], false];
 const consequenceFlag         = ['boolean', ['feature-state', 'consequence'], false];
 const consequenceUnmappedFlag = ['boolean', ['feature-state', 'consequenceUnmapped'], false];
-const consequencePartialFlag  = ['boolean', ['feature-state', 'consequencePartial'], false];
 const analyticFlag          = ['boolean', ['feature-state', 'analytic'], false];
 const analyticUnmappedFlag  = ['boolean', ['feature-state', 'analyticUnmapped'], false];
-const analyticPartialFlag   = ['boolean', ['feature-state', 'analyticPartial'], false];
 // Аналітична оцінка — найслабший сигнал на карті. Там, де вже є тривога або загроза, вона мовчить
 // повністю: два контури на одному полігоні читаються як два різні твердження про одне й те саме.
+// Похідне покриття сюди не входить: воно тепер не малює нічого, тож і глушити ним пунктир не можна —
+// інакше дослівно названа оцінка області зникала б через тривогу в одному сусідньому районі.
 const strongerThanAnalytic = ['any',
-  alertFlag, unmappedFlag, partialFlag, threatFlag, threatUnmappedFlag, threatPartialFlag];
-const fadingLabel = ['==', ['get', 'tone'], 'partial'];
+  alertFlag, unmappedFlag, threatFlag, threatUnmappedFlag];
 const crimeaSovereignty = ['==', ['get', 'sovereignty'], 'crimea-ukraine'];
 
 let snapshot = null;
@@ -196,7 +210,11 @@ let occupationLegendOpen = null;
 let occupationFetchedAt = null;
 let vectors = [];
 let vectorLegendOpen = null;
-let threatLegendOpen = null;   // 981px — дзеркало CSS-брейкпойнта 980px; тримати синхронно
+// null — оператор ще не чіпав легенду, тобто вона згорнута. Три розгорнуті легенди накривали
+// половину карти, тож стан «за замовчуванням» тепер один на всі ширини — закрито. Сам механізм
+// не змінився: клік записує сюди булеве значення, і саме воно переживає перемальовування
+// сторінки на кожну подію потоку.
+let threatLegendOpen = null;
 // Реєстрація сорока зображень і чотири шари, що їх малюють. Обидва прапорці скидаються разом із
 // картою: map.addImage не переживає map.remove(), а карту знищують на кожному переході з маршруту.
 let iconImagesReady = false;
@@ -520,7 +538,11 @@ function alertLabelCollection(fam) {
     } });
   };
   for (const id of fam.direct) add(id, 'direct');
-  for (const id of fam.covered) if (!fam.direct.has(id)) add(id, fam.unmapped.has(id) ? 'unmapped' : 'partial');
+  // Похідне покриття (`partial`) не підписується взагалі. Область, у якій названо район, не має ні
+  // заливки, ні контуру — червона назва на весь її обшир стверджувала б рівно те, що заливку звідти
+  // й прибрали. Фічі просто немає в джерелі: підпис із прозорістю 0 усе одно займав би місце в
+  // колізіях і виштовхував би справжні районні назви за межі кадру.
+  for (const id of fam.covered) if (!fam.direct.has(id) && fam.unmapped.has(id)) add(id, 'unmapped');
   return { type: 'FeatureCollection', features };
 }
 
@@ -570,8 +592,13 @@ function applyTerritoryLayers() {
 }
 
 // Районна геометрія вантажиться окремо й не блокує старт карти. Якщо файлу немає або він зіпсований,
-// карта лишається повністю робочою на рівні областей: районну тривогу все одно видно як приглушену
-// заливку батьківської області, бо стан підіймається вгору ієрархією каталогу.
+// карта лишається повністю робочою на рівні областей: районну тривогу все одно видно як заливку
+// батьківської області, бо nearestPolygonAncestor() не знаходить районної фічі й claim() записує
+// область як `unmapped` — той самий стан, яким світяться міста й громади без власного контуру.
+// Саме тому прибирання «часткової» заливки нічого не ламає в польоті: поки ADM2 не приїхав,
+// тривога взагалі не буває «частковою», а коли приїхав — її несе сам район.
+// Шари районів існують від самого початку й на будь-якому масштабі; поки джерело порожнє,
+// вони просто нічого не малюють і наповнюються на місці, щойно setData() отримає геометрію.
 async function loadRaionBoundaries() {
   try {
     const response = await fetch('/data/ukraine-adm2.geojson', { signal: AbortSignal.timeout(20000) });
@@ -818,11 +845,11 @@ function renderVectorLegend() {
   const hidden = vectors.reduce((sum, vector) => sum + (vector.segments ?? []).filter((segment) => !segment.drawable).length, 0);
   legend.hidden = !drawn;
   if (!drawn) return;
-  legend.open = vectorLegendOpen ?? window.matchMedia('(min-width: 981px)').matches;
+  legend.open = vectorLegendOpen ?? false;
   const swatch = (style) => `<i class="legend-swatch" style="height:0;border:0;border-top:2px solid ${vectorColor};${style}"></i>`;
-  legend.innerHTML = `<summary><i class="swatch threat"></i><span class="legend-title">Ланцюги повідомлень</span><span class="legend-caret" aria-hidden="true">▾</span></summary>
+  const summary = `${chains} ланцюг${chains === 1 ? '' : 'ів'} · ${drawn} відрізк${drawn === 1 ? '' : 'ів'}`;
+  legend.innerHTML = `<summary><i class="swatch threat"></i><span class="legend-title">Ланцюги повідомлень</span><span class="legend-sum">${summary}</span><span class="legend-caret" aria-hidden="true">▾</span></summary>
     <div class="legend-body">
-      <p class="legend-meta"><span>${chains} ланцюг${chains === 1 ? '' : 'ів'} · ${drawn} відрізк${drawn === 1 ? '' : 'ів'}</span></p>
       <p class="legend-warning">Це послідовність <b>повідомлень</b> із часом і джерелом, а не траєкторія польоту. Лінія показує, що і коли повідомили, а не куди прямує ціль. Система не прогнозує ціль, влучання або маршрут.</p>
       <ul class="legend-rows">
         <li>${swatch('opacity:.95')}<span>Суцільна — одне повідомлення ствердило сам рух («повз А на Б»).</span></li>
@@ -983,11 +1010,13 @@ function renderOccupationLegend() {
         <li><i class="legend-swatch liberated"></i><span>Звільнена територія</span></li>
       </ul>`
     : '<p class="legend-empty">Контурів для цього зрізу не отримано. Решта карти працює у звичайному режимі.</p>';
-  // Позначку «застаріло» дублюємо в summary: на вузьких екранах легенда згорнута,
-  // і застарілий шар не має жодного шансу виглядати актуальним.
-  legend.innerHTML = `<summary><i class="swatch occupation"></i><span class="legend-title">Тимчасово окуповані території</span>${stale ? '<b class="legend-stale">застаріло</b>' : ''}<span class="legend-caret" aria-hidden="true">▾</span></summary>
+  // Позначка «застаріло» і час зрізу стоять у самому summary: легенда згорнута за замовчуванням,
+  // і застарілий шар не має жодного шансу виглядати актуальним, поки її ніхто не розгорнув.
+  const captured = occupation.capturedLabel ? `станом на ${escapeHtml(occupation.capturedLabel)}` : 'час зрізу не вказано';
+  const areas = occupationCollection().features.length;
+  const summary = hasAreas ? `${areas} ${pluralUk(areas, 'контур', 'контури', 'контурів')} · ${captured}` : captured;
+  legend.innerHTML = `<summary><i class="swatch occupation"></i><span class="legend-title">Окуповані території</span><span class="legend-sum">${summary}</span>${stale ? '<b class="legend-stale">застаріло</b>' : ''}<span class="legend-caret" aria-hidden="true">▾</span></summary>
     <div class="legend-body">
-      <p class="legend-meta"><span>${occupation.capturedLabel ? `Станом на ${escapeHtml(occupation.capturedLabel)}` : 'Час зрізу не вказано'}</span></p>
       ${stale ? '<p class="legend-warning">Шар не оновлювався надто довго. Лінія контролю могла змінитися — не покладайтеся на ці контури як на поточні.</p>' : ''}
       ${rows}
       <p class="legend-note">Окупація — тимчасовий фактичний стан на території України, а не зміна кордону. Державний кордон України залишається незмінним; АР Крим і Севастополь — територія України.</p>
@@ -1252,9 +1281,13 @@ function writeMapAria() {
   node.textContent = text;
 }
 
-// Легенда чотирьох станів карти. Створюється зі скрипта, а не в public/index.html, бо той файл
-// зараз правлять інші гілки. Чотири речення тут дослівно повторюють .map-caption: підпис під картою
-// ховається нижче 980 px, і на телефоні легенда лишається єдиним поясненням трьох нових заливок.
+// Кодування чотирьох станів карти й десяти типів загроз. Тепер це ЄДИНЕ візуальне місце, де воно
+// записане: підпис під картою більше не повторює ті самі шість речень, бо два формулювання одного
+// кодування — це два кодування, і на 980 px одне з них зникало разом із поясненням.
+//
+// Легенда згорнута за замовчуванням на будь-якій ширині, тож увесь її зміст мусить бути й у
+// текстовому еквіваленті карти (#map-legend-text, див. ensureMapOverlays) — інакше читач екрана
+// отримав би менше, ніж дає одне натискання на «▾».
 function renderThreatLegend() {
   const panels = $('.map-panels');
   if (!panels) return;
@@ -1267,32 +1300,35 @@ function renderThreatLegend() {
     // Одразу під перемикачами шарів: легенда пояснює саме їх, а не шар окупації.
     panels.insertBefore(legend, $('.sovereignty-badge') ?? null);
   }
-  legend.open = threatLegendOpen ?? window.matchMedia('(min-width: 981px)').matches;
+  legend.open = threatLegendOpen ?? false;
   // Гліф у легенді — той самий рядок path, що вже лежить у бандлі, вставлений інлайновим SVG:
   // ні data:-адреси, ні зайвого запиту. Тон беремо «підтверджене джерело» — це нейтральний
   // представник класу, а не заява про стан якоїсь конкретної території.
+  //
+  // Підпис короткий, повна назва — в title і в aria-label самого рядка: сітка 2×5 має тримати
+  // однакову висоту клітинок, а перенесення «Мінометний обстріл» ламало саме її.
   const iconRow = (threatType) => {
-    const label = threatIconLabels[threatType] ?? threatType;
+    const short = threatIconShortLabels[threatType] ?? threatIconLabels[threatType] ?? threatType;
+    const full = threatIconLabels[threatType] ?? threatType;
     const aria = iconAriaLabel(threatType, 'confirmed');
-    return `<li><i class="legend-icon" role="img" aria-label="${escapeHtml(aria)}">`
+    return `<li title="${escapeHtml(full)}"><i class="legend-icon" role="img" aria-label="${escapeHtml(aria)}">`
       + `<svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">`
       + `<path fill="currentColor" fill-rule="evenodd" d="${threatIconPaths[threatType]}"/></svg>`
-      + `</i><span>${escapeHtml(label)}</span></li>`;
+      + `</i><span>${escapeHtml(short)}</span></li>`;
   };
-  legend.innerHTML = `<summary><i class="swatch threat"></i><span class="legend-title">Загрози на карті</span><span class="legend-caret" aria-hidden="true">▾</span></summary>
+  legend.innerHTML = `<summary><i class="swatch threat"></i><span class="legend-title">Загрози на карті</span><span class="legend-sum">4 стани · 10 типів</span><span class="legend-caret" aria-hidden="true">▾</span></summary>
     <div class="legend-body">
-      <p class="legend-meta"><span>4 стани · 10 типів</span></p>
-      <ul class="legend-rows">
-        <li><i class="legend-swatch state-alert"></i><span>Офіційна тривога — щільна червона заливка й контур.</span></li>
-        <li><i class="legend-swatch state-threat"></i><span>Активна загроза — помаранчева заливка, слабша за тривогу.</span></li>
-        <li><i class="legend-swatch state-consequence"></i><span>Підтверджена атака або наслідки — штрихування.</span></li>
-        <li><i class="legend-swatch state-analytic"></i><span>Аналітична оцінка — сірий пунктирний контур без заливки. Це не тривога.</span></li>
+      <ul class="legend-rows legend-states">
+        <li><i class="legend-swatch state-alert"></i><span><b>Офіційна тривога</b>щільна червона заливка й контур</span></li>
+        <li><i class="legend-swatch state-threat"></i><span><b>Активна загроза</b>помаранчева заливка, слабша за тривогу</span></li>
+        <li><i class="legend-swatch state-consequence"></i><span><b>Атака або наслідки</b>штрихування</span></li>
+        <li><i class="legend-swatch state-analytic"></i><span><b>Аналітична оцінка</b>сірий пунктир без заливки. Це не тривога</span></li>
       </ul>
       <ul class="legend-rows legend-icons">${Object.keys(threatIconPaths).map(iconRow).join('')}</ul>
-      <p class="legend-note">Показано до трьох найважливіших типів; решта — у бейджі +N. Іконка не означає прогнозу цілі.</p>
-      <p class="legend-note">Приглушений відтінок — стан лише в частині території; наблизьте карту,
-        щоб побачити райони. Полігон засвічується лише для території, названої в повідомленні або
-        в каталозі локацій, і для найближчої території з контуром, якщо в названої його немає.</p>
+      <p class="legend-note">Показано до трьох найважливіших типів; решта — у бейджі +N. Іконка не означає прогнозу цілі, а напрямки не є прогнозом траєкторії.</p>
+      <p class="legend-note">Коли стан оголошено на окремі райони, світяться саме вони — на будь-якому
+        масштабі; решта області лишається темною. Область заливається тоді, коли стан оголошено на
+        всю неї або коли названо місце без власного контуру всередині неї.</p>
     </div>`;
 }
 
@@ -1307,6 +1343,25 @@ function ensureMapOverlays() {
     node.className = 'visually-hidden';
     node.setAttribute('role', 'status');
     node.setAttribute('aria-live', 'polite');
+    stage.append(node);
+  }
+  // Текстовий еквівалент КОДУВАННЯ карти, на відміну від #map-aria, який перелічує території.
+  // Розділені навмисно з двох причин. Перша: aria-live перечитує свій вузол на кожну зміну, а
+  // постійне правило не має оголошуватися по чотири рази на секунду під час хвилі. Друга: легенда
+  // тепер згорнута за замовчуванням, а підпису під картою більше немає — без цього вузла читач
+  // екрана лишився б без пояснення заливок узагалі. Текст дослівно повторює #threat-legend.
+  if (!$('#map-legend-text')) {
+    const node = document.createElement('div');
+    node.id = 'map-legend-text';
+    node.className = 'visually-hidden';
+    node.textContent = 'Кодування карти. Офіційна тривога — щільна червона заливка й контур. '
+      + 'Активна загроза — помаранчева заливка, слабша за тривогу. '
+      + 'Підтверджена атака або наслідки — штрихування. '
+      + 'Аналітична оцінка — сірий пунктирний контур без заливки. Це не тривога. '
+      + 'Коли стан оголошено на окремі райони, світяться саме вони — на будь-якому масштабі; '
+      + 'решта області лишається темною. Іконка показує тип загрози, до трьох на територію; '
+      + 'решта — у бейджі «плюс N». Клікніть територію, щоб побачити її стан. '
+      + 'Напрямки не є прогнозом траєкторії.';
     stage.append(node);
   }
   if (!$('#publication-chip')) {
@@ -1342,9 +1397,9 @@ function initMap() {
   });
   // Єдиний обробник масштабу у файлі. MapLibre забороняє вираз ['zoom'] усередині filter, а згасання
   // прозорістю лишило б невидимі іконки займати місце в колізіях і виштовхувати справжні за межі
-  // карти. Тому джерело просто перевипускається на межі районного масштабу.
+  // карти. Тому джерело просто перевипускається на межі іконкового масштабу.
   map.on('zoomend', () => {
-    const next = map.getZoom() >= RAION_ZOOM_FULL ? 'raion' : 'oblast';
+    const next = map.getZoom() >= ICON_TIER_ZOOM ? 'raion' : 'oblast';
     if (next === iconTier) return;           // шторм панорамування нічого не коштує
     iconTier = next;
     updateTerritoryIcons();
@@ -1413,45 +1468,37 @@ function initMap() {
     // Заливка йде ПІД тривожну: додається раніше під тим самим якорем, тож червоне завжди виграє.
     map.addLayer({ id: 'threat-oblast-fill', type: 'fill', source: 'ukraine-admin', paint: {
       'fill-color': threatColor,
-      'fill-opacity': ['interpolate',['linear'],['zoom'],
-        RAION_ZOOM_MIN,  ['case', threatFlag, .22, threatUnmappedFlag, .16, threatPartialFlag, .12, 0],
-        RAION_ZOOM_FULL, ['case', threatFlag, .20, threatUnmappedFlag, .16, threatPartialFlag, .04, 0]]
+      'fill-opacity': ['case', threatFlag, .22, threatUnmappedFlag, .16, 0]
     } }, 'ukraine-sovereignty-fill');
-    map.addLayer({ id: 'threat-raion-fill', type: 'fill', source: 'ukraine-raions', minzoom: RAION_ZOOM_MIN, paint: {
+    map.addLayer({ id: 'threat-raion-fill', type: 'fill', source: 'ukraine-raions', paint: {
       'fill-color': threatColor,
-      'fill-opacity': ['interpolate',['linear'],['zoom'],
-        RAION_ZOOM_MIN,  0,
-        RAION_ZOOM_FULL, ['case', threatFlag, .28, threatUnmappedFlag, .20, threatPartialFlag, .18, 0]]
+      'fill-opacity': ['case', threatFlag, .28, threatUnmappedFlag, .20, 0]
     } }, 'ukraine-sovereignty-fill');
     // Заливки тривоги йдуть під ukraine-sovereignty-fill і додаються ПЕРЕД addOccupationLayers(),
     // тож окупаційні шари вставляються поверх них і лишаються читабельними, як і раніше.
     // Золоте підсвічування суверенітету (ukraine-region-fill) теж лишається зверху — воно важливіше за колір тривоги.
-    // alert — тривога оголошена дослівно на цю територію; partial — тривога лише в її частині,
-    // тому область гасне до ледь помітної, коли районна картина вже читається.
+    // Область заливається ЛИШЕ тоді, коли тривогу оголошено на всю неї (alert) або коли названо
+    // місце без власного контуру всередині неї (unmapped) — там детальнішого шару не буде ніколи.
+    // Область, у якій названо конкретні райони, не заливається взагалі: за неї говорять її ж
+    // засвічені районні полігони, а тихі райони лишаються темними. Поки ADM2 у польоті, районних
+    // фіч немає, і та сама тривога приходить сюди як `unmapped` (див. claim()) — область світиться,
+    // тривога з карти не зникає.
     map.addLayer({ id: 'alert-oblast-fill', type: 'fill', source: 'ukraine-admin', paint: {
       'fill-color': alertColor,
-      'fill-opacity': ['interpolate',['linear'],['zoom'],
-        RAION_ZOOM_MIN, ['case', alertFlag, .34, unmappedFlag, .24, partialFlag, .18, 0],
-        RAION_ZOOM_FULL, ['case', alertFlag, .30, unmappedFlag, .24, partialFlag, .06, 0]]
+      'fill-opacity': ['case', alertFlag, .34, unmappedFlag, .24, 0]
     } }, 'ukraine-sovereignty-fill');
-    map.addLayer({ id: 'alert-raion-fill', type: 'fill', source: 'ukraine-raions', minzoom: RAION_ZOOM_MIN, paint: {
+    map.addLayer({ id: 'alert-raion-fill', type: 'fill', source: 'ukraine-raions', paint: {
       'fill-color': alertColor,
-      'fill-opacity': ['interpolate',['linear'],['zoom'],
-        RAION_ZOOM_MIN, 0,
-        RAION_ZOOM_FULL, ['case', alertFlag, .40, unmappedFlag, .28, partialFlag, .26, 0]]
+      'fill-opacity': ['case', alertFlag, .40, unmappedFlag, .28, 0]
     } }, 'ukraine-sovereignty-fill');
     // ---- підтверджена атака / наслідки ---------------------------------------------------------
     // Штрихування, а не колір: наслідки — це те, що ВЖЕ сталося, і воно не мусить конкурувати
     // з тривогою відтінком червоного. Лежить НАД тривогою: підтверджений удар важливіший за попередження.
     map.addLayer({ id: 'consequence-oblast-fill', type: 'fill', source: 'ukraine-admin',
-      paint: consequenceFillPaint(['interpolate',['linear'],['zoom'],
-        RAION_ZOOM_MIN,  ['case', consequenceFlag, .55, consequenceUnmappedFlag, .40, consequencePartialFlag, .18, 0],
-        RAION_ZOOM_FULL, ['case', consequenceFlag, .55, consequenceUnmappedFlag, .40, consequencePartialFlag, .06, 0]])
+      paint: consequenceFillPaint(['case', consequenceFlag, .55, consequenceUnmappedFlag, .40, 0])
     }, 'ukraine-sovereignty-fill');
-    map.addLayer({ id: 'consequence-raion-fill', type: 'fill', source: 'ukraine-raions', minzoom: RAION_ZOOM_MIN,
-      paint: consequenceFillPaint(['interpolate',['linear'],['zoom'],
-        RAION_ZOOM_MIN,  0,
-        RAION_ZOOM_FULL, ['case', consequenceFlag, .55, consequenceUnmappedFlag, .40, consequencePartialFlag, .18, 0]])
+    map.addLayer({ id: 'consequence-raion-fill', type: 'fill', source: 'ukraine-raions',
+      paint: consequenceFillPaint(['case', consequenceFlag, .55, consequenceUnmappedFlag, .40, 0])
     }, 'ukraine-sovereignty-fill');
     addOccupationLayers();
     // ---- аналітична оцінка ---------------------------------------------------------------------
@@ -1460,69 +1507,71 @@ function initMap() {
     // прозорість примусово нульова: найслабший сигнал не перемальовує сильніший.
     // crimeaSovereignty перевіряється першим: районні фічі властивості sovereignty не мають узагалі,
     // тож на них ця гілка просто хибна, і той самий вираз працює на обох рівнях.
-    const analyticOpacity = (partial) => ['case',
+    // Один вираз на обидва рівні: похідне покриття не малює нічого, тож обласному й районному
+    // пунктиру більше нічим відрізнятися.
+    const analyticOpacity = ['case',
       crimeaSovereignty, 0,
       strongerThanAnalytic, 0,
-      analyticFlag, .70, analyticUnmappedFlag, .50, analyticPartialFlag, partial, 0];
-    map.addLayer({ id: 'analytic-raion-line', type: 'line', source: 'ukraine-raions', minzoom: RAION_ZOOM_MIN, paint: {
+      analyticFlag, .70, analyticUnmappedFlag, .50, 0];
+    map.addLayer({ id: 'analytic-raion-line', type: 'line', source: 'ukraine-raions', paint: {
       'line-color': analyticColor, 'line-dasharray': [1,2],
       'line-width': ['interpolate',['linear'],['zoom'], 4, 1.0, 8, 2.0],
-      'line-opacity': ['interpolate',['linear'],['zoom'], RAION_ZOOM_MIN, 0, RAION_ZOOM_FULL, analyticOpacity(.22)]
+      'line-opacity': analyticOpacity
     } }, 'ukraine-region-lines');
     map.addLayer({ id: 'analytic-oblast-line', type: 'line', source: 'ukraine-admin', paint: {
       'line-color': analyticColor, 'line-dasharray': [1,2],
       'line-width': ['interpolate',['linear'],['zoom'], 4, 1.0, 8, 2.0],
-      'line-opacity': ['interpolate',['linear'],['zoom'],
-        RAION_ZOOM_MIN,  analyticOpacity(.22),
-        RAION_ZOOM_FULL, analyticOpacity(.08)]
+      'line-opacity': analyticOpacity
     } }, 'ukraine-region-lines');
     // ---- активна загроза -----------------------------------------------------------------------
-    map.addLayer({ id: 'threat-raion-line', type: 'line', source: 'ukraine-raions', minzoom: RAION_ZOOM_MIN, paint: {
+    // Товщина ліній — єдине, чим тут керує масштаб: на оглядовому масштабі 136 контурів по 1.4 px
+    // зливаються в сітку й перебивають власні заливки. Прозорість від масштабу не залежить: те,
+    // ЩО стверджує карта, не може змінюватися від того, наскільки користувач наблизив її.
+    map.addLayer({ id: 'threat-raion-line', type: 'line', source: 'ukraine-raions', paint: {
       'line-color': threatColor,
-      'line-width': ['interpolate',['linear'],['zoom'], RAION_ZOOM_MIN, .5, 9, 1.4],
-      'line-opacity': ['interpolate',['linear'],['zoom'],
-        RAION_ZOOM_MIN,  0,
-        RAION_ZOOM_FULL, ['case', crimeaSovereignty, 0, threatFlag, .75, threatUnmappedFlag, .55, threatPartialFlag, .30, 0]]
+      'line-width': ['interpolate',['linear'],['zoom'], 4, .4, 9, 1.4],
+      'line-opacity': ['case', crimeaSovereignty, 0, threatFlag, .75, threatUnmappedFlag, .55, 0]
     } }, 'ukraine-region-lines');
     // Навколо Криму й Севастополя контуру не малюємо взагалі: там межа лишається золотою, бо це
     // підсвічування суверенітету. Стан там читається із заливки — так само, як робить тривога.
     map.addLayer({ id: 'threat-oblast-line', type: 'line', source: 'ukraine-admin', paint: {
       'line-color': threatColor,
       'line-width': ['interpolate',['linear'],['zoom'], 4, 1.1, 8, 2.2],
-      'line-opacity': ['interpolate',['linear'],['zoom'],
-        RAION_ZOOM_MIN,  ['case', crimeaSovereignty, 0, threatFlag, .75, threatUnmappedFlag, .55, threatPartialFlag, .30, 0],
-        RAION_ZOOM_FULL, ['case', crimeaSovereignty, 0, threatFlag, .75, threatUnmappedFlag, .55, threatPartialFlag, .10, 0]]
+      'line-opacity': ['case', crimeaSovereignty, 0, threatFlag, .75, threatUnmappedFlag, .55, 0]
     } }, 'ukraine-region-lines');
     // Обидва контури тривоги лежать ПІД ukraine-region-lines: інакше червона межа перекрила б
     // золоту лінію суверенітету навколо Криму й Севастополя. Колір тривоги програє суверенітету.
-    map.addLayer({ id: 'alert-raion-line', type: 'line', source: 'ukraine-raions', minzoom: RAION_ZOOM_MIN, paint: {
-      'line-color': ['case', alertFlag, alertColor, unmappedFlag, '#ff7a4d', partialFlag, '#ff7a4d', '#72d6ca'],
-      'line-width': ['interpolate',['linear'],['zoom'], RAION_ZOOM_MIN, .45, 9, 1.3],
+    // Останнє в цьому шарі, що ще залежить від масштабу, — НЕЙТРАЛЬНА бірюзова сітка районних меж
+    // (гілка за замовчуванням). Це підкладка, а не стан: на оглядовому масштабі 136 таких ліній
+    // перебивали б ті кілька районів, заради яких карту й дивляться, тож вона проявляється лише
+    // зблизька. Обидві державні гілки — alert і unmapped — на обох кінцях інтерполяції однакові,
+    // тобто масштаб не змінює нічого з того, що карта стверджує.
+    map.addLayer({ id: 'alert-raion-line', type: 'line', source: 'ukraine-raions', paint: {
+      'line-color': ['case', alertFlag, alertColor, unmappedFlag, '#ff7a4d', '#72d6ca'],
+      'line-width': ['interpolate',['linear'],['zoom'], 4, .35, 9, 1.3],
       'line-opacity': ['interpolate',['linear'],['zoom'],
-        RAION_ZOOM_MIN, 0,
-        RAION_ZOOM_FULL, ['case', alertFlag, .9, unmappedFlag, .66, partialFlag, .62, .22]]
+        6,   ['case', alertFlag, .9, unmappedFlag, .66, 0],
+        6.8, ['case', alertFlag, .9, unmappedFlag, .66, .22]]
     } }, 'ukraine-region-lines');
     // Навколо Криму й Севастополя червоний контур не малюємо взагалі: там межа має лишатися золотою,
     // бо це підсвічування суверенітету. Сама тривога там читається із заливки — так само, як усюди.
+    // Області з тривогою лише в частині районів контуру не дістають теж — навіть волосяного:
+    // обведена область читається як оголошена цілком, а це саме те твердження, якого джерело
+    // не робило. Її межа лишається звичайною бірюзовою лінією ukraine-region-lines.
     map.addLayer({ id: 'alert-oblast-line', type: 'line', source: 'ukraine-admin', paint: {
       'line-color': alertColor,
       'line-width': ['interpolate',['linear'],['zoom'], 4, 1.3, 8, 2.6],
-      'line-opacity': ['interpolate',['linear'],['zoom'],
-        RAION_ZOOM_MIN, ['case', crimeaSovereignty, 0, alertFlag, .85, unmappedFlag, .58, partialFlag, .45, 0],
-        RAION_ZOOM_FULL, ['case', crimeaSovereignty, 0, alertFlag, .85, unmappedFlag, .58, partialFlag, .16, 0]]
+      'line-opacity': ['case', crimeaSovereignty, 0, alertFlag, .85, unmappedFlag, .58, 0]
     } }, 'ukraine-region-lines');
     // ---- підтверджена атака / наслідки ---------------------------------------------------------
-    map.addLayer({ id: 'consequence-raion-line', type: 'line', source: 'ukraine-raions', minzoom: RAION_ZOOM_MIN, paint: {
-      'line-color': consequenceColor, 'line-width': 1.6,
-      'line-opacity': ['interpolate',['linear'],['zoom'],
-        RAION_ZOOM_MIN,  0,
-        RAION_ZOOM_FULL, ['case', crimeaSovereignty, 0, consequenceFlag, .9, consequenceUnmappedFlag, .7, consequencePartialFlag, .30, 0]]
+    map.addLayer({ id: 'consequence-raion-line', type: 'line', source: 'ukraine-raions', paint: {
+      'line-color': consequenceColor,
+      'line-width': ['interpolate',['linear'],['zoom'], 4, 1.0, 9, 1.6],
+      'line-opacity': ['case', crimeaSovereignty, 0, consequenceFlag, .9, consequenceUnmappedFlag, .7, 0]
     } }, 'ukraine-region-lines');
     map.addLayer({ id: 'consequence-oblast-line', type: 'line', source: 'ukraine-admin', paint: {
       'line-color': consequenceColor, 'line-width': 1.6,
-      'line-opacity': ['interpolate',['linear'],['zoom'],
-        RAION_ZOOM_MIN,  ['case', crimeaSovereignty, 0, consequenceFlag, .9, consequenceUnmappedFlag, .7, consequencePartialFlag, .30, 0],
-        RAION_ZOOM_FULL, ['case', crimeaSovereignty, 0, consequenceFlag, .9, consequenceUnmappedFlag, .7, consequencePartialFlag, .10, 0]]
+      'line-opacity': ['case', crimeaSovereignty, 0, consequenceFlag, .9, consequenceUnmappedFlag, .7, 0]
     } }, 'ukraine-region-lines');
     map.addLayer({ id: 'city-hit', type: 'circle', source: 'ukraine-cities', minzoom: 5.7, paint: {
       'circle-radius': ['interpolate',['linear'],['zoom'],5.7,3,9,6], 'circle-color': '#72d6ca',
@@ -1540,20 +1589,25 @@ function initMap() {
     }, paint: { 'text-color': '#e9e7e0', 'text-halo-color': '#06080c', 'text-halo-width': 2.6 } });
     // Підписи тривог лягають під підпис суверенітету; районний — над обласним,
     // щоб на великому масштабі точніша назва вигравала конкуренцію за місце.
+    // Обидва шари підписують ЛИШЕ те, що засвічено: alertLabelCollection() більше не випускає фіч
+    // похідного покриття, тож жодна прозорість тут ні від чого не залежить.
     map.addLayer({ id: 'alert-oblast-label', type: 'symbol', source: 'alert-labels', filter: ['==',['get','level'],'oblast'], layout: {
       'text-field': ['get','label'], 'text-size': ['interpolate',['linear'],['zoom'],4.5,11,8,14],
       'text-transform': 'uppercase', 'text-letter-spacing': .05, 'text-max-width': 7, 'text-padding': 6,
       'text-offset': [0,-1.4], 'text-font': ['Noto Sans Regular']
-    }, paint: { 'text-color': '#ffe1d8', 'text-halo-color': '#06080c', 'text-halo-width': 1.9,
-      'text-opacity': ['interpolate',['linear'],['zoom'],
-        RAION_ZOOM_MIN, ['case', fadingLabel, .8, 1],
-        RAION_ZOOM_FULL, ['case', fadingLabel, 0, 1]] } }, 'crimea-ukraine-label');
-    map.addLayer({ id: 'alert-raion-label', type: 'symbol', source: 'alert-labels', filter: ['==',['get','level'],'raion'], minzoom: RAION_ZOOM_MIN, layout: {
-      'text-field': ['get','label'], 'text-size': 11, 'text-max-width': 8, 'text-padding': 4, 'text-font': ['Noto Sans Regular']
-    }, paint: { 'text-color': '#ffd2c6', 'text-halo-color': '#06080c', 'text-halo-width': 1.7,
-      'text-opacity': ['interpolate',['linear'],['zoom'],
-        RAION_ZOOM_MIN, 0,
-        RAION_ZOOM_FULL, ['case', fadingLabel, .8, 1]] } }, 'crimea-ukraine-label');
+    }, paint: { 'text-color': '#ffe1d8', 'text-halo-color': '#06080c', 'text-halo-width': 1.9
+    } }, 'crimea-ukraine-label');
+    // Назва району читається на оглядовому масштабі — це головне, що робить окремий засвічений
+    // район твердженням, а не плямою. Ні text-allow-overlap, ні text-ignore-placement тут немає й
+    // не буде: проріджує підписи саме колізія MapLibre, і саме вона тримає оглядовий масштаб
+    // чистим, коли тривога охоплює півкраїни. Ширший text-padding на оглядовому масштабі просить
+    // її бути суворішою, менший зблизька — дозволяє показати всі.
+    map.addLayer({ id: 'alert-raion-label', type: 'symbol', source: 'alert-labels', filter: ['==',['get','level'],'raion'], layout: {
+      'text-field': ['get','label'], 'text-max-width': 8, 'text-font': ['Noto Sans Regular'],
+      'text-size': ['interpolate',['linear'],['zoom'], 4.5, 9, 8, 11.5],
+      'text-padding': ['interpolate',['linear'],['zoom'], 4.5, 9, 8, 4]
+    }, paint: { 'text-color': '#ffd2c6', 'text-halo-color': '#06080c', 'text-halo-width': 1.7
+    } }, 'crimea-ukraine-label');
     map.addSource('reported-directions', { type: 'geojson', data: directionCollection() });
     map.addLayer({ id: 'direction-lines', type: 'line', source: 'reported-directions', paint: { 'line-color': '#ff7a4d', 'line-width': 3, 'line-dasharray': [2,2], 'line-opacity': .8 } });
     addVectorLayers();
@@ -1562,8 +1616,7 @@ function initMap() {
     // окремо для кожного, у якому під точкою є фіча, — тож роботу робимо один раз на один DOM-клік
     // (originalEvent у всіх викликах той самий обʼєкт) і самі вирішуємо, яка територія точніша:
     // іконка → місто → район → область. Стек іконок — найточніша заява про територію на карті,
-    // тож він виграє в усіх. Районні заливки нижче RAION_ZOOM_MIN не малюються, тож там клік
-    // завжди обласний, а вимкнений перемикач просто знижує точність, а не ламає клік.
+    // тож він виграє в усіх. Вимкнений перемикач просто знижує точність, а не ламає клік.
     //
     // DOM-клік забирає собі ТОЙ виклик, який справді відкриває панель, — тобто прапорець ставиться
     // після всіх перевірок точності, а не на вході. Порядок, у якому MapLibre викликає обробники,
@@ -1574,13 +1627,20 @@ function initMap() {
     // нічого. Так виграє найточніший шар за будь-якого порядку викликів, а три районні заливки над
     // одним полігоном усе одно відкривають рівно одну панель: перша з них ставить прапорець.
     //
-    // alert-raion-fill лишається районною ціллю кліку навіть там, де fill-opacity дорівнює 0:
-    // queryRenderedFeatures перевіряє геометрію й видимість шару, а не прозорість фарби. Саме тому
-    // тихий район узагалі клікабельний.
+    // Районні заливки існують на будь-якому масштабі й повертаються з queryRenderedFeatures навіть
+    // там, де fill-opacity дорівнює 0: запит перевіряє геометрію й видимість шару, а не прозорість
+    // фарби. Тому на всій країні під кожним кліком лежить районний полігон, і без другої ознаки
+    // район забирав би клік у області геть усюди — зокрема там, де на ньому не оголошено нічого.
+    //
+    // Ознака — сам feature-state. applyTerritoryLayers() стирає стан джерела цілком і записує лише
+    // непорожні набори, тож тихий район не має ЖОДНОГО ключа, а засвічений має щонайменше один.
+    // Звідси правило в обидва боки: район без стану поступається області, район зі станом виграє.
+    // Точність від цього не падає — панель області однаково називає засвічені райони всередині.
     //
     // queryRenderedFeatures кидає виняток на неіснуючому шарі, а шарів іконок може не бути взагалі
     // (canvas недоступний), тож список фільтруємо перед кожним запитом.
     const liveLayers = (ids) => ids.filter((id) => map.getLayer(id));
+    const litFeature = (feature) => Object.keys(feature?.state ?? {}).length > 0;
     let lastTerritoryClick = null;
     const openTerritory = (event) => {
       if (event.originalEvent && event.originalEvent === lastTerritoryClick) return;
@@ -1591,8 +1651,9 @@ function initMap() {
       const onIcon = iconLayerIds.includes(layerId);
       if (!onIcon && map.queryRenderedFeatures(event.point, { layers: liveLayers(iconLayerIds) }).length) return;
       if (!onIcon && layerId !== 'city-hit' && map.queryRenderedFeatures(event.point, { layers: liveLayers(['city-hit']) }).length) return;
-      if (layerId === 'ukraine-region-fill'
-          && map.queryRenderedFeatures(event.point, { layers: liveLayers(raionFillLayerIds) }).length) return;
+      const litRaion = map.queryRenderedFeatures(event.point, { layers: liveLayers(raionFillLayerIds) }).some(litFeature);
+      if (layerId === 'ukraine-region-fill' && litRaion) return;
+      if (raionFillLayerIds.includes(layerId) && !litRaion) return;
       lastTerritoryClick = event.originalEvent ?? null;
       void showTerritoryPanel(locationId);
     };
@@ -1604,7 +1665,7 @@ function initMap() {
     mapLayersReady = true;
     applyTerritoryLayers();
     applyVectors();
-    iconTier = map.getZoom() >= RAION_ZOOM_FULL ? 'raion' : 'oblast';
+    iconTier = map.getZoom() >= ICON_TIER_ZOOM ? 'raion' : 'oblast';
     updateTerritoryIcons();
   });
   $('#fit-ukraine').addEventListener('click', () => map.fitBounds([[21.5,43.2],[41.2,52.5]], { padding: 36, duration: 700 }));
@@ -2252,8 +2313,9 @@ function renderMapPage() {
     (layerGroups[button.dataset.layer] ?? []).forEach((layer) => map.getLayer(layer) && map.setLayoutProperty(layer, 'visibility', active ? 'visible' : 'none'));
   }));
   const legend = $('#occupation-legend');
-  // Вибір користувача переживає перемальовування сторінки після кожної події потоку.
-  legend.open = occupationLegendOpen ?? window.matchMedia('(min-width: 981px)').matches;
+  // Вибір користувача переживає перемальовування сторінки після кожної події потоку. За
+  // замовчуванням — згорнуто на будь-якій ширині: стос легенд є покажчиком, а не документом.
+  legend.open = occupationLegendOpen ?? false;
   legend.addEventListener('toggle', () => { occupationLegendOpen = legend.open; });
   renderThreatLegend();
   renderOccupationLegend();
@@ -2708,37 +2770,199 @@ function trustLagLabel(seconds) {
   return value >= 60 ? `${Math.round(value / 60)} хв` : `${Math.round(value)} с`;
 }
 
-function sourceTrustRow(source) {
+// Те саме число для колонки завширшки в чотири символи. Довге «нікого не наздоганяв» лишається
+// в підказці й у розгорнутій картці — саме тому колонку взагалі можна скоротити.
+function trustLagShort(seconds) {
+  if (seconds == null) return '—';
+  const value = Number(seconds);
+  if (!Number.isFinite(value)) return '—';
+  return value >= 60 ? `${Math.round(value / 60)} хв` : `${Math.round(value)} с`;
+}
+
+// Тон — не прикраса, як і в решті ops-консолі: звичайне й нейтральне джерело лишається беззвучним,
+// бо жодної дії не вимагає, і саме тому знижена довіра помітна. Якби «звичайна» світилася
+// застережним тоном, то світився б увесь каталог — а список, у якому все жовте, не вирізняє нічого.
+function trustState(source) {
+  if (source.trust == null) return { label: 'не виміряно', tone: 'off' };
+  if (source.neutral) return { label: 'нейтрально', tone: 'off' };
+  if (source.label === 'висока') return { label: 'висока', tone: 'ok' };
+  if (source.label === 'знижена') return { label: 'знижена', tone: 'bad' };
+  return { label: 'звичайна', tone: 'off' };
+}
+
+// Джерело без вимірювання або з вибіркою, меншою за поріг, не має чого порівнювати. Тримати його
+// в одній таблиці з поміряними означає розбавляти порівняння рядками, які в ньому не беруть
+// участі, — тому вони йдуть у власний згорнутий кластер, але не зникають.
+const trustUnscored = (source) => source.trust == null || source.neutral === true;
+
+/**
+ * Колонки таблиці, оголошені один раз.
+ *
+ * Заголовок, скорочення, повна назва, значення для показу й значення для сортування живуть в
+ * одному місці — інакше `data-label` мобільної картки, `title` заголовка й вміст комірки
+ * розʼїжджаються при першій же правці. Скорочення тут навмисні: сім повних назв у рядку
+ * перетворюють таблицю на те, чим вона й була, — на стос карток.
+ */
+const TRUST_COLUMNS = [
+  { key: 'modifier', short: 'Внесок', full: 'Модифікатор внеску сигналу в індекс ризику',
+    text: (source) => (source.trust == null ? '—' : `×${Number(source.modifier).toFixed(2)}`),
+    sort: (source) => (source.trust == null ? null : Number(source.modifier)) },
+  { key: 'withdrawn', short: 'Відкл.', full: 'Відкликано тверджень',
+    text: (source) => trustPercent(source.components?.withdrawnShare),
+    sort: (source) => Number(source.components?.withdrawnShare ?? NaN) },
+  { key: 'corroborated', short: 'Підтв.', full: 'Підтверджено іншими джерелами',
+    text: (source) => trustPercent(source.components?.corroboratedShare),
+    sort: (source) => Number(source.components?.corroboratedShare ?? NaN) },
+  { key: 'first', short: 'Перш.', full: 'Першим повідомив, подій',
+    text: (source) => String(trustCount(source.components?.firstReports)),
+    sort: (source) => trustCount(source.components?.firstReports) },
+  { key: 'lag', short: 'Лаг', full: 'Медіанний лаг за лідером',
+    text: (source) => trustLagShort(source.components?.lagMedianSeconds),
+    title: (source) => trustLagLabel(source.components?.lagMedianSeconds),
+    sort: (source) => Number(source.components?.lagMedianSeconds ?? NaN) },
+  { key: 'unreadable', short: 'Нечит.', full: 'Не вдалося прочитати повідомлень',
+    text: (source) => trustPercent(source.components?.unreadableShare),
+    sort: (source) => Number(source.components?.unreadableShare ?? NaN) },
+  { key: 'sample', short: 'N', full: 'Обсяг вибірки — подій у вікні',
+    text: (source) => String(trustCount(source.components?.sampleSize)),
+    sort: (source) => trustCount(source.components?.sampleSize) }
+];
+
+// Порядок за замовчуванням відповідає питанню, з яким сюди приходять: «що псує індекс». Найгірша
+// довіра — угорі. Каталог, відсортований за назвою, відповідав би на питання «як це називається».
+const TRUST_SORTS = [
+  ['trust-asc', 'Довіра ↑ — проблемні спочатку'],
+  ['trust-desc', 'Довіра ↓ — найкращі спочатку'],
+  ['withdrawn-desc', 'Відкликано ↓'],
+  ['lag-desc', 'Медіанний лаг ↓'],
+  ['sample-desc', 'Обсяг вибірки ↓'],
+  ['name-asc', 'Назва А→Я']
+];
+
+function trustBar(source) {
+  const tone = trustState(source).tone;
+  const value = Number(source.trust);
+  const percent = Number.isFinite(value) ? Math.round(Math.min(1, Math.max(0, value)) * 100) : 0;
+  // aria-hidden: смуга — це друге кодування того самого числа, яке стоїть поруч цифрами. Читач
+  // екрана має почути число один раз, а не число і його ж довжину.
+  return `<span class="trust-bar is-${tone}" aria-hidden="true"><i style="width:${percent}%"></i></span>`;
+}
+
+function sourceTrustRow(source, methodology) {
+  const state = trustState(source);
+  const id = escapeHtml(source.sourceId);
+  const detailId = `trust-detail-${id}`;
+  const trustText = source.trust == null ? '—' : Number(source.trust).toFixed(2);
+  const cells = TRUST_COLUMNS.map((column) => {
+    const title = column.title ? ` title="${escapeHtml(column.title(source))}"` : '';
+    return `<td class="td-num" data-label="${escapeHtml(column.full)}"${title}>${escapeHtml(column.text(source))}</td>`;
+  }).join('');
+  const sortKeys = TRUST_COLUMNS
+    .map((column) => ` data-sort-${column.key}="${escapeHtml(String(column.sort(source) ?? ''))}"`).join('');
+  return `<tr class="trust-row" data-trust-row data-source="${id}"
+      data-name="${escapeHtml(`${source.name} ${source.sourceId}`.toLowerCase())}"
+      data-sort-trust="${source.trust == null ? '' : Number(source.trust)}"${sortKeys}>
+      <td class="td-name">
+        <button type="button" class="trust-name" data-trust-expand="${id}" aria-expanded="false" aria-controls="${detailId}">
+          <span class="trust-caret" aria-hidden="true">▸</span>
+          <span class="trust-title">${escapeHtml(source.name)}</span>
+          <span class="trust-chips">
+            <i class="trust-chip" title="Рівень джерела">${escapeHtml(source.tier)}</i>
+            ${source.official ? '<i class="trust-chip is-official" title="Офіційне джерело">офіц.</i>' : ''}
+            <i class="trust-chip is-muted" title="Група незалежності">${escapeHtml(source.independenceGroup)}</i>
+            ${source.enabled ? '' : '<i class="trust-chip is-muted" title="Джерело вимкнено">вимк.</i>'}
+          </span>
+        </button>
+      </td>
+      <td class="td-num td-trust" data-label="Довіра">
+        ${trustBar(source)}<b class="is-${state.tone}">${escapeHtml(trustText)}</b>
+        <span class="trust-word">${escapeHtml(state.label)}</span>
+      </td>
+      ${cells}
+    </tr>
+    <tr class="trust-detail" id="${detailId}" hidden>
+      <td colspan="${TRUST_COLUMNS.length + 2}">${sourceTrustDetail(source, methodology)}</td>
+    </tr>`;
+}
+
+// Розгорнутий рядок — це та сама картка, що була раніше, і саме тут живуть ПОВНІ назви метрик.
+// Скорочення в таблиці чесні рівно тому, що розшифровка лежить за одним натисканням, а не в
+// документації десь.
+function sourceTrustDetail(source, methodology) {
   const components = source.components ?? {};
-  // Тон — не прикраса, як і в решті ops-консолі: звичайне й нейтральне джерело лишається беззвучним,
-  // бо жодної дії не вимагає, і саме тому знижена довіра помітна. Якби «звичайна» світилася
-  // застережним тоном, то світився б увесь каталог — а список, у якому все жовте, не вирізняє нічого.
-  const state = source.trust == null ? { label: 'не виміряно', tone: 'off' }
-    : source.neutral ? { label: 'нейтрально', tone: 'off' }
-      : source.label === 'висока' ? { label: 'висока', tone: 'ok' }
-        : source.label === 'знижена' ? { label: 'знижена', tone: 'bad' }
-          : { label: 'звичайна', tone: 'off' };
-  return `<article>
-    <div>
-      <span>TIER ${escapeHtml(source.tier)}${source.official ? ' · офіційне' : ''} · група ${escapeHtml(source.independenceGroup)}</span>
-      <h3>${escapeHtml(source.name)}</h3>
-      <p>${source.trust == null ? 'Нічного розрахунку для цього джерела ще не було.' : `довіра ${Number(source.trust).toFixed(2)} · модифікатор внеску ×${Number(source.modifier).toFixed(2)}`}</p>
-      <dl class="codex-facts">
-        <div><dt>Відкликано тверджень</dt><dd>${trustPercent(components.withdrawnShare)}</dd></div>
-        <div><dt>Підтверджено іншими</dt><dd>${trustPercent(components.corroboratedShare)}</dd></div>
-        <div><dt>Першим повідомив</dt><dd>${trustCount(components.firstReports)} подій</dd></div>
-        <div><dt>Медіанний лаг</dt><dd>${escapeHtml(trustLagLabel(components.lagMedianSeconds))}</dd></div>
-        <div><dt>Не вдалося прочитати</dt><dd>${trustPercent(components.unreadableShare)}</dd></div>
-        <div><dt>Обсяг вибірки</dt><dd>${trustCount(components.sampleSize)} подій</dd></div>
-      </dl>
-    </div>
-    <div class="ops-channel-actions"><span class="codex-state is-${state.tone}">${escapeHtml(state.label)}</span></div>
-  </article>`;
+  const measured = source.trust != null;
+  const window = source.windowDays ?? methodology?.windowDays ?? null;
+  const reason = !measured
+    ? 'Нічного розрахунку для цього джерела ще не було: воно або щойно додане, або жодного разу не потрапило в прохід.'
+    : source.neutral
+      ? `Замало спостережень для власної оцінки: ${trustCount(components.sampleSize)} подій за ${trustCount(window)} днів `
+        + `проти порога ${trustCount(methodology?.minSampleSize)}. Довіра лишається нейтральною, внесок — незміненим.`
+      : '';
+  return `<div class="trust-detail-body">
+    ${reason ? `<p class="legend-note">${escapeHtml(reason)}</p>` : ''}
+    <dl class="codex-facts">
+      <div><dt>Відкликано тверджень</dt><dd>${trustPercent(components.withdrawnShare)}</dd></div>
+      <div><dt>Підтверджено іншими</dt><dd>${trustPercent(components.corroboratedShare)}</dd></div>
+      <div><dt>Першим повідомив</dt><dd>${trustCount(components.firstReports)} подій</dd></div>
+      <div><dt>Медіанний лаг</dt><dd>${escapeHtml(trustLagLabel(components.lagMedianSeconds))}</dd></div>
+      <div><dt>Не вдалося прочитати</dt><dd>${trustPercent(components.unreadableShare)}</dd></div>
+      <div><dt>Обсяг вибірки</dt><dd>${trustCount(components.sampleSize)} подій</dd></div>
+      <div><dt>Ідентифікатор</dt><dd>${escapeHtml(source.sourceId)}</dd></div>
+      <div><dt>Методологія</dt><dd>${escapeHtml(source.methodologyVersion ?? '—')}</dd></div>
+      <div><dt>Розраховано</dt><dd>${source.computedAt ? escapeHtml(new Date(source.computedAt).toLocaleString('uk-UA')) : 'ще не було'}</dd></div>
+    </dl>
+    <div class="trust-history" data-trust-history></div>
+  </div>`;
+}
+
+// Ряд, що стоїть за поточним числом. Список віддає лише поточне значення, тож історія вантажиться
+// на розгортання й рівно один раз на рядок: 70 запитів на відкриття сторінки — це не «історія
+// присутня», це відмова в обслуговуванні власному серверу.
+function sourceTrustHistoryHtml(history) {
+  if (!Array.isArray(history) || !history.length) {
+    return '<p class="legend-note">Історії ще немає: це перший розрахунок для джерела.</p>';
+  }
+  const rows = history.map((run) => {
+    const percent = Math.round(Math.min(1, Math.max(0, Number(run.trust))) * 100);
+    return `<li>
+      <time>${escapeHtml(new Date(run.computedAt).toLocaleDateString('uk-UA'))}</time>
+      <span class="trust-bar is-off" aria-hidden="true"><i style="width:${percent}%"></i></span>
+      <b>${escapeHtml(Number(run.trust).toFixed(2))}</b>
+      <small>${trustCount(run.components?.sampleSize)} подій · вікно ${trustCount(run.windowDays)} днів</small>
+    </li>`;
+  }).join('');
+  return `<h4>Історія розрахунків</h4><ul class="trust-history-list">${rows}</ul>`;
+}
+
+function trustTableHtml(sources, methodology, bodyAttribute) {
+  const head = TRUST_COLUMNS
+    .map((column) => `<th scope="col" class="th-num"><abbr title="${escapeHtml(column.full)}">${escapeHtml(column.short)}</abbr></th>`)
+    .join('');
+  return `<div class="trust-table-wrap">
+    <table class="trust-table">
+      <thead><tr>
+        <th scope="col" class="th-name">Джерело</th>
+        <th scope="col" class="th-num th-trust">Довіра</th>
+        ${head}
+      </tr></thead>
+      <tbody ${bodyAttribute}>${sources.map((source) => sourceTrustRow(source, methodology)).join('')}</tbody>
+    </table>
+  </div>`;
 }
 
 function opsSourceTrustSection(data) {
   if (!data) return '<section class="ops-section" id="source-trust-section"><header class="ops-section-head"><div><p>Джерела</p><h2>Довіра до джерел</h2></div></header><p class="legend-note">Розрахунок довіри недоступний.</p></section>';
   const methodology = data.methodology ?? {};
+  const all = data.sources ?? [];
+  // Порядок за замовчуванням той самий, який одразу застосує applyTrustView(): вона є єдиним
+  // розпорядником порядку, а це — стан до першого кадру. Розійтися їм не можна, інакше рядки
+  // переставилися б на очах у того, хто нічого не чіпав.
+  const byTrustAsc = (a, b) => (a.trust == null ? Infinity : Number(a.trust))
+    - (b.trust == null ? Infinity : Number(b.trust));
+  const scored = all.filter((source) => !trustUnscored(source)).sort(byTrustAsc);
+  const unscored = all.filter(trustUnscored).sort(byTrustAsc);
+  const sortOptions = TRUST_SORTS
+    .map(([value, label]) => `<option value="${value}">${escapeHtml(label)}</option>`).join('');
   return `<section class="ops-section" id="source-trust-section">
     <header class="ops-section-head">
       <div><p>Джерела · вікно ${trustCount(methodology.windowDays)} днів</p><h2>Довіра до джерел</h2></div>
@@ -2751,19 +2975,119 @@ function opsSourceTrustSection(data) {
       <div><dt>Нейтральний старт до</dt><dd>${trustCount(methodology.minSampleSize)} подій</dd></div>
     </dl>
     <div class="safety-note"><strong>Довіра не змінює рівень джерела</strong><p>${escapeHtml(methodology.notice ?? '')}</p></div>
-    <div class="ops-channel-list">${(data.sources ?? []).map(sourceTrustRow).join('')}</div>
+    <div class="trust-controls">
+      <label class="trust-filter">Фільтр за назвою
+        <input type="search" data-trust-filter placeholder="назва або ідентифікатор" autocomplete="off" spellcheck="false">
+      </label>
+      <label class="trust-order">Порядок
+        <select data-trust-sort>${sortOptions}</select>
+      </label>
+      <output class="trust-count" data-trust-count>${scored.length} ${pluralUk(scored.length, 'джерело', 'джерела', 'джерел')} з вимірюванням</output>
+    </div>
+    ${scored.length
+      ? trustTableHtml(scored, methodology, 'data-trust-body')
+      : '<p class="legend-note">Жодного джерела з достатньою вибіркою. Усі — у кластері нижче.</p>'}
+    ${unscored.length
+      ? `<details class="trust-neutral">
+          <summary><span>Нейтральні (недостатньо даних)</span><b>${unscored.length}</b><span class="legend-caret" aria-hidden="true">▾</span></summary>
+          <p class="legend-note">Менше ніж ${trustCount(methodology.minSampleSize)} подій у вікні або розрахунку ще не було. Довіра таких джерел нейтральна, а внесок — незмінений: порівнювати їх поки нема з чим.</p>
+          ${trustTableHtml(unscored, methodology, 'data-trust-neutral-body')}
+        </details>`
+      : ''}
   </section>`;
 }
 
+/**
+ * Фільтр і порядок працюють по DOM, а не перемальовуванням секції.
+ *
+ * Перемальовування згорнуло б кожен розгорнутий рядок, скинуло б фокус із поля пошуку на кожну
+ * літеру й викинуло б уже завантажену історію. Тут же рядок або ховається, або переставляється —
+ * пара «рядок + його деталь» переставляється разом, інакше деталь опинилася б під чужим рядком.
+ */
+function trustRowPairs(body) {
+  return [...body.querySelectorAll('[data-trust-row]')]
+    .map((row) => ({ row, detail: row.nextElementSibling }));
+}
+
+function applyTrustView(section) {
+  const query = ($('[data-trust-filter]', section)?.value ?? '').trim().toLowerCase();
+  const sort = $('[data-trust-sort]', section)?.value ?? 'trust-asc';
+  const [key, direction] = sort.split('-');
+  // `withdrawn-desc` → dataset.sortWithdrawn. Одне перетворення на всі колонки: атрибути пише
+  // TRUST_COLUMNS із того самого ключа, тож новий стовпчик стає сортовним без правки тут.
+  const attribute = `sort${key[0].toUpperCase()}${key.slice(1)}`;
+  let shown = 0;
+  let total = 0;
+  for (const body of section.querySelectorAll('[data-trust-body], [data-trust-neutral-body]')) {
+    const pairs = trustRowPairs(body);
+    const numeric = key !== 'name';
+    const value = ({ row }) => {
+      if (!numeric) return row.dataset.name ?? '';
+      const raw = Number(row.dataset[attribute]);
+      // Порожнє значення завжди в кінці, у який би бік не сортували: «немає числа» — це не
+      // «нуль», і джерело без метрики не має права очолити рейтинг найгірших.
+      return Number.isFinite(raw) ? raw : (direction === 'asc' ? Infinity : -Infinity);
+    };
+    pairs.sort((a, b) => {
+      if (!numeric) return String(value(a)).localeCompare(String(value(b)), 'uk');
+      return direction === 'desc' ? value(b) - value(a) : value(a) - value(b);
+    });
+    for (const pair of pairs) {
+      total += 1;
+      const match = !query || (pair.row.dataset.name ?? '').includes(query);
+      pair.row.hidden = !match;
+      if (pair.detail) pair.detail.hidden = !match || pair.row.querySelector('[data-trust-expand]')?.getAttribute('aria-expanded') !== 'true';
+      if (match) shown += 1;
+      body.append(pair.row);
+      if (pair.detail) body.append(pair.detail);
+    }
+  }
+  const count = $('[data-trust-count]', section);
+  if (count) {
+    count.textContent = query
+      ? `Показано ${shown} із ${total} ${pluralUk(total, 'джерела', 'джерел', 'джерел')}`
+      : `${total} ${pluralUk(total, 'джерело', 'джерела', 'джерел')} у каталозі`;
+  }
+}
+
 function wireSourceTrustSection(root) {
-  $('[data-source-trust-recalculate]', root)?.addEventListener('click', async (event) => {
+  const section = $('#source-trust-section', root);
+  if (!section) return;
+  applyTrustView(section);
+
+  $('[data-trust-filter]', section)?.addEventListener('input', () => applyTrustView(section));
+  $('[data-trust-sort]', section)?.addEventListener('change', () => applyTrustView(section));
+
+  section.addEventListener('click', async (event) => {
+    const button = event.target.closest('[data-trust-expand]');
+    if (!button || !section.contains(button)) return;
+    const row = button.closest('[data-trust-row]');
+    const detail = row?.nextElementSibling;
+    if (!detail) return;
+    const open = button.getAttribute('aria-expanded') === 'true';
+    button.setAttribute('aria-expanded', String(!open));
+    row.classList.toggle('is-open', !open);
+    detail.hidden = open;
+    if (open || row.dataset.historyLoaded) return;
+    row.dataset.historyLoaded = '1';
+    const target = detail.querySelector('[data-trust-history]');
+    if (!target) return;
+    target.innerHTML = '<p class="legend-note">Завантажуємо історію…</p>';
+    const payload = await opsFetch(`/ops/api/source-trust/${encodeURIComponent(row.dataset.source)}?limit=30`)
+      .then((result) => result.ok ? result.json() : null).catch(() => null);
+    target.innerHTML = payload
+      ? sourceTrustHistoryHtml(payload.history)
+      : '<p class="legend-note">Історію завантажити не вдалося.</p>';
+  });
+
+  $('[data-source-trust-recalculate]', section)?.addEventListener('click', async (event) => {
     const button = event.currentTarget;
     button.disabled = true; button.textContent = 'Рахуємо…';
     await opsFetch('/ops/api/source-trust/recalculate', { method: 'POST' }).catch(() => null);
     const data = await opsFetch('/ops/api/source-trust').then((r) => r.ok ? r.json() : null).catch(() => null);
-    const section = $('#source-trust-section', root);
-    if (!section) return;
-    section.outerHTML = opsSourceTrustSection(data);
+    const current = $('#source-trust-section', root);
+    if (!current) return;
+    current.outerHTML = opsSourceTrustSection(data);
     wireSourceTrustSection(root);
   });
 }
@@ -3058,27 +3382,170 @@ function wireCodexSection(root, settings) {
 // перемикачів аналітичних функцій тут НЕМАЄ навмисно: вони вже живуть у картці «Codex-аналітика»,
 // а два перемикачі на одне рішення — найзаплутаніший стан, у якому може бути операційна сторінка.
 
+// Імена полів у журналі змін. Ключі — snake_case, як їх пише аудит на сервері.
 const RUNTIME_FIELD_NAMES = {
   publication_mode: 'режим показу',
   analytics_event_driven: 'подієве оновлення аналітики',
   analytics_debounce_ms: 'пауза перед перерахунком',
   analytics_max_delay_ms: 'гранична затримка перерахунку',
+  analytics_min_pass_interval_ms: 'мінімальний інтервал між проходами',
   codex_cooldown_ms: 'інтервал між зверненнями до Codex'
 };
+
+// Підписи числових полів форми. Ключі — camelCase, як їх називають `bounds` у GET /ops/api/runtime
+// і `issues` у 400 на PUT.
+//
+// Це САМЕ підписи, а не перелік полів: список будує runtimeBoundedFields() з того, що прислав
+// сервер. Нове обмеження в міграції зʼявляється у формі без правки цього файлу, а поле, підпису
+// для якого тут немає, малюється зі своїм ключем — незграбний підпис кращий за невидиме
+// налаштування, яке оператор не може ні побачити, ні змінити.
+const RUNTIME_FIELD_LABELS = {
+  analyticsDebounceMs: 'Пауза перед перерахунком',
+  analyticsMaxDelayMs: 'Гранична затримка перерахунку',
+  analyticsMinPassIntervalMs: 'Мінімальний інтервал між проходами',
+  codexCooldownMs: 'Мінімальний інтервал між зверненнями до Codex'
+};
+const RUNTIME_FIELD_NOTES = {
+  analyticsDebounceMs: 'Скільки чекати після останньої події, перш ніж рахувати.',
+  analyticsMaxDelayMs: 'Максимум, на скільки безперервний потік подій може відкласти перерахунок.',
+  analyticsMinPassIntervalMs: 'Скільки щонайменше має минути між двома проходами аналітики.',
+  codexCooldownMs: '0 — без обмеження.'
+};
+// Порядок показу знайомих полів. Незнайоме йде в кінець у тому порядку, у якому його прислав сервер.
+const RUNTIME_FIELD_ORDER = [
+  'analyticsDebounceMs', 'analyticsMaxDelayMs', 'analyticsMinPassIntervalMs', 'codexCooldownMs'
+];
+// Одиниця виміру читається із суфікса ключа, а не зі списку полів: поле, названого за тією самою
+// угодою, форма підпише правильно й без правки.
+const RUNTIME_UNIT_SUFFIXES = [['Ms', 'мс'], ['Seconds', 'с'], ['Minutes', 'хв'], ['Days', 'днів']];
+const runtimeUnit = (field) => RUNTIME_UNIT_SUFFIXES.find(([suffix]) => field.endsWith(suffix))?.[1] ?? '';
+const runtimeFieldLabel = (field) => RUNTIME_FIELD_LABELS[field] ?? field;
+// 600000 читається як «600 000» — вузьким нерозривним пробілом, як велить uk-UA. Шістка нулів
+// поспіль у підказці про межі — це підказка, яку доводиться рахувати пальцем.
+const ukNumberFormat = new Intl.NumberFormat('uk-UA');
+const ukNumber = (value) => (Number.isFinite(Number(value)) ? ukNumberFormat.format(Number(value)) : String(value));
+
 // Тривалість hold конфігурована на сервері (bounds.publicationDelaySeconds), тож підписи режиму
 // будуються функцією, а не константою з переписаною цифрою.
 const runtimeModeNames = (delaySeconds) => ({ live: 'Наживо', delayed_15s: `Із затримкою ${delaySeconds} с` });
 
+// Числове поле форми — це рівно те, для чого сервер надіслав діапазон. `publicationDelaySeconds`
+// приходить у тому ж обʼєкті голим числом (це константа розгортання, а не налаштування), і саме
+// форма діапазону, а не список імен, відрізняє одне від одного.
+function runtimeBoundedFields(bounds) {
+  const ranged = Object.keys(bounds ?? {}).filter((key) => {
+    const bound = bounds[key];
+    return bound != null && typeof bound === 'object'
+      && Number.isFinite(Number(bound.min)) && Number.isFinite(Number(bound.max));
+  });
+  const known = RUNTIME_FIELD_ORDER.filter((key) => ranged.includes(key));
+  return [...known, ...ranged.filter((key) => !known.includes(key))];
+}
+
 // min/max приходять із меж, які надіслав сервер, а не переписані тут константою: обмеження
 // живуть у CHECK міграції, і форма мусить дізнаватися їх звідти, а не з чужої копії.
-function runtimeNumberField(field, title, note, bound, value) {
-  const min = bound?.min ?? 0;
-  const max = bound?.max ?? 0;
-  return `<label class="codex-feature">
-    <span class="codex-feature-title">${escapeHtml(title)}</span>
-    <input type="number" data-runtime-field="${escapeHtml(field)}" min="${min}" max="${max}" step="1000" value="${escapeHtml(String(value ?? min))}">
-    <span class="codex-feature-note">${escapeHtml(note)}</span>
-  </label>`;
+//
+// Межі не просто написані під полем — вони натискні. Підказка «від 0 до 600 000 мс» і кнопка
+// «підставити мінімум» — це та сама пара чисел, і робити з них два різні органи керування
+// означало б показати межу двічі, а виконати її жодного разу.
+function runtimeNumberField(field, bound, value) {
+  const min = Number(bound.min);
+  const max = Number(bound.max);
+  const unit = runtimeUnit(field);
+  const suffix = unit ? ` ${unit}` : '';
+  const title = runtimeFieldLabel(field);
+  const note = RUNTIME_FIELD_NOTES[field] ?? '';
+  const id = escapeHtml(field);
+  const current = Number.isFinite(Number(value)) ? Math.trunc(Number(value)) : min;
+  const pick = (kind, edge, word) => `<button type="button" class="bound-pick" data-runtime-bound="${kind}"`
+    + ` data-runtime-for="${id}" aria-label="Підставити ${word}: ${escapeHtml(ukNumber(edge))}${escapeHtml(suffix)}"`
+    + `>${escapeHtml(ukNumber(edge))}</button>`;
+  return `<div class="codex-feature runtime-field" data-runtime-row="${id}">
+    <label class="codex-feature-title" for="runtime-in-${id}">${escapeHtml(title)}${escapeHtml(unit ? `, ${unit}` : '')}</label>
+    <input id="runtime-in-${id}" type="number" data-runtime-field="${id}" min="${min}" max="${max}" step="1"
+      inputmode="numeric" value="${escapeHtml(String(current))}"
+      aria-describedby="runtime-hint-${id} runtime-error-${id}">
+    <p class="runtime-bounds" id="runtime-hint-${id}">від ${pick('min', min, 'мінімум')} до ${pick('max', max, 'максимум')}${escapeHtml(suffix)}</p>
+    ${note ? `<p class="codex-feature-note">${escapeHtml(note)}</p>` : ''}
+    <p class="runtime-field-error" id="runtime-error-${id}" data-runtime-error hidden></p>
+  </div>`;
+}
+
+// Перевірка ДО запиту. Раніше «поставив усі затримки на 0» їхало на сервер і поверталося рядком
+// «Не вдалося зберегти.» — повідомленням, яке не називає ні поля, ні межі, ні того, що саме в
+// ньому не так. Тут кожна проблема називає поле, значення й діапазон, і жодна з них не коштує
+// звернення до мережі.
+function validateRuntimeForm(section) {
+  const problems = [];
+  const values = {};
+  section.querySelectorAll('input[type="number"][data-runtime-field]').forEach((input) => {
+    const field = input.dataset.runtimeField;
+    const name = runtimeFieldLabel(field);
+    const unit = runtimeUnit(field);
+    const suffix = unit ? ` ${unit}` : '';
+    const min = Number(input.min);
+    const max = Number(input.max);
+    const range = `від ${ukNumber(min)} до ${ukNumber(max)}${suffix}`;
+    const raw = input.value.trim();
+    const value = Number(raw);
+    if (raw === '' || !Number.isFinite(value) || !Number.isInteger(value)) {
+      problems.push({ field, message: `${name}: потрібне ціле число, ${range}.` });
+      return;
+    }
+    values[field] = value;
+    if (value < min || value > max) {
+      problems.push({ field, message: `${name}: ${ukNumber(value)}${suffix} поза межами — ${range}.` });
+    }
+  });
+  // Перехресне правило runtime_settings_delay_order із міграції 022. Сервер називає в `issues`
+  // саме максимум, тому й тут воно висить на максимумі: пауза 0 законна поруч із будь-яким
+  // законним максимумом, тож порушити пару можна лише згори.
+  const { analyticsDebounceMs: debounce, analyticsMaxDelayMs: maxDelay } = values;
+  if (Number.isFinite(debounce) && Number.isFinite(maxDelay) && maxDelay < debounce) {
+    problems.push({
+      field: 'analyticsMaxDelayMs',
+      message: `${runtimeFieldLabel('analyticsMaxDelayMs')}: ${ukNumber(maxDelay)} мс менше за паузу `
+        + `${ukNumber(debounce)} мс. Гранична затримка не може бути меншою за паузу.`
+    });
+  }
+  return problems;
+}
+
+/**
+ * Малює проблеми біля полів і повертає ті, для яких поля у формі немає.
+ *
+ * Порожній список — це скидання: клас, повідомлення й aria-invalid знімаються з УСІХ рядків, тож
+ * виправлене поле перестає світитися, щойно оператор натиснув «Зберегти» вдруге.
+ */
+function showRuntimeFieldErrors(section, problems) {
+  section.querySelectorAll('[data-runtime-row]').forEach((row) => {
+    row.classList.remove('is-invalid');
+    row.querySelector('input')?.removeAttribute('aria-invalid');
+    const output = row.querySelector('[data-runtime-error]');
+    if (output) { output.textContent = ''; output.hidden = true; }
+  });
+  const orphans = [];
+  for (const problem of problems) {
+    const row = section.querySelector(`[data-runtime-row="${problem.field}"]`);
+    if (!row) { orphans.push(problem); continue; }
+    row.classList.add('is-invalid');
+    row.querySelector('input')?.setAttribute('aria-invalid', 'true');
+    const output = row.querySelector('[data-runtime-error]');
+    if (output) { output.textContent = problem.message; output.hidden = false; }
+  }
+  section.querySelector('.is-invalid input')?.focus();
+  return orphans;
+}
+
+// Що сказати про поле, яке відхилив сервер. Межі беремо з самого поля — вони вже прийшли від
+// сервера в `bounds` і лежать в атрибутах, тож повідомлення не вигадує діапазон від себе.
+function runtimeIssueMessage(section, field) {
+  const name = RUNTIME_FIELD_LABELS[field] ?? RUNTIME_FIELD_NAMES[field] ?? field;
+  const input = section.querySelector(`[data-runtime-field="${field}"]`);
+  if (!input || input.type !== 'number') return `${name}: сервер відхилив це значення.`;
+  const unit = runtimeUnit(field);
+  const suffix = unit ? ` ${unit}` : '';
+  return `${name}: сервер відхилив це значення. Дозволено від ${ukNumber(input.min)} до ${ukNumber(input.max)}${suffix}.`;
 }
 
 function runtimeAuditRow(row) {
@@ -3128,13 +3595,12 @@ function opsRuntimeSection(data) {
         <input type="checkbox" data-runtime-field="analyticsEventDriven"${settings.analyticsEventDriven ? ' checked' : ''}>
         <span><strong>Подієве оновлення аналітики</strong>Перерахунок після кожної релевантної події, а не лише за таймером.</span>
       </label>
-      ${runtimeNumberField('analyticsDebounceMs', 'Пауза перед перерахунком, мс', 'Скільки чекати після останньої події.', bounds.analyticsDebounceMs, settings.analyticsDebounceMs)}
-      ${runtimeNumberField('analyticsMaxDelayMs', 'Гранична затримка перерахунку, мс', 'Максимум, на скільки безперервний потік подій може відкласти перерахунок.', bounds.analyticsMaxDelayMs, settings.analyticsMaxDelayMs)}
-      ${runtimeNumberField('codexCooldownMs', 'Мінімальний інтервал між зверненнями до Codex, мс', '0 — без обмеження.', bounds.codexCooldownMs, settings.codexCooldownMs)}
+      ${runtimeBoundedFields(bounds).map((field) => runtimeNumberField(field, bounds[field], settings[field])).join('')}
     </div>
     ${effectiveFacts}
-    <div class="ops-channel-actions">
+    <div class="ops-channel-actions runtime-actions">
       <button type="button" data-runtime-save>Зберегти</button>
+      <button type="button" data-runtime-minimums>Мінімальні затримки</button>
       <output id="runtime-status"></output>
     </div>
     <output id="analytics-recalculate-status"></output>
@@ -3173,8 +3639,51 @@ function wireRuntimeSection(root, onSaved) {
   };
   const refresh = onSaved ?? rerender;
 
+  // Натискна межа. Одна делегація на секцію, а не по слухачу на кнопку: поля будуються з того,
+  // що прислав сервер, і їхня кількість тут наперед невідома.
+  section.addEventListener('click', (event) => {
+    const button = event.target.closest('[data-runtime-bound]');
+    if (!button || !section.contains(button)) return;
+    const input = $(`[data-runtime-field="${button.dataset.runtimeFor}"]`, section);
+    if (!input) return;
+    input.value = button.dataset.runtimeBound === 'max' ? input.max : input.min;
+    input.dispatchEvent(new Event('input', { bubbles: true }));
+    input.focus();
+  });
+
+  // Помилка гасне на першому ж дотику до поля: підсвічений рядок, який лишається підсвіченим
+  // після виправлення, вчить не довіряти підсвічуванню взагалі.
+  section.addEventListener('input', (event) => {
+    const row = event.target.closest?.('[data-runtime-row]');
+    if (!row) return;
+    row.classList.remove('is-invalid');
+    row.querySelector('input')?.removeAttribute('aria-invalid');
+    const output = row.querySelector('[data-runtime-error]');
+    if (output) { output.textContent = ''; output.hidden = true; }
+  });
+
+  // «Усі затримки на мінімум» — той самий намір, з якого почалася скарга, тільки виконуваний
+  // одним натисканням і завжди в межах: мінімум кожного поля береться з його ж діапазону, а
+  // перехресне правило «максимум ≥ пауза» на мінімумах виконується завжди.
+  $('[data-runtime-minimums]', section)?.addEventListener('click', () => {
+    const status = $('#runtime-status', section);
+    const fields = [...section.querySelectorAll('input[type="number"][data-runtime-field]')];
+    fields.forEach((input) => { input.value = input.min; });
+    showRuntimeFieldErrors(section, []);
+    status.textContent = fields.length
+      ? `Підставлено мінімальні межі для ${fields.length} ${pluralUk(fields.length, 'поля', 'полів', 'полів')}. Натисніть «Зберегти».`
+      : 'Числових полів у формі немає.';
+  });
+
   $('[data-runtime-save]', section)?.addEventListener('click', async () => {
     const status = $('#runtime-status', section);
+    const local = validateRuntimeForm(section);
+    if (local.length) {
+      showRuntimeFieldErrors(section, local);
+      status.textContent = `Не надіслано: ${local.length} ${pluralUk(local.length, 'поле', 'поля', 'полів')} поза межами. Виправте позначене.`;
+      return;
+    }
+    showRuntimeFieldErrors(section, []);
     const body = { publicationMode: $('[data-runtime-mode]', section)?.value };
     section.querySelectorAll('[data-runtime-field]').forEach((input) => {
       body[input.dataset.runtimeField] = input.type === 'checkbox' ? input.checked : Number(input.value);
@@ -3183,7 +3692,22 @@ function wireRuntimeSection(root, onSaved) {
     const result = await opsFetch('/ops/api/runtime', {
       method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body)
     }).catch(() => null);
-    if (!result?.ok) { status.textContent = 'Не вдалося зберегти.'; return; }
+    if (!result) { status.textContent = 'Сервер недоступний. Нічого не збережено.'; return; }
+    if (!result.ok) {
+      // 400 несе `issues: ['analyticsMaxDelayMs']` — імена полів, а не текст. Малюємо їх біля
+      // самих полів: узагальнене «Не вдалося зберегти.» лишається рівно на той випадок, коли
+      // сервер справді не назвав нічого, і навіть тоді воно каже код відповіді.
+      const payload = await result.json().catch(() => null);
+      const issues = Array.isArray(payload?.issues) ? payload.issues : [];
+      const orphans = showRuntimeFieldErrors(section, issues.map((field) => ({
+        field, message: runtimeIssueMessage(section, field)
+      })));
+      status.textContent = issues.length
+        ? `Сервер відхилив ${issues.length} ${pluralUk(issues.length, 'поле', 'поля', 'полів')}.`
+          + (orphans.length ? ` Поза формою: ${orphans.map((problem) => problem.field).join(', ')}.` : ' Виправте позначене.')
+        : `Не вдалося зберегти (HTTP ${result.status}). Сервер не назвав жодного поля.`;
+      return;
+    }
     status.textContent = 'Збережено.';
     // Повний перемалюнок: режим змінює підказки й в інших картках, тож показувати новий стан лише
     // в одному місці означало б показати два різні стани поруч.

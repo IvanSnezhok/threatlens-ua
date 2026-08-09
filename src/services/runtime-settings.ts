@@ -33,6 +33,12 @@ export interface RuntimeSettings {
   analyticsEventDriven: boolean;
   analyticsDebounceMs: number;
   analyticsMaxDelayMs: number;
+  /**
+   * Minimum gap between two COMPLETED analytics passes. The storm guard, and — since migration 028 —
+   * operator-owned rather than compiled into `analytics-scheduler.ts`. It is what makes
+   * `analyticsDebounceMs: 0` a safe thing to ask for.
+   */
+  analyticsMinPassIntervalMs: number;
   codexCooldownMs: number;
   updatedAt: string | null;
   updatedBy: string | null;
@@ -68,10 +74,34 @@ export const RUNTIME_SETTINGS_DEFAULTS: RuntimeSettings = {
   analyticsEventDriven: true,
   analyticsDebounceMs: 20_000,
   analyticsMaxDelayMs: 120_000,
+  analyticsMinPassIntervalMs: 60_000,
   codexCooldownMs: 900_000,
   updatedAt: null,
   updatedBy: null
 };
+
+/**
+ * Every numeric field's legal range, and the ONE place it is written down.
+ *
+ * These are the CHECK constraints of migrations 022 and 028, restated in TypeScript because three
+ * different consumers need them and a fourth transcription is how they drift: the ops route's zod
+ * schema rejects out-of-range input before a statement is issued, {@link validateRuntimeSettings}
+ * re-checks inside the row lock so a direct `saveRuntimeSettings` call cannot reach the constraint
+ * and turn it into a 500, and `GET /ops/api/runtime` ships the object itself so the console's number
+ * inputs carry their own `min`/`max` instead of learning them from a 400. That last consumer is the
+ * reported bug: setting every delay to 0 failed with no indication of which field or what bound.
+ *
+ * `analyticsDebounceMs.min` is 0 — migration 028 lowered it, and the comment there explains why the
+ * protection it was thought to provide never lived here.
+ */
+export const RUNTIME_SETTINGS_BOUNDS = {
+  analyticsDebounceMs: { min: 0, max: 600_000 },
+  analyticsMaxDelayMs: { min: 5_000, max: 1_800_000 },
+  analyticsMinPassIntervalMs: { min: 5_000, max: 900_000 },
+  codexCooldownMs: { min: 0, max: 86_400_000 }
+} as const;
+
+export type RuntimeSettingsBoundedField = keyof typeof RUNTIME_SETTINGS_BOUNDS;
 
 /**
  * Two seconds, not one. The hub ticks at exactly 1000 ms, so a 1000 ms TTL is essentially never a
@@ -105,19 +135,50 @@ export class RuntimeSettingsRangeError extends Error {
   }
 }
 
+/**
+ * Pure. Throws {@link RuntimeSettingsRangeError} naming ONE field, which is the whole point: a
+ * refusal that does not say which of five numbers is wrong is the bug this delivery started from.
+ *
+ * Called inside `saveRuntimeSettings`'s `FOR UPDATE`, so it is authoritative rather than advisory.
+ * The ops route runs the equivalent checks first (zod for the per-field ranges, the cross-field rule
+ * against the stored row) as a fast path that produces a better message; neither of those can see
+ * the combination two concurrent requests produce, and reaching the CHECK constraint instead would
+ * give the operator a 500 with no `issues` array to act on.
+ *
+ * Field order is the order the console renders, so an operator who set several fields wrong is told
+ * about the first one they would look at.
+ */
+export function validateRuntimeSettings(settings: RuntimeSettings): void {
+  const fields: RuntimeSettingsBoundedField[] = [
+    'analyticsDebounceMs', 'analyticsMaxDelayMs', 'analyticsMinPassIntervalMs', 'codexCooldownMs'
+  ];
+  for (const field of fields) {
+    const value = settings[field];
+    const { min, max } = RUNTIME_SETTINGS_BOUNDS[field];
+    if (!Number.isInteger(value) || value < min || value > max) throw new RuntimeSettingsRangeError(field);
+  }
+  // The cross-field rule, `runtime_settings_delay_order` in migration 022. It names the MAXIMUM
+  // rather than the debounce because the maximum is the field that has to move: a debounce of 0 is
+  // legal beside every legal maximum, so the pair can only be violated from above.
+  if (settings.analyticsMaxDelayMs < settings.analyticsDebounceMs) {
+    throw new RuntimeSettingsRangeError('analyticsMaxDelayMs');
+  }
+}
+
 interface SettingsRow {
   publication_mode: string;
   mode_changed_at: Date;
   analytics_event_driven: boolean;
   analytics_debounce_ms: number;
   analytics_max_delay_ms: number;
+  analytics_min_pass_interval_ms: number;
   codex_cooldown_ms: number;
   updated_at: Date;
   updated_by: string;
 }
 
 const SETTINGS_COLUMNS = `publication_mode,mode_changed_at,analytics_event_driven,analytics_debounce_ms,
-       analytics_max_delay_ms,codex_cooldown_ms,updated_at,updated_by`;
+       analytics_max_delay_ms,analytics_min_pass_interval_ms,codex_cooldown_ms,updated_at,updated_by`;
 
 /**
  * An unknown `publication_mode` is impossible through the CHECK and possible through a hand-edited
@@ -138,6 +199,7 @@ function fromRow(row: SettingsRow): RuntimeSettings {
     analyticsEventDriven: row.analytics_event_driven,
     analyticsDebounceMs: Number(row.analytics_debounce_ms),
     analyticsMaxDelayMs: Number(row.analytics_max_delay_ms),
+    analyticsMinPassIntervalMs: Number(row.analytics_min_pass_interval_ms),
     codexCooldownMs: Number(row.codex_cooldown_ms),
     updatedAt: row.updated_at.toISOString(),
     updatedBy: row.updated_by
@@ -147,8 +209,10 @@ function fromRow(row: SettingsRow): RuntimeSettings {
 /**
  * Pure. `undefined` keeps the current value, a value sets it. The three-way discipline
  * `codex-settings.test.ts` pins for `model` is preserved here so a `curl` that flips one field
- * cannot silently reset the other four — and so `analyticsEventDriven: false` is a *value*, which
- * is why every line below is `??` and never `||`.
+ * cannot silently reset the other five — and so `analyticsEventDriven: false` is a *value*, which
+ * is why every line below is `??` and never `||`. `analyticsDebounceMs: 0` is the same trap with a
+ * number: since migration 028 zero is a legal, meaningful value («наживо»), and `||` would read it
+ * as an absence and quietly keep the stored twenty seconds.
  *
  * `modeChangedAt` is deliberately not patchable: it is derived from `publication_mode` changing, by
  * the upsert, in the same statement as the mode it describes.
@@ -162,6 +226,7 @@ export function applyRuntimeSettingsPatch(
     analyticsEventDriven: patch.analyticsEventDriven ?? current.analyticsEventDriven,
     analyticsDebounceMs: patch.analyticsDebounceMs ?? current.analyticsDebounceMs,
     analyticsMaxDelayMs: patch.analyticsMaxDelayMs ?? current.analyticsMaxDelayMs,
+    analyticsMinPassIntervalMs: patch.analyticsMinPassIntervalMs ?? current.analyticsMinPassIntervalMs,
     codexCooldownMs: patch.codexCooldownMs ?? current.codexCooldownMs,
     updatedAt: current.updatedAt,
     updatedBy: current.updatedBy
@@ -182,6 +247,7 @@ export function runtimeSettingsDiff(
     ['analyticsEventDriven', 'analytics_event_driven'],
     ['analyticsDebounceMs', 'analytics_debounce_ms'],
     ['analyticsMaxDelayMs', 'analytics_max_delay_ms'],
+    ['analyticsMinPassIntervalMs', 'analytics_min_pass_interval_ms'],
     ['codexCooldownMs', 'codex_cooldown_ms']
   ];
   const rows: RuntimeSettingsChange[] = [];
@@ -275,24 +341,28 @@ export async function saveRuntimeSettings(
     )).rows[0];
     const before = currentRow ? fromRow(currentRow) : RUNTIME_SETTINGS_DEFAULTS;
     const after = applyRuntimeSettingsPatch(before, patch);
-    // The AUTHORITATIVE cross-field check, inside the FOR UPDATE. The route's identical pre-check is
-    // a fast path only: two concurrent ops requests each read the pre-transaction row, each pass a
-    // check against a value the other is about to change, and the combined row violates
-    // `runtime_settings_delay_order` — which reaches the operator as the 500 the check exists to
-    // prevent, with no `issues` array to act on.
-    if (after.analyticsMaxDelayMs < after.analyticsDebounceMs) {
+    // The AUTHORITATIVE range and cross-field check, inside the FOR UPDATE. The route's identical
+    // pre-checks are a fast path only: two concurrent ops requests each read the pre-transaction
+    // row, each pass a check against a value the other is about to change, and the combined row
+    // violates `runtime_settings_delay_order` — which reaches the operator as the 500 the check
+    // exists to prevent, with no `issues` array to act on.
+    try {
+      validateRuntimeSettings(after);
+    } catch (error) {
       await client.query('ROLLBACK');
-      throw new RuntimeSettingsRangeError('analyticsMaxDelayMs');
+      throw error;
     }
     const saved = fromRow((await client.query<SettingsRow>(
       `INSERT INTO runtime_settings(singleton,publication_mode,analytics_event_driven,
-         analytics_debounce_ms,analytics_max_delay_ms,codex_cooldown_ms,updated_at,updated_by)
-       VALUES (true,$1,$2,$3,$4,$5,now(),$6)
+         analytics_debounce_ms,analytics_max_delay_ms,analytics_min_pass_interval_ms,
+         codex_cooldown_ms,updated_at,updated_by)
+       VALUES (true,$1,$2,$3,$4,$5,$6,now(),$7)
        ON CONFLICT (singleton) DO UPDATE SET
          publication_mode=EXCLUDED.publication_mode,
          analytics_event_driven=EXCLUDED.analytics_event_driven,
          analytics_debounce_ms=EXCLUDED.analytics_debounce_ms,
          analytics_max_delay_ms=EXCLUDED.analytics_max_delay_ms,
+         analytics_min_pass_interval_ms=EXCLUDED.analytics_min_pass_interval_ms,
          codex_cooldown_ms=EXCLUDED.codex_cooldown_ms,
          updated_at=now(), updated_by=EXCLUDED.updated_by,
          -- In the SAME statement as the mode it describes, so no reader can see one without the
@@ -304,7 +374,8 @@ export async function saveRuntimeSettings(
            THEN now() ELSE runtime_settings.mode_changed_at END
        RETURNING ${SETTINGS_COLUMNS}`,
       [after.publicationMode, after.analyticsEventDriven, after.analyticsDebounceMs,
-        after.analyticsMaxDelayMs, after.codexCooldownMs, changedBy]
+        after.analyticsMaxDelayMs, after.analyticsMinPassIntervalMs, after.codexCooldownMs,
+        changedBy]
     )).rows[0]!);
 
     const changes = runtimeSettingsDiff(before, saved);
