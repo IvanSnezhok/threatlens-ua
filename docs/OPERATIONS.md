@@ -588,6 +588,58 @@ Production backups must additionally be encrypted and copied to independent obje
   Lowering `ALERT_END_DEBOUNCE_SECONDS` does not help in this scenario — with no polls, nothing
   re-evaluates. If *every* official source is down the site is in its documented degraded state and
   the alert layer must be presented as stale, not as current.
+- **Community aerial mirror has silently dropped back to oblast granularity.** The source reads
+  `?source=ual&raw` for raion- and hromada-level alerts and falls back to the aggregated oblast feed
+  when that payload cannot be used. Falling back is the adapter working, so **`health_status` stays
+  `current`** and nothing else makes it visible. The signal is the metric:
+
+  ```promql
+  rate(threatlens_aerial_mirror_polls_total{mode="unified_fallback"}[15m])   # should be ~0
+  threatlens_aerial_mirror_raw_regions                                       # by level; District > 0 on any busy night
+  ```
+
+  `mode` is one of `raw` (healthy steady state), `raw_quiet` (raw feed empty and the aggregated feed
+  agrees the country is calm), `unified_fallback` (raw feed unusable) and `unified_only`
+  (`AERIAL_MIRROR_RAW_SOURCE` is empty, so the passthrough is switched off by configuration). The
+  accompanying log line carries the reason:
+
+  ```
+  aerial mirror raw feed unusable, falling back to the aggregated oblast feed for this poll
+  ```
+
+  What to do:
+  1. **Read the `reason` field.** `raw feed reported no air-raid region while the aggregated feed
+     reports N` means the upstream is answering but empty — the quiet-versus-broken cross-check
+     caught it. Anything else (`carries no raw array`, `no readable entries`, `Aerial alert mirror
+     5xx`) means the passthrough itself is failing.
+  2. **Check the passthrough by hand — one request, not a loop.** Two requests per second per host is
+     the published limit and a burst is answered with a truncated body:
+
+     ```bash
+     curl -s 'https://ubilling.net.ua/aerialalerts/?source=ual&raw' | head -c 300
+     ```
+
+     Expect `{"source":"ukrainealarm.com API","cachedat":"…","raw":[…]}`, `cachedat` within seconds
+     of now in Kyiv local time, and `raw` entries carrying `regionType` and `activeAlerts`.
+  3. **If the upstream has reshaped its body**, set `AERIAL_MIRROR_RAW_SOURCE=` (empty) and redeploy.
+     That is a full retreat to the oblast-only path this source shipped with — one request per poll,
+     twenty-five oblast rows — not a degraded mode, and it is the intended response while the adapter
+     is updated. `ual` is the only probed upstream that publishes below oblast level, so naming a
+     different one (`klimenko`, `skog`) buys granularity back only if that has changed.
+  4. **A `provider locations could not be mapped` warning naming this source is now expected in small
+     numbers and is not an outage.** The label space is every raion and hromada in the country, and a
+     hromada whose name exists in two raions is deliberately resolved to nothing — raising the wrong
+     raion is worse than raising none. What matters is the trend: a jump means the KATOTTG catalogue
+     sync is behind, or a raion has been renamed (see `migrations/026_renamed_toponym_aliases.sql`
+     for the fix shape). Confirm the catalogue actually has the raion tier at all:
+
+     ```bash
+     docker compose exec -T postgres psql -U threatlens -d threatlens -c "
+       SELECT type, count(*) FROM locations GROUP BY type ORDER BY 1"   # expect ~136 raions
+     ```
+
+     A database that has never run the KATOTTG sync carries two raion rows, and every District label
+     will be unresolved.
 - **Community aerial mirror stale or down (`aerial-alerts-mirror` shows `error`).** Read
   `last_error` first, because the two failures need opposite reactions:
 
@@ -596,6 +648,10 @@ Production backups must additionally be encrypted and copied to independent obje
     SELECT health_status, last_success_at, last_error_at, last_error
     FROM sources WHERE id='aerial-alerts-mirror'"
   ```
+
+  An `error` on this source now means **both** feeds failed in the same poll: the raw passthrough was
+  unusable *and* the aggregated feed it fell back to could not be read either. A single-feed failure
+  is a fallback, not an error — see the entry above.
 
   - `aerial mirror is stale: cachedat … is N s old` — **the safety gate fired and it did its job.**
     The mirror answered, but its own cache stamp says the process feeding it has stopped. The poll was
@@ -606,15 +662,19 @@ Production backups must additionally be encrypted and copied to independent obje
     mirror is believed.
   - `Aerial alert mirror 429` / `5xx` / a fetch timeout — transport, not freshness. 429 is unexpected:
     the published limit is two requests per second per host and we poll every fifteen, so a 429 means
-    the egress IP is shared with something else that is hammering the endpoint.
-  - ``carries no `states` object`` / `no readable regions` — a truncated or reshaped body. If it
-    persists, the feed's schema has changed and the adapter needs updating; the source stays in
-    `error` and holds its alerts until it does.
+    the egress IP is shared with something else that is hammering the endpoint. Note that a poll which
+    needs the cross-check makes two requests, sequenced `AERIAL_MIRROR_REQUEST_GAP_MS` apart; do not
+    set that to 0 in production.
+  - ``carries no `states` object`` / `no readable regions` — a truncated or reshaped body from the
+    *aggregated* feed. If it persists, the feed's schema has changed and the adapter needs updating;
+    the source stays in `error` and holds its alerts until it does.
 
-  Check the feed by hand before doing anything else — one request, not a loop:
+  Check both feeds by hand before doing anything else — one request each, spaced, not a loop:
 
   ```bash
   curl -s https://ubilling.net.ua/aerialalerts/ | head -c 200   # `cachedat` should be within seconds of now, in Kyiv local time
+  sleep 1
+  curl -s 'https://ubilling.net.ua/aerialalerts/?source=ual&raw' | head -c 200
   ```
 
   Recovery, in order:
@@ -635,7 +695,12 @@ Production backups must additionally be encrypted and copied to independent obje
   One more signal worth watching: a `provider locations could not be mapped to the local location
   catalogue` warning naming this source means the feed has relabelled or added a region. It is a
   catalogue gap, not an outage — the rest of the snapshot still applied and the source stays healthy —
-  but that region's alerts are invisible until an alias is added.
+  but that region's alerts are invisible until an alias is added. Since the granularity upgrade this
+  warning names raions and hromadas, not only oblasts; see the entry above for how to read it.
+
+  Note what an `error` on this source no longer means: it is **not** raised when only the raw
+  passthrough fails. Two feeds have to fail in the same poll. If the map has gone coarse but the
+  health card is green, you are looking at a fallback, and the runbook entry above is the right one.
 - **Stuck alert on the official channel source (`threatlens_alert_channel_stuck_alerts_total > 0`).**
   The channel is event-driven: an alert ends only when a 🟢 message names its location. If such a
   message is never published, is edited away, or arrives in a shape the parser refuses, the location

@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto';
 import type { PoolClient } from 'pg';
-import { Counter, type Registry } from 'prom-client';
+import { Counter, Gauge, type Registry } from 'prom-client';
 import { config } from '../config.js';
 import { pool } from '../db/pool.js';
 import { parseAlertChannelMessage } from '../domain/alert-parser.js';
@@ -10,7 +10,9 @@ import {
   type ClassificationLogEntry
 } from '../repositories/events.js';
 import {
-  AERIAL_MIRROR_SOURCE_ID, AERIAL_MIRROR_USER_AGENT, parseAerialMirrorPayload, toAlarmSnapshotBody
+  AERIAL_MIRROR_SOURCE_ID, AERIAL_MIRROR_USER_AGENT, aerialMirrorRawUrl, parseAerialMirrorPayload,
+  parseAerialMirrorRawPayload, toAlarmSnapshotBody,
+  type AerialMirrorRawSnapshot, type AerialMirrorSnapshot
 } from '../sources/aerial-mirror.js';
 import type { NormalizedMessage } from '../types.js';
 import { markSourceError, markSourceSuccess } from './operations.js';
@@ -319,6 +321,43 @@ async function reconcileAggregateAlert(
   }
 }
 
+/**
+ * Folds provider rows that turned out to name the same catalogue row.
+ *
+ * `alert_source_states` is unique on `(source_id, location_id, alert_type)`, so duplicates were
+ * never a correctness problem at rest — the upsert simply let the last write win. They became a
+ * *meaning* problem when the aerial mirror moved to raion and hromada granularity, because the
+ * catalogue is three-tier and folds a hromada into its raion: on one live poll «Чугуївський район»
+ * and «Вовчанська територіальна громада» were both alight, and both are `katottg-ua63140…`. Last
+ * write wins then makes `provider_started_at` depend on the order the upstream happened to list two
+ * labels in, and the period's start time is what the timeline and the monthly analytics read.
+ *
+ * The fold is: a location holds if ANY row holding it says so, and it started at the EARLIEST start
+ * among the rows that hold it. Both halves are the over-warning direction, which is the one this
+ * project takes deliberately. When nothing holds, the earliest start still wins so an inactive row
+ * carries a stable timestamp rather than a coin flip.
+ *
+ * Applies to every snapshot source, not only the mirror. The two APIs have never been observed to
+ * emit two labels for one location, so for them this is a no-op that removes a latent nondeterminism.
+ */
+function dedupeResolvedRecords<T extends AlarmRecord & { locationId: string }>(records: T[]): T[] {
+  const byLocation = new Map<string, T>();
+  for (const record of records) {
+    const key = `${record.locationId}:${record.alertType}`;
+    const existing = byLocation.get(key);
+    if (!existing) { byLocation.set(key, record); continue; }
+    const winner = existing.active === record.active
+      ? (record.startedAt < existing.startedAt ? record : existing)
+      : (record.active ? record : existing);
+    byLocation.set(key, {
+      ...winner,
+      active: existing.active || record.active,
+      startedAt: winner.startedAt
+    });
+  }
+  return [...byLocation.values()];
+}
+
 async function persistOfficialAlertSnapshot(sourceId: string, body: unknown): Promise<{ resolved: number; unresolved: string[] }> {
   const normalized = normalizeAlarmResponse(body);
   if (normalized.candidateCount > 0 && normalized.records.length === 0) {
@@ -336,6 +375,7 @@ async function persistOfficialAlertSnapshot(sourceId: string, body: unknown): Pr
   if (normalized.records.length > 0 && resolved.length === 0) {
     throw new Error(`${sourceId}: no provider locations matched local locations (${unresolved.slice(0, 5).join(', ')})`);
   }
+  const deduped = dedupeResolvedRecords(resolved);
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
@@ -353,7 +393,7 @@ async function persistOfficialAlertSnapshot(sourceId: string, body: unknown): Pr
        WHERE source_id=$1`,
       [sourceId]
     );
-    for (const record of resolved) {
+    for (const record of deduped) {
       affectedKeys.add(`${record.locationId}:${record.alertType}`);
       await client.query(
         `INSERT INTO alert_source_states(source_id,location_id,alert_type,active,provider_started_at,external_id)
@@ -377,7 +417,9 @@ async function persistOfficialAlertSnapshot(sourceId: string, body: unknown): Pr
   } finally {
     client.release();
   }
-  return { resolved: resolved.length, unresolved };
+  // Distinct catalogue rows written, not provider labels read: after the fold above those are no
+  // longer the same number.
+  return { resolved: deduped.length, unresolved };
 }
 
 export async function syncOfficialAlerts(log?: { warn: Function }): Promise<void> {
@@ -450,21 +492,17 @@ export async function syncAlertsInUa(log?: { warn: Function }): Promise<void> {
  * the payload distinguishes that from a genuinely quiet country, and the debounce plus the two-source
  * aggregate are the only defences left. It is the strongest argument for not running the mirror as
  * the sole alert source.
+ *
+ * ## Two feeds, and the rule for choosing between them
+ *
+ * See `collectAerialMirrorSnapshot`. Nothing about the paragraphs above changes: whichever feed is
+ * read, the result reaches `persistOfficialAlertSnapshot` only after a parser has accepted it, and
+ * every refusal on every path is a throw into the catch below.
  */
 export async function syncAerialMirror(log?: { warn: Function }): Promise<void> {
   if (!config.AERIAL_MIRROR_ENABLED) return;
   try {
-    const response = await fetch(config.AERIAL_MIRROR_URL, {
-      headers: { Accept: 'application/json', 'User-Agent': AERIAL_MIRROR_USER_AGENT },
-      signal: AbortSignal.timeout(10_000)
-    });
-    // 429 included: the published limit is two requests per second per host and the scheduler polls
-    // every fifteen, so a 429 means something else is sharing the egress IP — a source error, not a
-    // reason to touch alert state.
-    if (!response.ok) throw new Error(`Aerial alert mirror ${response.status}`);
-    const snapshot = parseAerialMirrorPayload(
-      await response.json(), new Date(), config.AERIAL_MIRROR_STALE_SECONDS
-    );
+    const snapshot = await collectAerialMirrorSnapshot(new Date(), log);
     const persisted = await persistOfficialAlertSnapshot(
       AERIAL_MIRROR_SOURCE_ID, toAlarmSnapshotBody(snapshot)
     );
@@ -475,6 +513,123 @@ export async function syncAerialMirror(log?: { warn: Function }): Promise<void> 
     countChannelError(AERIAL_MIRROR_SOURCE_ID, 'collect');
     throw error;
   }
+}
+
+/** One GET against the mirror, with the identification header and the non-2xx rule. */
+async function fetchAerialMirror(url: string): Promise<unknown> {
+  const response = await fetch(url, {
+    headers: { Accept: 'application/json', 'User-Agent': AERIAL_MIRROR_USER_AGENT },
+    signal: AbortSignal.timeout(10_000)
+  });
+  // 429 included: the published limit is two requests per second per host and the scheduler polls
+  // every fifteen, so a 429 means something else is sharing the egress IP — a source error, not a
+  // reason to touch alert state.
+  if (!response.ok) throw new Error(`Aerial alert mirror ${response.status}`);
+  return response.json();
+}
+
+/**
+ * Reads the mirror at the finest granularity it will give, and decides what to believe.
+ *
+ * The mirror serves two bodies. `?source=ual&raw` is Ukraine Alarm's own payload — `State`,
+ * `District` and `Community` entries, which after resolution are oblasts, raions and (through the
+ * catalogue's hromada aliases) raions again. The bare URL is the aggregator's `states` object, which
+ * is twenty-five oblast rows and nothing finer. The raw feed is the primary; the aggregated one is
+ * the fallback and, in one specific case, the witness.
+ *
+ * ## The quiet-versus-broken rule
+ *
+ * A raw payload that lists nothing alight is ambiguous in the worst possible way. It is what a
+ * genuinely calm night looks like — and refusing it would put this source into `error` every time
+ * the country was at peace, which is both wrong and would train an operator to ignore the health
+ * card. It is ALSO what a half-broken upstream looks like: `cachedat` fresh, envelope intact, `raw`
+ * empty because whatever fills it has stopped. Believed, that empty list clears every raion the
+ * mirror was holding.
+ *
+ * Nothing inside the payload separates the two, so the rule reaches outside it: **when the raw feed
+ * reports no air-raid region, ask the aggregated feed before believing it.**
+ *
+ *   - aggregated feed also reports nothing alight → the country is quiet. The empty raw snapshot is
+ *     accepted and the mirror clears normally (through the end debounce, as always).
+ *   - aggregated feed reports at least one oblast alight → the raw feed is not describing the
+ *     present. Fall back to the aggregated body for this poll, at oblast granularity, under the same
+ *     `source_id` — degraded resolution beats a wrong all-clear — and log it.
+ *   - aggregated feed cannot be read either → **hold.** The throw escapes, `markSourceError` runs and
+ *     `alert_source_states` is never opened. Two unreadable feeds are not evidence of peace.
+ *
+ * The same fallback carries a raw payload the parser REFUSED outright — stale, future, non-array,
+ * unreadable entries. There the aggregated feed is a substitute rather than a witness, but the
+ * ordering and the both-fail outcome are identical, so it is one path.
+ *
+ * ## Request budget
+ *
+ * The endpoint publishes two requests per second per host. The common case — the raw feed answers
+ * and something is alight — is ONE request; the cross-check happens only when the raw feed found
+ * nothing or was refused. The two requests are sequenced with `AERIAL_MIRROR_REQUEST_GAP_MS` between
+ * them and are never issued together: during research two requests inside one second were answered
+ * with a truncated body, which is the precise failure the parsers exist to refuse.
+ *
+ * Setting `AERIAL_MIRROR_RAW_SOURCE=''` skips the raw feed entirely and restores the original
+ * oblast-only behaviour, one request per poll.
+ */
+async function collectAerialMirrorSnapshot(
+  now: Date, log?: { warn: Function }
+): Promise<AerialMirrorSnapshot> {
+  const stale = config.AERIAL_MIRROR_STALE_SECONDS;
+  const upstream = config.AERIAL_MIRROR_RAW_SOURCE.trim();
+  if (!upstream) {
+    aerialMirrorPolls.inc({ mode: 'unified_only' });
+    return parseAerialMirrorPayload(await fetchAerialMirror(config.AERIAL_MIRROR_URL), now, stale);
+  }
+
+  let raw: AerialMirrorRawSnapshot | null = null;
+  let reason = '';
+  try {
+    raw = parseAerialMirrorRawPayload(
+      await fetchAerialMirror(aerialMirrorRawUrl(config.AERIAL_MIRROR_URL, upstream)), now, stale
+    );
+  } catch (error) {
+    reason = error instanceof Error ? error.message : String(error);
+  }
+  if (raw && raw.regions.length) {
+    aerialMirrorPolls.inc({ mode: 'raw' });
+    aerialMirrorRawRegions.set({ level: 'State' }, raw.byLevel.State);
+    aerialMirrorRawRegions.set({ level: 'District' }, raw.byLevel.District);
+    aerialMirrorRawRegions.set({ level: 'Community' }, raw.byLevel.Community);
+    aerialMirrorRawRegions.set({ level: 'other' }, raw.byLevel.other);
+    return raw;
+  }
+
+  // Second request, spaced. Anything it throws escapes this function on purpose: with the raw feed
+  // already unusable, an unreadable aggregated feed leaves nothing that could justify writing.
+  if (config.AERIAL_MIRROR_REQUEST_GAP_MS > 0) {
+    await new Promise((resolve) => setTimeout(resolve, config.AERIAL_MIRROR_REQUEST_GAP_MS));
+  }
+  const unified = parseAerialMirrorPayload(
+    await fetchAerialMirror(config.AERIAL_MIRROR_URL), now, stale
+  );
+  const unifiedActive = unified.regions.filter((region) => region.active).length;
+
+  if (raw && !unifiedActive) {
+    // Quiet, corroborated. The empty raw snapshot is the honest one to persist: it is what the
+    // primary feed said, and the aggregated feed was consulted only as a witness.
+    aerialMirrorPolls.inc({ mode: 'raw_quiet' });
+    for (const level of ['State', 'District', 'Community', 'other'] as const) {
+      aerialMirrorRawRegions.set({ level }, 0);
+    }
+    return raw;
+  }
+
+  if (raw) {
+    reason = `raw feed reported no air-raid region while the aggregated feed reports ${unifiedActive}`
+      + ` (${raw.entryCount} raw entries, ${raw.readableCount} readable, ${raw.nonAirRegions} non-air)`;
+  }
+  aerialMirrorPolls.inc({ mode: 'unified_fallback' });
+  log?.warn(
+    { sourceId: AERIAL_MIRROR_SOURCE_ID, upstream, reason, unifiedActive },
+    'aerial mirror raw feed unusable, falling back to the aggregated oblast feed for this poll'
+  );
+  return unified;
 }
 
 // ------------------------------------------------------------------------------------------------
@@ -509,6 +664,37 @@ export const ALERT_CHANNEL_ADAPTER_TYPE = 'mtproto_alert_channel';
  * over the other rows: it is read from the registry like all of them.
  */
 export const ALERT_CHANNEL_SOURCE_ID = 'air-alert-ua';
+
+/**
+ * Which feed actually moved the mirror's alert state, per poll.
+ *
+ * The series an operator watches to know whether the granularity upgrade is live. `raw` is the
+ * healthy steady state; a `unified_fallback` rate that stops being ~zero means the `ual` passthrough
+ * is failing and the map has quietly gone back to oblast-only, which is a degradation nothing else
+ * makes visible — the source stays `current` throughout, because falling back is the adapter working
+ * as designed. `raw_quiet` separates "the country is calm and both feeds agree" from that.
+ */
+const aerialMirrorPolls = new Counter({
+  name: 'threatlens_aerial_mirror_polls_total',
+  help: 'Aerial mirror polls by which feed supplied the snapshot',
+  labelNames: ['mode'],
+  registers: []
+});
+
+/**
+ * Regions the raw feed had alight at the last poll, by administrative level.
+ *
+ * A gauge and not a counter: it is a description of the present picture, and it is the number that
+ * shows the upgrade doing what it exists for — `District` and `Community` above zero is granularity
+ * the aggregated feed cannot express at all. Reset to zero on a corroborated quiet poll so a calm
+ * night reads as calm rather than as the last wave, frozen.
+ */
+const aerialMirrorRawRegions = new Gauge({
+  name: 'threatlens_aerial_mirror_raw_regions',
+  help: 'Air-raid regions in the last usable raw aerial-mirror poll, by upstream region type',
+  labelNames: ['level'],
+  registers: []
+});
 
 const alertChannelMessages = new Counter({
   name: 'threatlens_alert_channel_messages_total',
@@ -601,7 +787,9 @@ const threatToDeEscalation = new Counter({
  * one.
  */
 export function registerAlertChannelMetrics(registry: Registry): void {
-  const metrics: ReadonlyArray<[string, Counter<string>]> = [
+  const metrics: ReadonlyArray<[string, Counter<string> | Gauge<string>]> = [
+    ['threatlens_aerial_mirror_polls_total', aerialMirrorPolls],
+    ['threatlens_aerial_mirror_raw_regions', aerialMirrorRawRegions],
     ['threatlens_alert_channel_messages_total', alertChannelMessages],
     ['threatlens_alert_channel_stuck_alerts_total', alertChannelStuckAlerts],
     ['threatlens_monitor_messages_total', monitorMessages],

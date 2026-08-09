@@ -1,8 +1,8 @@
 import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
 import {
-  AERIAL_MIRROR_SOURCE_ID, AerialMirrorStaleError, kyivWallClockToUtc,
-  parseAerialMirrorPayload, toAlarmSnapshotBody
+  AERIAL_MIRROR_AIR_TYPES, AERIAL_MIRROR_SOURCE_ID, AerialMirrorStaleError, aerialMirrorRawUrl,
+  kyivWallClockToUtc, parseAerialMirrorPayload, parseAerialMirrorRawPayload, toAlarmSnapshotBody
 } from './aerial-mirror.js';
 import { normalizeAlarmResponse } from '../services/ingestion.js';
 
@@ -239,5 +239,315 @@ describe('toAlarmSnapshotBody', () => {
 
   it('gives the source a stable registry id', () => {
     expect(AERIAL_MIRROR_SOURCE_ID).toBe('aerial-alerts-mirror');
+  });
+});
+
+// ================================================================================================
+// The `?source=ual&raw` passthrough — the granularity upgrade
+// ================================================================================================
+
+/**
+ * `tests/fixtures/aerial-mirror-raw-ual.json` is verbatim output of
+ * https://ubilling.net.ua/aerialalerts/?source=ual&raw captured on 2026-08-09 at 20:31:23 Kyiv,
+ * unedited and unredacted. It was chosen out of several probes because one live capture happens to
+ * contain every case this parser has to get right:
+ *
+ *   - all three `regionType` values — 3 `State`, 26 `District`, 5 `Community`;
+ *   - the upstream's non-air vocabulary, `ARTILLERY` and `URBAN_FIGHTS`, both of which this source
+ *     must ignore, and three Dnipropetrovshchyna hromadas that carry NOTHING else, so ignoring them
+ *     means dropping the entry outright;
+ *   - «Липецька територіальна громада» listing the same `AIR` alert twice;
+ *   - two Communities whose catalogue home is a raion that is ALSO listed as a District in the same
+ *     payload (Вовчанська → Чугуївський, Липецька → Харківський) — the duplicate that survives this
+ *     parser and is folded later, after resolution;
+ *   - two `State` entries that are not oblasts at all: «Автономна Республіка Крим», which the
+ *     aggregated feed does not carry in any form, and «м. Харків та Харківська територіальна
+ *     громада», which is a city the upstream files at state level.
+ *
+ * The envelope stamps are the mirror's Kyiv wall clocks; everything inside `raw[]` is Ukraine
+ * Alarm's own ISO-8601 with a `Z`, and mixing the two conventions up is the bug this file guards.
+ */
+const RAW_FIXTURE = JSON.parse(
+  readFileSync(new URL('../../tests/fixtures/aerial-mirror-raw-ual.json', import.meta.url), 'utf8')
+) as { source: string; cachedat: string; raw: Array<Record<string, unknown>> };
+
+/** `cachedat` 2026-08-09 20:31:23 Kyiv (EEST, +3) = 17:31:23Z. */
+const RAW_CAPTURED_AT = new Date('2026-08-09T17:31:23.000Z');
+
+function parseRaw(body: unknown = RAW_FIXTURE, now: Date = RAW_CAPTURED_AT, bound = STALE_SECONDS) {
+  return parseAerialMirrorRawPayload(body, now, bound);
+}
+
+/** An envelope with a fresh stamp around an arbitrary `raw` list. */
+function withRaw(raw: unknown, cachedat: string = RAW_FIXTURE.cachedat): Record<string, unknown> {
+  return { source: 'ukrainealarm.com API', cachedat, raw };
+}
+
+/** One `raw[]` entry, spelled the way the upstream spells them. */
+function entry(
+  regionName: string, regionType: string, types: string[], lastUpdate = '2026-08-09T17:00:00Z'
+): Record<string, unknown> {
+  return {
+    regionId: '1', regionType, regionName, regionEngName: '', lastUpdate,
+    activeAlerts: types.map((type) => ({ regionId: '1', regionType, type, lastUpdate }))
+  };
+}
+
+describe('aerialMirrorRawUrl', () => {
+  it('builds the passthrough URL for the configured base', () => {
+    expect(aerialMirrorRawUrl('https://ubilling.net.ua/aerialalerts/', 'ual'))
+      .toBe('https://ubilling.net.ua/aerialalerts/?source=ual&raw=');
+  });
+
+  it('preserves anything already on the base URL rather than concatenating a second query string', () => {
+    // The failure this prevents is silent: `base + '?source=…'` against a base that already carries
+    // `?x=1` produces a URL the endpoint reads as a different request, and the poll would quietly
+    // answer with something other than the passthrough.
+    expect(aerialMirrorRawUrl('https://mirror.test/alerts?x=1', 'klimenko'))
+      .toBe('https://mirror.test/alerts?x=1&source=klimenko&raw=');
+    // `raw=` and a bare `raw` are the same request to this endpoint — probed against the live one.
+    expect(aerialMirrorRawUrl('https://mirror.test/alerts?source=old', 'ual'))
+      .toBe('https://mirror.test/alerts?source=ual&raw=');
+  });
+});
+
+describe('parseAerialMirrorRawPayload — three levels out of one capture', () => {
+  it('reads every air-raid region of the captured response, at every level', () => {
+    const snapshot = parseRaw();
+    expect(snapshot.upstream).toBe('ukrainealarm.com API');
+    expect(snapshot.cachedAt.toISOString()).toBe('2026-08-09T17:31:23.000Z');
+    expect(snapshot.ageSeconds).toBe(0);
+    expect(snapshot.entryCount).toBe(34);
+    expect(snapshot.readableCount).toBe(34);
+    // 34 entries − 3 artillery-only hromadas = 31 labels alight for an air raid.
+    expect(snapshot.regions).toHaveLength(31);
+    expect(snapshot.byLevel).toEqual({ State: 3, District: 26, Community: 2, other: 0 });
+    expect(snapshot.nonAirRegions).toBe(3);
+    // Every region the upstream lists is alight; this payload has no inactive rows at all.
+    expect(snapshot.regions.every((region) => region.active)).toBe(true);
+  });
+
+  it('carries raion and hromada labels the aggregated feed cannot express', () => {
+    const names = parseRaw().regions.map((region) => region.name);
+    // The whole point of the upgrade: before this, «Харківська область» was the finest thing this
+    // source could say, and it said it about the entire oblast.
+    expect(names).toContain('Харківський район');
+    expect(names).toContain('Чугуївський район');
+    expect(names).toContain('Вовчанська територіальна громада');
+    // And a region the aggregated twenty-five-row feed carries no row for in any state.
+    expect(names).toContain('Автономна Республіка Крим');
+    expect(Object.keys(FIXTURE.states as object)).not.toContain('Автономна Республіка Крим');
+  });
+
+  it('ignores every alert type that is not an air raid', () => {
+    // ARTILLERY and URBAN_FIGHTS are real declarations and they are real in this capture. They are
+    // simply not this source's to move: it is registered as a mover of `air_raid` and nothing else,
+    // and a shelling warning rendered as an air-raid siren would misstate what was declared.
+    const names = parseRaw().regions.map((region) => region.name);
+    for (const artilleryOnly of [
+      'Червоногригорівська територіальна громада',
+      'Покровська територіальна громада',
+      'м. Марганець та Марганецька територіальна громада'
+    ]) {
+      expect(names, artilleryOnly).not.toContain(artilleryOnly);
+    }
+    // Вовчанська carries ARTILLERY and URBAN_FIGHTS *and* AIR, so it is kept — for the AIR alone.
+    expect(names).toContain('Вовчанська територіальна громада');
+  });
+
+  it('keeps a region that carries an air raid alongside types it ignores', () => {
+    const snapshot = parseRaw(withRaw([
+      entry('Тестовий район', 'District', ['ARTILLERY', 'AIR', 'URBAN_FIGHTS'])
+    ]));
+    expect(snapshot.regions.map((region) => region.name)).toEqual(['Тестовий район']);
+    expect(snapshot.nonAirRegions).toBe(0);
+  });
+
+  it.each([
+    ['ARTILLERY'], ['URBAN_FIGHTS'], ['CHEMICAL'], ['NUCLEAR'], ['INFO'], ['UNKNOWN']
+  ])('drops a region whose only alert is %s', (type) => {
+    const snapshot = parseRaw(withRaw([entry('Тестовий район', 'District', [type])]));
+    expect(snapshot.regions).toEqual([]);
+    expect(snapshot.nonAirRegions).toBe(1);
+    expect(snapshot.readableCount).toBe(1);
+  });
+
+  it('accepts AIR_RAID as a synonym of AIR, because the shared normalizer does', () => {
+    expect([...AERIAL_MIRROR_AIR_TYPES].sort()).toEqual(['AIR', 'AIR_RAID']);
+    const snapshot = parseRaw(withRaw([entry('Тестовий район', 'District', ['air_raid'])]));
+    expect(snapshot.regions).toHaveLength(1);
+  });
+
+  it('reads the alert timestamps as ISO instants, not as Kyiv wall clocks', () => {
+    // The two conventions live in one document: `cachedat` is a bare Kyiv wall clock, every
+    // `lastUpdate` inside `raw[]` is ISO-8601 with a `Z`. Running `kyivWallClockToUtc` over an
+    // instant that already carries its zone would shift every alert start by two or three hours.
+    const luhansk = parseRaw().regions.find((region) => region.name === 'Луганська область')!;
+    expect(luhansk.changedAt.toISOString()).toBe('2022-04-04T16:45:00.000Z');
+    // Same alert, as the aggregated feed prints it: «2022-04-04 19:45:39» Kyiv — the same instant.
+    expect(kyivWallClockToUtc('2022-04-04 19:45:39')!.getTime() - luhansk.changedAt.getTime())
+      .toBe(39_000);
+  });
+
+  it('dates a region from the EARLIEST air raid it lists', () => {
+    // «Липецька територіальна громада» lists AIR twice in the capture. Two stamps for one fact, and
+    // the period started at the first of them.
+    const snapshot = parseRaw(withRaw([{
+      ...entry('Тестовий район', 'District', []),
+      activeAlerts: [
+        { type: 'AIR', lastUpdate: '2026-08-09T17:20:00Z' },
+        { type: 'AIR', lastUpdate: '2026-08-09T16:05:00Z' }
+      ]
+    }]));
+    expect(snapshot.regions[0]!.changedAt.toISOString()).toBe('2026-08-09T16:05:00.000Z');
+  });
+
+  it('falls back through the entry stamp to the cache stamp when an alert has no readable time', () => {
+    const noAlertTime = parseRaw(withRaw([{
+      regionName: 'Тестовий район', regionType: 'District', lastUpdate: '2026-08-09T12:00:00Z',
+      activeAlerts: [{ type: 'AIR', lastUpdate: 'вчора' }]
+    }]));
+    expect(noAlertTime.regions[0]!.changedAt.toISOString()).toBe('2026-08-09T12:00:00.000Z');
+
+    const noTimeAtAll = parseRaw(withRaw([{
+      regionName: 'Тестовий район', regionType: 'District', activeAlerts: [{ type: 'AIR' }]
+    }]));
+    // Degrading the period start beats discarding a region whose CURRENT state is perfectly clear.
+    expect(noTimeAtAll.regions[0]!.changedAt.toISOString()).toBe('2026-08-09T17:31:23.000Z');
+  });
+
+  it('folds a label the upstream lists twice, keeping the earlier start', () => {
+    const snapshot = parseRaw(withRaw([
+      entry('Харківський район', 'District', ['AIR'], '2026-08-09T17:20:00Z'),
+      entry('харківський  район', 'Community', ['AIR'], '2026-08-09T15:00:00Z')
+    ]));
+    expect(snapshot.regions).toHaveLength(1);
+    expect(snapshot.duplicateLabels).toBe(1);
+    expect(snapshot.regions[0]!.changedAt.toISOString()).toBe('2026-08-09T15:00:00.000Z');
+    // The level is the first one seen; it is reporting only, and resolution never reads it.
+    expect(snapshot.byLevel).toEqual({ State: 0, District: 1, Community: 0, other: 0 });
+  });
+
+  it('buckets an unknown regionType rather than dropping the region', () => {
+    // A new level upstream must reach the map, not vanish. `other` above zero is the signal that the
+    // vocabulary has grown.
+    const snapshot = parseRaw(withRaw([entry('Тестова область', 'Settlement', ['AIR'])]));
+    expect(snapshot.regions).toHaveLength(1);
+    expect(snapshot.byLevel.other).toBe(1);
+  });
+});
+
+describe('the raw passthrough distinguishes quiet from broken — as far as one payload can', () => {
+  /**
+   * The asymmetry this whole feature turns on.
+   *
+   * An empty `raw` list is what a calm night looks like AND what a half-dead upstream looks like.
+   * This parser refuses to guess: it accepts both and reports what it saw, because the alternative —
+   * throwing on empty — would put the source into `error` every time the country was at peace, and
+   * an operator who sees `error` on every quiet night stops reading the health card at all.
+   *
+   * `syncAerialMirror` is where the guess is made, with the aggregated feed as a second witness.
+   * Everything below is only about what this function is allowed to decide alone.
+   */
+  it('accepts an empty raw list as a legitimate quiet night', () => {
+    const snapshot = parseRaw(withRaw([]));
+    expect(snapshot.regions).toEqual([]);
+    expect(snapshot.entryCount).toBe(0);
+    expect(snapshot.readableCount).toBe(0);
+    expect(snapshot.cachedAt.toISOString()).toBe('2026-08-09T17:31:23.000Z');
+  });
+
+  it('accepts a list in which everything alight is a type this source ignores', () => {
+    // Also quiet, for air raids. Three hromadas under shelling is not an air-raid alert anywhere.
+    const snapshot = parseRaw(withRaw([
+      entry('Червоногригорівська територіальна громада', 'Community', ['ARTILLERY']),
+      entry('Покровська територіальна громада', 'Community', ['ARTILLERY'])
+    ]));
+    expect(snapshot.regions).toEqual([]);
+    expect(snapshot.entryCount).toBe(2);
+    expect(snapshot.readableCount).toBe(2);
+    expect(snapshot.nonAirRegions).toBe(2);
+  });
+
+  it('refuses a list whose entries are all unreadable, which is a reshaped upstream', () => {
+    // The difference from the two cases above: here the upstream IS saying something and this
+    // adapter cannot read it. Believed as "nothing alight", it clears every raion the mirror holds.
+    expect(() => parseRaw(withRaw([{ region: 'Сумський район', alerts: ['AIR'] }])))
+      .toThrow(/no readable entries/);
+    expect(() => parseRaw(withRaw(['Сумський район', 42, null]))).toThrow(/no readable entries/);
+    // No `activeAlerts` array at all is not this payload's shape either.
+    expect(() => parseRaw(withRaw([{ regionName: 'Сумський район', regionType: 'District' }])))
+      .toThrow(/no readable entries/);
+  });
+
+  it('keeps the readable entries when only some are malformed', () => {
+    const snapshot = parseRaw(withRaw([
+      entry('Сумський район', 'District', ['AIR']),
+      { regionName: '', regionType: 'District', activeAlerts: [{ type: 'AIR' }] },
+      null
+    ]));
+    expect(snapshot.regions.map((region) => region.name)).toEqual(['Сумський район']);
+    expect(snapshot.entryCount).toBe(3);
+    expect(snapshot.readableCount).toBe(1);
+  });
+
+  it.each([
+    ['null', null],
+    ['a bare array', [{ regionName: 'Сумський район' }]],
+    ['a string', '{"raw":'],
+    ['an envelope with no raw', { source: 'ukrainealarm.com API', cachedat: '2026-08-09 20:31:23' }],
+    ['raw as an object', { cachedat: '2026-08-09 20:31:23', raw: { '0': {} } }],
+    ['the aggregated body', { cachedat: '2026-08-09 20:31:23', states: {} }]
+  ])('refuses %s', (_label, body) => {
+    expect(() => parseRaw(body)).toThrow();
+  });
+
+  it('applies the same freshness gate as the aggregated parser, on the same envelope', () => {
+    // One `readCachedAt`, two parsers. The safety rule cannot drift between the two payload shapes
+    // because there is only one copy of it.
+    expect(() => parseRaw(RAW_FIXTURE, new Date(RAW_CAPTURED_AT.getTime() + 301_000)))
+      .toThrow(AerialMirrorStaleError);
+    expect(() => parseRaw(RAW_FIXTURE, new Date(RAW_CAPTURED_AT.getTime() + 301_000)))
+      .toThrow(/stale: cachedat .* is 301s old, bound is 300s/);
+    expect(() => parseRaw(RAW_FIXTURE, new Date(RAW_CAPTURED_AT.getTime() - 301_000)))
+      .toThrow(/301s in the future/);
+    expect(() => parseRaw(withRaw([], '2026-08-09'))).toThrow(/unreadable/);
+    const missing = { source: 'x', raw: [] };
+    expect(() => parseRaw(missing)).toThrow(/carries no `cachedat`/);
+    // Inside the bound it is accepted, exactly like the aggregated one.
+    expect(parseRaw(RAW_FIXTURE, new Date(RAW_CAPTURED_AT.getTime() + 299_000)).ageSeconds).toBe(299);
+  });
+
+  it('refuses a FROZEN empty payload — the freshness gate outranks the quiet reading', () => {
+    // The order matters and this pins it: an empty `raw` under a stale stamp is refused as stale,
+    // never accepted as peace. Only a FRESH empty list is a candidate for "the country is quiet",
+    // and even then `syncAerialMirror` still asks the aggregated feed.
+    expect(() => parseRaw(withRaw([], '2026-08-09 15:00:00'))).toThrow(AerialMirrorStaleError);
+  });
+});
+
+describe('the raw snapshot goes through the same normalizer as everything else', () => {
+  it('produces air_raid records for every level, with no type of its own', () => {
+    const normalized = normalizeAlarmResponse(toAlarmSnapshotBody(parseRaw()));
+    expect(normalized.records).toHaveLength(31);
+    expect([...new Set(normalized.records.map((record) => record.alertType))]).toEqual(['air_raid']);
+    expect(normalized.records.every((record) => record.active)).toBe(true);
+    const names = normalized.records.map((record) => record.locationName);
+    expect(names).toContain('Сумський район');
+    expect(names).toContain('Вовчанська територіальна громада');
+  });
+
+  it('emits no location key, so an upstream region id can never be read as a catalogue code', () => {
+    // Ukraine Alarm's `regionId` is a small integer in its own namespace — "16", "1313". Forwarding
+    // it would put it into `resolveLocationId`'s `id OR official_code` probe, where a collision with
+    // a catalogue code is a silent mis-resolution rather than an error. Names only, as before.
+    const normalized = normalizeAlarmResponse(toAlarmSnapshotBody(parseRaw()));
+    expect(normalized.records.every((record) => record.locationKey === '')).toBe(true);
+  });
+
+  it('carries each region\'s air-raid start through as the provider start', () => {
+    const records = normalizeAlarmResponse(toAlarmSnapshotBody(parseRaw())).records;
+    const crimea = records.find((record) => record.locationName === 'Автономна Республіка Крим')!;
+    expect(crimea.startedAt.toISOString()).toBe('2022-12-10T22:22:00.000Z');
   });
 });

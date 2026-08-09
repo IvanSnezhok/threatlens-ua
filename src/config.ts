@@ -43,6 +43,30 @@ const envSchema = z.object({
   // own cache and a slow upstream switch would start reading as an outage.
   AERIAL_MIRROR_STALE_SECONDS: z.coerce.number().int()
     .min(60, 'Aerial mirror staleness bound must be at least a minute').default(300),
+  // Which upstream to read through the mirror's documented `?source=<x>&raw` passthrough, which
+  // returns that upstream's NATIVE body instead of the aggregated oblast-only `states` object.
+  //
+  // `ual` — Ukraine Alarm — is the default because it is the only probed upstream that publishes all
+  // three administrative levels: `State`, `District` (raion) and `Community` (hromada, folded into
+  // its raion by the catalogue). Measured on one live poll: 3 State + 26 District + 5 Community
+  // entries where the aggregated feed had nine oblasts and nothing finer, and a Crimea row the
+  // aggregated feed does not carry at all. `klimenko` serves the envelope but its district list was
+  // empty when probed, `jaam` returned `[]`, and `aiu` 429s readily — none is a drop-in.
+  //
+  // **Empty string turns the passthrough off** and restores oblast-only behaviour: one request per
+  // poll against the aggregated feed, exactly as this source shipped. That is the setting to reach
+  // for if the upstream reshapes its body — it is a full retreat to a known-good path, not a
+  // degradation — and it is why this is a string rather than a boolean.
+  AERIAL_MIRROR_RAW_SOURCE: z.string().default('ual'),
+  // Pause between the raw poll and the aggregated cross-check, when a cross-check is needed at all.
+  //
+  // The endpoint publishes two requests per second per host, and during research a probe loop that
+  // put two requests inside one second was answered with a truncated body — the exact failure the
+  // parser now refuses. The two requests this adapter can make in one poll are therefore SEQUENCED,
+  // never fired together, and this is the gap between them. 600ms is comfortably over the 500ms the
+  // limit implies without approaching the 15s poll interval. Zero is allowed so tests need not wait.
+  AERIAL_MIRROR_REQUEST_GAP_MS: z.coerce.number().int()
+    .min(0, 'Aerial mirror request gap cannot be negative').default(600),
   DEMO_SOURCE_ENABLED: z.string().default('true').transform((v) => v === 'true'),
   AI_BASE_URL: z.string().default(''),
   AI_API_KEY: z.string().default(''),

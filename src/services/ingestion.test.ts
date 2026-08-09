@@ -87,7 +87,7 @@ describe('location match resolution', () => {
 /**
  * The wiring, not the values.
  *
- * A counter that is incremented but never registered is invisible on `/metrics` and looks exactly
+ * A metric that is written but never registered is invisible on `/metrics` and looks exactly
  * like a quiet system, which is the failure mode ops instrumentation exists to prevent. This test
  * asserts only that every name this module owns — including the shadow-classifier ones that ride
  * along on the same call — reaches a registry, and that calling the registration twice is safe,
@@ -95,6 +95,8 @@ describe('location match resolution', () => {
  */
 describe('metric registration', () => {
   const expected = [
+    'threatlens_aerial_mirror_polls_total',
+    'threatlens_aerial_mirror_raw_regions',
     'threatlens_alert_channel_messages_total',
     'threatlens_alert_channel_stuck_alerts_total',
     'threatlens_monitor_messages_total',

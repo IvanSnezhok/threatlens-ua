@@ -108,10 +108,10 @@ One official-family source is neither an API with a contract nor a body with a m
 [ubilling.net.ua/aerialalerts](https://ubilling.net.ua/aerialalerts/), registered by
 `migrations/027_aerial_alert_mirror.sql` as `aerial-alerts-mirror` and polled on the same
 fifteen-second snapshot path as the two APIs. It republishes the same executive-authority air-raid
-state at oblast granularity — twenty-four oblasts and Kyiv city, no Crimea or Sevastopol row — for
-free, with no key and no application. It exists in the catalogue because it is the only HTTPS alert
-source this deployment can read while both API applications are pending, and it is registered
-`enabled=true` because a source that carries the live picture and is switched off carries nothing.
+state for free, with no key and no application. It exists in the catalogue because it is the only
+HTTPS alert source this deployment can read while both API applications are pending, and it is
+registered `enabled=true` because a source that carries the live picture and is switched off carries
+nothing.
 
 It is where **designation, not transport** stops being comfortable. The state it carries is the
 authorities' own declaration; the publisher relaying it has no mandate at all. The row follows the
@@ -134,6 +134,100 @@ Two caveats travel with it, and both are stronger than the national channel's:
 - **Its operator disclaims it.** "Do not perceive this API as absolutely reliable … use official
   sources of information."
 
+#### Granularity: what the mirror is actually read at
+
+The mirror serves two bodies and the adapter reads the finer one.
+
+| | request | shape | granularity |
+|---|---|---|---|
+| primary | `?source=ual&raw` | `{source, cachedat, raw:[…]}` — Ukraine Alarm's own payload inside the mirror's envelope | `State`, `District`, `Community` |
+| fallback | bare URL | `{source, cachedat, states:{…}}` — the aggregator's own digest | 25 oblast rows |
+
+`?source=<x>&raw` is a documented passthrough
+([wiki](https://wiki.ubilling.net.ua/doku.php?id=aerialalertsapi)): the mirror hands back the chosen
+upstream's native body unchanged. `ual` is Ukraine Alarm, and it is the only probed upstream that
+publishes below oblast level — `klimenko` serves the envelope with an empty district list, `jaam`
+returns `[]`, `aiu` rate-limits readily. One live poll measured 3 `State` + 26 `District` + 5
+`Community` entries while the aggregated feed, polled 26 seconds later, had nine oblasts and nothing
+finer.
+
+The three levels reach the catalogue through resolution that already existed, which is why this was
+an adapter change and not a schema one:
+
+- `State` → oblast, by name, exactly as before. Two `State` entries are not oblasts: «Автономна
+  Республіка Крим», which the aggregated feed carries **no row for in any state**, and «м. Харків та
+  Харківська територіальна громада», which the resolver's compound narrowing lands on the city.
+- `District` → raion. «Харківський район» is a rank-0 hit on the raion's own `name_uk` under the
+  literal-first lookup added when the aggregated feed was resolving «Донецька область» to Донецьк.
+- `Community` → **raion**, through the hromada aliases `raionAliases` writes onto every raion row.
+  The catalogue is deliberately three-tier, so «Вовчанська територіальна громада» resolves to
+  Чугуївський район, which contains it. Where two raions hold hromadas of the same name — Покровська
+  exists on both Донеччина and Дніпропетровщина — the alias is ambiguous, `pickLocationMatch` refuses
+  to guess, and the label lands in the unresolved-location report. Raising the wrong raion is worse
+  than raising none.
+
+Two labels therefore routinely name one catalogue row, and both shapes were present in a single
+capture: a District and a Community inside it (Чугуївський + Вовчанська), and two Communities of one
+raion. `persistOfficialAlertSnapshot` folds after resolution — a location holds if **any** row
+holding it says so, and its period starts at the **earliest** of their starts, so the timestamp does
+not depend on the order the upstream happened to list two labels in.
+
+**Alert types.** The `ual` payload carries Ukraine Alarm's whole vocabulary; `AIR`, `ARTILLERY` and
+`URBAN_FIGHTS` were all observed in one capture (`CHEMICAL`, `NUCLEAR`, `INFO` exist in the same
+enum). This source moves `air_raid` and nothing else, so only `AIR` is read and every other type is
+dropped — including when it is the *only* thing a region has, which is why three shelled
+Dnipropetrovshchyna hromadas are absent from that capture's output. They are not under an air-raid
+alert, and rendering a shelling warning as a siren would misstate what was declared.
+
+**Region ids are not forwarded.** Ukraine Alarm's `regionId` is a small integer in its own namespace
+("16", "1313"); `resolveLocationId` probes `id OR official_code` first, where a collision would be a
+silent mis-resolution rather than an error. Names only.
+
+`AERIAL_MIRROR_RAW_SOURCE=''` turns the passthrough off and restores oblast-only behaviour exactly
+as this source shipped — a full retreat to a known-good path if the upstream ever reshapes its body,
+not a degradation. It is a string and not a boolean so a different upstream can be named instead.
+
+#### Quiet, or broken? The rule for an empty raw feed
+
+The raw feed lists only what is alight, so "nothing alight" is an empty list — and an empty list is
+what a calm night looks like **and** what a half-dead upstream looks like: `cachedat` fresh, envelope
+intact, `raw` empty because whatever fills it has stopped. Refusing it would put the source into
+`error` every time the country was at peace, which is wrong and would train an operator to ignore the
+health card. Believing it would clear every raion the mirror holds.
+
+Nothing inside the payload separates the two, so the rule reaches outside it: **when the raw feed
+reports no air-raid region, ask the aggregated feed before believing it.** That feed is a different
+upstream inside the same mirror, and it is enough to answer the only question being asked — is
+anything alight anywhere?
+
+- aggregated feed also reports nothing → the country is quiet. The empty snapshot is accepted and
+  the mirror clears normally, through the end debounce as always.
+- aggregated feed reports at least one oblast → the raw feed is not describing the present. **Fall
+  back** to the aggregated body for this poll, at oblast granularity, under the same `source_id`, and
+  log it. Degraded resolution beats a wrong all-clear.
+- aggregated feed cannot be read either → **hold.** `markSourceError`, `alert_source_states` never
+  opened. Two unreadable feeds are not evidence of peace.
+
+The same fallback carries a raw payload the parser refused outright — stale, future, non-array,
+entries it cannot read, HTTP failure. There the aggregated feed is a substitute rather than a
+witness, but the ordering and the both-fail outcome are identical, so it is one path. Falling back is
+the adapter working rather than failing, so the source stays `current`; the signal is the log line
+and `threatlens_aerial_mirror_polls_total{mode="unified_fallback"}`, and a fallback rate that stops
+being ~zero means the map has quietly gone back to oblast-only.
+
+One consequence of switching granularity mid-stream is worth naming: the two feeds address different
+rows, so a poll that falls back stops re-stating the raions the previous poll raised, and they enter
+the end debounce while the oblast above them is raised. For up to `ALERT_END_DEBOUNCE_SECONDS` both
+are held. That is the over-warning direction and it is left alone — the alternative, letting a
+fallback poll clear rows it has no opinion about, is the direction §Consistency rules calls
+unrecoverable.
+
+**Request budget.** The mirror publishes two requests per second per host. The steady state is **one**
+request per poll — the cross-check runs only when the raw feed found nothing or was refused. The two
+are sequenced with `AERIAL_MIRROR_REQUEST_GAP_MS` (600 by default) between them and never issued
+together: during research two requests inside one second were answered with a truncated body, which
+is the precise failure the parsers exist to refuse.
+
 #### The stale-freeze rule
 
 A snapshot source is authoritative about what it *stops* reporting — that is what makes the
@@ -149,6 +243,13 @@ alerts rather than clearing them, and the operator sees an unhealthy source inst
 The same refusal covers a missing, unreadable or *future* `cachedat` — the feed prints bare
 Europe/Kyiv wall clocks with no zone, so a naive parse in a UTC container reads every stamp three
 hours into the future and would make the staleness test unfailable.
+
+The gate is one function shared by both parsers, because the surest way to keep two copies of a
+safety rule in agreement is not to have two copies. It applies to the mirror's **envelope** only:
+`cachedat` is a bare Kyiv wall clock, while every `lastUpdate` inside the `ual` passthrough is honest
+ISO-8601 with a `Z`, and running the wall-clock reader over an instant that already carries its zone
+would shift every alert start by two or three hours. The gate also outranks the quiet reading above:
+an empty `raw` list under a stale stamp is refused as stale, never considered as peace.
 
 Two consequences are deliberate and are the operator's to weigh, not the code's:
 

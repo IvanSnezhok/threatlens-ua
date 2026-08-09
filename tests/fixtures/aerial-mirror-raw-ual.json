@@ -1,0 +1,534 @@
+{
+  "source": "ukrainealarm.com API",
+  "cachedat": "2026-08-09 20:31:23",
+  "raw": [
+    {
+      "regionId": "16",
+      "regionType": "State",
+      "regionName": "Луганська область",
+      "regionEngName": "Luhanska region",
+      "lastUpdate": "2022-04-04T16:45:00Z",
+      "activeAlerts": [
+        {
+          "regionId": "16",
+          "regionType": "State",
+          "type": "AIR",
+          "lastUpdate": "2022-04-04T16:45:00Z"
+        }
+      ]
+    },
+    {
+      "regionId": "9999",
+      "regionType": "State",
+      "regionName": "Автономна Республіка Крим",
+      "regionEngName": "",
+      "lastUpdate": "2022-12-10T22:22:00Z",
+      "activeAlerts": [
+        {
+          "regionId": "9999",
+          "regionType": "State",
+          "type": "AIR",
+          "lastUpdate": "2022-12-10T22:22:00Z"
+        }
+      ]
+    },
+    {
+      "regionId": "1313",
+      "regionType": "Community",
+      "regionName": "Вовчанська територіальна громада",
+      "regionEngName": "Vovchanska community",
+      "lastUpdate": "2025-08-01T22:52:43Z",
+      "activeAlerts": [
+        {
+          "regionId": "1313",
+          "regionType": "Community",
+          "type": "ARTILLERY",
+          "lastUpdate": "2024-05-20T09:31:37Z"
+        },
+        {
+          "regionId": "1313",
+          "regionType": "Community",
+          "type": "URBAN_FIGHTS",
+          "lastUpdate": "2024-05-20T09:31:41Z"
+        },
+        {
+          "regionId": "122",
+          "regionType": "District",
+          "type": "AIR",
+          "lastUpdate": "2026-08-09T16:46:13.38228Z"
+        }
+      ]
+    },
+    {
+      "regionId": "1284",
+      "regionType": "Community",
+      "regionName": "Липецька територіальна громада",
+      "regionEngName": "Lypetska community",
+      "lastUpdate": "2026-03-10T14:01:38.549047Z",
+      "activeAlerts": [
+        {
+          "regionId": "1284",
+          "regionType": "Community",
+          "type": "AIR",
+          "lastUpdate": "2026-03-10T14:01:38.075992Z"
+        },
+        {
+          "regionId": "124",
+          "regionType": "District",
+          "type": "AIR",
+          "lastUpdate": "2026-08-09T16:20:59.73947Z"
+        }
+      ]
+    },
+    {
+      "regionId": "356",
+      "regionType": "Community",
+      "regionName": "Червоногригорівська територіальна громада",
+      "regionEngName": "Chervonohryhorivska community",
+      "lastUpdate": "2026-04-19T20:19:35.64511Z",
+      "activeAlerts": [
+        {
+          "regionId": "356",
+          "regionType": "Community",
+          "type": "ARTILLERY",
+          "lastUpdate": "2026-04-19T20:19:35.541259Z"
+        }
+      ]
+    },
+    {
+      "regionId": "353",
+      "regionType": "Community",
+      "regionName": "Покровська територіальна громада",
+      "regionEngName": "Pokrovska community",
+      "lastUpdate": "2026-07-26T14:38:45.281565Z",
+      "activeAlerts": [
+        {
+          "regionId": "353",
+          "regionType": "Community",
+          "type": "ARTILLERY",
+          "lastUpdate": "2026-07-26T14:38:44.698733Z"
+        }
+      ]
+    },
+    {
+      "regionId": "349",
+      "regionType": "Community",
+      "regionName": "м. Марганець та Марганецька територіальна громада",
+      "regionEngName": "Marhanets and Marhanetska community",
+      "lastUpdate": "2026-08-07T05:33:49.015854Z",
+      "activeAlerts": [
+        {
+          "regionId": "349",
+          "regionType": "Community",
+          "type": "ARTILLERY",
+          "lastUpdate": "2026-08-07T05:33:48.891497Z"
+        }
+      ]
+    },
+    {
+      "regionId": "114",
+      "regionType": "District",
+      "regionName": "Сумський район",
+      "regionEngName": "Sumskyi district",
+      "lastUpdate": "2026-08-09T16:16:22.497726Z",
+      "activeAlerts": [
+        {
+          "regionId": "114",
+          "regionType": "District",
+          "type": "AIR",
+          "lastUpdate": "2026-08-09T16:16:21.894567Z"
+        }
+      ]
+    },
+    {
+      "regionId": "1293",
+      "regionType": "State",
+      "regionName": "м. Харків та Харківська територіальна громада",
+      "regionEngName": "Kharkiv and Kharkivska community",
+      "lastUpdate": "2026-08-09T16:21:08.441727Z",
+      "activeAlerts": [
+        {
+          "regionId": "1293",
+          "regionType": "State",
+          "type": "AIR",
+          "lastUpdate": "2026-08-09T16:21:08.104638Z"
+        }
+      ]
+    },
+    {
+      "regionId": "141",
+      "regionType": "District",
+      "regionName": "Новгород-Сіверський район",
+      "regionEngName": "Novhorod-Siverskyi district",
+      "lastUpdate": "2026-08-09T13:29:50.272862Z",
+      "activeAlerts": [
+        {
+          "regionId": "141",
+          "regionType": "District",
+          "type": "AIR",
+          "lastUpdate": "2026-08-09T13:29:49.916175Z"
+        }
+      ]
+    },
+    {
+      "regionId": "116",
+      "regionType": "District",
+      "regionName": "Роменський район",
+      "regionEngName": "Romenskyi district",
+      "lastUpdate": "2026-08-09T17:19:03.323453Z",
+      "activeAlerts": [
+        {
+          "regionId": "116",
+          "regionType": "District",
+          "type": "AIR",
+          "lastUpdate": "2026-08-09T17:19:03.221886Z"
+        }
+      ]
+    },
+    {
+      "regionId": "126",
+      "regionType": "District",
+      "regionName": "Богодухівський район",
+      "regionEngName": "Bohodukhivskyi district",
+      "lastUpdate": "2026-08-09T11:50:43.082564Z",
+      "activeAlerts": [
+        {
+          "regionId": "126",
+          "regionType": "District",
+          "type": "AIR",
+          "lastUpdate": "2026-08-09T11:50:42.874514Z"
+        }
+      ]
+    },
+    {
+      "regionId": "109",
+      "regionType": "District",
+      "regionName": "Полтавський район",
+      "regionEngName": "Poltavskyi district",
+      "lastUpdate": "2026-08-09T14:53:36.63621Z",
+      "activeAlerts": [
+        {
+          "regionId": "109",
+          "regionType": "District",
+          "type": "AIR",
+          "lastUpdate": "2026-08-09T14:53:36.212366Z"
+        }
+      ]
+    },
+    {
+      "regionId": "118",
+      "regionType": "District",
+      "regionName": "Охтирський район",
+      "regionEngName": "Okhtyrskyi district",
+      "lastUpdate": "2026-08-09T16:10:02.163556Z",
+      "activeAlerts": [
+        {
+          "regionId": "118",
+          "regionType": "District",
+          "type": "AIR",
+          "lastUpdate": "2026-08-09T16:10:01.79348Z"
+        }
+      ]
+    },
+    {
+      "regionId": "55",
+      "regionType": "District",
+      "regionName": "Волноваський район",
+      "regionEngName": "Volnovaskyi district",
+      "lastUpdate": "2026-08-09T16:15:55.247803Z",
+      "activeAlerts": [
+        {
+          "regionId": "55",
+          "regionType": "District",
+          "type": "AIR",
+          "lastUpdate": "2026-08-09T16:15:54.846429Z"
+        }
+      ]
+    },
+    {
+      "regionId": "50",
+      "regionType": "District",
+      "regionName": "Краматорський район",
+      "regionEngName": "Kramatorskyi district",
+      "lastUpdate": "2026-08-09T16:15:55.247803Z",
+      "activeAlerts": [
+        {
+          "regionId": "50",
+          "regionType": "District",
+          "type": "AIR",
+          "lastUpdate": "2026-08-09T16:15:54.846434Z"
+        }
+      ]
+    },
+    {
+      "regionId": "49",
+      "regionType": "District",
+      "regionName": "Кальміуський район",
+      "regionEngName": "Kalmiuskyi district",
+      "lastUpdate": "2026-08-09T16:15:55.247803Z",
+      "activeAlerts": [
+        {
+          "regionId": "49",
+          "regionType": "District",
+          "type": "AIR",
+          "lastUpdate": "2026-08-09T16:15:54.846439Z"
+        }
+      ]
+    },
+    {
+      "regionId": "56",
+      "regionType": "District",
+      "regionName": "Покровський район",
+      "regionEngName": "Pokrovskyi district",
+      "lastUpdate": "2026-08-09T16:15:55.155481Z",
+      "activeAlerts": [
+        {
+          "regionId": "56",
+          "regionType": "District",
+          "type": "AIR",
+          "lastUpdate": "2026-08-09T16:15:54.646197Z"
+        }
+      ]
+    },
+    {
+      "regionId": "52",
+      "regionType": "District",
+      "regionName": "Маріупольський район",
+      "regionEngName": "Mariupolskyi district",
+      "lastUpdate": "2026-08-09T16:15:55.155481Z",
+      "activeAlerts": [
+        {
+          "regionId": "52",
+          "regionType": "District",
+          "type": "AIR",
+          "lastUpdate": "2026-08-09T16:15:54.648287Z"
+        }
+      ]
+    },
+    {
+      "regionId": "53",
+      "regionType": "District",
+      "regionName": "Донецький район",
+      "regionEngName": "Donetskyi district",
+      "lastUpdate": "2026-08-09T16:15:55.155481Z",
+      "activeAlerts": [
+        {
+          "regionId": "53",
+          "regionType": "District",
+          "type": "AIR",
+          "lastUpdate": "2026-08-09T16:15:54.657156Z"
+        }
+      ]
+    },
+    {
+      "regionId": "54",
+      "regionType": "District",
+      "regionName": "Бахмутський район",
+      "regionEngName": "Bakhmutskyi district",
+      "lastUpdate": "2026-08-09T16:15:55.155481Z",
+      "activeAlerts": [
+        {
+          "regionId": "54",
+          "regionType": "District",
+          "type": "AIR",
+          "lastUpdate": "2026-08-09T16:15:54.846403Z"
+        }
+      ]
+    },
+    {
+      "regionId": "51",
+      "regionType": "District",
+      "regionName": "Горлівський район",
+      "regionEngName": "Horlivskyi district",
+      "lastUpdate": "2026-08-09T16:15:55.155481Z",
+      "activeAlerts": [
+        {
+          "regionId": "51",
+          "regionType": "District",
+          "type": "AIR",
+          "lastUpdate": "2026-08-09T16:15:54.846422Z"
+        }
+      ]
+    },
+    {
+      "regionId": "124",
+      "regionType": "District",
+      "regionName": "Харківський район",
+      "regionEngName": "Kharkivskyi district",
+      "lastUpdate": "2026-08-09T16:20:59.801862Z",
+      "activeAlerts": [
+        {
+          "regionId": "124",
+          "regionType": "District",
+          "type": "AIR",
+          "lastUpdate": "2026-08-09T16:20:59.73947Z"
+        }
+      ]
+    },
+    {
+      "regionId": "115",
+      "regionType": "District",
+      "regionName": "Шосткинський район",
+      "regionEngName": "Shostkynskyi district",
+      "lastUpdate": "2026-08-09T16:21:27.127107Z",
+      "activeAlerts": [
+        {
+          "regionId": "115",
+          "regionType": "District",
+          "type": "AIR",
+          "lastUpdate": "2026-08-09T16:21:26.8072Z"
+        }
+      ]
+    },
+    {
+      "regionId": "108",
+      "regionType": "District",
+      "regionName": "Миргородський район",
+      "regionEngName": "Myrhorodskyi district",
+      "lastUpdate": "2026-08-09T16:32:35.755985Z",
+      "activeAlerts": [
+        {
+          "regionId": "108",
+          "regionType": "District",
+          "type": "AIR",
+          "lastUpdate": "2026-08-09T16:32:35.417081Z"
+        }
+      ]
+    },
+    {
+      "regionId": "117",
+      "regionType": "District",
+      "regionName": "Конотопський район",
+      "regionEngName": "Konotopskyi district",
+      "lastUpdate": "2026-08-09T16:39:53.341503Z",
+      "activeAlerts": [
+        {
+          "regionId": "117",
+          "regionType": "District",
+          "type": "AIR",
+          "lastUpdate": "2026-08-09T16:39:53.077222Z"
+        }
+      ]
+    },
+    {
+      "regionId": "122",
+      "regionType": "District",
+      "regionName": "Чугуївський район",
+      "regionEngName": "Chuhuivskyi district",
+      "lastUpdate": "2026-08-09T16:46:13.776061Z",
+      "activeAlerts": [
+        {
+          "regionId": "122",
+          "regionType": "District",
+          "type": "AIR",
+          "lastUpdate": "2026-08-09T16:46:13.38228Z"
+        }
+      ]
+    },
+    {
+      "regionId": "104",
+      "regionType": "District",
+      "regionName": "Одеський район",
+      "regionEngName": "Odeskyi district",
+      "lastUpdate": "2026-08-09T17:31:21.742088Z",
+      "activeAlerts": [
+        {
+          "regionId": "104",
+          "regionType": "District",
+          "type": "AIR",
+          "lastUpdate": "2026-08-09T17:31:21.646403Z"
+        }
+      ]
+    },
+    {
+      "regionId": "103",
+      "regionType": "District",
+      "regionName": "Роздільнянський район",
+      "regionEngName": "Rozdilnianskyi district",
+      "lastUpdate": "2026-08-09T17:31:21.742088Z",
+      "activeAlerts": [
+        {
+          "regionId": "103",
+          "regionType": "District",
+          "type": "AIR",
+          "lastUpdate": "2026-08-09T17:31:21.648303Z"
+        }
+      ]
+    },
+    {
+      "regionId": "105",
+      "regionType": "District",
+      "regionName": "Болградський район",
+      "regionEngName": "Bolhradskyi district",
+      "lastUpdate": "2026-08-09T17:31:21.742088Z",
+      "activeAlerts": [
+        {
+          "regionId": "105",
+          "regionType": "District",
+          "type": "AIR",
+          "lastUpdate": "2026-08-09T17:31:21.656264Z"
+        }
+      ]
+    },
+    {
+      "regionId": "99",
+      "regionType": "District",
+      "regionName": "Подільський район",
+      "regionEngName": "Podilskyi district",
+      "lastUpdate": "2026-08-09T17:31:22.495659Z",
+      "activeAlerts": [
+        {
+          "regionId": "99",
+          "regionType": "District",
+          "type": "AIR",
+          "lastUpdate": "2026-08-09T17:31:21.846615Z"
+        }
+      ]
+    },
+    {
+      "regionId": "100",
+      "regionType": "District",
+      "regionName": "Березівський район",
+      "regionEngName": "Berezivskyi district",
+      "lastUpdate": "2026-08-09T17:31:22.495659Z",
+      "activeAlerts": [
+        {
+          "regionId": "100",
+          "regionType": "District",
+          "type": "AIR",
+          "lastUpdate": "2026-08-09T17:31:21.846628Z"
+        }
+      ]
+    },
+    {
+      "regionId": "102",
+      "regionType": "District",
+      "regionName": "Білгород-Дністровський район",
+      "regionEngName": "Bilhorod-Dnistrovskyi district",
+      "lastUpdate": "2026-08-09T17:31:22.495659Z",
+      "activeAlerts": [
+        {
+          "regionId": "102",
+          "regionType": "District",
+          "type": "AIR",
+          "lastUpdate": "2026-08-09T17:31:21.846634Z"
+        }
+      ]
+    },
+    {
+      "regionId": "101",
+      "regionType": "District",
+      "regionName": "Ізмаїльський район",
+      "regionEngName": "Izmailskyi district",
+      "lastUpdate": "2026-08-09T17:31:22.495659Z",
+      "activeAlerts": [
+        {
+          "regionId": "101",
+          "regionType": "District",
+          "type": "AIR",
+          "lastUpdate": "2026-08-09T17:31:21.846642Z"
+        }
+      ]
+    }
+  ]
+}
