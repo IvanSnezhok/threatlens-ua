@@ -103,7 +103,14 @@ const opsCodexRoutes: FastifyPluginAsync = async (app) => {
       // The shadow classifier, off by default. Listed here like the rest rather than behind its own
       // route: an operator switching model use on and off wants one form, and a switch reachable
       // only by a different path is a switch nobody finds when the quota runs out.
-      shadow: z.boolean()
+      shadow: z.boolean(),
+      // The retrospective gate (migration 025), off by default and the only switch on this form that
+      // grants a model any authority over the pipeline: with it on, a model may convert a threat the
+      // rules would have published into an archive-only row, and may do nothing else. It belongs on
+      // the same form for the same reason as `shadow` — the operator turning model use off in a
+      // hurry must find every switch in one place — and its blast radius is documented beside it in
+      // `src/services/retrospective-gate.ts`.
+      retrospective_gate: z.boolean()
     }).partial().optional()
   });
 

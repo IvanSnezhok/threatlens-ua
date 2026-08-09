@@ -72,8 +72,25 @@ import {
  *   catalogue lacked, the Kyiv districts Троєщина and Жуляни as aliases of the city, and the removal
  *   of "запоріжжя" from the oblast's aliases so a bare "Запоріжжя" names the city the way a bare
  *   "Київ" already does.
+ * * `v5` — the retrospective veto. Everything up to `v4` read a message for the vocabulary in it and
+ *   nothing at all for the *tense* it was written in, so a monitoring channel's reflective essay
+ *   about last night — «Цієї ночі тисячі киян знову ночували на платформах метро… Раніше масовані
+ *   нальоти БпЛА… давали бодай якийсь час на підготовку. Тепер усе інакше» — matched `баліст`,
+ *   `бпла`, `ракет` and `Київ` and was published as a live «Київ — комбінована загроза» with a
+ *   Telegram notification. The Air Force's 09:00 night summary and the strategic-aviation channel's
+ *   after-action write-up fail the same way, and both are in the gold corpus as false positives.
+ *
+ *   {@link assessRetrospective} reads the register instead of the vocabulary: summary bulletins
+ *   («у ніч на 08 серпня», «станом на 09:00», «збито/подавлено», «підсумки», «за ніч», «вчора»),
+ *   narration («цієї ночі» beside a past-tense verb, the «раніше … тепер» contrast) and prose at
+ *   essay length. None of it can suppress anything on its own: a message that also carries a genuine
+ *   operational NOW-marker — a stated direction, an arrow bulletin, a national «загроза
+ *   застосування», a time-to-impact, the telegraphic «3х» count, a shelter instruction or a
+ *   present-tense verb of motion — publishes exactly as it did in `v4`. That asymmetry is deliberate
+ *   and is the whole safety argument: missing a retrospective false positive costs a reader one
+ *   wrong line, suppressing a real warning costs them the warning.
  */
-export const CLASSIFIER_VERSION = 'v4';
+export const CLASSIFIER_VERSION = 'v5';
 
 export interface LocationLexeme {
   id: string;
@@ -516,6 +533,252 @@ const ANTICIPATION_MARKERS = /((?<!\p{L})очікує|(?<!\p{L})чекає|сп�
  */
 const REDIRECT_PATTERN = /(?<!\p{L})повз\s+([^.!?\n]{2,60}?)\s+(?:на|у\s+напрямку|в\s+напрямку|до)\s+([^.!?\n]{2,80})/iu;
 
+// ------------------------------------------------------------------------------------------------
+// Retrospection and narration (`v5`)
+// ------------------------------------------------------------------------------------------------
+
+/**
+ * Past-tense and impersonal-perfect verb forms, as a closed list.
+ *
+ * A general Ukrainian past-tense detector is not expressible as a regex worth reviewing: the tense
+ * is carried by an `-л-` suffix whose endings — `-в`, `-ла`, `-ло`, `-ли` — are also the endings of
+ * ordinary nouns («число», «сила», «сталі»), so a generic rule would fire on half the language. What
+ * is listed here is the verb stock the *retrospective register* is actually built from, taken from
+ * the archive: what the enemy did, what the air defence did, what the readers did.
+ *
+ * It is only ever read as a **conjunct** — «цієї ночі» plus one of these — so the cost of the list
+ * being incomplete is that one narration marker does not fire, and the cost of it being too wide is
+ * bounded by the phrase it has to appear beside. Both errors point the safe way: nothing is
+ * suppressed, a message merely publishes.
+ */
+const PAST_NARRATION = new RegExp(
+  '(?<!\\p{L})(?:'
+  + 'був|була|було|були'
+  + '|(?:ночува|атакува|застосува|працюва|дава|трива|відбива|проводи|влучи|запусти|вдари|удари'
+  + '|загину|постражда|фіксува|спостеріга)(?:в|ла|ло|ли)'
+  + '|(?:при|про|від)?лет(?:ів|іла|іло|іли)'
+  + '|ста(?:лося|лася|лись|лися)'
+  + '|збито|подавлено|знищено|пошкоджено|зруйновано|зафіксовано|застосовано|виявлено|уражено|оголошено'
+  + ')(?!\\p{L})', 'iu');
+
+interface TextMarker {
+  name: string;
+  pattern: RegExp;
+  /** A second condition on the same message. Present only where the phrase alone means too little. */
+  requires?: RegExp;
+}
+
+/**
+ * The summary bulletin: a report *about* a period that has ended.
+ *
+ * These are decisive on their own. «У ніч на 08 серпня противник атакував…», «Станом на 09:00…», «За
+ * попередніми даними…», «ЗБИТО/ПОДАВЛЕНО 135…», «Починаючи з 13:00 було застосовано…» are not ways
+ * of describing something happening now; they are the fixed opening of a bulletin whose subject is
+ * over. The Air Force publishes one every morning and every one of them names weapons, places and
+ * counts — which is precisely why `v4` published them as live combined threats.
+ */
+const RETROSPECTIVE_SUMMARY_MARKERS: TextMarker[] = [
+  {
+    name: 'ретроспектива: нічний підсумок',
+    pattern: /(?<!\p{L})(?:підсум[а-яіїєґ]*|у\s+ніч\s+на(?!\p{L})|протягом\s+(?:ноч[іи]|доби)|за\s+(?:ніч|добу|ночі|доби)(?!\p{L})|за\s+попередн[а-яіїєґ]*\s+дан)/iu
+  },
+  // «Починаючи з 13:00 було застосовано…» opens an account of a window that has closed. Its obvious
+  // sibling «станом на 00:42» is deliberately NOT a marker of anything: the strategic-aviation
+  // channel opens its *live* hourly snapshots with it — «Приблизна ситуація в повітряному просторі
+  // України станом на 00:42 … 2 реактивні БпЛА на Житомир» — and a replay over the production
+  // archive showed that reading it as retrospective would have suppressed three live warnings for
+  // Zhytomyr and Kharkiv. "As of an hour" is how both a summary and a snapshot begin.
+  { name: 'ретроспектива: підсумок від години', pattern: /(?<!\p{L})починаючи\s+з\s+\d{1,2}[:.]\d{2}/iu },
+  {
+    // The morning tally, in the exact shape the Air Force writes it.
+    name: 'ретроспектива: зведення збиття',
+    pattern: /(?<!\p{L})(?:збито|знищено)\s*(?:\/|та\s+|і\s+)\s*подавлено/iu
+  },
+  { name: 'ретроспектива: вчорашній день', pattern: /(?<!\p{L})(?:вчора|учора|позавчора|напередодні)(?!\p{L})/iu },
+  {
+    name: 'ретроспектива: минула ніч або доба',
+    pattern: /(?<!\p{L})мину(?:лої|лу|лою)\s+(?:ноч[іи]|доб[иу])/iu
+  }
+];
+
+/**
+ * Narration: a message written *about* the war rather than *from* it.
+ *
+ * Softer than a summary bulletin, and treated as such — a narration marker beside a weak operational
+ * word is the grey band {@link RetrospectiveAssessment} calls `suspect`, which the rules resolve in
+ * favour of publishing and `src/services/retrospective-gate.ts` may ask a model about. On its own,
+ * with nothing operational anywhere in the message, it is enough.
+ *
+ * «цієї ночі» needs a past-tense verb beside it because the same words open an anticipation
+ * («цієї ночі очікується»), and an anticipation is a warning. The «раніше … тепер» contrast needs no
+ * second condition: it is the shape of an argument, and an argument is not a report.
+ */
+const RETROSPECTIVE_NARRATION_MARKERS: TextMarker[] = [
+  {
+    name: 'ретроспектива: «цієї ночі» з дієсловом минулого часу',
+    pattern: /(?<!\p{L})(?:ці(?:єї|ю)\s+(?:ноч[іи]|доб[иу])|сьогодні\s+(?:вночі|вранці|зранку)|цього\s+ранку)/iu,
+    requires: PAST_NARRATION
+  },
+  {
+    name: 'ретроспектива: «раніше — тепер»',
+    pattern: /(?<!\p{L})раніше(?!\p{L})[\s\S]{0,600}?(?<!\p{L})(?:тепер|нині)(?!\p{L})/iu
+  }
+];
+
+/** The essay marker's name, kept beside the numbers that produce it. */
+const ESSAY_MARKER = 'ретроспектива: розлога оповідь';
+
+/**
+ * Prose, measured rather than matched.
+ *
+ * The єРадар essay carries no dateline at all — it opens on last night and then argues about what
+ * the war has become — so no phrase in it is decisive. What separates it from every operational
+ * message these channels publish is its *shape*: four hundred characters and more, several
+ * sentences, and sentences long enough to be prose rather than a list.
+ *
+ * All three shape conditions matter. Length alone would catch the arrow bulletins, which run to four
+ * hundred characters of settlement names; the sentence count alone would catch a two-clause report;
+ * and the mean sentence length is what tells «Кіровоградська область ◦ Ударний Бп → Богданівка,
+ * Кам'янка…» (a real warning, mean ≈ 380 in one sentence — but see the strong-marker override, which
+ * protects it anyway) from a paragraph of argument.
+ *
+ * Shape alone is still not enough, and the replay over the production archive is what proved it: the
+ * strategic-aviation channel's target forecast — «Згідно деяких даних ворог може завдати удару
+ * балістичними ракетами… Потенційні цілі ураження: Київ: Дарниця, Жуляни… Коли саме буде здійснено
+ * атаку нам невідомо» — has exactly this shape and is *prospective*. Suppressing a forecast is a
+ * different mistake from suppressing a summary, and this layer has no business making it. So the
+ * essay marker additionally requires a past-tense verb ({@link PAST_NARRATION}): an essay is
+ * retrospective when it is about something that already happened, and a text with no past tense
+ * anywhere in it is not narrating anything.
+ *
+ * The numbers are calibrated against the 191 hand-labelled messages in
+ * `tests/fixtures/classifier-gold.json` and against a full `v4 → v5` replay of the production
+ * archive: on both, no message a reviewer read as a live threat reaches all four conditions.
+ */
+const ESSAY_MIN_CHARACTERS = 400;
+const ESSAY_MIN_SENTENCES = 3;
+const ESSAY_MIN_MEAN_SENTENCE = 45;
+
+function readsAsEssay(text: string): boolean {
+  if (!PAST_NARRATION.test(text)) return false;
+  const body = text.replace(/\s+/gu, ' ').trim();
+  if (body.length < ESSAY_MIN_CHARACTERS) return false;
+  const sentences = body.split(/[.!?…]+[\s"»]/u).map((part) => part.trim()).filter(Boolean);
+  if (sentences.length < ESSAY_MIN_SENTENCES) return false;
+  const mean = sentences.reduce((total, sentence) => total + sentence.length, 0) / sentences.length;
+  return mean >= ESSAY_MIN_MEAN_SENTENCE;
+}
+
+/**
+ * What says a message is reporting something happening **now**, in the strong sense.
+ *
+ * Every entry states live geometry or immediacy and cannot be produced by narrating a finished
+ * night: a course, an arrow, the Air Force's own national warning phrase, a time-to-impact, the
+ * telegraphic «3х» count these channels use for targets in the air, a shelter instruction, or a verb
+ * of motion in the present tense. One of these is an absolute veto on the veto — the message
+ * publishes, whatever else it says.
+ *
+ * `(?:за)?пуск` is deliberately **not** here even though a launch is operational: «Пуски
+ * проводилися з дронопорту "Цимбулова"» is the after-action write-up this release exists to stop
+ * publishing. It sits in the weak list instead, where it routes to the grey band rather than to a
+ * veto.
+ */
+const OPERATIONAL_NOW_STRONG: TextMarker[] = [
+  { name: 'now: напрямок руху', pattern: REPORTED_DIRECTION },
+  { name: 'now: стрілка-бюлетень', pattern: /(?:→|➡|⮕|➤|-->|->)\s*\p{L}/u },
+  { name: 'now: національне попередження', pattern: /загроз[а-яіїєґ]*\s+застосуванн/iu },
+  { name: 'now: підлітний час', pattern: /(?<!\p{L})\d+\s*хв/iu },
+  { name: 'now: телеграфний рахунок цілей', pattern: /(?<!\p{L})\d+\s*х(?!\p{L})/iu },
+  { name: 'now: вимога укриття', pattern: /(?<!\p{L})(?:[ув]|до)\s+укритт|(?<!\p{L})(?:негайно|терміново)(?!\p{L})/iu },
+  {
+    name: 'now: рух у теперішньому часі',
+    pattern: /(?<!\p{L})(?:лет(?:ить|ять)|йд(?:е|уть)|заход(?:ить|ять)|наближ[а-яіїєґ]*|прямує|руха(?:ється|ються))(?!\p{L})/iu
+  }
+];
+
+/**
+ * Words that *might* mean "now" and might equally be part of the story being told.
+ *
+ * «Атака триває» in the middle of a morning summary, «у повітряному просторі» in a sentence about
+ * what was in it last night, «пуски» in an after-action account of where they came from. Each is
+ * real evidence and none of it is conclusive, which is exactly the definition of the grey band: a
+ * narration marker plus one of these is `suspect`, and the deterministic answer for `suspect` is to
+ * publish.
+ */
+const OPERATIONAL_NOW_WEAK: TextMarker[] = [
+  {
+    name: 'now?: теперішній момент',
+    pattern: /(?<!\p{L})(?:зараз|наразі|щойно|цієї\s+хвилини|у\s+цю\s+хвилину|у\s+цей\s+момент)(?!\p{L})/iu
+  },
+  { name: 'now?: триває', pattern: /(?<!\p{L})трива(?:є|ють)(?!\p{L})/iu },
+  { name: 'now?: у повітряному просторі', pattern: /(?<!\p{L})(?:[ув]\s+повітр[а-яіїєґ]*|повітряному\s+просторі)/iu },
+  { name: 'now?: пуски', pattern: /(?<!\p{L})(?:за)?пуск[а-яіїєґ]*/iu },
+  { name: 'now?: увага', pattern: /(?<!\p{L})увага(?!\p{L})/iu }
+];
+
+/**
+ * What the retrospection rules concluded about one message.
+ *
+ * `vetoed` — the rules refuse it: it reads as a report about a period that has ended and carries
+ * nothing operational. {@link significanceRejection} answers `retrospective` and the pipeline
+ * archives it without raising anything.
+ *
+ * `suspect` — the grey band. The classification is **unchanged** and the message publishes; the flag
+ * exists so `src/services/retrospective-gate.ts` may put one narrow question to a model before the
+ * event is ingested. A model that is off, slow, broken or over budget changes nothing.
+ *
+ * `none` — either nothing retrospective fired, or something did and a strong operational marker
+ * overrode it.
+ */
+export type RetrospectiveVerdict = 'none' | 'suspect' | 'vetoed';
+
+export interface RetrospectiveAssessment {
+  verdict: RetrospectiveVerdict;
+  /** Names of the markers that fired, in declaration order. Archived as classifier indicators. */
+  markers: string[];
+  /** Names of the operational markers that fired, strong first. Empty when nothing did. */
+  nowMarkers: string[];
+}
+
+function firedMarkers(markers: TextMarker[], text: string): string[] {
+  return markers
+    .filter(({ pattern, requires }) => pattern.test(text) && (!requires || requires.test(text)))
+    .map(({ name }) => name);
+}
+
+/**
+ * Reads the register a message is written in, independently of the vocabulary in it.
+ *
+ * Pure and exported so the bands can be tested one marker at a time, and so a reviewer can ask the
+ * question about a message without running the whole classifier.
+ *
+ * The order of the three tests is the safety argument in code:
+ *
+ *  1. **Nothing retrospective fired** — `none`. This is the overwhelming majority of the traffic and
+ *     costs one pass over a handful of regexes.
+ *  2. **A strong operational marker fired** — `none`, whatever else the message says. A message that
+ *     narrates last night *and* states a course is a warning with context attached, and the context
+ *     is not permitted to swallow the warning.
+ *  3. Otherwise the message is retrospective, and the only remaining question is how sure the rules
+ *     are: a **summary** marker is decisive on its own, and a **narration** marker is decisive only
+ *     when nothing operational at all is present. Narration beside a weak operational word is the
+ *     grey band.
+ */
+export function assessRetrospective(text: string): RetrospectiveAssessment {
+  const summary = firedMarkers(RETROSPECTIVE_SUMMARY_MARKERS, text);
+  const narration = firedMarkers(RETROSPECTIVE_NARRATION_MARKERS, text);
+  if (readsAsEssay(text)) narration.push(ESSAY_MARKER);
+  const markers = [...summary, ...narration];
+  if (!markers.length) return { verdict: 'none', markers: [], nowMarkers: [] };
+
+  const strong = firedMarkers(OPERATIONAL_NOW_STRONG, text);
+  const weak = firedMarkers(OPERATIONAL_NOW_WEAK, text);
+  const nowMarkers = [...strong, ...weak];
+  if (strong.length) return { verdict: 'none', markers, nowMarkers };
+  if (summary.length || !weak.length) return { verdict: 'vetoed', markers, nowMarkers };
+  return { verdict: 'suspect', markers, nowMarkers };
+}
+
 const labels: Record<ThreatType, string> = {
   uav: 'Загроза ударних БпЛА',
   ballistic_missile: 'Балістична загроза',
@@ -571,12 +834,13 @@ function neutral(summary: string): ClassifiedMessage {
 /**
  * Whether a classification is allowed to become a threat event.
  *
- * Three conditions. The intent has to be an assertion — a withdrawal is not a threat, however much
- * threat vocabulary it contains. Something threat-shaped has to have been recognised. And, the
- * structural answer to satire, quotation and idle chatter, **a threat event has to be somewhere**:
- * either the message resolves a Ukrainian location, or it carries a strategic indicator or an
- * explicit national warning that makes it country-wide. A meme that says "шахед" and nothing else
- * names no place, so it raises nothing, whether or not any humour marker gave it away.
+ * Four conditions. The message must not read as a report about a period that has ended — see
+ * {@link assessRetrospective}. The intent has to be an assertion — a withdrawal is not a threat,
+ * however much threat vocabulary it contains. Something threat-shaped has to have been recognised.
+ * And, the structural answer to satire, quotation and idle chatter, **a threat event has to be
+ * somewhere**: either the message resolves a Ukrainian location, or it carries a strategic indicator
+ * or an explicit national warning that makes it country-wide. A meme that says "шахед" and nothing
+ * else names no place, so it raises nothing, whether or not any humour marker gave it away.
  */
 export function isSignificant(classified: ClassifiedMessage): boolean {
   return significanceRejection(classified) === null;
@@ -593,9 +857,15 @@ export function isSignificant(classified: ClassifiedMessage): boolean {
  * dominating one source means its place names are missing from the catalogue rather than that it
  * publishes noise.
  */
-export type SignificanceRejection = 'not_an_assertion' | 'no_threat_recognised' | 'no_location';
+export type SignificanceRejection =
+  'not_an_assertion' | 'no_threat_recognised' | 'no_location' | 'retrospective';
 
 export function significanceRejection(classified: ClassifiedMessage): SignificanceRejection | null {
+  // First, and as its own reason. A vetoed message would otherwise be reported as
+  // `not_an_assertion`, which is true of its `intent` and useless as a finding: "the rules read no
+  // assertion" and "the rules read an assertion about last night" are different things to know, and
+  // only the second one tells a reviewer to go and read the message.
+  if (classified.retrospective?.verdict === 'vetoed') return 'retrospective';
   if (classified.intent !== 'threat' && classified.intent !== 'redirect') return 'not_an_assertion';
   if (classified.threatType === 'unknown' && classified.indicators.length === 0) return 'no_threat_recognised';
   if (classified.locations.length === 0 && !classified.nationalScope) return 'no_location';
@@ -988,7 +1258,7 @@ export function classifyMessage(text: string, locations: LocationLexeme[]): Clas
 
   const direction = text.match(/(?:[ув] напрямку|курс(?:ом)? на|руха(?:ється|ються) до|прямує до)\s+([^.!\n]{2,80})/iu)?.[0]
     ?? text.match(/(?:→|➡|⮕|➤|-->|->)\s*([^.!?\n]{2,80})/u)?.[0];
-  return {
+  const assertion: ClassifiedMessage = {
     // `redirect` is still an assertion and still raises an event; what it adds is the statement that
     // the places in the "повз …" span are being passed rather than approached. Those locations stay
     // in `locations` — withdrawing them is a state decision, not a classification one — and are
@@ -1014,6 +1284,37 @@ export function classifyMessage(text: string, locations: LocationLexeme[]): Clas
           }
         }
       : {})
+  };
+
+  // ---- The retrospective veto, applied last and only to something that would otherwise publish ---
+  //
+  // Placing it here is the whole of the blast-radius argument. Everything above has already returned
+  // for a withdrawal, for a foreign event, for satire and for a message with nothing threat-shaped
+  // in it, and `significanceRejection` is asked before anything is changed — so the veto can only
+  // ever act on a classification that was about to become an event, and its only possible effect is
+  // to stop that. It cannot create an assertion, cannot widen one, cannot turn an all-clear back
+  // into a threat, and cannot reach a message the pipeline was already going to discard.
+  const retrospective = assessRetrospective(text);
+  if (retrospective.verdict === 'none' || significanceRejection(assertion) !== null) return assertion;
+  if (retrospective.verdict === 'suspect') {
+    // Unchanged, and published. The flag and the marker names travel with it so the grey band is
+    // visible in the archive whether or not a model is ever asked about it.
+    return {
+      ...assertion,
+      indicators: [...assertion.indicators, ...retrospective.markers],
+      retrospective: { verdict: 'suspect', markers: retrospective.markers }
+    };
+  }
+  // Vetoed. The threat classes that matched are kept as candidates and the markers as indicators —
+  // "why did this raise nothing" has to be answerable from the archive row alone — but the locations
+  // and the class are not: this message asserts a threat about nowhere, and recording Kyiv as an
+  // asserted location of a message the rules refused would put it into exactly the analytics the
+  // refusal exists to keep it out of.
+  return {
+    ...neutral(summary),
+    signalThreatTypes: assertion.signalThreatTypes,
+    indicators: [...assertion.indicators, ...retrospective.markers],
+    retrospective: { verdict: 'vetoed', markers: retrospective.markers }
   };
 }
 

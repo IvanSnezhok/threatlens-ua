@@ -121,12 +121,18 @@ async function writeVerdicts(inputs: ReplayInput[], rows: Map<string, ArchiveRow
   let written = 0;
   for (const { archived, fresh } of inputs) {
     const row = rows.get(archived.sourceMessageId)!;
-    // The same three-way judgement the live pipeline records, taken from the same function so the
-    // replayed rows are comparable with the archived ones rather than merely similar to them.
+    // The same judgement the live pipeline records, taken from the same function so the replayed rows
+    // are comparable with the archived ones rather than merely similar to them.
+    //
+    // `ignored_retrospective_model` is deliberately unreachable here: the replay calls no model, so
+    // a message the live pipeline would have handed to the grey-band gate is written as whatever the
+    // rules alone say — which is `event_created`. That is the honest record. A replay that guessed
+    // at a model's answer would put a suppression in the archive that nothing ever decided.
     const rejection = significanceRejection(fresh);
     const decision = fresh.intent === 'de_escalation' ? 'de_escalation'
       : rejection === null ? (fresh.intent === 'redirect' ? 'redirect' : 'event_created')
-        : rejection === 'no_location' ? 'ignored' : 'unrecognized';
+        : rejection === 'retrospective' ? 'ignored_retrospective'
+          : rejection === 'no_location' ? 'ignored' : 'unrecognized';
     const client = await pool.connect();
     try {
       await client.query('BEGIN');

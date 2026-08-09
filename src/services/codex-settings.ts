@@ -28,12 +28,21 @@ import { pool } from '../db/pool.js';
 /**
  * The call sites an operator may switch on and off, in the order the console shows them.
  *
- * `shadow` joined the first three in migration 020 and is deliberately last: the other three add
+ * `shadow` joined the first three in migration 020 and is deliberately fourth: the other three add
  * text to something a human is already looking at, while this one spends a call on every ingested
  * message and produces nothing anybody sees except a comparison table in `/ops`. Same mechanism,
  * very different cost, and the ordering is the only place that says so before the labels do.
+ *
+ * `retrospective_gate` joined them in migration 025 and is last because it is different in kind
+ * from all four. Every switch above it buys *text*: turn it off and a paragraph disappears, turn it
+ * on and a paragraph appears, and the numbers underneath are the same either way. This one is the
+ * only place in the codebase where a model's answer changes what the pipeline does — it may convert
+ * a threat the rules would have published into an archive-only row, and nothing else. It is off by
+ * default, it is bounded by a per-minute budget and a hard timeout, and every one of its failure
+ * modes resolves to the deterministic verdict. An operator reading this list from the top is
+ * reading it in order of how much authority they are granting.
  */
-export const CODEX_FEATURES = ['narrative', 'digest', 'attacks', 'shadow'] as const;
+export const CODEX_FEATURES = ['narrative', 'digest', 'attacks', 'shadow', 'retrospective_gate'] as const;
 export type CodexFeature = (typeof CODEX_FEATURES)[number];
 
 export type CodexFeatureFlags = Record<CodexFeature, boolean>;
@@ -67,12 +76,15 @@ interface SettingsRow {
   digest_enabled: boolean;
   attacks_enabled: boolean;
   shadow_enabled: boolean;
+  retrospective_gate_enabled: boolean;
   updated_at: Date;
 }
 
 const DEFAULTS: CodexSettings = {
   model: null,
-  features: { narrative: false, digest: false, attacks: false, shadow: false },
+  features: {
+    narrative: false, digest: false, attacks: false, shadow: false, retrospective_gate: false
+  },
   updatedAt: null
 };
 
@@ -83,7 +95,8 @@ function fromRow(row: SettingsRow): CodexSettings {
       narrative: row.narrative_enabled,
       digest: row.digest_enabled,
       attacks: row.attacks_enabled,
-      shadow: row.shadow_enabled
+      shadow: row.shadow_enabled,
+      retrospective_gate: row.retrospective_gate_enabled
     },
     updatedAt: row.updated_at.toISOString()
   };
@@ -145,7 +158,8 @@ export function applySettingsPatch(current: CodexSettings, patch: CodexSettingsP
       narrative: patch.features?.narrative ?? current.features.narrative,
       digest: patch.features?.digest ?? current.features.digest,
       attacks: patch.features?.attacks ?? current.features.attacks,
-      shadow: patch.features?.shadow ?? current.features.shadow
+      shadow: patch.features?.shadow ?? current.features.shadow,
+      retrospective_gate: patch.features?.retrospective_gate ?? current.features.retrospective_gate
     },
     updatedAt: current.updatedAt
   };
@@ -153,7 +167,8 @@ export function applySettingsPatch(current: CodexSettings, patch: CodexSettingsP
 
 export async function readCodexSettings(): Promise<CodexSettings> {
   const result = await pool.query<SettingsRow>(
-    `SELECT model,narrative_enabled,digest_enabled,attacks_enabled,shadow_enabled,updated_at
+    `SELECT model,narrative_enabled,digest_enabled,attacks_enabled,shadow_enabled,
+            retrospective_gate_enabled,updated_at
        FROM codex_settings WHERE singleton`
   );
   const row = result.rows[0];
@@ -169,14 +184,18 @@ export async function resolveCodexSettings(): Promise<ResolvedCodexSettings> {
 export async function saveCodexSettings(patch: CodexSettingsPatch): Promise<CodexSettings> {
   const next = applySettingsPatch(await readCodexSettings(), patch);
   const result = await pool.query<SettingsRow>(
-    `INSERT INTO codex_settings(singleton,model,narrative_enabled,digest_enabled,attacks_enabled,shadow_enabled,updated_at)
-     VALUES (true,$1,$2,$3,$4,$5,now())
+    `INSERT INTO codex_settings(singleton,model,narrative_enabled,digest_enabled,attacks_enabled,
+                                shadow_enabled,retrospective_gate_enabled,updated_at)
+     VALUES (true,$1,$2,$3,$4,$5,$6,now())
      ON CONFLICT (singleton) DO UPDATE SET
        model=EXCLUDED.model, narrative_enabled=EXCLUDED.narrative_enabled,
        digest_enabled=EXCLUDED.digest_enabled, attacks_enabled=EXCLUDED.attacks_enabled,
-       shadow_enabled=EXCLUDED.shadow_enabled, updated_at=now()
-     RETURNING model,narrative_enabled,digest_enabled,attacks_enabled,shadow_enabled,updated_at`,
-    [next.model, next.features.narrative, next.features.digest, next.features.attacks, next.features.shadow]
+       shadow_enabled=EXCLUDED.shadow_enabled,
+       retrospective_gate_enabled=EXCLUDED.retrospective_gate_enabled, updated_at=now()
+     RETURNING model,narrative_enabled,digest_enabled,attacks_enabled,shadow_enabled,
+               retrospective_gate_enabled,updated_at`,
+    [next.model, next.features.narrative, next.features.digest, next.features.attacks,
+      next.features.shadow, next.features.retrospective_gate]
   );
   return fromRow(result.rows[0]!);
 }

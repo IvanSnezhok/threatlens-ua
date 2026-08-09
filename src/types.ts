@@ -64,6 +64,19 @@ export interface ClassifiedMessage {
   summary: string;
   /** Present for `de_escalation` and `redirect`. Never a state change on its own. */
   retraction?: Retraction;
+  /**
+   * What the `v5` retrospection rules made of the message, when they made anything of it at all.
+   *
+   * Absent on the overwhelming majority of traffic. `vetoed` means the rules read a report about a
+   * period that has ended and refused to raise anything — {@link significanceRejection} answers
+   * `retrospective` and the pipeline archives the message. `suspect` is the grey band: the
+   * classification is untouched and the message publishes, and the field exists only so
+   * `src/services/retrospective-gate.ts` knows it may put one question to a model first.
+   *
+   * There is no third value, and in particular no value that makes a message *more* significant
+   * than the rest of this classification already says it is.
+   */
+  retrospective?: { verdict: 'suspect' | 'vetoed'; markers: string[] };
 }
 
 export interface LiveEvent {

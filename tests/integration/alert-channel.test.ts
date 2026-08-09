@@ -216,6 +216,49 @@ describe.skipIf(!integrationDatabaseAvailable)('official alert channel reconcili
     expect(await alertPeriods()).toEqual([{ location_id: KUPIANSK, status: 'active', ended_at: null }]);
   });
 
+  it('never lets the threat thread\'s bare "Відбій" end the alert its own body reports', async () => {
+    // The whole sequence is verbatim from production, 08.08–09.08.2026, #Донецька_область. The
+    // channel raised the alert over all eight raions of the oblast, then published a bare
+    // "🟡 Відбій" — the elided form of its guided-bomb stand-down, carrying that thread's standard
+    // "тривога ще триває у" list of those same eight raions — and only ended the air-raid alert ten
+    // hours later with the • form. Reading the bare "Відбій" as a partial all-clear would have taken
+    // a frontline oblast off the map in the middle of a live alert.
+    const donetskRaions = [
+      'Кальміуський', 'Краматорський', 'Горлівський', 'Маріупольський',
+      'Донецький', 'Бахмутський', 'Волноваський', 'Покровський'
+    ];
+    const ids = donetskRaions.map((name) => `test-raion-${name.toLowerCase()}`);
+    await sql(
+      `INSERT INTO locations(id,parent_id,type,name_uk,aliases)
+       SELECT id,'ua-14','raion',name,'{}' FROM unnest($1::text[],$2::text[]) AS t(id,name)
+       ON CONFLICT (id) DO NOTHING`,
+      [ids, donetskRaions.map((name) => `${name} район`)]
+    );
+    const bullets = donetskRaions.map((name) => `• ${name} район`).join('\n');
+    const stillActive = 'Зверніть увагу, тривога ще триває у:\n'
+      + donetskRaions.map((name) => `- ${name} район`).join('\n') + '\n#Донецька_область';
+
+    await ingest([{
+      id: '1', at: T0,
+      text: `🔴 19:44 Повітряна тривога в \n${bullets}\nСлідкуйте за подальшими повідомленнями.`
+    }]);
+    expect(await alertPeriods()).toHaveLength(8);
+
+    const ignored = await ingest([{ id: '2', at: T1, text: `🟡 20:53 Відбій\n${stillActive}` }]);
+
+    expect(ignored).toMatchObject({ events: 0, ignored: 1, applied: 0 });
+    expect((await alertPeriods()).every((period) => period.status === 'active')).toBe(true);
+    expect((await channelStates()).every((state) => state.active)).toBe(true);
+
+    // The form that does end it, published the next morning.
+    const cleared = await ingest([{
+      id: '3', at: T2,
+      text: `🟢 06:45 Відбій тривоги в \n${bullets}\nСлідкуйте за подальшими повідомленнями.`
+    }]);
+    expect(cleared).toMatchObject({ events: 1, applied: 8 });
+    expect((await alertPeriods()).every((period) => period.status === 'ended')).toBe(true);
+  });
+
   it('resolves a raion whose apostrophe differs from the catalogue spelling', async () => {
     // The channel prints U+2019; the catalogue row is seeded with the ASCII apostrophe. Without
     // folding, every Куп'янський / Кам'янський / Слов'янський message would be an unmapped location.
@@ -499,6 +542,22 @@ describe.skipIf(!integrationDatabaseAvailable)('official alert channel reconcili
         // `resetDatabase` restores per-test rows, not catalogue flags.
         await sql(`UPDATE sources SET enabled=true WHERE id=$1`, [VINNYTSIA_ODA]);
       }
+    });
+  });
+
+  describe('renamed toponyms', () => {
+    it('resolves the pre-rename raion name the national channel still publishes', async () => {
+      // Міграція 026: канал пише «Красноградський район», KATOTTG знає лише «Берестинський».
+      // Без алiаса старої назви тривога по району не досягала карти — бойовий випадок з
+      // журналу 2026-08-09 ("provider locations could not be mapped").
+      const summary = await ingest([{ id: '1', at: T0, text: '🔴 09:11 Повітряна тривога в Красноградський район.\nСлідкуйте за подальшими повідомленнями.' }]);
+      expect(summary).toMatchObject({ events: 1, applied: 1, unresolved: [] });
+
+      const states = await sql<{ location_id: string; active: boolean }>(
+        `SELECT location_id, active FROM alert_source_states WHERE source_id=$1 AND location_id=$2`,
+        [AIR_ALERT_UA, 'katottg-ua63060000000053698']
+      );
+      expect(states.rows).toEqual([{ location_id: 'katottg-ua63060000000053698', active: true }]);
     });
   });
 });

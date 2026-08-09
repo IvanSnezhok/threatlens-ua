@@ -131,6 +131,16 @@ It therefore has its own path, in the same module and sharing the same aggregate
 - A 🟡 partial all-clear subtracts the locations the same message repeats under "тривога ще триває у"
   (national) or "повітряна тривога досі триває у" (administrations). When nothing survives the
   subtraction, nothing is cleared.
+- **The addendum is not what makes a message an all-clear.** The national channel attaches the same
+  "тривога ще триває у:" list to its per-oblast threat commentary, where a 🟠 "КАБ напрямок
+  Краматорськ" is answered by a 🟡 stand-down whose headline is whatever the duty officer typed —
+  "Відбій по кабам", "Відбій", "к", "е" were all published under #Донецька_область over
+  07.08–09.08.2026, each over an identical list of all eight raions of the oblast. A bare "Відбій"
+  is therefore the elided member of the "Відбій <загрози|атаки|по …>" family, and the archive proves
+  it: after the bare "🟡 20:53 Відбій" of 08.08 the alert ran ten more hours and ended, with no 🔴 in
+  between, as "🟢 06:45 Відбій тривоги в" over a • list. Those headlines are ignored, and a bare
+  "Відбій" arriving *without* the addendum stays `unrecognized` rather than being read as a full
+  all-clear. Both are pinned as fixtures.
 - An administration also publishes ordinary news, and about a third of those posts mention
   "повітряної тривоги" in passing. A message with no status circle **and** no alert phrase in its
   headline is filed as `ignored: 'unrelated'`; anything carrying a circle, or an alert phrase without
@@ -262,6 +272,71 @@ Migration 024 landed with it: eighteen settlements the channels name and the imp
 aliases of the city, and "запоріжжя" removed from the oblast's aliases so a bare "Запоріжжя" names the
 city exactly as a bare "Київ" already did.
 
+### Retrospection: reading the tense, not just the vocabulary (`v5`)
+
+Everything up to `v4` read a message for the words in it and nothing at all for the *tense* it was
+written in. On 2026-08-09 at 08:25Z the єРадар channel published a reflective essay — «Цієї ночі
+тисячі киян знову ночували на платформах метро… Раніше масовані нальоти БпЛА… давали бодай якийсь
+час на підготовку. Тепер усе інакше.» — which contains `баліст`, `БПЛА`, `ракети` and `Києва`, so the
+classifier opened a live «Київ — комбінована загроза» and notified subscribers. The Air Force's 09:00
+morning tally and the strategic-aviation channel's after-action write-ups fail identically, and both
+had been sitting in the gold corpus as labelled false positives for two versions.
+
+`assessRetrospective` in `src/domain/classifier.ts` reads the register in three bands:
+
+- **Summary bulletins** — «підсумки», «у ніч на 08 серпня», «за ніч», «за попередніми даними»,
+  «збито/подавлено», «вчора», «минулої доби», «починаючи з 13:00» — are decisive on their own.
+- **Narration** — «цієї ночі» beside a past-tense verb, the «раніше … тепер» contrast, and prose at
+  essay length (≥ 400 characters, ≥ 3 sentences, mean sentence ≥ 45 characters, *and* a past-tense
+  verb somewhere) — is decisive only when nothing operational is present.
+- **Operational NOW-markers** override everything. A stated course, an arrow bulletin, «загроза
+  застосування», a time-to-impact, the telegraphic «3х» count, a shelter instruction and a
+  present-tense verb of motion are **strong**: a message carrying any of them publishes exactly as it
+  did in `v4`, however much it also narrates. «зараз», «триває», «у повітряному просторі», «пуски» and
+  «увага» are **weak**: narration beside one of those is the grey band.
+
+The asymmetry is the whole safety argument, and it is enforced structurally as well as stated: the
+veto is applied *last*, and only to a classification `significanceRejection` has already passed. It
+can therefore convert would-publish into archive-only and do nothing else — it cannot create an
+assertion, widen one, turn a withdrawal back into a threat, or touch a message the pipeline was
+already discarding. Refused messages archive as `decision = 'ignored_retrospective'` with the markers
+that fired in `indicators`, so the refusal is legible from the row alone; the class survives in
+`candidate_threat_types` and the locations are deliberately **not** recorded, because a place a
+message asserts nothing about does not belong in the location analytics.
+
+Two markers were considered and rejected after a full `v4 → v5` replay over the production archive,
+and both rejections are pinned as tests. «станом на 00:42» is not a marker of anything: the
+strategic-aviation channel opens its *live* hourly snapshots with it, and reading it as a summary
+would have suppressed three live warnings for Zhytomyr and Kharkiv. Essay shape alone is not a marker
+either: an intelligence *forecast* («Потенційні цілі ураження: Київ: Дарниця, Жуляни… Коли саме буде
+здійснено атаку нам невідомо») has exactly that shape and is prospective, so the essay rule
+additionally requires a past-tense verb. The replay over 918 archived decisions moved four messages,
+all four hand-reviewed retrospectives, and made none newly significant.
+
+**The grey-band gate.** With the `retrospective_gate` switch on in `/ops` (migration 025, off by
+default), a message the rules mark `suspect` gets one narrow question put to a model before the event
+is ingested: is this current, or retrospective? This is the only place in the system where a model's
+answer changes what the pipeline does, and the authority is bounded in one direction only. It is
+reached from exactly one call site and only for a `suspect` classification, which the rules set only
+on a message that was about to become an event; the result type admits `archive` from a single branch
+reached only when the model affirms «retrospective» with confidence ≥ 0.7; and every other path —
+switched off, over budget, no session, transport failure, timeout, prose where JSON was asked for, an
+answer of «current» — returns `publish`. A model that is broken, slow, absent or hostile can lose a
+*suppression* and can never lose a *warning*.
+
+It is synchronous, inside `classifyAndIngest`, after burst coalescing and before `ingestThreat`, with
+a hard `RETROSPECTIVE_GATE_TIMEOUT_MS` (default 2500 ms) and a rolling per-minute budget
+(`RETROSPECTIVE_GATE_MAX_PER_MINUTE`, default 6). It is not inside the ingestion *transaction*, so a
+slow model holds no connection and no row lock. Post-publication withdrawal was rejected outright:
+§Consistency rules already treats a published fact that later vanishes as unrecoverable, and a threat
+that reaches the map and a subscriber's Telegram and then disappears teaches that subscriber the app
+guesses. Gating only the notification leg was rejected too — it would split one fact into two truths
+and leave the map and the bot disagreeing for as long as the model took. The call goes through the
+one Codex client, so it is audited in `ai_runs` under `surface = 'retrospective_gate'`,
+`prompt_version = 'retrospective-gate-v1'`. A suppression it produces archives as
+`decision = 'ignored_retrospective_model'`, kept apart from the deterministic word because a replay
+reproduces the first and can never reproduce the second.
+
 ### Classification archive
 
 `source_messages` keeps the raw text and one `processing_status` word; everything the classifier
@@ -311,9 +386,11 @@ is the answer: 191 real archived messages, each read and labelled by hand, with 
 method and conventions in the file's own header. `src/domain/classifier-gold.test.ts` scores the
 current rules against it on the same three axes the replay compares and asserts each number as a
 **floor**, so a future edit that quietly loses recall fails in CI rather than on somebody's phone at
-three in the morning. `v4` measures significance P=98.4% / R=90.4%, threat-class accuracy 100% over
-the messages both sides call significant, and locations P=97.2% / R=93.1%. (`v3` measured
-significance P=97.2% / R=88.8% and locations P=R=89.4%.)
+three in the morning. `v5` measures significance P=100% / R=90.4%, threat-class accuracy 100% over
+the messages both sides call significant, and locations P=99.6% / R=93.1%. (`v4` measured
+significance P=98.4% / R=90.4% and locations P=97.2% / R=93.1%; `v3` measured P=97.2% / R=88.8% and
+P=R=89.4%.) What `v5` moved is precision alone, through the two retrospective false positives `v4`
+left — recall is unchanged and must be, because the veto is only allowed to subtract.
 
 The fixture separates two things that used to be one number. `assertsThreat` is the reviewer's
 reading of the text; `significant` additionally requires that the place named exists in the location
@@ -336,7 +413,11 @@ must never start producing quietly. `threatlens_shadow_attempts_total` and
 `threatlens_shadow_outcomes_total{status,reason}` give shadow coverage as a query
 (`outcomes{status="recorded"} / classifications_total`) rather than as a gauge, because a ratio
 computed inside one process cannot be aggregated across restarts and a counter divided at query time
-can.
+can. `threatlens_retrospective_gate_attempts_total` counts messages that entered the grey band —
+which says whether the band is drawn in the right place, independently of whether a model was ever
+asked — and `threatlens_retrospective_gate_outcomes_total{verdict,reason}` carries both, so
+"publications that happened because the model could not be reached" is a label selector rather than a
+join.
 
 ### Attack analytics over the archive
 

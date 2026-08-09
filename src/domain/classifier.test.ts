@@ -1,5 +1,7 @@
 import { describe, expect, it } from 'vitest';
-import { classifyMessage, isDeEscalation, isSignificant, riskLevel } from './classifier.js';
+import {
+  classifyMessage, isDeEscalation, isSignificant, riskLevel, significanceRejection
+} from './classifier.js';
 
 const locations = [
   { id: 'ua-80', name: 'Київ', aliases: ['києва', 'києві'] },
@@ -958,5 +960,267 @@ describe('classifyMessage on Ukrainian place-name morphology (v4)', () => {
   it('lets a longer name take the text a shorter one sits inside', () => {
     expect(at('БпЛА курсом на Велику Димерку')).toEqual(['city-dymerka']);
     expect(at('Шахед на Київщину та в місто Київ')).toEqual(['ua-32', 'ua-80']);
+  });
+});
+
+// ------------------------------------------------------------------------------------------------
+// `v5`: the retrospective veto
+// ------------------------------------------------------------------------------------------------
+
+/**
+ * A monitoring channel telling readers about the war it is otherwise reporting.
+ *
+ * Fixture #1 is verbatim from the production archive — єРадар, `source_messages` id
+ * a9353a5a-85b6-49d2-82e0-e5956698b696, published 2026-08-09T08:25:53Z — and it is the message this
+ * whole layer exists for. It contains `баліст`, `БПЛА`, `ракети` and `Києва`, so `v4` classified it
+ * as a live «Київ — комбінована загроза», opened an event and sent a Telegram notification for a
+ * reflective essay about people sleeping in the metro.
+ *
+ * The block below pairs every marker with a message that does *not* carry it, because a veto is only
+ * as good as the traffic it leaves alone. The negative of each pair is a real operational shape from
+ * the same channels.
+ */
+const RETROSPECTIVE_ESSAY = [
+  'Цієї ночі тисячі киян знову ночували на платформах метро. 💔',
+  '',
+  'Раніше масовані нальоти БПЛА та часові розрахунки після зльоту бортів стратегічної авіації давали бодай якийсь час на підготовку. ',
+  '',
+  'Тепер усе інакше. ',
+  'росіяни дедалі частіше б’ють балістикою, яка застає людей зненацька посеред ночі. Часу на реакцію просто немає — ракети прилітають за лічені хвилини.',
+  '',
+  'Через цю непередбачуваність мешканці Києва змушені йти до підземки наперед. Навіть коли тривогу ще не оголосили, люди спускаються в метро, щоб просто встигнути врятуватися.',
+  '',
+  'Це важко, це страшно, це шалено виснажує морально й фізично. Але іншого варіанту немає — точно знати, коли кацапи запустять чергову балістику по місту, неможливо. Робимо все, щоб вижити. 🙏 ',
+  '',
+  'Стійкості всім нам.',
+  '',
+  '@eRadarrua'
+].join('\n');
+
+describe('classifyMessage on retrospective and narrative messages (v5)', () => {
+  it('refuses the єРадар metro essay that v4 published as a live Kyiv threat', () => {
+    const result = classify(RETROSPECTIVE_ESSAY);
+    // What `v4` did with this text, kept in the test so the regression is legible: it resolved Kyiv,
+    // matched ballistic + UAV + aviation and titled it «Комбінована загроза».
+    expect(classify(RETROSPECTIVE_ESSAY.replace('Цієї ночі', 'Зараз БпЛА курсом на')).threatType)
+      .toBe('combined');
+
+    expect(result.intent).toBe('none');
+    expect(result.locations).toEqual([]);
+    expect(isSignificant(result)).toBe(false);
+    expect(significanceRejection(result)).toBe('retrospective');
+    expect(result.retrospective).toEqual({
+      verdict: 'vetoed',
+      markers: [
+        'ретроспектива: «цієї ночі» з дієсловом минулого часу',
+        'ретроспектива: «раніше — тепер»',
+        'ретроспектива: розлога оповідь'
+      ]
+    });
+    // The markers are archived as indicators, which is what makes "why was this ignored?" answerable
+    // from the classification row alone.
+    expect(result.indicators).toEqual(expect.arrayContaining([
+      'ретроспектива: «цієї ночі» з дієсловом минулого часу'
+    ]));
+    // The classes it matched survive as candidates: the message is *about* ballistic missiles, and
+    // an archive that forgot that could not answer what the veto suppressed.
+    expect(result.signalThreatTypes).toEqual(expect.arrayContaining(['ballistic_missile']));
+  });
+
+  describe('summary-bulletin markers, each decisive on its own', () => {
+    it('refuses the nightly tally and lets the live warning through', () => {
+      expect(significanceRejection(classify('Підсумки ночі: балістика по Києву'))).toBe('retrospective');
+      expect(significanceRejection(classify('У ніч на 08 серпня противник атакував Київ балістикою'))).toBe('retrospective');
+      expect(significanceRejection(classify('Протягом ночі БпЛА атакували Київ'))).toBe('retrospective');
+      expect(significanceRejection(classify('За ніч по Києву застосовано балістику'))).toBe('retrospective');
+      expect(significanceRejection(classify('За попередніми даними, по Києву працювала балістика'))).toBe('retrospective');
+      // Negative: the same vocabulary with no summary frame.
+      expect(isSignificant(classify('Балістика по Києву'))).toBe(true);
+    });
+
+    it('does not read «станом на …» as retrospective, because a live snapshot opens that way too', () => {
+      // The negative that cost the most to find. «Станом на 09:00» opens the Air Force's morning
+      // tally, and «станом на 00:42» opens the strategic-aviation channel's LIVE hourly snapshot —
+      // «Приблизна ситуація в повітряному просторі України станом на 00:42 … 2 реактивні БпЛА на
+      // Житомир». A `v4 → v5` replay over the production archive showed that treating the phrase as
+      // a summary marker would have suppressed three live warnings, for Zhytomyr and Kharkiv. The
+      // tally is refused by the markers it carries besides this one; the snapshot publishes.
+      expect(isSignificant(classify(
+        'Приблизна ситуація в повітряному просторі України станом на 00:42. '
+        + 'UPD 1:05 все що залишилося це 2 реактивні БпЛА на Київ.'
+      ))).toBe(true);
+      expect(isSignificant(classify('Балістика по Києву, підліт 3 хв'))).toBe(true);
+    });
+
+    it('refuses an after-action account opened with a start time', () => {
+      expect(significanceRejection(classify('Починаючи з 13:00 було застосовано 18 груп реактивних Шахедів по Києву')))
+        .toBe('retrospective');
+      expect(isSignificant(classify('Група реактивних Шахедів курсом на Київ'))).toBe(true);
+    });
+
+    it('refuses the shot-down tally the Air Force publishes each morning', () => {
+      expect(significanceRejection(classify('ЗБИТО/ПОДАВЛЕНО 135 ворожих БпЛА над Києвом'))).toBe('retrospective');
+      // Negative: a single interception reported as it happens is a de-escalation, not a summary.
+      expect(classify('Ціль знищена над Києвом').intent).toBe('de_escalation');
+    });
+
+    it('refuses yesterday and publishes today', () => {
+      expect(significanceRejection(classify('Вчора ворог атакував Київ балістикою'))).toBe('retrospective');
+      expect(significanceRejection(classify('Напередодні по Києву працювала балістика'))).toBe('retrospective');
+      expect(isSignificant(classify('Балістична загроза для Києва'))).toBe(true);
+    });
+
+    it('refuses last night and publishes this minute', () => {
+      expect(significanceRejection(classify('Минулої ночі БпЛА атакували Київ'))).toBe('retrospective');
+      expect(significanceRejection(classify('За минулу добу по Києву застосовано балістику'))).toBe('retrospective');
+      expect(isSignificant(classify('БпЛА над Києвом'))).toBe(true);
+    });
+  });
+
+  describe('narration markers, decisive only when nothing operational is present', () => {
+    it('needs a past-tense verb beside «цієї ночі», because anticipation is a warning', () => {
+      expect(significanceRejection(classify('Цієї ночі БпЛА атакували Київ'))).toBe('retrospective');
+      // The same opening with no past tense: an expectation about the night ahead must publish.
+      expect(isSignificant(classify('Цієї ночі можлива балістична загроза для Києва'))).toBe(true);
+    });
+
+    it('reads the «раніше — тепер» contrast as an argument rather than a report', () => {
+      expect(significanceRejection(
+        classify('Раніше по Києву була переважно балістика. Тепер усе інакше.')
+      )).toBe('retrospective');
+      // Negative: «тепер» on its own says the opposite — it is the report.
+      expect(isSignificant(classify('Тепер балістика по Києву'))).toBe(true);
+    });
+
+    it('reads prose at essay length as narration, and a long bulletin as a bulletin', () => {
+      const essay = 'Мешканці Києва щоночі стикаються з новою реальністю повітряної війни, '
+        + 'і кожна така ніч змінює те, як місто планує свій наступний день, '
+        + 'як батьки збирають дітей до школи і як люди домовляються про зустрічі. '
+        + 'Балістика змінила уявлення про час, який залишається людині на реакцію, '
+        + 'а БпЛА змінили уявлення про те, скільки годин поспіль може тривати одна тривога '
+        + 'і скільки разів за добу доводиться спускатися до підземного паркінгу. '
+        + 'Про це варто говорити спокійно, бо страх сам по собі нікого не рятує, '
+        + 'а звичка діяти за планом рятує майже завжди.';
+      expect(essay.length).toBeGreaterThan(400);
+      expect(significanceRejection(classify(essay))).toBe('retrospective');
+      // A bulletin of the same length is a list of places, not prose, and every arrow in it is a
+      // strong operational marker besides.
+      const bulletin = 'Кіровоградська область ◦ Ударний Бп → Богданівка, Кам’янка, Кропивницький. '
+        + 'Полтавська область ◦ Ударний Бп → Голобородьківське, Крем’янка, Лутайка, Пронозівка. '
+        + 'Черкаська область ◦ Ударний Бп → Малий Ржавець, Пішки, Старосілля, Чигирин, Чорнобай. '
+        + 'Чернігівська область ◦ Реактивний → Блешня, Гучин, Рудня ◦ Ударний Бп → Марс, Чернацьке. '
+        + 'Сумська область ◦ Ударний Бп → Кириківка, Тростянець, Боромля, Ворожба, Білопілля. '
+        + 'Київ ◦ Ударний Бп → Троєщина.';
+      expect(bulletin.length).toBeGreaterThan(400);
+      expect(isSignificant(classify(bulletin))).toBe(true);
+    });
+
+    it('does not read a target forecast as narration, however long it runs', () => {
+      // The other expensive negative from the replay. This has exactly the shape of an essay — five
+      // hundred characters, several sentences, prose — and it is *prospective*: it names what the
+      // enemy may hit and says outright that the timing is unknown. Suppressing a forecast is a
+      // different mistake from suppressing a summary, so the essay marker additionally requires a
+      // past-tense verb, and there is none here.
+      const forecast = 'Згідно деяких даних ворог може завдати удару балістичними ракетами '
+        + '«Іскандер-М/С-400/КN-23» та гіперзвуковими ракетами «Циркон» по деяких обʼєктах. '
+        + 'Потенційні цілі ураження: Київ: Дарниця, Жуляни, Позняки, Солом’янський район. '
+        + 'Київщина: Біла Церква, Бровари, Васильків. '
+        + 'Коли саме буде здійснено атаку нам невідомо, але просимо уважно реагувати на сигнал '
+        + 'повітряної тривоги, особливо по балістиці — вона долітає за лічені хвилини.';
+      expect(forecast.length).toBeGreaterThan(400);
+      expect(classify(forecast).retrospective).toBeUndefined();
+      expect(isSignificant(classify(forecast))).toBe(true);
+    });
+  });
+
+  describe('the strong operational markers, each of which overrides every retrospective marker', () => {
+    // The safety asymmetry, one case per marker: the message narrates last night AND states
+    // something happening now, and every one of them publishes. Missing a retrospective false
+    // positive costs a reader one wrong line; suppressing one of these costs them the warning.
+    const withYesterday = (now: string) => `Вчора ворог атакував Київ балістикою. ${now}`;
+
+    it('a stated direction', () => {
+      expect(isSignificant(classify(withYesterday('БпЛА курсом на Київ')))).toBe(true);
+    });
+
+    it('an arrow bulletin', () => {
+      expect(isSignificant(classify(withYesterday('Київщина ◦ Ударний Бп → Бровари')))).toBe(true);
+    });
+
+    it('the national «загроза застосування» warning', () => {
+      expect(isSignificant(classify(withYesterday('Загроза застосування балістичного озброєння')))).toBe(true);
+    });
+
+    it('a time to impact', () => {
+      expect(isSignificant(classify(withYesterday('Балістика по Києву, 4 хв')))).toBe(true);
+    });
+
+    it('the telegraphic target count', () => {
+      expect(isSignificant(classify(withYesterday('3х шахеди на Київ')))).toBe(true);
+    });
+
+    it('a shelter instruction', () => {
+      expect(isSignificant(classify(withYesterday('Балістика по Києву, негайно в укриття')))).toBe(true);
+    });
+
+    it('a verb of motion in the present tense', () => {
+      expect(isSignificant(classify(withYesterday('Балістика летить на Київ')))).toBe(true);
+      expect(isSignificant(classify(withYesterday('Шахеди заходять на Київ')))).toBe(true);
+    });
+  });
+
+  describe('the grey band', () => {
+    // Narration plus a word that might mean "now" and might be part of the story. The rules resolve
+    // it towards publishing and mark it, which is the only thing that lets
+    // `src/services/retrospective-gate.ts` ask about it.
+    const suspect = (now: string) =>
+      classify(`Цієї ночі БпЛА атакували Київ, і місто знову не спало. ${now}`);
+
+    it('publishes and flags a narration beside a weak operational word', () => {
+      for (const now of ['Зараз тихо.', 'Атака триває.', 'У повітряному просторі ситуація складна.',
+        'Пуски фіксувалися всю ніч.', 'Увага киянам.']) {
+        const result = suspect(now);
+        expect(result.retrospective?.verdict, now).toBe('suspect');
+        expect(isSignificant(result), now).toBe(true);
+      }
+    });
+
+    it('keeps the same message vetoed when the weak word is absent', () => {
+      const result = classify('Цієї ночі БпЛА атакували Київ, і місто знову не спало.');
+      expect(result.retrospective?.verdict).toBe('vetoed');
+    });
+
+    it('does not enter the band at all when a summary marker is present', () => {
+      // A summary bulletin is decisive: «Атака триває» inside the Air Force's morning tally is part
+      // of the tally, and paying a model call to be told so would be a call spent on a certainty.
+      const result = classify('ЗБИТО/ПОДАВЛЕНО 135 ворожих БпЛА над Києвом. Атака триває.');
+      expect(result.retrospective?.verdict).toBe('vetoed');
+    });
+  });
+
+  describe('what the veto is not allowed to touch', () => {
+    it('never turns a withdrawal into an assertion', () => {
+      const result = classify('Вчора була важка ніч. Наразі по Києву нічого не летить, відбій загрози.');
+      expect(result.intent).toBe('de_escalation');
+      expect(significanceRejection(result)).toBe('not_an_assertion');
+      expect(result.retrospective).toBeUndefined();
+    });
+
+    it('never changes a message that was already going to raise nothing', () => {
+      // A retrospective with no place in it was `no_threat_recognised`/`no_location` before and
+      // stays that way: the veto is applied only to a classification that would otherwise publish,
+      // so it cannot rewrite the rejection reasons the archive already uses.
+      expect(significanceRejection(classify('Вчора був важкий день. Тримаймося.')))
+        .toBe('not_an_assertion');
+      expect(significanceRejection(classify('Вчора ворог застосував балістику')))
+        .toBe('no_location');
+    });
+
+    it('leaves ordinary operational traffic completely unmarked', () => {
+      for (const text of ['Ударні БпЛА у напрямку Києва', 'Загроза балістики для Сумщини',
+        '⚠️ КИЇВ! УВАГА! РАКЕТА!', 'Одеса дорозвідка', 'Балістика повз Бровари на Бориспіль']) {
+        expect(classify(text).retrospective, text).toBeUndefined();
+      }
+    });
   });
 });

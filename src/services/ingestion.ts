@@ -16,6 +16,7 @@ import { markSourceError, markSourceSuccess } from './operations.js';
 import {
   countChannelError, observeClassificationDuration, observeIngestionLag
 } from './publication.js';
+import { retrospectiveGate, retrospectiveGateMetrics } from './retrospective-gate.js';
 import { scheduleShadowClassification, shadowClassifierMetrics } from './shadow-classifier.js';
 
 interface AlarmRecord {
@@ -511,7 +512,8 @@ const threatToDeEscalation = new Counter({
  * Attaches this module's metrics to a Prometheus registry, mirroring `registerOccupationMetrics`.
  * Nothing in `src/services` owns the HTTP registry, so the wiring lives wherever the registry is
  * created. The monitoring-channel counter rides along rather than adding a second call site, and so
- * do the shadow-classifier ones: that module is reached only through this one.
+ * do the shadow-classifier and retrospective-gate ones: both modules are reached only through this
+ * one.
  */
 export function registerAlertChannelMetrics(registry: Registry): void {
   const metrics: ReadonlyArray<[string, Counter<string>]> = [
@@ -523,7 +525,8 @@ export function registerAlertChannelMetrics(registry: Registry): void {
     ['threatlens_classifications_total', classificationDecisions],
     ['threatlens_classification_rejections_total', classificationRejections],
     ['threatlens_threat_to_de_escalation_total', threatToDeEscalation],
-    ...shadowClassifierMetrics()
+    ...shadowClassifierMetrics(),
+    ...retrospectiveGateMetrics()
   ];
   for (const [name, metric] of metrics) {
     if (!registry.getSingleMetric(name)) registry.registerMetric(metric);
@@ -1070,12 +1073,16 @@ async function classifyAndIngest(message: NormalizedMessage, options: ProcessMes
     classificationRejections.inc({ source: message.sourceId, reason: rejection });
     await archiveClassification({
       sourceId: message.sourceId, sourceMessageId, publishedAt: message.publishedAt, classified,
-      // "Recognised nothing" and "recognised something that is nowhere" are different findings: the
-      // first says the vocabulary has drifted or the message was never about a threat, the second
-      // says the place is missing from the catalogue. Collapsing them into one word is what made
-      // "why was this ignored?" unanswerable. `ignored_reason` keeps the precise rejection either
-      // way; `decision` is the coarse split a dashboard groups on.
-      decision: rejection === 'no_location' ? 'ignored' : 'unrecognized',
+      // "Recognised nothing", "recognised something that is nowhere" and "recognised a report about
+      // last night" are three different findings: the first says the vocabulary has drifted or the
+      // message was never about a threat, the second says the place is missing from the catalogue,
+      // and the third says the rules read the message as retrospective and refused it. Collapsing
+      // them into one word is what made "why was this ignored?" unanswerable. `ignored_reason` keeps
+      // the precise rejection either way; `decision` is the coarse split a dashboard groups on, and
+      // the retrospective one is kept apart because it is the only refusal that discards a message
+      // in which a threat *and* a place were both recognised.
+      decision: rejection === 'retrospective' ? 'ignored_retrospective'
+        : rejection === 'no_location' ? 'ignored' : 'unrecognized',
       ignoredReason: rejection
     });
     return { ignored: true as const };
@@ -1090,6 +1097,39 @@ async function classifyAndIngest(message: NormalizedMessage, options: ProcessMes
       decision: 'coalesced', ignoredReason: 'restated_within_coalesce_window'
     });
     return { coalesced: true as const };
+  }
+  // The grey band, and the only model call in this codebase that is awaited on the ingestion path.
+  //
+  // It sits here — after coalescing, before `ingestThreat` — for three reasons. After coalescing,
+  // because a restatement inside the burst window publishes nothing anyway and paying a model call
+  // to suppress a suppression would be spending quota during an attack for no effect. Before
+  // `ingestThreat`, because the alternative is publishing and retracting, and a threat that appears
+  // on the map and in a subscriber's Telegram and then vanishes is worse than the false positive it
+  // was meant to fix. And outside `ingestThreat` rather than inside it, because that function opens
+  // the transaction: a slow model must not hold a database connection or a row lock.
+  //
+  // `retrospectiveGate` never throws and never returns `archive` for anything the classifier did not
+  // already mark `suspect`. Off, over quota, unreachable, slow, or answering prose — every one of
+  // those is `publish`, which is exactly what this line does when the branch is not taken. See
+  // `src/services/retrospective-gate.ts` for why that is structural rather than a convention.
+  if (classified.retrospective?.verdict === 'suspect') {
+    const gate = await retrospectiveGate({
+      sourceId: message.sourceId, text: message.text, classified
+    });
+    if (gate.verdict === 'archive') {
+      const sourceMessageId = await recordUnprocessedMessage(message, 'ignored');
+      count('ignored');
+      // A rejection reason of its own, and deliberately not `retrospective`: that word means the
+      // rules refused the message and a replay reproduces the refusal. This one is a model's opinion
+      // at one moment and reproduces as nothing, which is precisely what somebody auditing a
+      // suppression needs to be told before they read anything else.
+      classificationRejections.inc({ source: message.sourceId, reason: 'retrospective_model' });
+      await archiveClassification({
+        sourceId: message.sourceId, sourceMessageId, publishedAt: message.publishedAt, classified,
+        decision: 'ignored_retrospective_model', ignoredReason: 'retrospective_model'
+      });
+      return { ignored: true as const };
+    }
   }
   count('classified');
   const result = await ingestThreat(message, classified, { historical: options.historical });

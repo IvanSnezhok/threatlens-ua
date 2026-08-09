@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
-  applySettingsPatch, FALLBACK_CODEX_MODELS, mergeModelCatalogue, resolveSettings, type CodexSettings
+  applySettingsPatch, CODEX_FEATURES, FALLBACK_CODEX_MODELS, mergeModelCatalogue, resolveSettings,
+  type CodexSettings
 } from './codex-settings.js';
 
 /**
@@ -15,7 +16,9 @@ import {
 
 const stored: CodexSettings = {
   model: null,
-  features: { narrative: false, digest: false, attacks: false, shadow: false },
+  features: {
+    narrative: false, digest: false, attacks: false, shadow: false, retrospective_gate: false
+  },
   updatedAt: '2026-08-08T00:00:00.000Z'
 };
 
@@ -64,11 +67,17 @@ describe('the model catalogue', () => {
 describe('applying a patch', () => {
   it('leaves untouched fields exactly as they were', () => {
     const current: CodexSettings = {
-      ...stored, model: 'o5', features: { narrative: true, digest: true, attacks: false, shadow: true }
+      ...stored,
+      model: 'o5',
+      features: {
+        narrative: true, digest: true, attacks: false, shadow: true, retrospective_gate: true
+      }
     };
     const next = applySettingsPatch(current, { features: { digest: false } });
     expect(next.model).toBe('o5');
-    expect(next.features).toEqual({ narrative: true, digest: false, attacks: false, shadow: true });
+    expect(next.features).toEqual({
+      narrative: true, digest: false, attacks: false, shadow: true, retrospective_gate: true
+    });
   });
 
   it('reads a cleared model field as "defer to CODEX_MODEL", not as a model named ""', () => {
@@ -81,16 +90,32 @@ describe('applying a patch', () => {
     expect(applySettingsPatch({ ...stored, model: 'o5' }, { model: null }).model).toBeNull();
   });
 
-  it('switches a feature on without touching the other three', () => {
+  it('switches a feature on without touching the others', () => {
     const next = applySettingsPatch(stored, { features: { attacks: true } });
-    expect(next.features).toEqual({ narrative: false, digest: false, attacks: true, shadow: false });
+    expect(next.features).toEqual({
+      narrative: false, digest: false, attacks: true, shadow: false, retrospective_gate: false
+    });
   });
 
-  it('treats the shadow switch as one of the four, not as a special case', () => {
-    // It arrived a migration later than its neighbours and is the only per-message call site, which
-    // is precisely why it must go through the same patch path: a switch with its own code path is a
-    // switch that will one day be forgotten by a change made to the other three.
-    const next = applySettingsPatch(stored, { features: { shadow: true } });
-    expect(next.features).toEqual({ narrative: false, digest: false, attacks: false, shadow: true });
+  it('treats every switch the same way, however late it arrived', () => {
+    // `shadow` arrived in migration 020 and `retrospective_gate` in 025, and both are per-message
+    // call sites rather than per-page ones — which is precisely why they must go through the same
+    // patch path as the first three. A switch with its own code path is a switch that will one day
+    // be forgotten by a change made to the rest.
+    for (const feature of CODEX_FEATURES) {
+      const next = applySettingsPatch(stored, { features: { [feature]: true } });
+      expect(next.features[feature], feature).toBe(true);
+      const others = CODEX_FEATURES.filter((name) => name !== feature);
+      expect(others.map((name) => next.features[name]), feature).toEqual(others.map(() => false));
+    }
+  });
+
+  it('defaults the retrospective gate off, because it is the only switch with authority', () => {
+    // Every other switch buys text. This one lets a model convert a threat the rules would have
+    // published into an archive-only row, so an installation that upgrades into migration 025 must
+    // find it off — see `src/services/retrospective-gate.ts`.
+    expect(stored.features.retrospective_gate).toBe(false);
+    expect(applySettingsPatch(stored, { features: { narrative: true } }).features.retrospective_gate)
+      .toBe(false);
   });
 });

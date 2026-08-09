@@ -8,7 +8,7 @@ const uuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}
  * The same closed list the `surface` column's writers use. Validated rather than passed through so
  * a typo comes back as a named 400 instead of an empty page an operator reads as "no model calls".
  */
-const SURFACES = ['narrative', 'digest', 'attacks', 'shadow', 'risk'];
+const SURFACES = ['narrative', 'digest', 'attacks', 'shadow', 'risk', 'retrospective_gate'];
 
 function authorised(request: FastifyRequest): boolean {
   return hasValidOpsAuth(request.headers.authorization);

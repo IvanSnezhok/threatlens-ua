@@ -244,6 +244,44 @@ describe.skipIf(!integrationDatabaseAvailable)('classification archive', () => {
       });
     });
 
+    it('records a retrospective refusal as its own decision, with the markers that produced it', async () => {
+      // `v5`. The message names a weapon AND a place, so it passes every condition `v4` had and was
+      // published as a live threat; what refuses it is the tense it is written in. That makes it the
+      // only refusal in this table where something threat-shaped was recognised in a place that
+      // exists, which is why it gets a decision word of its own rather than joining `ignored`.
+      await ingest(ERADAR, 'Вчора ворог атакував Полтавщину ударними БпЛА. Наслідки уточнюються.');
+
+      const rows = await classifications();
+      expect(rows).toHaveLength(1);
+      expect(rows[0]).toMatchObject({
+        source_id: ERADAR, classifier_version: CLASSIFIER_VERSION,
+        decision: 'ignored_retrospective', intent: 'none', ignored_reason: 'retrospective',
+        created_event: false, event_id: null
+      });
+      // The markers travel into `indicators`, so "why was this ignored?" is answerable from the row.
+      expect(rows[0]!.indicators).toContain('ретроспектива: вчорашній день');
+      // …and the class it would have been filed under survives as a candidate, so the archive can
+      // still answer what the refusal suppressed.
+      expect(rows[0]!.candidate_threat_types).toContain('uav');
+      // Nothing was raised and nowhere was named: a refused message must not put Poltava oblast into
+      // the location analytics the refusal exists to keep it out of.
+      expect(await classificationLocations('ignored_retrospective')).toEqual([]);
+      expect(await sql('SELECT 1 FROM threat_events')).toMatchObject({ rowCount: 0 });
+    });
+
+    it('never lets a retrospective reach the official alert tables', async () => {
+      // The isolation rule, restated for the new decision. An OSINT monitor cannot start or end an
+      // official alert under any classification, and a refusal is no exception — `alert_periods` and
+      // `alert_source_states` are reconciled from Tier A sources alone.
+      await ingest(ERADAR, 'Вчора ворог атакував Полтавщину ударними БпЛА. Наслідки уточнюються.');
+      await ingest(WAR_MONITOR, 'Підсумки ночі: балістика по Полтавщині.');
+
+      expect(await sql('SELECT 1 FROM alert_periods')).toMatchObject({ rowCount: 0 });
+      expect(await sql('SELECT 1 FROM alert_source_states')).toMatchObject({ rowCount: 0 });
+      expect((await classifications()).map((row) => row.decision))
+        .toEqual(['ignored_retrospective', 'ignored_retrospective']);
+    });
+
     it('records what a withdrawal took back, and the last claim that preceded it', async () => {
       await ingest(WAR_MONITOR, 'Шахед курсом на Полтавщину.');
       const asserted = await sql<{ asserted_at: string }>(

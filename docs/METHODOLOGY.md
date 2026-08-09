@@ -69,6 +69,16 @@ is strong enough to be worth restricting, so it is restricted:
   Where a name has two referents in the catalogue and the message does not say which — two Південне,
   two Городок — nothing is named, because publishing either one would tell half the subscribers a
   threat is somewhere it is not.
+- A message written in the past tense asserts nothing about now. A summary bulletin («у ніч на 08
+  серпня», «за попередніми даними», «збито/подавлено»), a narrative essay about last night, or an
+  after-action account raises no threat and puts no place on the map, even when it names weapons and
+  cities — which they all do, and which is why they used to. The exception is the whole of the safety
+  argument: a message that *also* states something happening now — a course, an arrow bulletin, a
+  national «загроза застосування», a time-to-impact, a shelter instruction, a verb of motion in the
+  present tense — is read exactly as it was before. Missing a retrospective costs a reader one wrong
+  line; suppressing a warning costs them the warning, so the rules are built to make only the first
+  mistake. Between the two sits a grey band that publishes by default and where, if an operator has
+  switched it on, a model may be asked one question whose only possible effect is to withhold.
 - An assessment becomes an icon only at `significant` or above. The analytical **contour** keeps the
   lower `elevated` floor, because a dotted outline is a hint about a territory and a glyph is a claim
   about a class.

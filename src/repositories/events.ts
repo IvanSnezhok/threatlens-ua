@@ -422,7 +422,12 @@ export async function applyDeEscalation(
 // ------------------------------------------------------------------------------------------------
 
 export type ClassificationDecision =
-  'event_created' | 'event_merged' | 'redirect' | 'de_escalation' | 'ignored' | 'unrecognized' | 'coalesced';
+  'event_created' | 'event_merged' | 'redirect' | 'de_escalation' | 'ignored' | 'unrecognized'
+  | 'coalesced'
+  /** Refused by the deterministic `v5` retrospection rules; reproducible by replaying them. */
+  | 'ignored_retrospective'
+  /** Refused by the model gate in the grey band; reproducible by nothing. See migration 025. */
+  | 'ignored_retrospective_model';
 
 export interface ClassificationLogEntry {
   sourceId: string;

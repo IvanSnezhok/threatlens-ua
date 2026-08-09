@@ -64,6 +64,30 @@
  * same reason: it is what stops a hypothetical "Херсонський район - відбій загрози БпЛА!" from
  * reading as an all-clear now that the phrase no longer has to sit at the start of the headline.
  *
+ * ### A bare "Відбій" is a threat stand-down, not a shortened all-clear
+ *
+ * The national channel also runs a per-oblast threat commentary, and #Донецька_область is where it
+ * is most visible: 🟠 "КАБ напрямок Краматорськ" while the guided bombs are in the air, then a 🟡
+ * stand-down once they are not. Every one of those stand-downs repeats the *same* body — "Зверніть
+ * увагу, тривога ще триває у:" followed by all eight raions of the oblast — and the headline is
+ * whatever the duty officer typed. Over 07.08–09.08.2026 the observed headlines were, verbatim,
+ * "Відбій по кабам", "Відбій", "к" and "е", each one preceded within the hour by a 🟠 КАБ post.
+ *
+ * So the shortest of them, "🟡 Відбій", is the *elided* member of the "Відбій <загрози|атаки|по …>"
+ * family and not a partial air-raid all-clear whose location the channel forgot to print. Two
+ * independent readings of the archive say so: the message states in its own body that the alert is
+ * still running in every raion it covers, and the air-raid alert those raions were under actually
+ * ended hours later, in the form this parser already reads — "🟢 Відбій тривоги в" over a • list.
+ * On 08.08 the bare "🟡 20:53 Відбій" was followed by *ten more hours* of alert and then by the real
+ * "🟢 06:45 Відбій тривоги в • …" the next morning, with no 🔴 in between.
+ *
+ * It reaches `ignored: 'still_active_notice'` through {@link readBody}, the same route as "к" and
+ * "е", and that is the intended outcome rather than an accident of the fallback order: the reliable
+ * part of the shape is the addendum, not the headline. A bare "Відбій" that ever arrives *without*
+ * the addendum has never been published and stays `unrecognized` on purpose — a circle over a
+ * headline this parser cannot read is the wording-drift alarm, and guessing "probably a full
+ * all-clear" is exactly the guess an alert source is not allowed to make.
+ *
  * ## Ordinary channel prose
  *
  * The national channel publishes nothing but alerts; an administration channel publishes school-bus

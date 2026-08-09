@@ -151,6 +151,29 @@ const envSchema = z.object({
   // not an environment variable — see `src/services/codex-settings.ts`.
   SHADOW_CLASSIFIER_MAX_PER_MINUTE: z.coerce.number().int().min(0).max(120).default(6),
 
+  // ---- Retrospective gate (model confirmation for the grey band) --------------------------------
+  // The only model call in this codebase that sits *inside* the ingestion path, and the only one
+  // whose answer is acted on. It is asked one question — «is this message reporting a threat
+  // happening now, or a retrospective account?» — about a message the `v5` rules have already
+  // flagged as `suspect`, and the single thing it can do with the answer is turn a would-publish
+  // into an archive-only row. See `src/services/retrospective-gate.ts` for why it can do nothing
+  // else, structurally.
+  //
+  // Being on the ingestion path is what makes the timeout a safety bound rather than a preference.
+  // A message that waits on a model is a message that is not on the map yet, so the budget has to be
+  // small enough that the worst case is invisible next to the thirty-minute validity window an event
+  // carries and next to the seconds these channels are ahead of the official alert. 2.5 s is roughly
+  // one tenth of `AI_TIMEOUT_MS`, which bounds the surfaces that face a human who can wait. The
+  // floor of 250 ms exists so a misconfiguration cannot make every call a timeout — that would be
+  // harmless (the deterministic verdict stands) but would spend a call to learn nothing. The ceiling
+  // of 10 s is the point at which a burst of suspect messages during an attack would start to
+  // serialise behind the model rather than behind the database.
+  RETROSPECTIVE_GATE_TIMEOUT_MS: z.coerce.number().int().min(250).max(10_000).default(2500),
+  // A spending ceiling per rolling minute, exactly like the shadow classifier's and for the same
+  // reason. Over budget the gate returns the deterministic verdict, which is to publish: running out
+  // of quota must never be a way to lose a warning, only a way to lose a suppression.
+  RETROSPECTIVE_GATE_MAX_PER_MINUTE: z.coerce.number().int().min(0).max(120).default(6),
+
   // ---- Codex sign-in over OAuth ----------------------------------------------------------------
   // The operator presses a button in `/ops` instead of copying a token out of `~/.codex/auth.json`.
   // Everything here describes *where* the browser is sent and *where it comes back to*; whether a

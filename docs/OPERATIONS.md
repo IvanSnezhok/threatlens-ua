@@ -600,9 +600,18 @@ Production backups must additionally be encrypted and copied to independent obje
   `SELECT public_url FROM sources WHERE id='…'`, open `https://t.me/s/<handle>`, find the all-clear
   for that location and compare it against `src/domain/alert-parser.ts`. The channels publish partial
   all-clears (🟡) carrying a "тривога ще триває у:" / "повітряна тривога досі триває у:" addendum,
-  threat stand-downs (`Відбій загрози`, `Відбій по КАБах`) that must never end an air raid, and
+  threat stand-downs (`Відбій загрози`, `Відбій по кабам`) that must never end an air raid, and
   occasional typo headlines. A new wording variant belongs in the parser with a fixture from that
   specific channel, not in a lowered threshold.
+
+  **The addendum is the trap.** @air_alert_ua attaches the identical "тривога ще триває у:" list to
+  its per-oblast threat commentary, so a stand-down there looks like a partial all-clear that lost
+  its location — `🟡 20:53 Відбій`, `🟡 10:23 Відбій по кабам`, `🟡 15:51 к` and `🟡 05:01 е` were all
+  published under #Донецька_область over one 48-hour window, each over the same list of all eight
+  raions. A bare `Відбій` is the elided form of `Відбій по кабам`, not a shortened all-clear: read
+  the 🟠 posts in the half hour before it and the real `🟢 … Відбій тривоги в` that follows, and the
+  pairing is unambiguous. These are pinned as negative fixtures in `src/domain/alert-parser.test.ts`
+  precisely so that a stuck-alert investigation does not "fix" them into all-clears.
 
   If the channel's whole format has moved rather than one message, the correct response is
   `UPDATE sources SET enabled=false WHERE id='…'` — the backstop keeps sweeping disabled rows, so

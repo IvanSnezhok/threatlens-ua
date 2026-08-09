@@ -104,10 +104,12 @@ describe('metric registration', () => {
     'threatlens_classification_rejections_total',
     'threatlens_threat_to_de_escalation_total',
     'threatlens_shadow_attempts_total',
-    'threatlens_shadow_outcomes_total'
+    'threatlens_shadow_outcomes_total',
+    'threatlens_retrospective_gate_attempts_total',
+    'threatlens_retrospective_gate_outcomes_total'
   ];
 
-  it('attaches every counter this module owns, shadow ones included', () => {
+  it('attaches every counter this module owns, model-layer ones included', () => {
     const registry = new Registry();
     registerAlertChannelMetrics(registry);
     const names = registry.getMetricsAsArray().map((metric) => metric.name);

@@ -131,6 +131,111 @@ describe('alert channel parser — partial all-clears (🟡)', () => {
       + '- Кальміуський район\n- Краматорський район\n- Горлівський район';
     expect(parse(text)).toMatchObject({ kind: 'ignored', reason: 'still_active_notice' });
   });
+
+  it('clears the city a 🟡 names when the still-active list names the raion around it', () => {
+    // Verbatim, 08.08.2026 10:30 — and published two seconds after the threat stand-down pinned
+    // below as "🟡 drone-attack stand-down carrying the still-active list". Same circle, same
+    // addendum, same minute, opposite outcome: the only thing that separates them is "тривоги в".
+    const text = '🟡 10:30 Відбій тривоги в м. Нікополь та Нікопольська територіальна громада.\n'
+      + 'Зверніть увагу, тривога ще триває у:\n- Нікопольський район\n'
+      + '#м_Нікополь_та_Нікопольська_територіальна_громада';
+    expect(action(text)).toBe('end');
+    // The raion around the city is a different catalogue row, so the subtraction does not fire.
+    expect(names(text)).toEqual(['м. Нікополь та Нікопольська територіальна громада']);
+  });
+
+  it('clears the raions of a bullet-list 🟡 that the hromada-level addendum does not repeat', () => {
+    // Verbatim, 07.08.2026 18:14. Seven raions clear; what stays under alert are hromadas inside
+    // them, which this catalogue does not model, so the raion-level all-clear stands.
+    const text = '🟡 18:14 Відбій тривоги в \n'
+      + '• Кам’янський район\n• Новомосковський район\n• Дніпровський район\n• Павлоградський район\n'
+      + '• Криворізький район\n• Синельниківський район\n• Нікопольський район\n'
+      + 'Зверніть увагу, тривога ще триває у:\n'
+      + '- м. Марганець та Марганецька територіальна громада\n'
+      + '- Покровська територіальна громада\n- Червоногригорівська територіальна громада\n'
+      + '#Камянський_район #Новомосковський_район #Дніпровський_район #Павлоградський_район '
+      + '#Криворізький_район #Синельниківський_район #Нікопольський_район';
+    expect(action(text)).toBe('end');
+    expect(names(text)).toEqual([
+      'Кам’янський район', 'Новомосковський район', 'Дніпровський район', 'Павлоградський район',
+      'Криворізький район', 'Синельниківський район', 'Нікопольський район'
+    ]);
+  });
+});
+
+/**
+ * @air_alert_ua publishes more than alert transitions. Under a single oblast hashtag it also runs a
+ * guided-bomb commentary — 🟠 "КАБ напрямок Краматорськ" while the bombs are in the air, a 🟡
+ * stand-down once they are not — and every stand-down repeats the *same* body: "Зверніть увагу,
+ * тривога ще триває у:" over all eight raions of Донецька область. Only the headline varies, and it
+ * is whatever the duty officer typed. Verbatim pairs from the production archive, 07.08–09.08.2026:
+ *
+ *   🟠 15:37 КАБ напрямок Краматорськ            → 🟡 15:51 к
+ *   🟠 04:23 КАБ напрямок Слов'янськ             → 🟡 05:01 е
+ *   🟠 11:29 КАБи в напрямку Краматорськ-Дружківка‼️ → 🟡 11:58 Відбій
+ *   🟠 20:22 Загроза кабів Краматорськ Словянськ → 🟡 20:53 Відбій
+ *   🟠 09:45…10:10 КАБ напрямок … (six posts)    → 🟡 10:23 Відбій по кабам
+ *
+ * The bare "Відбій" is therefore the elided member of the "Відбій <загрози|атаки|по …>" family, not
+ * a partial all-clear that lost its location. The air-raid alert over those eight raions ran
+ * through every one of these messages and ended, ten hours after the 20:53 one, in the shape this
+ * parser does read. Both shapes are pinned here side by side because the wording is all that
+ * separates a threat standing down from an authority saying the air-raid alert is over.
+ */
+describe('alert channel parser — the national channel\'s per-oblast threat thread', () => {
+  const stillActiveDonetsk = 'Зверніть увагу, тривога ще триває у:\n'
+    + '- Кальміуський район\n- Краматорський район\n- Горлівський район\n- Маріупольський район\n'
+    + '- Донецький район\n- Бахмутський район\n- Волноваський район\n- Покровський район\n'
+    + '#Донецька_область';
+
+  it('refuses a bare "Відбій" headline carrying the still-active list', () => {
+    // Verbatim, 08.08.2026 20:53. The message says in its own body that the alert is still running
+    // in all eight raions of the oblast it covers; the real all-clear for them arrived at 06:45 the
+    // next morning. Reading this as an air-raid all-clear would push an "Офіційний відбій" into a
+    // frontline oblast under a live alert — the one failure this project treats as unrecoverable.
+    expect(parse(`🟡 20:53 Відбій\n${stillActiveDonetsk}`))
+      .toMatchObject({ kind: 'ignored', reason: 'still_active_notice' });
+  });
+
+  it('refuses the same body under the spelled-out KAB stand-down headline', () => {
+    // Verbatim, 09.08.2026 10:23 — the same shape with the subject printed instead of elided.
+    expect(parse(`🟡 10:23 Відбій по кабам\n${stillActiveDonetsk}`))
+      .toMatchObject({ kind: 'ignored', reason: 'threat_notice' });
+  });
+
+  it('refuses the same body under the typo\'d headlines the channel also publishes', () => {
+    // Verbatim, 07.08.2026 15:51 and 08.08.2026 05:01. These are what prove the addendum, not the
+    // headline, is the reliable part of the shape.
+    expect(parse(`🟡 15:51 к\n${stillActiveDonetsk}`))
+      .toMatchObject({ kind: 'ignored', reason: 'still_active_notice' });
+    expect(parse(`🟡 05:01 е\n${stillActiveDonetsk}`))
+      .toMatchObject({ kind: 'ignored', reason: 'still_active_notice' });
+  });
+
+  it('reads the real all-clear the same raions eventually got', () => {
+    // Verbatim, 08.08.2026 19:19. This is the contrast the block exists for: when the authority
+    // ends the air-raid alert it prints "Відбій тривоги в" and lists the raions with • bullets.
+    const text = '🟢 19:19 Відбій тривоги в \n'
+      + '• Кальміуський район\n• Краматорський район\n• Горлівський район\n• Маріупольський район\n'
+      + '• Донецький район\n• Бахмутський район\n• Волноваський район\n• Покровський район\n'
+      + 'Слідкуйте за подальшими повідомленнями.\n'
+      + '#Кальміуський_район #Краматорський_район #Горлівський_район #Маріупольський_район '
+      + '#Донецький_район #Бахмутський_район #Волноваський_район #Покровський_район';
+    expect(action(text)).toBe('end');
+    expect(names(text)).toEqual([
+      'Кальміуський район', 'Краматорський район', 'Горлівський район', 'Маріупольський район',
+      'Донецький район', 'Бахмутський район', 'Волноваський район', 'Покровський район'
+    ]);
+  });
+
+  it('refuses a bare "Відбій" that arrives without the addendum, loudly', () => {
+    // Never published, and that is the point: with no addendum there is nothing reliable left to
+    // read, so the shape stays `unrecognized` and wakes the wording-drift alarm rather than being
+    // guessed at as "probably a full all-clear".
+    expect(parse('🟡 20:53 Відбій').kind).toBe('unrecognized');
+    expect(parse('🟢 20:53 Відбій\nСлідкуйте за подальшими повідомленнями.').kind)
+      .toBe('unrecognized');
+  });
 });
 
 /**
@@ -231,6 +336,25 @@ describe('alert channel parser — messages that must never move alert state', (
       + 'Слідкуйте за подальшими повідомленнями.'],
     ['🟡 KAB stand-down', '🟡 22:02 Відбій по КАБах\nЗверніть увагу, тривога ще триває у:\n'
       + '- Кальміуський район\n- Краматорський район'],
+    // The four shapes below are verbatim, and each one carries the "still under alert" addendum that
+    // a partial all-clear also carries. The addendum is not what makes a message an all-clear; the
+    // phrase "відбій … тривоги" is. Without these pins, widening the parser to read the addendum
+    // alone would turn every one of them into an "Офіційний відбій" over a live alert.
+    ['🟡 KAB stand-down carrying the still-active list', '🟡 08:51 Відбій загрози застосування '
+      + 'керованих авіаційних бомб (КАБів).\nЗверніть увагу, тривога ще триває у:\n'
+      + '- Запорізька область\n- Запорізький район\n#Запорізький_район'],
+    ['🟡 drone-attack stand-down carrying the still-active list', '🟡 10:30 Відбій атаки '
+      + 'дронів-камікадзе\nЗверніть увагу, тривога ще триває у:\n- Нікопольський район\n'
+      + '#м_Нікополь_та_Нікопольська_територіальна_громада'],
+    // The nastiest near miss in the archive: a threat stand-down that also names a place after "в",
+    // so it is one word ("загрози") away from the accepted all-clear shape.
+    ['🟡 artillery stand-down that names a place after "в"', '🟡 15:34 Відбій загрози артобстрілу '
+      + 'в м. Нікополь та Нікопольська територіальна громада.\n'
+      + 'Зверніть увагу, тривога ще триває у:\n- Дніпропетровська область\n- Нікопольський район\n'
+      + '#м_Нікополь_та_Нікопольська_територіальна_громада'],
+    ['🟡 УВАГА bulletin carrying the still-active list', '🟡 18:10 УВАГА !!!\n'
+      + 'Зверніть увагу, тривога ще триває у:\n- Запорізька область\n- Пологівський район\n'
+      + '#Пологівський_район'],
     ['🟢 KAB stand-down under an Увага headline', '🟢 17:49 Увага\n'
       + 'Відбій загрози застосування керованих авіаційних бомб (КАБів).'],
     // Verbatim, and the reason "загроз" is no longer anchored to the start of the headline: the
