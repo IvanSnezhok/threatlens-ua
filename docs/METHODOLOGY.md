@@ -61,8 +61,14 @@ is strong enough to be worth restricting, so it is restricted:
   an outline above a named place that has none. An ancestor lit merely because a territory inside it
   was named keeps its muted polygon and gets no icon.
 - A location the classifier related as `mentioned` — which is what it assigns to transit («повз
-  Миколаїв») and as the fall-through for any alias found in the text — appears in the territory panel
+  Миколаїв») and as the fall-through for any name found in the text — appears in the territory panel
   and produces no icon.
+- A place is only "named" when the message writes its name as a whole word, in some case Ukrainian
+  actually forms. A name found inside a longer word is not a mention of that place: «Баришівку» does
+  not name Бар, «Обухівку» does not name Обухів, and «південно-західний» names no settlement at all.
+  Where a name has two referents in the catalogue and the message does not say which — two Південне,
+  two Городок — nothing is named, because publishing either one would tell half the subscribers a
+  threat is somewhere it is not.
 - An assessment becomes an icon only at `significant` or above. The analytical **contour** keeps the
   lower `elevated` floor, because a dotted outline is a hint about a territory and a glyph is a claim
   about a class.

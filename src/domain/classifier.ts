@@ -1,4 +1,8 @@
 import type { ClassifiedMessage, RelationType, ThreatType } from '../types.js';
+import {
+  ADMIN_CONNECTORS, inflections, isBlockedPlaceToken, nameTokens, OBLAST_HEADS, type PlaceToken,
+  RAION_HEADS, sameLexeme, tokenize
+} from './place-morphology.js';
 
 /**
  * Version of the rules in this module, stamped on every decision in `message_classifications`.
@@ -44,13 +48,62 @@ import type { ClassifiedMessage, RelationType, ThreatType } from '../types.js';
  *   next to a Ukrainian place, and the generic nouns additionally require an operational cue, so
  *   neither a parcel-post notice nor a meme about drones can raise anything. A direction with no
  *   named type produces `unknown`, never a class carried over from an earlier message.
+ * * `v4` — location resolution, rebuilt. `v3` looked for a place name as a **substring** of the
+ *   message, which has no word boundary on either side, so a name resolved out of the middle of a
+ *   different word: "Баришівку" produced Бар, "Обухівку" produced Обухів, "Березну" produced
+ *   Березне, "Самарському р-ні" produced Самар, and "південно-західний" produced the settlement
+ *   Південне — a compass bearing published as a town. Each of those is a real place on the map that
+ *   the message never named, which is worse than resolving nothing: it tells that settlement's
+ *   subscribers a threat was addressed to them.
+ *
+ *   Matching is now by whole word in any case, against a closed, generated Ukrainian declension
+ *   table (`src/domain/place-morphology.ts`), so a name matches only where every one of its words
+ *   equals a message word. The same change makes the inflections `v3` could not read resolvable at
+ *   all — "Києвом", "Кропивницьким", "Фастова" — because the paradigm is generated rather than
+ *   guessed at by clipping a suffix.
+ *
+ *   Three rules ride on top of it. An oblast or raion adjective names its unit only next to the head
+ *   noun, which is what stops the **city** of Kyiv from being read out of "Київської області" and
+ *   what makes "Київської та Чернігівської областей" name both oblasts. A span claimed by two
+ *   catalogue rows is refused unless the catalogue itself ranks them. And a one-word name is never
+ *   read out of a compass bearing.
+ *
+ *   Migration 024 lands beside it: eighteen settlements the monitoring channels name and the
+ *   catalogue lacked, the Kyiv districts Троєщина and Жуляни as aliases of the city, and the removal
+ *   of "запоріжжя" from the oblast's aliases so a bare "Запоріжжя" names the city the way a bare
+ *   "Київ" already does.
  */
-export const CLASSIFIER_VERSION = 'v3';
+export const CLASSIFIER_VERSION = 'v4';
 
 export interface LocationLexeme {
   id: string;
   name: string;
   aliases: string[];
+  /**
+   * `locations.type`, used only to break a tie between two rows that spell the same.
+   *
+   * Optional so a test or a caller that only cares about the text can build a lexeme from a name and
+   * its aliases. Absent means "not administrative", which makes the tie-break refuse rather than
+   * guess.
+   */
+  type?: string;
+  /**
+   * Whether the catalogue geocoded this row, i.e. `latitude IS NOT NULL`.
+   *
+   * The importer never writes coordinates, so the flag is true for exactly the hand-seeded rows: the
+   * oblasts, the two special cities and the oblast capitals. It is a tie-break between two rows of
+   * the same name and is read for nothing else — see {@link pickAmongTied}.
+   */
+  geocoded?: boolean;
+  /**
+   * The oblast (or special city) this row sits in, walked up `locations.parent_id`.
+   *
+   * Read only to let a message disambiguate a name it has already qualified: "Одещина: … на
+   * Південне" names one of the two settlements called Південне and not the other. Absent on the
+   * oblast rows themselves, and absent from a lexeme built by hand, in which case that tie-break
+   * simply does not fire.
+   */
+  oblastId?: string;
 }
 
 const patterns: Array<[ThreatType, RegExp]> = [
@@ -561,113 +614,299 @@ interface ResolvedLocation {
   /**
    * The lower-cased substring of the message that actually matched.
    *
-   * Not the declared alias. An alias is matched by its stem — "богодухові" resolves "Богодухів"
-   * through the stem "богодух" — and every downstream regex that has to find the place *in the
-   * text* has to look for the form the text uses. Building "→\s*…богодухові" against a message that
-   * says "→Гути/Богодухів" finds nothing, and the relation silently degrades to `mentioned`.
+   * Not the declared alias. A name is matched in whatever case the message used — "Києвом" resolves
+   * "Київ" — and every downstream regex that has to find the place *in the text* has to look for the
+   * form the text uses. Building "→\s*…київ" against a message that says "→Гути/Богодухів" finds
+   * nothing, and the relation silently degrades to `mentioned`.
    */
   needle: string;
 }
 
 /**
- * Inflectional endings stripped from a single word to reach its stem.
+ * An administrative unit named by an adjective plus a head noun.
  *
- * Wider than the whole-string suffix rule below because it is applied per word inside a compound
- * name, where the ending carried by each word is what changes: "Харківський район" ->
- * "Харківського району" -> "Харківським районом".
+ * "Київська" is an adjective; it is the oblast only next to "область". Keeping the two apart is what
+ * stops the **city** of Kyiv from being read out of "Київської області" and what lets
+ * "Київської та Чернігівської областей" — one head noun, two adjectives — name both oblasts.
  */
-const WORD_ENDING = /(?:ого|ому|ими|ої|ій|ий|их|им|ам|ах|ям|ями|ами|ові|еві|ою|ею|ом|а|я|и|і|у|ю|е|о|ь|й)$/u;
-
-function wordStem(word: string): string {
-  const stripped = word.replace(WORD_ENDING, '');
-  // A stem shorter than four letters stops identifying the place — "біла" would become "біл" and
-  // start matching anything beginning with it.
-  return stripped.length >= 4 ? stripped : word;
+interface AdminUnit {
+  location: LocationLexeme;
+  order: number;
+  kind: 'oblast' | 'raion';
 }
 
-const compoundPatterns = new Map<string, RegExp | null>();
+interface AliasEntry {
+  location: LocationLexeme;
+  order: number;
+  /** Comparison keys of the alias, in order. Never empty. */
+  tokens: string[];
+}
+
+interface CatalogueIndex {
+  /**
+   * Alias entries reachable from one message token, keyed by **every case form** of the alias's
+   * first word. Built once per catalogue so a message costs one map lookup per token rather than a
+   * scan over six hundred catalogue rows.
+   */
+  byFirstToken: Map<string, AliasEntry[]>;
+  /** Administrative adjectives, keyed the same way. */
+  adminByForm: Map<string, AdminUnit[]>;
+}
+
+/** A catalogue name of the shape "<adjective> область" / "<adjective> район". */
+const ADMIN_NAME = /^(.+?)\s+(область|район)$/u;
+
+function pushInto<T>(index: Map<string, T[]>, key: string, value: T): void {
+  const bucket = index.get(key);
+  if (bucket) bucket.push(value); else index.set(key, [value]);
+}
 
 /**
- * Case-tolerant pattern for a multi-word place name.
+ * Builds the lookup structures for one catalogue.
  *
- * The whole-string stemmer strips one ending from the end of the *last* word, so a compound name
- * only survives the cases somebody thought to enumerate as an alias. The KATOTTG importer emits
- * "харківський район", "харківського району" and "харківському районі" — and nothing else, so
- * "Шахед над Харківським районом" matched no raion at all and fell through to the substring
- * "харків", tagging the **city**. That is the worst shape this can fail in: a wrong location that
- * looks right, inflating the city's risk signals and telling its subscribers a raion threat was
- * addressed to them.
+ * ## The precedence rule for administrative adjectives, and why it is asymmetric
  *
- * Stemming each word and allowing a short ending after it covers the declension table generically
- * instead. The left boundary keeps "Нехарківський" out; the words must be adjacent, and each ending
- * is capped at four letters, so the pattern cannot wander.
+ * An oblast adjective is feminine ("Київська", "Чернігівська") and a raion adjective is masculine
+ * ("Броварський", "Кропивницький"). That accident of Ukrainian grammar decides how far each one may
+ * be trusted on its own, and the catalogue has already relied on it once: `raionAliases` emits the
+ * bare masculine adjective as an alias precisely because it "cannot shadow an oblast the way a bare
+ * feminine one would".
+ *
+ *   * **A bare oblast adjective names the oblast.** "чернігівська реактивні ще" is a real archive
+ *     message and it means the oblast. Nothing else in the catalogue spells that way — no settlement
+ *     is called Чернігівська — and the city can no longer be read out of it, because "чернігів" is
+ *     not a word-for-word match for "чернігівська". A longer name that merely *starts* with the
+ *     adjective ("Чернігівська територіальна громада", an alias of the raion) still wins, because a
+ *     longer name takes the text it covers.
+ *   * **A bare raion adjective does not name the raion.** It collides head-on with a settlement:
+ *     "БпЛА над Кропивницьким" means the **city**, and under the old longest-name-first rule the
+ *     raion won every time. The bare alias is therefore dropped from the free-text index and the
+ *     raion is reached through {@link adminCandidates}, which requires the head noun "район" —
+ *     which is how every feed that means the raion actually writes it.
+ *
+ * The alias itself stays in the catalogue untouched, so the alert-channel lookup in
+ * `src/services/ingestion.ts` — which matches a published label exactly and never sees free prose —
+ * is unaffected either way.
  */
-function compoundPattern(lowered: string): RegExp | null {
-  if (compoundPatterns.has(lowered)) return compoundPatterns.get(lowered)!;
-  const words = lowered.split(/\s+/u).filter(Boolean);
-  const pattern = words.length < 2 ? null : new RegExp(
-    `(?<!\\p{L})${words.map((word) => `${wordStem(word).replace(/[.*+?^${}()|[\]\\]/gu, '\\$&')}[а-яіїєґ'ʼ]{0,4}`).join('\\s+')}`,
-    'u'
-  );
-  compoundPatterns.set(lowered, pattern);
-  return pattern;
+function buildIndex(locations: LocationLexeme[]): CatalogueIndex {
+  const index: CatalogueIndex = { byFirstToken: new Map(), adminByForm: new Map() };
+  locations.forEach((location, order) => {
+    const admin = ADMIN_NAME.exec(location.name);
+    const adjective = admin ? nameTokens(admin[1]!) : [];
+    const kind = admin && adjective.length === 1
+      ? (admin[2] === 'область' ? 'oblast' as const : 'raion' as const)
+      : null;
+    if (kind) {
+      const unit: AdminUnit = { location, order, kind };
+      for (const form of inflections(adjective[0]!)) pushInto(index.adminByForm, form, unit);
+    }
+    const spellings = [location.name, ...location.aliases,
+      ...(kind === 'oblast' ? [adjective[0]!] : [])];
+    for (const alias of spellings) {
+      const tokens = nameTokens(alias);
+      if (!tokens.length) continue;
+      if (kind === 'raion' && tokens.length === 1 && tokens[0] === adjective[0]) continue;
+      const entry: AliasEntry = { location, order, tokens };
+      for (const form of inflections(tokens[0]!)) pushInto(index.byFirstToken, form, entry);
+    }
+  });
+  return index;
 }
 
-/** The substring that actually matched, so overlaps between place names can be compared. */
-function matchedNeedle(candidate: string, normalized: string): string | null {
-  const lowered = candidate.toLocaleLowerCase('uk-UA');
-  if (normalized.includes(lowered)) return lowered;
-  const compound = compoundPattern(lowered)?.exec(normalized);
-  if (compound) return compound[0];
-  const stem = lowered.replace(/(ою|ею|ами|ями|ові|еві|а|я|и|і|у|ю|е)$/u, '');
-  return stem.length >= 5 && normalized.includes(stem) ? stem : null;
+/**
+ * One index per catalogue array, keyed on the array itself.
+ *
+ * The catalogue is loaded once and handed to every message of a run — the live pipeline, the replay
+ * and the gold corpus all pass the same array thousands of times — so building the index per call
+ * would dominate the cost of classification. A `WeakMap` means a catalogue that is reloaded simply
+ * drops out.
+ */
+const catalogueIndexes = new WeakMap<LocationLexeme[], CatalogueIndex>();
+
+function indexFor(locations: LocationLexeme[]): CatalogueIndex {
+  const cached = catalogueIndexes.get(locations);
+  if (cached) return cached;
+  const built = buildIndex(locations);
+  catalogueIndexes.set(locations, built);
+  return built;
 }
 
-function occurrences(haystack: string, needle: string): Array<[number, number]> {
-  const spans: Array<[number, number]> = [];
-  for (let from = 0; ; from += 1) {
-    const at = haystack.indexOf(needle, from);
-    if (at < 0) return spans;
-    spans.push([at, at + needle.length]);
-    from = at;
+interface Candidate {
+  location: LocationLexeme;
+  order: number;
+  /** Number of words the name spans; a longer name takes the text it covers. */
+  words: number;
+  start: number;
+  end: number;
+}
+
+/** Candidates from ordinary names and aliases: every word matched as a whole word, in any case. */
+function aliasCandidates(tokens: PlaceToken[], index: CatalogueIndex): Candidate[] {
+  const candidates: Candidate[] = [];
+  tokens.forEach((token, position) => {
+    for (const entry of index.byFirstToken.get(token.key) ?? []) {
+      // A one-word name read out of a compass bearing or an ordinary Ukrainian word is the failure
+      // mode this guard exists for; a name of two words or more carries its own evidence, and a
+      // message that spells the name exactly as the catalogue does is naming the place.
+      if (entry.tokens.length === 1 && isBlockedPlaceToken(token.key, token.key !== entry.tokens[0])) continue;
+      const last = position + entry.tokens.length - 1;
+      if (last >= tokens.length) continue;
+      const matched = entry.tokens.every((name, offset) => sameLexeme(name, tokens[position + offset]!.key));
+      if (!matched) continue;
+      candidates.push({
+        location: entry.location, order: entry.order, words: entry.tokens.length,
+        start: token.start, end: tokens[last]!.end
+      });
+    }
+  });
+  return candidates;
+}
+
+/**
+ * Candidates from an administrative adjective licensed by a head noun.
+ *
+ * The walk runs backwards from the head so that one head noun can license a coordinated list:
+ * "по межі Київської та Чернігівської областей" reaches both adjectives, and
+ * "у Київській, Чернігівській та Сумській областях" reaches all three. Anything that is neither an
+ * adjective of the same kind nor a connector ends the chain, and the chain is bounded so a head noun
+ * cannot reach across a sentence.
+ *
+ * The span recorded is the **adjective alone**, never the adjective plus the head. Two coordinated
+ * oblasts would otherwise claim overlapping spans and the outer one would swallow the inner.
+ */
+const ADMIN_CHAIN_LIMIT = 6;
+
+function adminCandidates(tokens: PlaceToken[], index: CatalogueIndex): Candidate[] {
+  const candidates: Candidate[] = [];
+  tokens.forEach((token, position) => {
+    const kind = OBLAST_HEADS.has(token.key) ? 'oblast' : RAION_HEADS.has(token.key) ? 'raion' : null;
+    if (!kind) return;
+    for (let cursor = position - 1; cursor >= 0 && position - cursor <= ADMIN_CHAIN_LIMIT; cursor -= 1) {
+      const previous = tokens[cursor]!;
+      const units = (index.adminByForm.get(previous.key) ?? []).filter((unit) => unit.kind === kind);
+      if (units.length) {
+        for (const unit of units) {
+          candidates.push({
+            location: unit.location, order: unit.order, words: 1,
+            start: previous.start, end: previous.end
+          });
+        }
+        continue;
+      }
+      if (!ADMIN_CONNECTORS.has(previous.key)) return;
+    }
+  });
+  return candidates;
+}
+
+/**
+ * The one location a span names, or `null` when the span is ambiguous.
+ *
+ * The same rule `pickLocationMatch` applies to the alert-channel lookup, for the same reason:
+ * refusing is the only safe answer when a name has two referents, because publishing either one
+ * tells half the subscribers a threat is somewhere it is not. Ukraine really does hold two Південне,
+ * two Городок and a Миколаїв that is not the oblast capital, and the catalogue holds a settlement
+ * for only one of the several Обухівки and Погреби on the map.
+ *
+ * Three tie-breaks are tried, strongest evidence first.
+ *
+ *  1. **Administrative rank.** An oblast or a special city outranks a settlement of the same name.
+ *  2. **The message's own oblasts.** "Одещина: реактив на Коблеве / Південне" names the oblast that
+ *     contains exactly one of the two Південне, so the message has answered the question itself.
+ *     This is the only tie-break that reads the text, and it reads nothing but places already
+ *     resolved unambiguously.
+ *  3. **Seeded rank.** Coordinates are the catalogue's own marker of a first-order settlement: they
+ *     are set on the twenty-five oblasts, the two special cities and the seeded oblast capitals, and
+ *     on nothing the KATOTTG importer writes. That keeps a bare "Миколаїв" the oblast capital.
+ *
+ * When none of the three leaves a single row, the span resolves to nothing. "Городок" — two KATOTTG
+ * rows, neither seeded, in two oblasts the message does not name — stays refused.
+ */
+function pickAmongTied(tied: Candidate[], namedOblasts: ReadonlySet<string>): Candidate | null {
+  const narrow = (candidates: Candidate[], keep: (candidate: Candidate) => boolean) => {
+    const kept = candidates.filter(keep);
+    return kept.length ? kept : candidates;
+  };
+  let finalists = narrow(tied, ({ location }) =>
+    location.type === 'oblast' || location.type === 'special_city');
+  finalists = narrow(finalists, ({ location }) =>
+    !!location.oblastId && namedOblasts.has(location.oblastId));
+  finalists = narrow(finalists, ({ location }) => !!location.geocoded);
+  return new Set(finalists.map(({ location }) => location.id)).size === 1 ? finalists[0]! : null;
+}
+
+/**
+ * Drops every candidate whose exact span is claimed by more than one location.
+ *
+ * Run in two passes so the oblast tie-break has something to read: the first pass keeps only the
+ * spans that were never in doubt, and the oblasts among those — plus the oblast each of them sits
+ * in — are the context the second pass uses. An ambiguous span therefore never disambiguates
+ * another ambiguous span, which would make the result depend on the order they were found in.
+ */
+function resolveSpanCollisions(candidates: Candidate[]): Candidate[] {
+  const bySpan = new Map<string, Candidate[]>();
+  for (const candidate of candidates) pushInto(bySpan, `${candidate.start}:${candidate.end}`, candidate);
+  const groups = [...bySpan.values()];
+  const unambiguous = groups.filter((tied) => new Set(tied.map(({ location }) => location.id)).size === 1);
+  const namedOblasts = new Set(unambiguous.flatMap(([candidate]) => [
+    ...(candidate!.location.type === 'oblast' || candidate!.location.type === 'special_city'
+      ? [candidate!.location.id] : []),
+    ...(candidate!.location.oblastId ? [candidate!.location.oblastId] : [])
+  ]));
+  const kept: Candidate[] = [];
+  for (const tied of groups) {
+    if (new Set(tied.map(({ location }) => location.id)).size === 1) { kept.push(...tied); continue; }
+    const winner = pickAmongTied(tied, namedOblasts);
+    if (winner) kept.push(...tied.filter(({ location }) => location.id === winner.location.id));
   }
+  return kept;
 }
 
 /**
  * Locations named in `text`, with longer place names taking the text they cover.
  *
- * Matching is substring-based because Ukrainian inflects place names, and that alone made every
- * oblast mention also name its city: "київ" is inside "київщина", "харків" inside "харківщину".
- * The event then claimed the city had been named when only the oblast was, which inflates the
- * city's risk signals and tells its subscribers the threat was addressed to them. The hierarchy
- * already carries oblast events down to their cities, so the extra tag was both wrong and double
- * counting. A shorter name therefore only survives where it occurs outside every longer match —
- * "Київщина та місто Київ" still resolves both.
+ * Matching is by whole word in any case: the message is cut into tokens, each catalogue name is cut
+ * into tokens, and a name matches only where every one of its words equals a message word modulo
+ * declension (see `src/domain/place-morphology.ts`). That is what makes "Баришівку" unreachable from
+ * "Бар" and "південно-західний" unreachable from "Південне" — under the substring rule this replaced,
+ * both resolved, and each one put a real settlement on the map that the message never named.
+ *
+ * A longer name still takes the text it covers, so a shorter one only survives where it occurs
+ * outside every longer match: "Київщина та місто Київ" resolves both, "Київська область" alone
+ * resolves only the oblast.
  */
 function resolveLocations(text: string, locations: LocationLexeme[]): ResolvedLocation[] {
   const normalized = text.toLocaleLowerCase('uk-UA');
-  const candidates: Array<{ location: LocationLexeme; alias: string; needle: string; order: number }> = [];
-  locations.forEach((location, order) => {
-    const aliases = [location.name, ...location.aliases].sort((a, b) => b.length - a.length);
-    for (const alias of aliases) {
-      const needle = matchedNeedle(alias, normalized);
-      if (needle) { candidates.push({ location, alias, needle, order }); return; }
-    }
-  });
+  const tokens = tokenize(normalized);
+  const index = indexFor(locations);
+  const candidates = resolveSpanCollisions([
+    ...aliasCandidates(tokens, index),
+    ...adminCandidates(tokens, index)
+  ]);
+
+  const byLocation = new Map<string, Candidate[]>();
+  for (const candidate of candidates) pushInto(byLocation, candidate.location.id, candidate);
+
+  // Longest name first, so a name nested inside another cannot claim its text. The remaining
+  // tie-breaks are on the catalogue order alone: nothing about the result may depend on the order
+  // two equally long candidates happened to be generated in.
+  const ranked = [...byLocation.values()]
+    .map((group) => [...group].sort((a, b) => (b.end - b.start) - (a.end - a.start))!)
+    .sort((a, b) => b[0]!.words - a[0]!.words
+      || (b[0]!.end - b[0]!.start) - (a[0]!.end - a[0]!.start)
+      || a[0]!.order - b[0]!.order);
 
   const claimed: Array<[number, number]> = [];
-  const seen = new Set<string>();
   const kept: Array<ResolvedLocation & { order: number }> = [];
-  for (const candidate of [...candidates].sort((a, b) => b.needle.length - a.needle.length)) {
-    if (seen.has(candidate.location.id)) continue;
-    const free = occurrences(normalized, candidate.needle)
-      .filter(([start, end]) => !claimed.some(([from, to]) => start >= from && end <= to));
+  for (const group of ranked) {
+    const free = group.filter(({ start, end }) => !claimed.some(([from, to]) => start >= from && end <= to));
     if (!free.length) continue;
-    seen.add(candidate.location.id);
-    claimed.push(...free);
+    const first = free[0]!;
+    claimed.push(...free.map(({ start, end }) => [start, end] as [number, number]));
+    const needle = normalized.slice(first.start, first.end);
     kept.push({
-      id: candidate.location.id, name: candidate.location.name,
-      relationType: relationFor(text, candidate.needle), needle: candidate.needle, order: candidate.order
+      id: first.location.id, name: first.location.name,
+      relationType: relationFor(text, needle), needle, order: first.order
     });
   }
   return kept.sort((a, b) => a.order - b.order)

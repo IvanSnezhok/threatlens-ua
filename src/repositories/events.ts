@@ -91,11 +91,39 @@ export async function relatedLocationIds(locationId: string): Promise<string[]> 
   return result.rows.map((row) => row.id);
 }
 
+/**
+ * The catalogue as the classifier reads it.
+ *
+ * `type`, `geocoded` and `oblast_id` ride along with the names because two catalogue rows can spell
+ * the same — Миколаїв the oblast capital and Миколаїв the town in Lviv oblast, Городок twice,
+ * Південне twice — and the classifier refuses such a span unless something ranks the rows. Only the
+ * hand-seeded first-order rows carry coordinates (the KATOTTG importer writes none), so
+ * `latitude IS NOT NULL` is the catalogue's own statement that a row is the well-known one, and the
+ * oblast walked up `parent_id` is what lets a message that already said "Одещина" pick the Південне
+ * it means. All three are read for that tie-break and nothing else.
+ */
 export async function listLocationLexemes() {
-  const result = await pool.query<{ id: string; name_uk: string; aliases: string[] }>(
-    `SELECT id, name_uk, aliases FROM locations WHERE type <> 'country' ORDER BY length(name_uk) DESC`
+  const result = await pool.query<{
+    id: string; name_uk: string; aliases: string[]; type: string;
+    geocoded: boolean; oblast_id: string | null;
+  }>(
+    `WITH RECURSIVE ancestry(id, ancestor_id, ancestor_type) AS (
+       SELECT id, id, type FROM locations
+       UNION ALL
+       SELECT ancestry.id, parent.id, parent.type
+         FROM ancestry JOIN locations child ON child.id = ancestry.ancestor_id
+                       JOIN locations parent ON parent.id = child.parent_id
+     )
+     SELECT l.id, l.name_uk, l.aliases, l.type, l.latitude IS NOT NULL AS geocoded,
+            (SELECT ancestor_id FROM ancestry
+              WHERE ancestry.id = l.id AND ancestor_type IN ('oblast','special_city')
+              LIMIT 1) AS oblast_id
+       FROM locations l WHERE l.type <> 'country' ORDER BY length(l.name_uk) DESC, l.id`
   );
-  return result.rows.map((row) => ({ id: row.id, name: row.name_uk, aliases: row.aliases ?? [] }));
+  return result.rows.map((row) => ({
+    id: row.id, name: row.name_uk, aliases: row.aliases ?? [], type: row.type,
+    geocoded: row.geocoded, ...(row.oblast_id ? { oblastId: row.oblast_id } : {})
+  }));
 }
 
 async function appendSystemEvent(client: PoolClient, eventType: string, payload: unknown) {

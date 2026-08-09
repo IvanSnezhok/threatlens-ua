@@ -214,6 +214,54 @@ is true" across both domains is the point of the shape.
   `alert_source_states` or `alert_periods`, and the integration suite asserts that directly rather
   than inferring it from the routing code.
 
+### Reading a place name out of free text
+
+The alert channels publish a location as a label and it is looked up whole. The OSINT monitors write
+prose, and Ukrainian declines every place name in it, so the classifier has to recognise "Києвом",
+"Фастова" and "Білої Церкви" as the rows the catalogue spells "Київ", "Фастів" and "Біла Церква".
+
+Until `v4` it did that by looking for the name as a **substring** of the message. A substring has no
+word boundary on either side, and the failure mode is not a near miss: "Бар" is inside "Баришівку",
+"Обухів" inside "Обухівку", "Березне" inside "Березну", "Самар" inside "Самарському", "Чоп" inside
+"Чоповичі", "Приморськ" inside "Приморськ-Ахтарська" — each one a **different real settlement**
+published on the map and pushed to that settlement's subscribers. "південно-західний" resolved as the
+town of Південне: a compass bearing turned into a place.
+
+`v4` matches whole words instead. The message is cut into tokens, each catalogue name is cut into
+tokens, and a name matches only where every one of its words equals a message word modulo declension.
+The declension itself is a generated, closed table (`src/domain/place-morphology.ts`): a paradigm is
+picked by the shape of the nominative and produces an enumerated set of forms, which is what keeps
+"Березну" out of "Березне" — the neuter adjectival paradigm has no `-у` form at all — where a
+symmetric stemmer could not, since both words stem to "березн". Nothing consults a dictionary, a
+model or the network; `place-morphology.test.ts` prints the table the rules generate so a reviewer can
+read what they claim.
+
+Four rules ride on top of it, and each answers a case the archive actually contains:
+
+- **An oblast adjective is not its city.** "Київської області" names `ua-32` and never `ua-80`,
+  because "київ" is not a word-for-word match for "київської". A bare feminine oblast adjective does
+  name the oblast ("чернігівська реактивні ще"); a bare **masculine raion** adjective does not,
+  because it collides head-on with a settlement — "БпЛА над Кропивницьким" is the city — so the raion
+  needs its head noun ("Кропивницькому районі"). One head noun licenses a coordinated list:
+  "Київської та Чернігівської областей" names both.
+- **A span two catalogue rows spell the same is refused**, the same rule the alert-channel lookup
+  applies, unless something ranks them: administrative rank first, then the oblast the message itself
+  already named ("Одещина: … на Південне" picks the Odesa one of the two), then whether the row is a
+  hand-seeded first-order settlement — coordinates are set on the oblasts, the special cities and the
+  seeded capitals and on nothing the importer writes, which is what keeps a bare "Миколаїв" the oblast
+  capital. Городок, two KATOTTG rows in two oblasts nobody named, stays refused.
+- **A declined compass word is a bearing, never a place**, and so is a short list of ordinary words a
+  generated paradigm can reach. Both apply only to a form the message *declined*: a message that
+  spells the name exactly as the catalogue does is taken at its word, so "2 реактивних Мена" is the
+  town and "мені" is not.
+- **A longer name takes the text it covers**, so a shorter one survives only where it occurs outside
+  every longer match.
+
+Migration 024 landed with it: eighteen settlements the channels name and the importer does not read
+(it imports KATOTTG cities, not the 29 000 villages), the Kyiv districts Троєщина and Жуляни as
+aliases of the city, and "запоріжжя" removed from the oblast's aliases so a bare "Запоріжжя" names the
+city exactly as a bare "Київ" already did.
+
 ### Classification archive
 
 `source_messages` keeps the raw text and one `processing_status` word; everything the classifier
@@ -263,15 +311,18 @@ is the answer: 191 real archived messages, each read and labelled by hand, with 
 method and conventions in the file's own header. `src/domain/classifier-gold.test.ts` scores the
 current rules against it on the same three axes the replay compares and asserts each number as a
 **floor**, so a future edit that quietly loses recall fails in CI rather than on somebody's phone at
-three in the morning. `v3` measures significance P=97.2% / R=88.8%, threat-class accuracy 100% over
-the messages both sides call significant, and locations P=R=89.4%.
+three in the morning. `v4` measures significance P=98.4% / R=90.4%, threat-class accuracy 100% over
+the messages both sides call significant, and locations P=97.2% / R=93.1%. (`v3` measured
+significance P=97.2% / R=88.8% and locations P=R=89.4%.)
 
 The fixture separates two things that used to be one number. `assertsThreat` is the reviewer's
 reading of the text; `significant` additionally requires that the place named exists in the location
-catalogue. Twenty-one of the 191 are correct reports about settlements the catalogue does not hold —
+catalogue. Twenty-one of the 191 were correct reports about settlements the catalogue did not hold —
 Згурівка, Велика Димерка, Троєщина, Жуляни — and those are a coverage problem for the location
 importer, not a rules problem. Counting them as classifier misses would blame the regexes and hide
-the real cause.
+the real cause. Migration 024 added eighteen of those settlements and the two Kyiv districts, so the
+corpus's own labels moved with the catalogue: those places are now ids in `gold.locations` rather
+than names in `outsideCatalogue`, and one message is left in the gap column.
 
 **Watching it in production.** `threatlens_classifications_total{version,decision}` carries the
 classifier version, so a version bump appears on the dashboard as one series ending and another

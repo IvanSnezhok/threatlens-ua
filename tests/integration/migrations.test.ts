@@ -24,7 +24,8 @@ const MIGRATION_FILES = [
   '020_shadow_classifications.sql',
   '021_source_trust.sql',
   '022_publication_runtime.sql',
-  '023_deployment_and_backfill.sql'
+  '023_deployment_and_backfill.sql',
+  '024_settlement_catalogue_gaps.sql'
 ];
 
 describe.skipIf(!integrationDatabaseAvailable)('migration runner against live PostgreSQL', () => {

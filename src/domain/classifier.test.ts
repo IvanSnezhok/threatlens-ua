@@ -776,3 +776,187 @@ describe('classifyMessage on v3 vocabulary', () => {
     });
   });
 });
+
+// ------------------------------------------------------------------------------------------------
+// v4 location resolution
+// ------------------------------------------------------------------------------------------------
+//
+// One test per defect the v3 measurement found, and each one is a pair: the message that must stop
+// resolving the wrong place, and a message naming the place it was being confused with, which must
+// still resolve. A rule that fixes the first by breaking the second has fixed nothing.
+//
+// The catalogue below is the real one, trimmed to the rows these messages can reach, with the
+// `type`, `geocoded` and `oblastId` columns `listLocationLexemes` reads. Ids and KATOTTG codes are
+// the production ones so a failure here names a row a reviewer can look up.
+
+describe('classifyMessage on Ukrainian place-name morphology (v4)', () => {
+  const catalogue = [
+    { id: 'ua-12', name: 'Дніпропетровська область', aliases: ['дніпропетровщина'], type: 'oblast', geocoded: true },
+    { id: 'ua-32', name: 'Київська область', aliases: ['київщина'], type: 'oblast', geocoded: true },
+    { id: 'ua-51', name: 'Одеська область', aliases: ['одещина'], type: 'oblast', geocoded: true },
+    { id: 'ua-59', name: 'Сумська область', aliases: ['сумщина'], type: 'oblast', geocoded: true },
+    { id: 'ua-63', name: 'Харківська область', aliases: ['харківщина'], type: 'oblast', geocoded: true },
+    { id: 'ua-74', name: 'Чернігівська область', aliases: ['чернігівщина'], type: 'oblast', geocoded: true },
+    { id: 'ua-23', name: 'Запорізька область', aliases: ['запорізька область'], type: 'oblast', geocoded: true },
+    { id: 'ua-80', name: 'Київ', aliases: ['київ', 'києва', 'троєщина', 'троя', 'жуляни'], type: 'special_city', geocoded: true },
+    { id: 'ua-city-dnipro', name: 'Дніпро', aliases: ['дніпро'], type: 'city', geocoded: true, oblastId: 'ua-12' },
+    { id: 'ua-city-zaporizhzhia', name: 'Запоріжжя', aliases: ['запоріжжя'], type: 'city', geocoded: true, oblastId: 'ua-23' },
+    { id: 'ua-city-kropyvnytskyi', name: 'Кропивницький', aliases: ['кропивницький'], type: 'city', geocoded: true, oblastId: 'ua-35' },
+    { id: 'ua-city-mykolaiv', name: 'Миколаїв', aliases: ['миколаїв'], type: 'city', geocoded: true, oblastId: 'ua-48' },
+    { id: 'raion-kropyvnytskyi', name: 'Кропивницький район', aliases: ['кропивницький', 'кропивницький район'], type: 'raion', oblastId: 'ua-35' },
+    { id: 'raion-brovary', name: 'Броварський район', aliases: ['броварський', 'броварський район'], type: 'raion', oblastId: 'ua-32' },
+    { id: 'raion-boryspil', name: 'Бориспільський район', aliases: ['бориспільський'], type: 'raion', oblastId: 'ua-32' },
+    { id: 'city-obukhiv', name: 'Обухів', aliases: ['обухів'], type: 'city', oblastId: 'ua-32' },
+    { id: 'city-obukhivka', name: 'Обухівка', aliases: ['обухівка'], type: 'city', oblastId: 'ua-12' },
+    { id: 'city-bar', name: 'Бар', aliases: ['бар'], type: 'city', oblastId: 'ua-05' },
+    { id: 'city-berezne', name: 'Березне', aliases: ['березне'], type: 'city', oblastId: 'ua-56' },
+    { id: 'city-samar', name: 'Самар', aliases: ['самар'], type: 'city', oblastId: 'ua-12' },
+    { id: 'city-fastiv', name: 'Фастів', aliases: ['фастів'], type: 'city', oblastId: 'ua-32' },
+    { id: 'city-brovary', name: 'Бровари', aliases: ['бровари'], type: 'city', oblastId: 'ua-32' },
+    { id: 'city-pivdenne-odesa', name: 'Південне', aliases: ['південне'], type: 'city', oblastId: 'ua-51' },
+    { id: 'city-pivdenne-kharkiv', name: 'Південне', aliases: ['південне'], type: 'city', oblastId: 'ua-63' },
+    { id: 'city-horodok-lviv', name: 'Городок', aliases: ['городок'], type: 'city', oblastId: 'ua-46' },
+    { id: 'city-horodok-khmeln', name: 'Городок', aliases: ['городок'], type: 'city', oblastId: 'ua-68' },
+    { id: 'city-mykolaiv-lviv', name: 'Миколаїв', aliases: ['миколаїв'], type: 'city', oblastId: 'ua-46' },
+    { id: 'city-zgurivka', name: 'Згурівка', aliases: ['згурівка'], type: 'city', oblastId: 'ua-32' },
+    { id: 'city-dymerka', name: 'Велика Димерка', aliases: ['велика димерка'], type: 'city', oblastId: 'ua-32' },
+    { id: 'city-zazymia', name: 'Зазим’я', aliases: ['зазим’я'], type: 'city', oblastId: 'ua-32' },
+    { id: 'city-pohreby', name: 'Погреби', aliases: ['погреби'], type: 'city', oblastId: 'ua-32' },
+    { id: 'city-kozelets', name: 'Козелець', aliases: ['козелець'], type: 'city', oblastId: 'ua-74' },
+    { id: 'city-mala-divytsia', name: 'Мала Дівиця', aliases: ['мала дівиця'], type: 'city', oblastId: 'ua-74' },
+    { id: 'city-dihtiari', name: 'Дігтярі', aliases: ['дігтярі'], type: 'city', oblastId: 'ua-74' },
+    { id: 'city-khotin', name: 'Хотінь', aliases: ['хотінь'], type: 'city', oblastId: 'ua-59' },
+    { id: 'city-yunakivka', name: 'Юнаківка', aliases: ['юнаківка'], type: 'city', oblastId: 'ua-59' },
+    { id: 'city-mena', name: 'Мена', aliases: ['мена'], type: 'city', oblastId: 'ua-74' }
+  ];
+  const at = (text: string) => classifyMessage(text, catalogue).locations.map((location) => location.id).sort();
+
+  // ----------------------------------------------------------------------------------------------
+  // A. Wrong resolutions: v3 named a real settlement the message never mentioned.
+  // ----------------------------------------------------------------------------------------------
+
+  it('A1 does not read Обухів out of Обухівка, and still reads Обухів', () => {
+    expect(at('Дніпропетровщина: 6х БпЛА курсом на Обухівку')).toEqual(['city-obukhivka', 'ua-12']);
+    expect(at('БпЛА курсом на Обухів')).toEqual(['city-obukhiv']);
+    expect(at('Новий реактив у Обухова')).toEqual(['city-obukhiv']);
+  });
+
+  it('A2 does not read Бар out of Баришівка, and still reads Бар', () => {
+    expect(at('Реактивний БпЛА на Київщині повз Баришівку')).toEqual(['ua-32']);
+    expect(at('БпЛА на Бар')).toEqual(['city-bar']);
+  });
+
+  it('A3 does not read Березне out of Березна, and still reads Березне', () => {
+    expect(at('Чернігівщина - реактивний повз Березну на Козелець'))
+      .toEqual(['city-kozelets', 'ua-74']);
+    expect(at('БпЛА курсом на Березне')).toEqual(['city-berezne']);
+  });
+
+  it('A4 never reads a settlement out of a compass bearing', () => {
+    // Three shapes: the hyphenated adjective, the declined adjective and the bare noun. None of
+    // them is a place, and the second is a legal form of the neuter name Південне.
+    expect(at('БпЛА на півночі Чернігівщини, на південно-західний напрямок')).toEqual(['ua-74']);
+    expect(at('Реактивний БпЛА на Київщині, південним курсом')).toEqual(['ua-32']);
+    expect(at('БпЛА курсом на Дніпро з південного сходу')).toEqual(['ua-city-dnipro']);
+    // ...and the settlement is still reachable where the message spells it as the catalogue does
+    // and says which of the two it means.
+    expect(at('Одещина: реактив на Південне')).toEqual(['city-pivdenne-odesa', 'ua-51']);
+  });
+
+  it('A5 never reads the city out of an oblast adjective, however the oblast was spelled', () => {
+    // The v3 failure needed two spellings of the oblast in one message: the alias matched one of
+    // them, leaving the substring "київ" inside the other free for the city to claim.
+    expect(at('Київщина чисто. Реактив з Чернігівщини на північ Київщини')).toEqual(['ua-32', 'ua-74']);
+    expect(at('Реактивний БпЛА курсом на Київщину. Київщина - реактивний на Фастів'))
+      .toEqual(['city-fastiv', 'ua-32']);
+    expect(at('Шахед над Харківською областю')).toEqual(['ua-63']);
+    // Both are named when both were named.
+    expect(at('Загроза балістики по м.Київ, Київській області, зокрема м.Бровари'))
+      .toEqual(['city-brovary', 'ua-32', 'ua-80']);
+  });
+
+  it('A6 does not read Самар out of Самарський, and keeps the city the message did name', () => {
+    expect(at('Розвідувальний БпЛА в Самарському р-ні Дніпра')).toEqual(['ua-city-dnipro']);
+  });
+
+  // ----------------------------------------------------------------------------------------------
+  // B. Inflections v3 could not resolve at all.
+  // ----------------------------------------------------------------------------------------------
+
+  it('B1 resolves the instrumental "Києвом"', () => {
+    expect(at('5 балістик над Києвом!')).toEqual(['ua-80']);
+  });
+
+  it('B2 resolves "Кропивницьким" as the city, and the raion only with its head noun', () => {
+    // The precedence rule for a masculine administrative adjective, both ways round.
+    expect(at('БпЛА над Кропивницьким')).toEqual(['ua-city-kropyvnytskyi']);
+    expect(at('БпЛА у Кропивницькому районі')).toEqual(['raion-kropyvnytskyi']);
+  });
+
+  it('B3 resolves the genitive "Фастова"', () => {
+    expect(at('Київщина - реактивний керований на Фастова')).toEqual(['city-fastiv', 'ua-32']);
+  });
+
+  it('B4 resolves both oblasts of a coordinated pair, and a longer list too', () => {
+    expect(at('2х реактива по межі Київської та Чернігівської областей')).toEqual(['ua-32', 'ua-74']);
+    expect(at('БпЛА у Київській, Чернігівській та Сумській областях')).toEqual(['ua-32', 'ua-59', 'ua-74']);
+    expect(at('Шахед у Броварському та Бориспільському районах')).toEqual(['raion-boryspil', 'raion-brovary']);
+  });
+
+  // ----------------------------------------------------------------------------------------------
+  // C. The dual alias: Запоріжжя is the city, Запорізька область is the oblast.
+  // ----------------------------------------------------------------------------------------------
+
+  it('C reads a bare Запоріжжя as the city and the adjective as the oblast', () => {
+    expect(at('КАБи на Запоріжжі')).toEqual(['ua-city-zaporizhzhia']);
+    expect(at('БпЛА курсом на Запоріжжя з півдня')).toEqual(['ua-city-zaporizhzhia']);
+    expect(at('Шахед на Запорізьку область')).toEqual(['ua-23']);
+  });
+
+  // ----------------------------------------------------------------------------------------------
+  // D. The settlements migration 024 adds.
+  // ----------------------------------------------------------------------------------------------
+
+  it('D resolves the settlements the catalogue used to lack', () => {
+    expect(at('Пара реактивних на Згурівку')).toEqual(['city-zgurivka']);
+    expect(at('Курс на н.п. Дігтярі та Мала Дівиця!')).toEqual(['city-dihtiari', 'city-mala-divytsia']);
+    expect(at('Бомба у напрямку Юнаківки/Хотіні')).toEqual(['city-khotin', 'city-yunakivka']);
+    expect(at('БпЛА у напрямку Зазим’є Велика Димерка')).toEqual(['city-dymerka', 'city-zazymia']);
+    expect(at('Погреби - Троя рух БПЛА')).toEqual(['city-pohreby', 'ua-80']);
+    expect(at('Жуляни 2 балістики падають!!')).toEqual(['ua-80']);
+  });
+
+  // ----------------------------------------------------------------------------------------------
+  // The rules that keep the additions honest.
+  // ----------------------------------------------------------------------------------------------
+
+  it('refuses a name two catalogue rows spell the same way', () => {
+    // Two Городок, in two oblasts the message does not name. Publishing either is a coin toss with
+    // somebody's air-raid warning, so neither is published.
+    expect(at('Шахед над Городком')).toEqual([]);
+    expect(at('Реактивний на Південне')).toEqual([]);
+  });
+
+  it('lets the message break the tie by naming the oblast', () => {
+    expect(at('Одещина: реактив на Південне')).toEqual(['city-pivdenne-odesa', 'ua-51']);
+    expect(at('Харківщина: реактив на Південне')).toEqual(['city-pivdenne-kharkiv', 'ua-63']);
+  });
+
+  it('breaks a tie towards the seeded first-order settlement', () => {
+    // Миколаїв the oblast capital and Миколаїв the town in Lviv oblast. Only the first is geocoded.
+    expect(at('Шахед на Миколаїв')).toEqual(['ua-city-mykolaiv']);
+  });
+
+  it('never reads a place out of an ordinary word a paradigm happens to reach', () => {
+    expect(at('Троє БпЛА над Києвом')).toEqual(['ua-80']);
+    expect(at('Мені здається, там БпЛА над Києвом')).toEqual(['ua-80']);
+    // ...while the town itself, spelled as the catalogue spells it, still resolves.
+    expect(at('Чернігівщина - реактивний Козелець - 2 реактивних Мена'))
+      .toEqual(['city-kozelets', 'city-mena', 'ua-74']);
+  });
+
+  it('lets a longer name take the text a shorter one sits inside', () => {
+    expect(at('БпЛА курсом на Велику Димерку')).toEqual(['city-dymerka']);
+    expect(at('Шахед на Київщину та в місто Київ')).toEqual(['ua-32', 'ua-80']);
+  });
+});
