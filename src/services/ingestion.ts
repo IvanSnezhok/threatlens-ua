@@ -9,6 +9,9 @@ import {
   applyDeEscalation, ingestThreat, listLocationLexemes, recordClassification,
   type ClassificationLogEntry
 } from '../repositories/events.js';
+import {
+  AERIAL_MIRROR_SOURCE_ID, AERIAL_MIRROR_USER_AGENT, parseAerialMirrorPayload, toAlarmSnapshotBody
+} from '../sources/aerial-mirror.js';
 import type { NormalizedMessage } from '../types.js';
 import { markSourceError, markSourceSuccess } from './operations.js';
 // One-way import, on purpose: the observations are ops instrumentation and this file stays free of
@@ -156,6 +159,28 @@ function normalizeForCatalogue(name: string): string {
     .replace(/^(м\.|місто|обл\.|область)\s*/u, '').replace(/\s+(обл\.|область)$/u, '').trim();
 }
 
+/**
+ * The normalized spellings to try for one candidate, most literal first.
+ *
+ * `normalizeForCatalogue` strips the «область» affix, which is what lets «Київська обл.» find
+ * «Київська область». Stripping it *before* the query is also how three oblasts used to resolve to
+ * the wrong row: the catalogue gives the occupied oblast capitals their declined forms as aliases —
+ * `донецька` on Донецьк, `луганська` on Луганськ, `івано-франківська` on Івано-Франківськ — and once
+ * «Донецька область» has been cut down to `донецька` that alias is an EXACT hit at rank 1, while the
+ * oblast it actually names is only a rank 2 prefix hit. `pickLocationMatch` prefers the better rank,
+ * as it should, and answered Донецьк. Донеччина and Луганщина are under alert almost permanently, so
+ * this was not a rare edge: it was two of the loudest rows in every snapshot landing on a city.
+ *
+ * The fix is to ask the literal question first. The unstripped spelling matches the oblast's own
+ * `name_uk` at rank 0 and wins outright; only when nothing matches it does the stripped form run and
+ * behave exactly as it did before. Names with no affix to strip — every raion the alert channel
+ * publishes — produce one form, so the extra query is paid only where the two spellings differ.
+ */
+function catalogueLookupForms(candidate: string): string[] {
+  const literal = candidate.toLocaleLowerCase('uk-UA').replace(/['‘’ʼ`´]/gu, '').trim();
+  return [...new Set([literal, normalizeForCatalogue(candidate)])].filter(Boolean);
+}
+
 export interface LocationQuery {
   locationKey?: string;
   locationName: string;
@@ -170,13 +195,13 @@ async function resolveLocationId(query: LocationQuery): Promise<string | null> {
   }
   if (!query.locationName) return null;
   for (const candidate of locationNameCandidates(query.locationName)) {
-    const normalized = normalizeForCatalogue(candidate);
-    if (!normalized) continue;
-    const rows = await pool.query<LocationCandidate>(
-      LOCATION_MATCH_SQL, [normalized, escapeLikePattern(normalized), APOSTROPHE_CHARACTERS]
-    );
-    const matched = pickLocationMatch(rows.rows);
-    if (matched) return matched;
+    for (const normalized of catalogueLookupForms(candidate)) {
+      const rows = await pool.query<LocationCandidate>(
+        LOCATION_MATCH_SQL, [normalized, escapeLikePattern(normalized), APOSTROPHE_CHARACTERS]
+      );
+      const matched = pickLocationMatch(rows.rows);
+      if (matched) return matched;
+    }
   }
   return null;
 }
@@ -388,6 +413,66 @@ export async function syncAlertsInUa(log?: { warn: Function }): Promise<void> {
   } catch (error) {
     await markSourceError('alerts-in-ua', error);
     countChannelError('alerts-in-ua', 'collect');
+    throw error;
+  }
+}
+
+/**
+ * The community aerial-alert mirror — the one official-family snapshot source that needs no token.
+ *
+ * Structurally identical to the two adapters above: fetch, normalize, hand the whole national
+ * picture to `persistOfficialAlertSnapshot`, let the aggregate decide. One thing is different, and
+ * it is the reason this function exists rather than a third `config.*_URL` on the generic path.
+ *
+ * ## The mirror may not clear the map on the strength of a response we do not believe
+ *
+ * `persistOfficialAlertSnapshot` clears everything the source holds before re-raising what the
+ * response reports. For an API that answers "here is the country, right now" that is correct. For a
+ * third-party republication it is correct only while the republication is *live*, and a mirror has a
+ * failure mode the APIs do not: it can keep answering 200 with a well-formed body long after the
+ * process feeding it has stopped. Every region then reads `alertnow: false`, the snapshot is
+ * structurally perfect, and running it would publish «Офіційний відбій» for the entire country
+ * during an attack. That is the direction docs/ARCHITECTURE.md §Consistency rules calls
+ * unrecoverable.
+ *
+ * `parseAerialMirrorPayload` is therefore called BEFORE anything is persisted and throws on a
+ * `cachedat` older than `AERIAL_MIRROR_STALE_SECONDS`. The throw lands in the catch below, becomes
+ * `markSourceError`, and `alert_source_states` is never opened — so a frozen mirror holds its alerts
+ * instead of clearing them, and the operator sees an unhealthy source rather than a quiet map.
+ *
+ * The accepted cost of that choice, stated plainly because docs/OPERATIONS.md has to answer for it:
+ * a mirror that freezes while holding alerts holds them until it recovers. There is no sweeper for
+ * this source — `expireStuckAlertChannelAlerts` is scoped to `mtproto_alert_channel` rows — so an
+ * over-warning map is the deliberate failure direction, and releasing a permanently dead mirror's
+ * holds is a documented operator action.
+ *
+ * What this cannot catch: a mirror serving stale *alert state* under a fresh `cachedat`. Nothing in
+ * the payload distinguishes that from a genuinely quiet country, and the debounce plus the two-source
+ * aggregate are the only defences left. It is the strongest argument for not running the mirror as
+ * the sole alert source.
+ */
+export async function syncAerialMirror(log?: { warn: Function }): Promise<void> {
+  if (!config.AERIAL_MIRROR_ENABLED) return;
+  try {
+    const response = await fetch(config.AERIAL_MIRROR_URL, {
+      headers: { Accept: 'application/json', 'User-Agent': AERIAL_MIRROR_USER_AGENT },
+      signal: AbortSignal.timeout(10_000)
+    });
+    // 429 included: the published limit is two requests per second per host and the scheduler polls
+    // every fifteen, so a 429 means something else is sharing the egress IP — a source error, not a
+    // reason to touch alert state.
+    if (!response.ok) throw new Error(`Aerial alert mirror ${response.status}`);
+    const snapshot = parseAerialMirrorPayload(
+      await response.json(), new Date(), config.AERIAL_MIRROR_STALE_SECONDS
+    );
+    const persisted = await persistOfficialAlertSnapshot(
+      AERIAL_MIRROR_SOURCE_ID, toAlarmSnapshotBody(snapshot)
+    );
+    await markSourceSuccess(AERIAL_MIRROR_SOURCE_ID);
+    recordUnresolvedLocations(AERIAL_MIRROR_SOURCE_ID, persisted.unresolved, log);
+  } catch (error) {
+    await markSourceError(AERIAL_MIRROR_SOURCE_ID, error);
+    countChannelError(AERIAL_MIRROR_SOURCE_ID, 'collect');
     throw error;
   }
 }
@@ -1195,6 +1280,11 @@ export function startIngestionScheduler(log: { info: Function; warn: Function; e
       // is lost by not rethrowing.
       const results = await Promise.allSettled([
         syncOfficialAlerts(log), syncAlertsInUa(log),
+        // Same fifteen-second cadence and the same overlap guard as the two token APIs, for the same
+        // reason: it is a snapshot source, and two snapshots interleaving their writes can reconcile
+        // from a half-applied picture. The published rate limit is two requests per second per host,
+        // so fifteen seconds is three orders of magnitude inside it.
+        syncAerialMirror(log),
         // The channel is pushed to, not polled; the only thing the scheduler owes it is the
         // maximum-duration backstop, which has to run whether or not any message arrives.
         expireStuckAlertChannelAlerts(log)

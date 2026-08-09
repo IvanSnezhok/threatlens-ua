@@ -44,7 +44,13 @@ async function importOnce(): Promise<CatalogImportSummary> {
 
 async function cleanup(): Promise<void> {
   await sql(`DELETE FROM locations WHERE id LIKE 'test-%'`);
-  await sql(`DELETE FROM locations WHERE id LIKE 'katottg-%'`);
+  // Тільки рядки, які створив імпорт ЦЬОГО тесту. Голе `LIKE 'katottg-%'` зносило й рядки,
+  // посіяні міграціями 024/026/027, — а ensureMigrated() на повторно використаній базі бачить
+  // міграції застосованими і не відновлює їх, тож наступний прогін падав у чужому файлі.
+  await sql(
+    `DELETE FROM locations WHERE id = ANY($1::text[])`,
+    [[RAION_CODE, HROMADA_CODE, CITY_CODE].map((code) => `katottg-${code.toLocaleLowerCase()}`)]
+  );
   await sql(`UPDATE locations SET official_code=NULL WHERE id='ua-23'`);
 }
 
@@ -106,7 +112,9 @@ describe.skipIf(!integrationDatabaseAvailable)('KATOTTG raion import against liv
   it('is idempotent: the second import writes the same rows and moves nothing', async () => {
     expect(first).toEqual({ raions: 1, cities: 1, reparentedCities: 1 });
     expect(second).toEqual({ raions: 1, cities: 1, reparentedCities: 0 });
-    expect(await count('locations', `type='raion'`)).toBe(1);
+    // Лише рядок, який створив цей імпорт: у каталозі є й міграційно посіяні райони (026),
+    // і рахувати їх тут означало б знову вимагати їх знесення перед прогоном.
+    expect(await count('locations', `type='raion' AND id='${RAION_ID}'`)).toBe(1);
     const sync = await sql<{ imported_rows: number; status: string }>(
       `SELECT imported_rows,status FROM reference_dataset_syncs WHERE dataset_id='katottg'`
     );

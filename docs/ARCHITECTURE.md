@@ -102,6 +102,64 @@ than agreement between an official source and an OSINT group. Where two rows are
 speaking twice — an administration and the personal channel of the person who heads it — they share
 a group so a repost cannot corroborate itself.
 
+### The community mirror
+
+One official-family source is neither an API with a contract nor a body with a mandate:
+[ubilling.net.ua/aerialalerts](https://ubilling.net.ua/aerialalerts/), registered by
+`migrations/027_aerial_alert_mirror.sql` as `aerial-alerts-mirror` and polled on the same
+fifteen-second snapshot path as the two APIs. It republishes the same executive-authority air-raid
+state at oblast granularity — twenty-four oblasts and Kyiv city, no Crimea or Sevastopol row — for
+free, with no key and no application. It exists in the catalogue because it is the only HTTPS alert
+source this deployment can read while both API applications are pending, and it is registered
+`enabled=true` because a source that carries the live picture and is switched off carries nothing.
+
+It is where **designation, not transport** stops being comfortable. The state it carries is the
+authorities' own declaration; the publisher relaying it has no mandate at all. The row follows the
+state — `tier='A'`, `official=true` — because its only function is to move official alert periods,
+and a row wired into the snapshot reconciler but labelled Tier B would misdescribe what the system
+does with it. The contrary reading is recorded in the migration header rather than argued away, and
+the columns are inert on this path: the reconciler is keyed on `source_id` and reads neither.
+**The catalogue decision is the product owner's**, who asked for the source.
+
+Two caveats travel with it, and both are stronger than the national channel's:
+
+- **Corroboration with it is worth almost nothing.** `?source=default` is an aggregator over five
+  upstreams — `skog`, `klimenko`, `jaam`, `aiu`, `ual` — serving whichever is most current, and the
+  last two *are* Alerts.in.ua and Ukraine Alarm. On any given poll this row may be one of the other
+  two API rows wearing a different hat. Hence `independence_group='community-alert-mirror'`, shared
+  with nothing: the group is not a claim of independence, it is a refusal to pool the mirror with
+  `official-civil-alerts` and let one upstream corroborate itself. Agreement between the mirror and
+  an OSINT group still means something; agreement between the mirror and the APIs may be one fact
+  counted twice.
+- **Its operator disclaims it.** "Do not perceive this API as absolutely reliable … use official
+  sources of information."
+
+#### The stale-freeze rule
+
+A snapshot source is authoritative about what it *stops* reporting — that is what makes the
+reconciler able to clear a location. A mirror has a failure mode the APIs do not: it can keep
+answering `200` with a structurally perfect body long after the process feeding it has died. Every
+region then reads `alertnow: false`, and running that snapshot publishes «Офіційний відбій» for the
+entire country during an attack — the direction §Consistency rules calls unrecoverable.
+
+So freshness is checked **before** anything is persisted. The feed stamps every response with its own
+`cachedat`; past `AERIAL_MIRROR_STALE_SECONDS` (300 by default) the poll is refused, becomes
+`markSourceError`, and `alert_source_states` is never opened. A frozen mirror therefore **holds** its
+alerts rather than clearing them, and the operator sees an unhealthy source instead of a quiet map.
+The same refusal covers a missing, unreadable or *future* `cachedat` — the feed prints bare
+Europe/Kyiv wall clocks with no zone, so a naive parse in a UTC container reads every stamp three
+hours into the future and would make the staleness test unfailable.
+
+Two consequences are deliberate and are the operator's to weigh, not the code's:
+
+- A mirror that freezes while holding alerts holds them until it recovers. There is no sweeper —
+  `expireStuckAlertChannelAlerts` is scoped to `mtproto_alert_channel` rows — so over-warning is the
+  chosen failure direction and releasing a permanently dead mirror's holds is a documented manual
+  action in [`docs/OPERATIONS.md`](OPERATIONS.md).
+- Nothing detects stale *alert state* served under a fresh `cachedat`. It is indistinguishable from a
+  genuinely quiet country, and the end-debounce plus the two-source aggregate are the only defences
+  left. It is the strongest argument for not running the mirror as the sole alert source.
+
 ### Event-driven official alert source
 
 The APIs return the complete national picture on every poll, so their reconciler is a snapshot: it

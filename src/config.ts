@@ -17,6 +17,32 @@ const envSchema = z.object({
   UKRAINE_ALARM_API_URL: z.string().url().default('https://api.ukrainealarm.com/api/v3/alerts'),
   ALERTS_IN_UA_TOKEN: z.string().default(''),
   ALERTS_IN_UA_URL: z.string().url().default('https://api.alerts.in.ua/v1/alerts/active.json'),
+
+  // ---- Community aerial-alert mirror ------------------------------------------------------------
+  // The tokenless third-party republication of the same alert state the two APIs above serve, and
+  // the only one of the three that needs no written application. Registered by
+  // `migrations/027_aerial_alert_mirror.sql`; see docs/ARCHITECTURE.md for why it carries its own
+  // independence group.
+  //
+  // Default ON, unlike every other credentialed source, because there is no credential to withhold:
+  // the deployment-level kill switch is the only "off" this source has, exactly as
+  // ALERT_CHANNEL_ENABLED is for the alert channels. It must keep working without database access,
+  // which is why it is here and not a `sources.enabled` flip.
+  AERIAL_MIRROR_ENABLED: z.string().default('true').transform((value) => value === 'true'),
+  AERIAL_MIRROR_URL: z.string().url().default('https://ubilling.net.ua/aerialalerts/'),
+  // How old the mirror's own `cachedat` stamp may be before a poll is refused outright.
+  //
+  // The bound is a safety device, not a tuning knob. Past it the response is treated as a source
+  // ERROR and nothing is written, so the alerts the mirror is holding stay on the map; the failure
+  // it exists to prevent is a frozen mirror serving `alertnow: false` for the whole country and the
+  // snapshot reconciler dutifully clearing it. Measured behaviour: the feed regenerates on demand
+  // behind a three-second cache, and across thirteen consecutive fifteen-second polls `cachedat` was
+  // never more than two seconds behind the request. 300s is therefore roughly a hundred times the
+  // observed lag — wide enough that ordinary upstream churn cannot trip it, narrow enough that a
+  // genuine freeze is caught inside five minutes. The floor is one minute: below that the mirror's
+  // own cache and a slow upstream switch would start reading as an outage.
+  AERIAL_MIRROR_STALE_SECONDS: z.coerce.number().int()
+    .min(60, 'Aerial mirror staleness bound must be at least a minute').default(300),
   DEMO_SOURCE_ENABLED: z.string().default('true').transform((v) => v === 'true'),
   AI_BASE_URL: z.string().default(''),
   AI_API_KEY: z.string().default(''),

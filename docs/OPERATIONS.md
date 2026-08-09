@@ -588,6 +588,54 @@ Production backups must additionally be encrypted and copied to independent obje
   Lowering `ALERT_END_DEBOUNCE_SECONDS` does not help in this scenario — with no polls, nothing
   re-evaluates. If *every* official source is down the site is in its documented degraded state and
   the alert layer must be presented as stale, not as current.
+- **Community aerial mirror stale or down (`aerial-alerts-mirror` shows `error`).** Read
+  `last_error` first, because the two failures need opposite reactions:
+
+  ```bash
+  docker compose exec -T postgres psql -U threatlens -d threatlens -c "
+    SELECT health_status, last_success_at, last_error_at, last_error
+    FROM sources WHERE id='aerial-alerts-mirror'"
+  ```
+
+  - `aerial mirror is stale: cachedat … is N s old` — **the safety gate fired and it did its job.**
+    The mirror answered, but its own cache stamp says the process feeding it has stopped. The poll was
+    refused *before* anything was written, so the alerts this source was holding are still held and
+    nothing was cleared. That is the designed outcome: a frozen mirror serving `alertnow: false` for
+    all twenty-five regions would otherwise publish «Офіційний відбій» for the whole country. Do not
+    "fix" it by raising `AERIAL_MIRROR_STALE_SECONDS` — that only widens the window in which a dead
+    mirror is believed.
+  - `Aerial alert mirror 429` / `5xx` / a fetch timeout — transport, not freshness. 429 is unexpected:
+    the published limit is two requests per second per host and we poll every fifteen, so a 429 means
+    the egress IP is shared with something else that is hammering the endpoint.
+  - ``carries no `states` object`` / `no readable regions` — a truncated or reshaped body. If it
+    persists, the feed's schema has changed and the adapter needs updating; the source stays in
+    `error` and holds its alerts until it does.
+
+  Check the feed by hand before doing anything else — one request, not a loop:
+
+  ```bash
+  curl -s https://ubilling.net.ua/aerialalerts/ | head -c 200   # `cachedat` should be within seconds of now, in Kyiv local time
+  ```
+
+  Recovery, in order:
+
+  1. **Wait, if anything else still polls.** The mirror self-heals: the first fresh response
+     reconciles every region through the normal path and the map corrects itself.
+  2. **If it will be down for a long time**, treat it exactly like any other frozen holder — the
+     «Provider died completely» procedure above applies unchanged, including its `UPDATE
+     alert_source_states … missing_since=now()-interval '1 hour'` step with
+     `source_id='aerial-alerts-mirror'`. Note the caveat stated there: that step only takes effect
+     when some source still polls those locations, so if the mirror is the *only* live alert source
+     the alerts stay up until it returns. Over-warning is the deliberate failure direction here.
+  3. **To switch it off**, set `AERIAL_MIRROR_ENABLED=false` and redeploy. This stops the source being
+     **read**; it does **not** withdraw what it was holding — there is no sweeper for this adapter
+     type (`expireStuckAlertChannelAlerts` covers `mtproto_alert_channel` rows only). If you want the
+     holds released as well, run step 2 in the same maintenance window, before or after the redeploy.
+
+  One more signal worth watching: a `provider locations could not be mapped to the local location
+  catalogue` warning naming this source means the feed has relabelled or added a region. It is a
+  catalogue gap, not an outage — the rest of the snapshot still applied and the source stays healthy —
+  but that region's alerts are invisible until an alias is added.
 - **Stuck alert on the official channel source (`threatlens_alert_channel_stuck_alerts_total > 0`).**
   The channel is event-driven: an alert ends only when a 🟢 message names its location. If such a
   message is never published, is edited away, or arrives in a shape the parser refuses, the location

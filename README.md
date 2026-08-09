@@ -188,6 +188,9 @@ Prerequisites and boundaries, in full in `docs/OPERATIONS.md`:
 | What | Why |
 |---|---|
 | `UKRAINE_ALARM_API_TOKEN` / `ALERTS_IN_UA_TOKEN` | A second independent official source. Issued on written application; corroboration, not a prerequisite. |
+| `AERIAL_MIRROR_ENABLED=false` | Stop reading the community aerial-alert mirror. **On by default** — it is the only HTTP alert source that needs no token, so it is what carries live oblast-level alerts while the API applications above are pending. Turning it off stops the source being read; it does not withdraw alerts it was holding, see [`docs/OPERATIONS.md`](docs/OPERATIONS.md). |
+| `AERIAL_MIRROR_URL` | Default `https://ubilling.net.ua/aerialalerts/`. Point it at a different mirror only if the payload shape matches — `{cachedat, states:{"<Область>":{alertnow,changed}}}`. |
+| `AERIAL_MIRROR_STALE_SECONDS` | Default 300, floor 60. How old the mirror's own cache stamp may be before a poll is refused outright. This is the safety bound that stops a frozen mirror from clearing the map, not a tuning knob; raising it widens the window in which a dead mirror is believed. |
 | `AI_BASE_URL` / `AI_API_KEY` / `AI_MODEL` | Model-written risk explanations. The deterministic engine runs without it. |
 | `MAP_STYLE_URL` | Self-hosted basemap instead of the public one; see `data/map/README.md`. |
 | `OCCUPATION_SOURCE_ENABLED=false` | Turn off the occupied-territories layer. |
