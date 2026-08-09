@@ -19,6 +19,15 @@ import {
 
 interface Branch { oblast: string; raion: string; city: string }
 
+/**
+ * Live-режимний cutoff для locationTimeline. Не голий `new Date()`: фікстури пишуться з `now()`
+ * PostgreSQL, а на CI база живе в service-контейнері, чий годинник може бути на мить попереду
+ * годинника раннера — і щойно посіяний рядок опиняється «в майбутньому» відносно cutoff та зникає
+ * з вибірки. У продакшні ця пара не розʼїжджається: сервер передає cutoff, обчислений тим самим
+ * `now()` бази (publicationSlice), тож хвилина запасу тут компенсує лише міжконтейнерний skew CI.
+ */
+const liveCutoff = () => new Date(Date.now() + 60_000);
+
 async function seedBranch(name: string): Promise<Branch> {
   const branch: Branch = { oblast: `test-${name}-oblast`, raion: `test-${name}-raion`, city: `test-${name}-city` };
   await sql(
@@ -110,7 +119,7 @@ describe.skipIf(!integrationDatabaseAvailable)('location hierarchy', () => {
       const eventId = await seedThreatEvent({ locationIds: [branch.city] });
       const { locationTimeline } = await import('../../src/repositories/events.js');
 
-      const timeline = await locationTimeline(branch.oblast, new Date());
+      const timeline = await locationTimeline(branch.oblast, liveCutoff());
 
       expect(timeline!.counts.threats).toBe(1);
       expect(timeline!.items.map((item) => item.id)).toEqual([eventId]);
@@ -121,7 +130,7 @@ describe.skipIf(!integrationDatabaseAvailable)('location hierarchy', () => {
       const eventId = await seedThreatEvent({ locationIds: [branch.oblast] });
       const { locationTimeline } = await import('../../src/repositories/events.js');
 
-      const timeline = await locationTimeline(branch.city, new Date());
+      const timeline = await locationTimeline(branch.city, liveCutoff());
 
       expect(timeline!.counts.threats).toBe(1);
       expect(timeline!.items.map((item) => item.id)).toEqual([eventId]);
@@ -135,7 +144,7 @@ describe.skipIf(!integrationDatabaseAvailable)('location hierarchy', () => {
       const { locationTimeline } = await import('../../src/repositories/events.js');
 
       for (const anchor of [branch.oblast, branch.raion, branch.city]) {
-        expect((await locationTimeline(anchor, new Date()))!.counts.alerts).toBe(3);
+        expect((await locationTimeline(anchor, liveCutoff()))!.counts.alerts).toBe(3);
       }
     });
 
@@ -146,7 +155,7 @@ describe.skipIf(!integrationDatabaseAvailable)('location hierarchy', () => {
       await seedAlert(other.raion);
       const { locationTimeline } = await import('../../src/repositories/events.js');
 
-      const timeline = await locationTimeline(branch.oblast, new Date());
+      const timeline = await locationTimeline(branch.oblast, liveCutoff());
 
       expect(timeline!.counts).toMatchObject({ threats: 0, alerts: 0, assessments: 0 });
       expect(timeline!.items).toEqual([]);
@@ -158,14 +167,14 @@ describe.skipIf(!integrationDatabaseAvailable)('location hierarchy', () => {
       const eventId = await seedThreatEvent({ locationIds: [branch.city] });
       const { locationTimeline } = await import('../../src/repositories/events.js');
 
-      const timeline = await locationTimeline(branch.oblast, new Date());
+      const timeline = await locationTimeline(branch.oblast, liveCutoff());
 
       expect(timeline!.items.map((item) => item.id)).toEqual([eventId]);
     });
 
     it('still returns null for a location that is not in the catalogue', async () => {
       const { locationTimeline } = await import('../../src/repositories/events.js');
-      expect(await locationTimeline('test-does-not-exist', new Date())).toBeNull();
+      expect(await locationTimeline('test-does-not-exist', liveCutoff())).toBeNull();
     });
   });
 
