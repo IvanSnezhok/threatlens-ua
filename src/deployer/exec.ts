@@ -45,8 +45,6 @@ export type Exec = (step: ExecStep) => Promise<ExecResult>;
 export interface SpawnExecOptions {
   /** Ceiling on the retained tail of each stream. Older output is dropped, not buffered. */
   logTailBytes: number;
-  /** Literal secrets to strip from captured output before it can reach the journal. */
-  redact: readonly string[];
 }
 
 /** What a redacted secret is replaced by. Fixed text so a diff of two log tails stays readable. */
@@ -84,7 +82,14 @@ function tailBuffer(limit: number) {
 }
 
 /**
- * The production {@link Exec}: `spawn` with no shell, a hard timeout and a bounded, redacted tail.
+ * The production {@link Exec}: `spawn` with no shell, a hard timeout and a bounded RAW tail.
+ *
+ * The output is deliberately NOT redacted here. The first production check failed on exactly that:
+ * the Postgres password was a substring of the repository name, the redactor rewrote the origin URL
+ * that `git remote get-url` printed, and the runner compared the mangled string against its
+ * configuration — a permanent, baffling `remote_mismatch` on a perfectly configured host. Command
+ * output feeds COMPARISONS first and the journal second, so secrets are stripped at the journal
+ * boundary (`openRunJournal` / `writeDeploymentState`), never at capture.
  *
  * The timeout kills with SIGKILL rather than SIGTERM. `docker compose build` spawns a tree of
  * BuildKit processes; a polite signal to the parent leaves the build running and the runner waiting
@@ -93,7 +98,6 @@ function tailBuffer(limit: number) {
  */
 export function spawnExec(options: SpawnExecOptions): Exec {
   const limit = Math.max(256, options.logTailBytes);
-  const redact = [...options.redact];
   return (step) => new Promise<ExecResult>((settle) => {
     const stdout = tailBuffer(limit);
     const stderr = tailBuffer(limit);
@@ -105,8 +109,8 @@ export function spawnExec(options: SpawnExecOptions): Exec {
       clearTimeout(timer);
       settle({
         code,
-        stdout: redactSecrets(stdout.read(), redact),
-        stderr: redactSecrets(stderr.read(), redact),
+        stdout: stdout.read(),
+        stderr: stderr.read(),
         timedOut
       });
     };

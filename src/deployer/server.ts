@@ -39,6 +39,8 @@ export interface DeployServerDeps {
   probe: ReadyProbe;
   runnerId: string;
   log: RunnerLogger;
+  /** Секрети процесу; вирізаються з кожного вільнотекстового поля журналу при записі. */
+  redact?: readonly string[];
   /** Injected only by tests; production always runs the real scenario. */
   run?: typeof runDeployment;
   now?: () => number;
@@ -137,7 +139,8 @@ export function createHttpProbe(config: DeployerConfig): ReadyProbe {
  * it. `ls-remote` is one HTTPS request that touches nothing.
  */
 export async function runRemoteCheck(
-  exec: Exec, config: DeployerConfig, pool: pg.Pool, runnerId: string
+  exec: Exec, config: DeployerConfig, pool: pg.Pool, runnerId: string,
+  redact: readonly string[] = []
 ): Promise<void> {
   const repo = config.DEPLOY_REPO_PATH;
   const git = (args: string[]) =>
@@ -156,7 +159,7 @@ export async function runRemoteCheck(
       lastCheckOk: false,
       lastCheckError: `origin is «${originUrl}», not the configured «${config.DEPLOY_REPO_URL}»`,
       runnerVersion: runnerId
-    });
+    }, redact);
     return;
   }
 
@@ -172,7 +175,7 @@ export async function runRemoteCheck(
     // The tail of stderr, not the whole of it: this string is rendered on the ops card.
     lastCheckError: ok ? null : (lsRemote.stderr.trim().slice(-500) || 'git ls-remote failed'),
     runnerVersion: runnerId
-  });
+  }, redact);
 }
 
 export interface DeployServer {
@@ -183,7 +186,7 @@ export interface DeployServer {
 }
 
 export function createDeployServer(deps: DeployServerDeps): DeployServer {
-  const { config, pool, exec, probe, runnerId, log } = deps;
+  const { config, pool, exec, probe, runnerId, log, redact = [] } = deps;
   const run = deps.run ?? runDeployment;
   const now = deps.now ?? Date.now;
   const settings = settingsOf(config);
@@ -259,7 +262,7 @@ export function createDeployServer(deps: DeployServerDeps): DeployServer {
     inFlight = (async () => {
       try {
         const result = await run({
-          journal: openRunJournal(pool, runId),
+          journal: openRunJournal(pool, runId, redact),
           exec,
           probe,
           migrations: { applied: () => appliedMigrations(pool) },
@@ -291,7 +294,7 @@ export function createDeployServer(deps: DeployServerDeps): DeployServer {
         const path = (request.url ?? '/').split('?')[0];
         if (request.method === 'GET' && path === '/status') return json(response, 200, status());
         if (request.method === 'POST' && path === '/check') {
-          await runRemoteCheck(exec, config, pool, runnerId);
+          await runRemoteCheck(exec, config, pool, runnerId, redact);
           return json(response, 200, { checked: true });
         }
         if (request.method === 'POST' && path === '/deploy') {

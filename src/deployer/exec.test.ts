@@ -17,7 +17,7 @@ import { REDACTED, fakeExec, redactSecrets, spawnExec, type ExecStep } from './e
 const GIT_TIMEOUT = 15_000;
 
 describe('spawnExec', () => {
-  const exec = spawnExec({ logTailBytes: 8192, redact: [] });
+  const exec = spawnExec({ logTailBytes: 8192 });
 
   it('passes shell metacharacters to the child as literal bytes', async () => {
     const result = await exec({
@@ -59,21 +59,22 @@ describe('spawnExec', () => {
     expect(result.stderr).toContain('threatlens-no-such-binary');
   });
 
-  it('strips the configured secrets out of captured output', async () => {
-    const secret = 'runner-token-0123456789abcdef0123456789';
-    const redacting = spawnExec({ logTailBytes: 8192, redact: [secret] });
-    const result = await redacting({
-      command: 'git', args: ['rev-parse', '--sq-quote', secret], timeoutMs: GIT_TIMEOUT
+  it('returns RAW output even when a secret is a substring of legitimate text', async () => {
+    // Регресія бойового інциденту: пароль бази був підрядком назви репозиторію, редакція на рівні
+    // exec переписала origin-URL до порівняння, і runner назавжди відповідав remote_mismatch на
+    // правильно налаштованому хості. Порівняння мусять бачити сирі байти; редакція живе на межі
+    // журналу (openRunJournal / writeDeploymentState), і саме там її пінують тести журналу.
+    const url = 'https://github.com/IvanSnezhok/threatlens-ua.git';
+    const result = await exec({
+      command: 'git', args: ['rev-parse', '--sq-quote', url], timeoutMs: GIT_TIMEOUT
     });
-    // `deployment_runs.log_tail` is rendered verbatim on the ops page. A build log that echoed the
-    // runner token would publish it to everyone holding an ops password.
-    expect(result.stdout).not.toContain(secret);
-    expect(result.stdout).toContain(REDACTED);
+    expect(result.stdout).toContain(url);
+    expect(result.stdout).not.toContain(REDACTED);
   });
 
   it('keeps only the tail of an oversized stream', async () => {
     const long = 'x'.repeat(4000);
-    const bounded = spawnExec({ logTailBytes: 512, redact: [] });
+    const bounded = spawnExec({ logTailBytes: 512 });
     const result = await bounded({
       command: 'git', args: ['rev-parse', '--sq-quote', long], timeoutMs: GIT_TIMEOUT
     });

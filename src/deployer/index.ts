@@ -49,12 +49,12 @@ function databasePassword(url: string): string {
 const config = loadDeployerConfig();
 const runnerId = `${hostname()}/${process.pid}`;
 const pool = createDeployPool(config.DEPLOY_DATABASE_URL);
-const exec = spawnExec({
-  logTailBytes: config.DEPLOY_LOG_TAIL_BYTES,
-  // Both secrets this process holds. `spawnExec` strips them from every captured stream before the
-  // text can reach `deployment_runs.log_tail`, which is rendered verbatim on the ops page.
-  redact: [config.DEPLOY_RUNNER_TOKEN, databasePassword(config.DEPLOY_DATABASE_URL)]
-});
+const exec = spawnExec({ logTailBytes: config.DEPLOY_LOG_TAIL_BYTES });
+// Обидва секрети процесу. Вирізаються на межі ЖУРНАЛУ, а не при захопленні виводу: перший бойовий
+// check упав саме на редакції до порівняння — пароль бази виявився підрядком назви репозиторію,
+// редактор переписав origin-URL з git remote get-url, і runner порівнював спотворений рядок із
+// конфігурацією. Сирі байти — для порівнянь; редагований текст — для deployment_runs/log_tail.
+const redact = [config.DEPLOY_RUNNER_TOKEN, databasePassword(config.DEPLOY_DATABASE_URL)];
 
 const startupLock = await acquireDeployLock(pool);
 if (startupLock) {
@@ -79,7 +79,7 @@ deployServer.server.listen(config.DEPLOY_PORT, '0.0.0.0', () => {
 });
 
 const check = () => {
-  void runRemoteCheck(exec, config, pool, runnerId)
+  void runRemoteCheck(exec, config, pool, runnerId, redact)
     .catch((error) => logger.error({ error }, 'origin/main check failed'));
 };
 check();

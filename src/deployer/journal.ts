@@ -1,4 +1,5 @@
 import pg from 'pg';
+import { redactSecrets } from './exec.js';
 
 /**
  * The deployment journal: everything this package writes to and reads from PostgreSQL.
@@ -190,12 +191,21 @@ export async function createRun(pool: pg.Pool, input: CreateRunInput): Promise<n
   return Number(result.rows[0]!.id);
 }
 
-/** The PostgreSQL-backed {@link RunJournal} for one run. */
-export function openRunJournal(pool: pg.Pool, runId: number): RunJournal {
+/**
+ * The PostgreSQL-backed {@link RunJournal} for one run.
+ *
+ * `redact` strips the process's secrets from every free-text column at the moment of the write.
+ * This is THE redaction boundary: `spawnExec` hands back raw output because the runner compares it
+ * (the first production check died on a password that was a substring of the repository name), and
+ * only what lands in the journal is rendered on the ops page.
+ */
+export function openRunJournal(pool: pg.Pool, runId: number, redact: readonly string[] = []): RunJournal {
+  const clean = (text: string | null | undefined) =>
+    text === null || text === undefined ? null : redactSecrets(text, redact);
   const appendEvent = async (entry: RunEvent) => {
     await pool.query(
       `INSERT INTO deployment_run_events(run_id,stage,outcome,duration_ms,detail) VALUES ($1,$2,$3,$4,$5)`,
-      [runId, entry.stage, entry.outcome, entry.durationMs ?? null, entry.detail ?? null]
+      [runId, entry.stage, entry.outcome, entry.durationMs ?? null, clean(entry.detail)]
     );
   };
   return {
@@ -242,7 +252,7 @@ export function openRunJournal(pool: pg.Pool, runId: number): RunJournal {
                 error_code=$4, error_summary=$5, log_tail=$6
           WHERE id=$1`,
         [runId, outcome.status, outcome.stage, outcome.errorCode ?? null,
-          outcome.errorSummary ?? null, outcome.logTail ?? null]
+          clean(outcome.errorSummary), clean(outcome.logTail)]
       );
       await appendEvent({
         stage: outcome.stage,
@@ -276,15 +286,22 @@ export async function appliedMigrations(pool: pg.Pool): Promise<string[]> {
 }
 
 /** Upserts the singleton observation row. The row itself is seeded by migration 023. */
-export async function writeDeploymentState(pool: pg.Pool, state: DeploymentStateInput): Promise<void> {
+export async function writeDeploymentState(
+  pool: pg.Pool, state: DeploymentStateInput, redact: readonly string[] = []
+): Promise<void> {
   await pool.query(
     `UPDATE deployment_state SET
        remote_url=$1, remote_commit=$2, working_tree_commit=$3, working_tree_dirty=$4,
        last_checked_at=now(), last_check_ok=$5, last_check_error=$6, runner_version=$7, updated_at=now()
      WHERE singleton`,
     [
-      state.remoteUrl, state.remoteCommit, state.workingTreeCommit, state.workingTreeDirty,
-      state.lastCheckOk, state.lastCheckError, state.runnerVersion
+      // remote_url і текст помилки — єдині вільнотекстові поля рядка; редагування тут, а не при
+      // захопленні виводу, бо порівняння в runner мусять бачити сирі байти.
+      redactSecrets(state.remoteUrl ?? '', redact) || null, state.remoteCommit,
+      state.workingTreeCommit, state.workingTreeDirty,
+      state.lastCheckOk,
+      state.lastCheckError === null ? null : redactSecrets(state.lastCheckError, redact),
+      state.runnerVersion
     ]
   );
 }
