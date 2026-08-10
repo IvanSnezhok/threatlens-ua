@@ -131,13 +131,40 @@ const occupationColor = ['case', ['==',['get','status'],'occupied'], '#ff7a4d', 
 //   direction — повідомлено напрямок, але не прибуття: штрихова;
 //   sequence  — два різні повідомлення в різний час; порядок наш, рух не стверджував ніхто: крапкова.
 // Порядок у масиві збігається з порядком додавання шарів і, отже, з їхнім z-порядком.
-const vectorLayerIds = ['threat-vector-sequence','threat-vector-direction','threat-vector-transit','threat-vector-nodes','threat-vector-order'];
+const vectorLayerIds = ['threat-vector-sequence','threat-vector-direction','threat-vector-transit','threat-vector-nodes','threat-vector-order','threat-vector-arrowhead','threat-vector-class'];
 const vectorColor = '#ff7a4d';
 const vectorBasisLabels = {
   reported_transit: 'джерело повідомило сам рух',
   reported_direction: 'джерело повідомило напрямок',
   observation_sequence: 'послідовність окремих повідомлень'
 };
+
+// ВІСТРЯ = ЗАЯВА ПРО РУХ, і воно належить рівно тим двом рівням доказовості, де рух ствердило
+// джерело. Це найважливіше правило цього файлу після самої заборони екстраполяції:
+//
+//   reported_transit   — «Балістика повз Полтаву на Харків»: одне повідомлення назвало і те, що
+//                        минають, і те, до чого йдуть. Рух ствердив публікатор → суцільне вістря.
+//   reported_direction — «у напрямку Харкова»: джерело назвало курс, але не прибуття. Рух ствердило,
+//                        напрямок теж → вістря, але порожнє: контур замість заливки, бо прибуття
+//                        ніхто не обіцяв.
+//   observation_sequence — вістря НЕ ОТРИМУЄ НІКОЛИ. Порядок цих двох повідомлень наш, і стрілка
+//                        на ньому була б твердженням, якого не робило жодне джерело. Крапкова лінія
+//                        з номерами вузлів лишається єдиним, що показує послідовність.
+//
+// Відсутність ключа в цій таблиці — і є те правило. `vectorHeadCollection()` читає її, а не список
+// винятків, тож новий рівень доказовості за замовчуванням лишається без стрілки.
+const ARROW_BASIS_IMAGES = {
+  reported_transit: 'threat-vector-arrow-solid',
+  reported_direction: 'threat-vector-arrow-open'
+};
+const VECTOR_ARROW_PX = 16;        // CSS px — сторона бітмапа вістря
+// Фішка класу стоїть ПІД головою ланцюга. Зсув саме вертикальний, а не вбік: вістря повернуте за
+// курсом, і бічний зсув фішки то накривав би його, то відлітав від нього залежно від того курсу.
+// А вниз, а не вгору, тому що над вузлом уже стоїть його номер (threat-vector-order, text-offset
+// -1.3 em): фішка додається пізніше, тобто лежить вище, і зсунута вгору вона накрила б саме той
+// номер, яким читається порядок повідомлень. +30 px лишає просвіт і над вістрям, і під номером на
+// обох кінцях інтерполяції icon-size. Одиниці — пікселі, помножені на icon-size, як і в ICON_SLOT_OFFSETS.
+const VECTOR_CLASS_OFFSET = [0, 30];
 
 // Хороплет тривог. Заливка регіону, а не точка: офіційний канал оголошує тривогу на цілу територію,
 // а в районів у каталозі KATOTTG узагалі немає координат, тож точка для них неможлива в принципі.
@@ -779,6 +806,111 @@ function vectorNodeCollection() {
   return { type: 'FeatureCollection', features };
 }
 
+// Ордината веб-Меркатора в тих самих одиницях, у яких абсциса дорівнює довготі в радіанах.
+// Полюси в цій проєкції лежать у нескінченності, тож широта затиснута тим самим порогом
+// ±85.051129°, яким її затискає й сам MapLibre.
+function mercatorY(latitude) {
+  const clamped = Math.max(-85.051129, Math.min(85.051129, latitude));
+  return Math.log(Math.tan(Math.PI / 4 + (clamped * Math.PI / 180) / 2));
+}
+
+/**
+ * Курс відрізка в градусах за годинниковою стрілкою від півночі, 0 ⩽ кут < 360.
+ *
+ * Рахуємо саме в Меркаторі, а не по великому колу. MapLibre малює LineString прямою в проєкованих
+ * координатах, тобто на екрані відрізок має СТАЛИЙ кут, тоді як початковий курс ортодромії з ним не
+ * збігається: для відрізка строго на схід на широті 50° ортодромія дала б 89.6°, і вістря стояло б
+ * під помітним кутом до власної лінії. Тут же відрізок на схід — це рівно 90°, на північ — 0°.
+ *
+ * `null` для відрізка нульової довжини: два різні місця з однією координатою (наприклад, два
+ * центроїди, що збіглися) не мають напрямку, і стрілка з довільним кутом була б вигадкою.
+ */
+function segmentBearing(from, to) {
+  const dx = (((to[0] - from[0]) + 540) % 360) - 180;    // найкоротший бік, а не через антимеридіан
+  const dy = mercatorY(to[1]) - mercatorY(from[1]);
+  if (!dx && !dy) return null;
+  return ((Math.atan2(dx * Math.PI / 180, dy) * 180 / Math.PI) + 360) % 360;
+}
+
+// Тон фішки класу — те саме правило, що й у стеків територій (threatTone у
+// src/domain/territory-state.ts): офіційне або підтверджене → 'confirmed', решта → 'reported'.
+// 'consequence' і 'analytic' тут неможливі: ланцюг складено з тверджень про рух, а не з наслідків
+// на місці й не з аналітичної оцінки.
+function vectorClassTone(evidenceLevel) {
+  return evidenceLevel === 'official' || evidenceLevel === 'confirmed' ? 'confirmed' : 'reported';
+}
+
+/**
+ * Голови векторів: вістря на кінці кожного відрізка, рух у якому ствердило джерело, і рівно одна
+ * фішка класу на ланцюг.
+ *
+ * Одне джерело на два шари, як `threat-vector-segments` уже тримає три лінійні шари: кардинальність
+ * різна (вістер стільки, скільки стверджених відрізків; фішка одна), тож фічі розрізняє властивість
+ * `kind`, а не окреме джерело.
+ *
+ * Фішка одна на ланцюг і стоїть у найновішій намальованій точці. Клас уздовж ланцюга не міняється
+ * майже ніколи, і десять однакових фішок на десяти відрізках забрали б у карти оглядовий масштаб
+ * заради повторення однієї й тієї самої заяви.
+ *
+ * Лінії напрямку (`threat.geometry` типу LineString) отримують те саме вістря й ту саму фішку. Свого
+ * запиту для них не зʼявилося: `snapshot.threats[]` — це LiveEvent, у якого threatType і
+ * evidenceLevel уже лежать поруч із геометрією, тож серверу тут не додано нічого.
+ */
+function vectorHeadCollection() {
+  const features = [];
+  const arrow = (id, point, bearing, image, basis, label) => ({
+    type: 'Feature', id,
+    geometry: { type: 'Point', coordinates: point },
+    properties: { kind: 'arrow', arrow: image, bearing, basis, label }
+  });
+  // Текстового еквівалента фішка не несе, і це не пропуск: #map-aria описує СТАНИ ТЕРИТОРІЙ, а клас,
+  // що рухається, уже названо в картці події — у списку «Активні події», який лишається канонічною
+  // текстовою поверхнею, і в діалозі події рядком «Тип». Властивість aria тут лежала б мертвою й
+  // виглядала б як доступність, якої насправді немає.
+  const chip = (id, point, threatType, tone, label) => ({
+    type: 'Feature', id,
+    geometry: { type: 'Point', coordinates: point },
+    properties: { kind: 'class', icon: iconImageId(threatType, tone), label }
+  });
+
+  for (const vector of vectors) {
+    const drawable = (vector.segments ?? []).filter((segment) => segment.drawable);
+    for (const [order, segment] of (vector.segments ?? []).entries()) {
+      const image = ARROW_BASIS_IMAGES[segment.basis];
+      if (!image || !segment.drawable) continue;
+      const from = vector.nodes[segment.from];
+      const to = vector.nodes[segment.to];
+      if (!from?.coordinates || !to?.coordinates) continue;
+      const bearing = segmentBearing(from.coordinates, to.coordinates);
+      if (bearing === null) continue;
+      features.push(arrow(`va-${vector.eventId}-${order}`, to.coordinates, bearing, image,
+        segment.basis, `${from.name} → ${to.name}`));
+    }
+    const head = drawable[drawable.length - 1];
+    const point = head ? vector.nodes[head.to] : null;
+    if (!point?.coordinates) continue;
+    features.push(chip(`vc-${vector.eventId}`, point.coordinates,
+      head.threatType ?? vector.threatType ?? 'unknown', vectorClassTone(head.evidenceLevel),
+      point.name));
+  }
+
+  for (const threat of snapshot?.threats ?? []) {
+    const line = threat.geometry?.type === 'LineString' ? threat.geometry.coordinates ?? [] : [];
+    const end = line[line.length - 1];
+    const previous = line[line.length - 2];
+    if (!end || !previous) continue;
+    const bearing = segmentBearing(previous, end);
+    if (bearing === null) continue;
+    // Той самий рівень, що й у reported_direction ланцюга, і з тієї самої причини: геометрія події
+    // будується з relation_type='reported_direction', тобто джерело назвало курс, а не прибуття.
+    features.push(arrow(`da-${threat.id}`, end, bearing, ARROW_BASIS_IMAGES.reported_direction,
+      'reported_direction', threat.title));
+    features.push(chip(`dc-${threat.id}`, end, threat.threatType ?? 'unknown',
+      vectorClassTone(threat.evidenceLevel), threat.title));
+  }
+  return { type: 'FeatureCollection', features };
+}
+
 async function loadVectors() {
   try {
     const response = await fetch('/api/v1/vectors', { cache: 'no-store', signal: AbortSignal.timeout(12000) });
@@ -796,8 +928,59 @@ function applyVectors() {
   if (mapLayersReady && map?.getSource('threat-vector-segments')) {
     map.getSource('threat-vector-segments').setData(vectorSegmentCollection());
     map.getSource('threat-vector-points')?.setData(vectorNodeCollection());
+    // Голови приходять із ДВОХ джерел даних — /api/v1/vectors і snapshot.threats — тож їх
+    // перевидає саме applyVectors(): і loadVectors(), і updateMap() проходять через нього.
+    map.getSource('threat-vector-heads')?.setData(vectorHeadCollection());
   }
   renderVectorLegend();
+}
+
+/**
+ * Вістря як бітмап: рівнобедрений трикутник носом СТРОГО ВГОРУ, тобто на північ при icon-rotate 0.
+ * Кут дає icon-rotate, а не сорок заздалегідь повернутих картинок.
+ *
+ * Той самий синхронний шлях, що й occupation-hatch-pattern та сорок фішок класів: canvas →
+ * ImageData → addImage. Асинхронна картинка змагалася б зі style.load, а глобальний обробник
+ * styleimagemissing мовчки підставив би прозорий піксель 1×1 — і «стрілки немає» не відрізнялося б
+ * від «стрілка не додалася».
+ *
+ * `filled` — рух ствердило одне повідомлення (reported_transit): суцільна заливка.
+ * Порожній контур — повідомлено лише напрямок: та сама відмінність «форма, а не прозорість», якою
+ * порожній вузол уже позначає наближену координату.
+ */
+function vectorArrowImage(filled) {
+  const size = VECTOR_ARROW_PX * ICON_PIXEL_RATIO;
+  const canvas = document.createElement('canvas');
+  canvas.width = canvas.height = size;
+  const ctx = canvas.getContext('2d');
+  if (!ctx) return null;
+  ctx.scale(ICON_PIXEL_RATIO, ICON_PIXEL_RATIO);
+  const box = VECTOR_ARROW_PX;
+  ctx.beginPath();
+  ctx.moveTo(box / 2, 1.6);
+  ctx.lineTo(box - 2.4, box - 2.2);
+  ctx.lineTo(box / 2, box - 5.4);
+  ctx.lineTo(2.4, box - 2.2);
+  ctx.closePath();
+  // Темний обвід іде першим і ширшим за саму фігуру: помаранчеве вістря лежить на помаранчевій
+  // лінії й на помаранчевій заливці загрози, і без обводу зливається з обома.
+  ctx.strokeStyle = '#06080c'; ctx.lineWidth = 2.6; ctx.lineJoin = 'round'; ctx.stroke();
+  if (filled) {
+    ctx.fillStyle = vectorColor; ctx.fill();
+  }
+  ctx.strokeStyle = vectorColor; ctx.lineWidth = filled ? 1 : 1.8; ctx.stroke();
+  return ctx.getImageData(0, 0, size, size);
+}
+
+/** Реєстрація передує шарам, як і в іконок територій. false → шар вістер не додається взагалі. */
+function addVectorArrowImages(map) {
+  for (const [filled, id] of [[true, ARROW_BASIS_IMAGES.reported_transit], [false, ARROW_BASIS_IMAGES.reported_direction]]) {
+    if (map.hasImage(id)) continue;
+    const image = vectorArrowImage(filled);
+    if (!image) return false;
+    map.addImage(id, image, { pixelRatio: ICON_PIXEL_RATIO });
+  }
+  return true;
 }
 
 function addVectorLayers() {
@@ -833,6 +1016,35 @@ function addVectorLayers() {
     'text-field': ['get','order'], 'text-size': 10, 'text-offset': [0,-1.3], 'text-anchor': 'bottom',
     'text-font': ['Noto Sans Regular'], 'text-allow-overlap': true
   }, paint: { 'text-color': '#ffd9c9', 'text-halo-color': '#06080c', 'text-halo-width': 1.5 } }, anchor);
+  // Голови ланцюга додаються ПІСЛЯ всієї сімʼї threat-vector-*, тобто над нею: вістря мусить лежати
+  // на кінці своєї лінії, а не під нею. Якір той самий, тож підписи лишаються вище за все це.
+  let arrowsReady = false;
+  try { arrowsReady = addVectorArrowImages(map); } catch { arrowsReady = false; }
+  map.addSource('threat-vector-heads', { type: 'geojson', data: vectorHeadCollection() });
+  if (arrowsReady) {
+    // icon-rotation-alignment: 'map' — вістря повертається РАЗОМ із картою, як і сама лінія;
+    // у 'viewport' воно застигло б відносно екрана й розійшлося б із лінією на першому ж повороті.
+    // allow-overlap: вістря — це і є заява про рух; погашене колізією, воно перетворило б
+    // ствердження джерела на звичайну лінію. ignore-placement: але й нікого не відштовхує — воно
+    // мале й пояснювальне, а місце на карті належить іконкам класів і підписам територій.
+    map.addLayer({ id: 'threat-vector-arrowhead', type: 'symbol', source: 'threat-vector-heads',
+      filter: ['==', ['get','kind'], 'arrow'], layout: {
+        'icon-image': ['get','arrow'], 'icon-rotate': ['get','bearing'],
+        'icon-rotation-alignment': 'map', 'icon-size': ['interpolate',['linear'],['zoom'],5,.72,9,1],
+        'icon-allow-overlap': true, 'icon-ignore-placement': true
+      } }, anchor);
+  }
+  if (iconImagesReady) {
+    // Фішка класу — ті самі сорок зображень, що вже зареєстровані для стеків територій; другого
+    // конвеєра іконок тут немає й не буде. На відміну від вістря вона ЗАЛЕЖИТЬ від колізії: клас
+    // повторено в картці події й у стеку території, тож на оглядовому масштабі фішка має право
+    // поступитися — а стеки територій лежать вище й тому виграють у неї місце.
+    map.addLayer({ id: 'threat-vector-class', type: 'symbol', source: 'threat-vector-heads',
+      filter: ['==', ['get','kind'], 'class'], layout: {
+        'icon-image': ['get','icon'], 'icon-size': ['interpolate',['linear'],['zoom'],5,.62,9,.86],
+        'icon-offset': VECTOR_CLASS_OFFSET, 'icon-padding': 4
+      } }, anchor);
+  }
 }
 
 function vectorLegendElement() {
@@ -856,13 +1068,31 @@ function renderVectorLegend() {
   const legend = vectorLegendElement();
   if (!legend) return;
   const drawn = vectorSegmentCollection().features.length;
+  // Вістря лічимо окремо, бо їх дають ДВА джерела: ланцюги і лінії напрямку самих подій. Подія з
+  // геометрією-лінією, у якої ланцюг ще не склався, лишила б карту зі стрілками й без жодного
+  // рядка, який пояснює, що стрілка означає. Легенда мусить існувати рівно тоді, коли на карті є
+  // хоч що-небудь із того, що вона пояснює.
+  const pointed = vectorHeadCollection().features.filter((feature) => feature.properties.kind === 'arrow').length;
   const chains = vectors.filter((vector) => (vector.segments ?? []).some((segment) => segment.drawable)).length;
   const hidden = vectors.reduce((sum, vector) => sum + (vector.segments ?? []).filter((segment) => !segment.drawable).length, 0);
-  legend.hidden = !drawn;
-  if (!drawn) return;
+  legend.hidden = !drawn && !pointed;
+  if (legend.hidden) return;
   legend.open = vectorLegendOpen ?? false;
   const swatch = (style) => `<i class="legend-swatch" style="height:0;border:0;border-top:2px solid ${vectorColor};${style}"></i>`;
-  const summary = `${chains} ланцюг${chains === 1 ? '' : 'ів'} · ${drawn} відрізк${drawn === 1 ? '' : 'ів'}`;
+  // Вістря в легенді дивиться праворуч, а не вгору: рядок легенди читається зліва направо, і
+  // трикутник носом угору поруч із горизонтальною лінією прочитався б як окремий знак, а не як
+  // кінець цієї лінії. На карті кут дає icon-rotate, тут напрямок не означає нічого.
+  //
+  // Кожне вістря — окремий рядок із власним значком у першій колонці. Вставлений усередину речення
+  // гліф лишився б невидимим: .legend-icon дістає розміри лише як елемент флекса, тобто прямою
+  // дитиною <li>, а всередині <span> це інлайновий <i> нульового розміру.
+  const arrowSwatch = (filled) => `<i class="legend-icon" role="img" aria-hidden="true">`
+    + `<svg viewBox="0 0 24 24" focusable="false"><path d="M3.4 2.6 L21.4 12 L3.4 21.4 L7.6 12 Z"`
+    + ` fill="${filled ? 'currentColor' : 'none'}" stroke="currentColor" stroke-width="2.2" stroke-linejoin="round"/></svg></i>`;
+  const chipSwatch = `<i class="legend-swatch" style="border-radius:3px;border-color:${vectorColor};background:rgba(255,122,77,.22)"></i>`;
+  const summary = drawn
+    ? `${chains} ланцюг${chains === 1 ? '' : 'ів'} · ${drawn} відрізк${drawn === 1 ? '' : 'ів'}`
+    : `${pointed} напрямк${pointed === 1 ? '' : 'ів'}`;
   legend.innerHTML = `<summary><i class="swatch threat"></i><span class="legend-title">Ланцюги повідомлень</span><span class="legend-sum">${summary}</span><span class="legend-caret" aria-hidden="true">▾</span></summary>
     <div class="legend-body">
       <p class="legend-warning">Це послідовність <b>повідомлень</b> із часом і джерелом, а не траєкторія польоту. Лінія показує, що і коли повідомили, а не куди прямує ціль. Система не прогнозує ціль, влучання або маршрут.</p>
@@ -870,6 +1100,10 @@ function renderVectorLegend() {
         <li>${swatch('opacity:.95')}<span>Суцільна — одне повідомлення ствердило сам рух («повз А на Б»).</span></li>
         <li>${swatch('border-top-style:dashed;opacity:.75')}<span>Штрихова — джерело повідомило напрямок, але не прибуття.</span></li>
         <li>${swatch('border-top-style:dotted;opacity:.5')}<span>Крапкова — різні повідомлення в різний час. Порядок наш; рух не стверджувало жодне джерело.</span></li>
+        <li>${arrowSwatch(true)}<span>Вістря — рух ствердило саме джерело. Суцільне: одне повідомлення назвало і те, що минають, і те, до чого йдуть.</span></li>
+        <li>${arrowSwatch(false)}<span>Порожнє вістря — джерело назвало курс, але не прибуття.</span></li>
+        <li>${swatch('border-top-style:dotted;opacity:.5')}<span><b>На крапковій лінії вістря немає ніколи</b> — стрілка на ній була б твердженням про рух, якого не робило жодне джерело. Там лишаються номери точок: це порядок повідомлень, а не шлях.</span></li>
+        <li>${chipSwatch}<span>Фішка на голові ланцюга — клас, який рухається за повідомленнями. Той самий гліф, що й у легенді «Загрози на карті».</span></li>
       </ul>
       <p class="legend-note">Порожнє коло — район без координат у каталозі KATOTTG: точку взято з центроїда полігона, це наближення до району, а не місце.${hidden ? ` ${hidden} відрізк${hidden === 1 ? '' : 'ів'} не намальовано взагалі — для цих територій контуру немає; вони лишаються в картці події текстом.` : ''}</p>
     </div>`;
@@ -885,14 +1119,23 @@ function vectorChainHtml(vector) {
     const approximate = [from, to].some((node) => node?.coordinatePrecision === 'approximate')
       ? '<small>Координата району наближена — центроїд полігона.</small>' : '';
     const undrawn = segment.drawable ? '' : '<small>Немає координат — на карті не показано.</small>';
+    // Клас відрізка називаємо лише тоді, коли він РОЗІЙШОВСЯ з класом події: інакше це був би той
+    // самий рядок під кожним переходом. Розбіжність же — справжня новина: повідомлення про БпЛА,
+    // за яким ішло повідомлення про балістику на тій самій події.
+    const drift = segment.threatType && segment.threatType !== vector.threatType
+      ? `<br><small>Це повідомлення назвало клас: ${escapeHtml(threatNames[segment.threatType] ?? segment.threatType)}.</small>` : '';
     return `<li><time>${shortTime(segment.reportedAt)}</time> <b>${escapeHtml(from?.name ?? '?')} → ${escapeHtml(to?.name ?? '?')}</b>
       <span class="evidence ${escapeHtml(segment.evidenceLevel)}">${escapeHtml(evidenceNames[segment.evidenceLevel] ?? segment.evidenceLevel)}</span>
       <br><small>${escapeHtml(vectorBasisLabels[segment.basis] ?? segment.basis)} · ${escapeHtml(segment.source?.name ?? 'джерело не вказано')} · ${escapeHtml(gap)}${corroboration}</small>
-      ${segment.statement ? `<br><small>«${escapeHtml(segment.statement)}»</small>` : ''}${approximate}${undrawn}</li>`;
+      ${segment.statement ? `<br><small>«${escapeHtml(segment.statement)}»</small>` : ''}${drift}${approximate}${undrawn}</li>`;
   }).join('');
   const span = vector.span ?? {};
+  // Клас відкриває рядок: перше питання про вектор — «що саме рухається», і воно має стояти перед
+  // лічильниками джерел і переходів.
+  const moving = vector.threatType
+    ? `${escapeHtml(threatNames[vector.threatType] ?? vector.threatType)} · ` : '';
   return `<h3>Ланцюг повідомлень</h3>
-    <p class="detail-summary">${span.sourceCount ?? 0} джерел${span.sourceCount === 1 ? 'о' : ''} за ${Math.max(1, Math.round((span.elapsedSeconds ?? 0) / 60))} хв · ${vector.nodes.length} точ${vector.nodes.length === 1 ? 'ка' : 'ок'} · ${vector.segments.length} перехід${vector.segments.length === 1 ? '' : 'ів'}</p>
+    <p class="detail-summary">${moving}${span.sourceCount ?? 0} джерел${span.sourceCount === 1 ? 'о' : ''} за ${Math.max(1, Math.round((span.elapsedSeconds ?? 0) / 60))} хв · ${vector.nodes.length} точ${vector.nodes.length === 1 ? 'ка' : 'ок'} · ${vector.segments.length} перехід${vector.segments.length === 1 ? '' : 'ів'}</p>
     <ol class="update-list">${rows}</ol>
     <div class="safety-note"><strong>Це не траєкторія</strong><p>${escapeHtml(vector.disclaimer ?? '')}</p></div>`;
 }
@@ -1832,7 +2075,7 @@ async function showThreatDetails(id) {
   // тож ідентифікатор лишається лише тоді, коли назви для нього ще немає.
   const updates = item.updates.map((update) => `<li><time>${escapeHtml(agoOrUnknown(new Date(update.created_at).getTime()))}</time> <b>${escapeHtml(sentence(updateReasonNames[update.reason] ?? update.reason))}</b><br><small>стан: ${escapeHtml(statusNames[update.new_status] ?? update.new_status)} · доказовість: ${escapeHtml(evidenceNames[update.new_evidence_level] ?? update.new_evidence_level)}</small></li>`).join('');
   openDetail(item.title, evidenceNames[item.evidence_level] ?? item.evidence_level,
-    `<p class="detail-summary">${escapeHtml(item.summary)}</p><dl><div><dt>Остання згадка</dt><dd>${escapeHtml(agoOrUnknown(new Date(item.last_observed_at).getTime()))}</dd></div><div><dt>Дійсна до</dt><dd>${item.valid_until ? escapeHtml(shortTime(item.valid_until)) : 'не визначено'}</dd></div><div><dt>Напрямок</dt><dd>${escapeHtml(item.direction_text || 'не повідомлявся')}</dd></div></dl>${vectorChainHtml(vector)}<h3>Джерела</h3>${sources}${updates ? `<h3>Історія змін</h3><ol class="update-list">${updates}</ol>` : ''}<div class="safety-note"><strong>Геометрія не є прогнозом</strong><p>Система показує лише дослівно повідомлену територію або напрямок і не екстраполює маршрут.</p></div>`);
+    `<p class="detail-summary">${escapeHtml(item.summary)}</p><dl><div><dt>Тип</dt><dd>${escapeHtml(threatNames[item.threat_type] ?? item.threat_type ?? 'не визначено')}</dd></div><div><dt>Остання згадка</dt><dd>${escapeHtml(agoOrUnknown(new Date(item.last_observed_at).getTime()))}</dd></div><div><dt>Дійсна до</dt><dd>${item.valid_until ? escapeHtml(shortTime(item.valid_until)) : 'не визначено'}</dd></div><div><dt>Напрямок</dt><dd>${escapeHtml(item.direction_text || 'не повідомлявся')}</dd></div></dl>${vectorChainHtml(vector)}<h3>Джерела</h3>${sources}${updates ? `<h3>Історія змін</h3><ol class="update-list">${updates}</ol>` : ''}<div class="safety-note"><strong>Геометрія не є прогнозом</strong><p>Система показує лише дослівно повідомлену територію або напрямок і не екстраполює маршрут.</p></div>`);
 }
 
 async function showAssessmentDetails(id) {

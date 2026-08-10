@@ -32,6 +32,8 @@ interface RowOptions {
   intent?: string;
   text?: string;
   directionText?: string | null;
+  eventThreatType?: string;
+  classificationThreatType?: string | null;
 }
 
 function row(options: RowOptions): VectorChainRow {
@@ -43,6 +45,9 @@ function row(options: RowOptions): VectorChainRow {
     intent: options.intent ?? 'threat',
     direction_text: options.directionText ?? null,
     source_message_id: `msg-${options.classification}`,
+    event_threat_type: options.eventThreatType ?? 'ballistic_missile',
+    classification_threat_type: options.classificationThreatType === undefined
+      ? 'ballistic_missile' : options.classificationThreatType,
     source_id: options.source ?? 'osint-war-monitor',
     source_name: options.sourceName ?? 'War Monitor',
     tier: options.tier ?? 'B',
@@ -248,6 +253,91 @@ describe('reported vector chain', () => {
     const foreign = { ...row({ classification: 'x', at: '2026-08-07T20:00:00.000Z', location: 'ua-city-lviv', name: 'Львів' }), event_id: 'other' };
     expect(buildReportedVector(EVENT, [foreign])).toBeNull();
     expect(buildReportedVector(EVENT, [])).toBeNull();
+  });
+
+  /**
+   * A vector says *what* is moving as plainly as it says where.
+   *
+   * The two fields answer two different questions and are not interchangeable: the envelope carries
+   * the class the EVENT is filed under — the same one the card, the icon stack and the bot already
+   * show — and a segment carries the class the message that produced its destination end reported.
+   * They agree almost always, and the case where they do not is the one worth publishing: a chain
+   * that opened as БпЛА and continued as ballistics.
+   */
+  describe('the class that is moving', () => {
+    it('publishes the event class on the envelope and the message class on every segment', () => {
+      const vector = buildReportedVector(EVENT, [
+        row({
+          classification: 'a', at: '2026-08-07T20:00:00.000Z', location: 'ua-city-brovary',
+          name: 'Бровари', latitude: 50.5111, longitude: 30.7903,
+          eventThreatType: 'ballistic_missile', classificationThreatType: 'ballistic_missile'
+        }),
+        row({
+          classification: 'b', at: '2026-08-07T20:02:00.000Z', location: 'ua-city-boryspil',
+          name: 'Бориспіль', latitude: 50.3527, longitude: 30.9550,
+          eventThreatType: 'ballistic_missile', classificationThreatType: 'ballistic_missile'
+        })
+      ])!;
+      expect(vector.threatType).toBe('ballistic_missile');
+      expect(vector.segments.map((segment) => segment.threatType)).toEqual(['ballistic_missile']);
+    });
+
+    it('keeps a leg whose message reported a different class from the event it landed on', () => {
+      const vector = buildReportedVector(EVENT, [
+        row({
+          classification: 'a', at: '2026-08-07T20:00:00.000Z', location: 'ua-city-chernihiv',
+          name: 'Чернігів', latitude: 51.4982, longitude: 31.2893,
+          eventThreatType: 'combined', classificationThreatType: 'uav'
+        }),
+        row({
+          classification: 'b', at: '2026-08-07T20:04:00.000Z', location: 'ua-city-brovary',
+          name: 'Бровари', latitude: 50.5111, longitude: 30.7903,
+          eventThreatType: 'combined', classificationThreatType: 'ballistic_missile'
+        })
+      ])!;
+      // The destination end made the leg, so the leg carries what that message said.
+      expect(vector.segments[0]!.threatType).toBe('ballistic_missile');
+      // The event is still what the event is.
+      expect(vector.threatType).toBe('combined');
+    });
+
+    it('falls back to the event class for a message that recorded none', () => {
+      // `message_classifications.threat_type` is nullable — a withdrawal raises no class of its own.
+      // The leg is still a leg, and «клас не вказано» on the map would be a second, wrong statement.
+      const vector = buildReportedVector(EVENT, [
+        row({
+          classification: 'a', at: '2026-08-07T20:00:00.000Z', location: 'ua-city-brovary',
+          name: 'Бровари', latitude: 50.5111, longitude: 30.7903,
+          eventThreatType: 'guided_air_bomb', classificationThreatType: 'guided_air_bomb'
+        }),
+        row({
+          classification: 'b', at: '2026-08-07T20:02:00.000Z', location: 'ua-city-boryspil',
+          name: 'Бориспіль', latitude: 50.3527, longitude: 30.9550,
+          eventThreatType: 'guided_air_bomb', classificationThreatType: null
+        })
+      ])!;
+      expect(vector.segments[0]!.threatType).toBe('guided_air_bomb');
+    });
+
+    it('adds the two fields without touching anything that was already published', () => {
+      // Additive, literally: every key the previous payload had is still present and still carries
+      // the same value, so a client written against it needs no change.
+      const rows = [
+        row({ classification: 'a', at: '2026-08-07T20:00:00.000Z', location: 'ua-city-brovary', name: 'Бровари' }),
+        row({
+          classification: 'b', at: '2026-08-07T20:02:00.000Z', location: 'ua-city-boryspil',
+          name: 'Бориспіль', latitude: 50.3527, longitude: 30.9550
+        })
+      ];
+      const vector = buildReportedVector(EVENT, rows)!;
+      expect(Object.keys(vector).sort())
+        .toEqual(['disclaimer', 'eventId', 'kind', 'nodes', 'segments', 'span', 'threatType']);
+      expect(Object.keys(vector.segments[0]!).sort()).toEqual([
+        'basis', 'basisLabel', 'drawable', 'elapsedSeconds', 'evidenceLevel', 'from',
+        'independentEnds', 'missingCoordinates', 'originSource', 'reportedAt', 'source',
+        'statement', 'threatType', 'to'
+      ]);
+    });
   });
 
   it('publishes the same disclaimer on every chain', () => {

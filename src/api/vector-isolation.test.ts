@@ -170,6 +170,19 @@ interface AddedLayer { id: string; beforeId: string | null }
 
 const APP_SOURCE = read('web/app.js');
 
+/**
+ * Every layer `addVectorLayers()` contributes, in insertion order.
+ *
+ * Named once because three separate assertions depend on the same list — the exact global order, the
+ * "icons stay on top" rule and the shared anchor — and a family that grew in one of them and not in
+ * the others would leave the other two silently describing a map that no longer exists.
+ */
+const VECTOR_LAYER_IDS = [
+  'threat-vector-sequence', 'threat-vector-direction', 'threat-vector-transit',
+  'threat-vector-nodes', 'threat-vector-order',
+  'threat-vector-arrowhead', 'threat-vector-class'
+];
+
 /** Span of the balanced bracket that opens at `start`, inclusive of both brackets. */
 function balanced(source: string, start: number, open: string, close: string): number {
   let depth = 0;
@@ -264,6 +277,10 @@ describe('map layer order', () => {
     // Within one anchor the later insert sits higher, so the fills read bottom-to-top as
     // threat → alert → consequence → occupation and the outlines as
     // analytic → threat → alert → consequence: the weakest signal never overdraws a stronger one.
+    //
+    // The chain's two head layers close the family and are appended, never interleaved: an arrowhead
+    // has to sit ON the end of its own line rather than under it, and the class chip has to sit over
+    // the arrowhead. Both stay under the territory icon stacks, which remain the map's top layer.
     expect(order).toEqual([
       'ukraine-sovereignty-fill', 'ukraine-region-fill', 'ukraine-region-lines', 'ukraine-state-border',
       'threat-oblast-fill', 'threat-raion-fill',
@@ -278,6 +295,7 @@ describe('map layer order', () => {
       'direction-lines',
       'threat-vector-sequence', 'threat-vector-direction', 'threat-vector-transit',
       'threat-vector-nodes', 'threat-vector-order',
+      'threat-vector-arrowhead', 'threat-vector-class',
       'territory-icon-slot-0', 'territory-icon-slot-1', 'territory-icon-slot-2', 'territory-icon-badge'
     ]);
   });
@@ -285,8 +303,7 @@ describe('map layer order', () => {
   it('keeps the threat icons above every other layer', () => {
     // Іконки — головний показник карти, тож вони додаються без якоря й лягають на самий верх.
     const iconIds = ['territory-icon-slot-0', 'territory-icon-slot-1', 'territory-icon-slot-2', 'territory-icon-badge'];
-    const lastVector = Math.max(...['threat-vector-sequence', 'threat-vector-direction', 'threat-vector-transit',
-      'threat-vector-nodes', 'threat-vector-order'].map((id) => order.indexOf(id)));
+    const lastVector = Math.max(...VECTOR_LAYER_IDS.map((id) => order.indexOf(id)));
     for (const id of iconIds) {
       expect(layers.find((layer) => layer.id === id)?.beforeId).toBeNull();
       expect(order.indexOf(id)).toBeGreaterThan(lastVector);
@@ -417,7 +434,7 @@ describe('map layer order', () => {
   });
 
   it('inserts the vector chain under the labels instead of on top of the map', () => {
-    for (const id of ['threat-vector-sequence', 'threat-vector-direction', 'threat-vector-transit', 'threat-vector-nodes', 'threat-vector-order']) {
+    for (const id of VECTOR_LAYER_IDS) {
       expect(layers.find((layer) => layer.id === id)?.beforeId).toBe('alert-oblast-label');
     }
     // The existing reported-direction layer is untouched: same id, still anchorless, still last of
@@ -493,6 +510,247 @@ function lazy<T>(build: () => T): () => T {
     return value;
   };
 }
+
+// ------------------------------------------------------------------------------------------------
+// A vector that points: the arrowhead is an assertion of movement, and two bases may make it
+// ------------------------------------------------------------------------------------------------
+
+/**
+ * The arrowhead is the first thing this map has ever drawn that *points*, and the honesty rule is
+ * the whole of its specification:
+ *
+ *   * `reported_transit` — one message said "повз Полтаву на Харків". The publisher asserted the
+ *     movement itself, so an arrow repeats the publisher rather than adding to them.
+ *   * `reported_direction` — one message said "у напрямку Харкова". A heading was asserted; an
+ *     arrival was not. It gets a hollow arrow, drawn from the same statement.
+ *   * `observation_sequence` — two messages, two places, two times, and **no source said the target
+ *     moved between them**. The ordering is ours. An arrowhead here would convert an ordering this
+ *     system imposed into a movement somebody reported, which is the exact claim the product
+ *     commitment forbids and the map legend disclaims in so many words.
+ *
+ * The rule is encoded as data — a lookup table with two keys — rather than as a condition, so a
+ * fourth basis added later is silently arrow-less until somebody deliberately types it in. These
+ * tests run the shipped collection builder and assert on the features it emits, so they fail on a
+ * wrong decision inside the function and not only on a renamed layer.
+ */
+describe('vector heads', () => {
+  interface Head { properties: Record<string, string | number> }
+
+  const bearingSource = lazy(() => [
+    `function mercatorY(latitude) ${bodyOf('mercatorY')}`,
+    `function segmentBearing(from, to) ${bodyOf('segmentBearing')}`
+  ].join('\n'));
+  const bearing = lazy(() => evaluateSlice<(from: number[], to: number[]) => number | null>(
+    bearingSource(), 'segmentBearing'));
+
+  const headSource = lazy(() => [
+    constDeclaration('ARROW_BASIS_IMAGES'),
+    bearingSource(),
+    `function vectorClassTone(evidenceLevel) ${bodyOf('vectorClassTone')}`,
+    `function vectorHeadCollection() ${bodyOf('vectorHeadCollection')}`
+  ].join('\n'));
+
+  /** Runs the shipped builder over injected chains and threats, exactly as the bundle calls it. */
+  function heads(vectors: unknown[], threats: unknown[] = []): Head[] {
+    return evaluateSlice<() => { features: Head[] }>(headSource(), 'vectorHeadCollection', {
+      vectors,
+      snapshot: { threats },
+      iconImageId: (threatType: string, tone: string) => `ti-${threatType}-${tone}`
+    })().features;
+  }
+
+  const node = (name: string, coordinates: [number, number] | null) => ({
+    name, coordinates, coordinatePrecision: coordinates ? 'point' : 'unavailable'
+  });
+  const leg = (from: number, to: number, basis: string, options: Record<string, unknown> = {}) => ({
+    from, to, basis, drawable: true, evidenceLevel: 'monitoring', threatType: 'ballistic_missile', ...options
+  });
+
+  const arrows = (features: Head[]) => features.filter((feature) => feature.properties.kind === 'arrow');
+  const chips = (features: Head[]) => features.filter((feature) => feature.properties.kind === 'class');
+
+  describe('the bearing an arrow is drawn at', () => {
+    /**
+     * Mercator, deliberately, not the great circle.
+     *
+     * MapLibre draws a `LineString` as a straight line in projected space, so the angle the arrow has
+     * to match is the angle *on screen*. The initial great-circle bearing is a different number for
+     * every leg that is not meridional — 89.6° for a due-east leg at 50°N — and an arrowhead drawn at
+     * it would sit visibly askew on its own line. `src/services/vector-projection.ts` computes the
+     * great-circle bearing and is right to: it extrapolates a flight, this rotates a glyph.
+     */
+    it.each([
+      ['due east', [30, 50], [31, 50], 90],
+      ['due east at 60°N, where the great circle would say 89.6°', [30, 60], [31, 60], 90],
+      ['due north', [30, 50], [30, 51], 0],
+      ['due south', [30, 50], [30, 49], 180],
+      ['due west', [30, 50], [29, 50], 270]
+    ])('reads %s', (_name, from, to, expected) => {
+      expect(bearing()(from as number[], to as number[])).toBeCloseTo(expected as number, 9);
+    });
+
+    it('stays inside [0, 360) for a leg heading north-west', () => {
+      const value = bearing()([30, 50], [29, 51])!;
+      expect(value).toBeGreaterThan(270);
+      expect(value).toBeLessThan(360);
+    });
+
+    it('refuses to invent a direction for a leg of zero length', () => {
+      // Two different places can share one coordinate — two raion centroids that collapsed, a city
+      // and the raion it is the centre of. An arrow there would point wherever atan2(0,0) happened
+      // to land, which is a direction nobody reported.
+      expect(bearing()([30, 50], [30, 50])).toBeNull();
+    });
+  });
+
+  describe('which legs may carry one', () => {
+    it('gives an arrow to reported_transit and reported_direction, and never to observation_sequence', () => {
+      const features = heads([{
+        eventId: 'e1', threatType: 'ballistic_missile',
+        nodes: [node('Суми', [34.8, 50.9]), node('Полтава', [34.55, 49.59]),
+          node('Харків', [36.23, 49.99]), node('Мерефа', [36.05, 49.81])],
+        segments: [leg(0, 1, 'reported_transit'), leg(1, 2, 'reported_direction'), leg(2, 3, 'observation_sequence')]
+      }]);
+      expect(arrows(features).map((feature) => feature.properties.basis))
+        .toEqual(['reported_transit', 'reported_direction']);
+      expect(arrows(features).map((feature) => feature.properties.arrow))
+        .toEqual(['threat-vector-arrow-solid', 'threat-vector-arrow-open']);
+    });
+
+    it('draws a chain of nothing but observation_sequence with no arrow at all', () => {
+      // The commonest chain there is: three channels naming three places. The dotted line and the
+      // node numbers stay; the map still says "ці повідомлення, в цьому порядку" and nothing more.
+      const features = heads([{
+        eventId: 'e1', threatType: 'uav',
+        nodes: [node('Чернігів', [31.29, 51.5]), node('Бровари', [30.79, 50.51]), node('Бориспіль', [30.96, 50.35])],
+        segments: [leg(0, 1, 'observation_sequence'), leg(1, 2, 'observation_sequence')]
+      }]);
+      expect(arrows(features)).toEqual([]);
+      // …and the class chip is still there: what is moving was reported, the movement was not.
+      expect(chips(features)).toHaveLength(1);
+    });
+
+    it('keeps the rule as a table with two keys rather than as a condition', () => {
+      // A condition is one `||` away from growing a third branch in a hurry. A table cannot: the
+      // weakest rung has no key, so it has no image, so the builder has nothing to place.
+      const table = evaluateSlice<Record<string, string>>(
+        constDeclaration('ARROW_BASIS_IMAGES'), 'ARROW_BASIS_IMAGES');
+      expect(Object.keys(table).sort()).toEqual(['reported_direction', 'reported_transit']);
+      expect(table.observation_sequence).toBeUndefined();
+    });
+
+    it('places the arrow at the head of the leg, pointing the way the leg was drawn', () => {
+      const features = heads([{
+        eventId: 'e1', threatType: 'ballistic_missile',
+        nodes: [node('Полтава', [34, 50]), node('Харків', [36, 50])],
+        segments: [leg(0, 1, 'reported_transit')]
+      }]);
+      const [arrow] = arrows(features);
+      expect((arrow as unknown as { geometry: { coordinates: number[] } }).geometry.coordinates).toEqual([36, 50]);
+      expect(arrow!.properties.bearing).toBeCloseTo(90, 9);
+    });
+
+    it('draws no arrow on a leg the map is not drawing', () => {
+      // `drawable: false` is a leg that exists as a stated fact and has no coordinate for one end.
+      // The line is not drawn, so an arrowhead would be a floating glyph asserting a movement
+      // between a place and nowhere.
+      const features = heads([{
+        eventId: 'e1', threatType: 'ballistic_missile',
+        nodes: [node('Якась громада', null), node('Харків', [36.23, 49.99])],
+        segments: [leg(0, 1, 'reported_transit', { drawable: false })]
+      }]);
+      expect(arrows(features)).toEqual([]);
+      expect(chips(features)).toEqual([]);
+    });
+  });
+
+  describe('the class chip', () => {
+    it('draws one per chain, at the newest point the chain actually reached', () => {
+      const features = heads([{
+        eventId: 'e1', threatType: 'ballistic_missile',
+        nodes: [node('Суми', [34.8, 50.9]), node('Полтава', [34.55, 49.59]), node('Харків', [36.23, 49.99])],
+        segments: [leg(0, 1, 'reported_transit'), leg(1, 2, 'reported_transit')]
+      }]);
+      expect(chips(features)).toHaveLength(1);
+      expect((chips(features)[0] as unknown as { geometry: { coordinates: number[] } }).geometry.coordinates)
+        .toEqual([36.23, 49.99]);
+    });
+
+    it('reuses the registered threat-icon image instead of a second icon pipeline', () => {
+      const features = heads([{
+        eventId: 'e1', threatType: 'uav',
+        nodes: [node('Полтава', [34, 50]), node('Харків', [36, 50])],
+        segments: [leg(0, 1, 'reported_transit', { threatType: 'uav', evidenceLevel: 'official' })]
+      }]);
+      // The same 40-image catalogue the territory stacks draw from: `ti-<class>-<tone>`, with the
+      // tone rule of `threatTone` in src/domain/territory-state.ts — official/confirmed → confirmed.
+      expect(chips(features)[0]!.properties.icon).toBe('ti-uav-confirmed');
+    });
+
+    it('takes the tone of the leg it stands on, never a stronger one', () => {
+      const monitoring = heads([{
+        eventId: 'e1', threatType: 'uav',
+        nodes: [node('Полтава', [34, 50]), node('Харків', [36, 50])],
+        segments: [leg(0, 1, 'reported_transit', { threatType: 'uav', evidenceLevel: 'monitoring' })]
+      }]);
+      expect(chips(monitoring)[0]!.properties.icon).toBe('ti-uav-reported');
+    });
+
+    it('names the class the leg reported, not only the class of the event', () => {
+      // A chain whose class changed mid-way: the event is filed as `combined`, the newest leg was
+      // reported as ballistics. The head says what the newest message said.
+      const features = heads([{
+        eventId: 'e1', threatType: 'combined',
+        nodes: [node('Суми', [34.8, 50.9]), node('Полтава', [34.55, 49.59]), node('Харків', [36.23, 49.99])],
+        segments: [
+          leg(0, 1, 'reported_transit', { threatType: 'uav' }),
+          leg(1, 2, 'reported_transit', { threatType: 'ballistic_missile' })
+        ]
+      }]);
+      expect(chips(features)[0]!.properties.icon).toBe('ti-ballistic_missile-reported');
+    });
+  });
+
+  describe('the reported-direction lines of the threat payload', () => {
+    /**
+     * `direction-lines` draws `threat_events.geometry`, which is built from
+     * `relation_type='reported_direction'` — a heading a source stated. Same basis, so the same
+     * hollow arrowhead, and the class comes from the `LiveEvent` the geometry already belongs to.
+     * No server change was needed for this half: `snapshot.threats[]` carries `threatType` beside
+     * `geometry`, and joining them in the browser costs one property read.
+     */
+    it('gets the hollow arrow of a stated heading, and the class of its own event', () => {
+      const features = heads([], [{
+        id: 't1', title: 'Крилаті ракети на Львівщину', threatType: 'cruise_missile',
+        evidenceLevel: 'confirmed',
+        geometry: { type: 'LineString', coordinates: [[30, 50], [24, 50]] }
+      }]);
+      expect(arrows(features)).toHaveLength(1);
+      expect(arrows(features)[0]!.properties.arrow).toBe('threat-vector-arrow-open');
+      expect(arrows(features)[0]!.properties.basis).toBe('reported_direction');
+      expect(arrows(features)[0]!.properties.bearing).toBeCloseTo(270, 9);
+      expect(chips(features)[0]!.properties.icon).toBe('ti-cruise_missile-confirmed');
+    });
+
+    it('ignores a threat whose geometry is not a line, and a line with one point', () => {
+      const features = heads([], [
+        { id: 't1', title: 'Точка', threatType: 'uav', geometry: { type: 'Point', coordinates: [30, 50] } },
+        { id: 't2', title: 'Огризок', threatType: 'uav', geometry: { type: 'LineString', coordinates: [[30, 50]] } },
+        { id: 't3', title: 'Без геометрії', threatType: 'uav', geometry: null }
+      ]);
+      expect(features).toEqual([]);
+    });
+  });
+
+  it('says all of this in the legend, and keeps the honesty sentence word for word', () => {
+    const legend = bodyOf('renderVectorLegend');
+    // The sentence that predates the arrowhead and outlives it. Verbatim, U+02BC and all.
+    expect(legend).toContain('Крапкова — різні повідомлення в різний час. Порядок наш; рух не стверджувало жодне джерело.');
+    // And the two things the arrowhead added, stated rather than left to be inferred from a glyph.
+    expect(legend).toContain('Вістря — рух ствердило саме джерело.');
+    expect(legend).toContain('На крапковій лінії вістря немає ніколи');
+  });
+});
 
 function* permutations<T>(items: T[]): Generator<T[]> {
   if (items.length <= 1) { yield [...items]; return; }

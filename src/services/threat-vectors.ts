@@ -43,6 +43,24 @@ import type { EvidenceLevel } from '../types.js';
  * exists, is useful, and lives in `src/services/vector-projection.ts` behind ops authentication —
  * this module does not import it, cannot reach it, and `src/api/vector-isolation.test.ts` fails the
  * build if that ever changes.
+ *
+ * ## What is moving, not only where
+ *
+ * «Балістика повз Полтаву на Харків» names a class as plainly as it names two places, and a chain
+ * that published only the places threw half of the sentence away — the map then had to guess the
+ * class from a marker somewhere else, or say nothing. So both the envelope and every segment carry
+ * `threatType`, and the two are not the same statement:
+ *
+ *   * the envelope's is `threat_events.threat_type` — the class the EVENT is filed under, which is
+ *     the class every other public surface already shows for it;
+ *   * a segment's is `message_classifications.threat_type` — the class the message that produced
+ *     that leg's destination reported, falling back to the event's when that message recorded none
+ *     (a withdrawal, or a decision that raised no class of its own). A chain whose class changes
+ *     mid-way is a real thing — a report of БпЛА followed by a report of ballistics on the same
+ *     event — and flattening it to the event's aggregate would hide exactly the change that matters.
+ *
+ * Both are additive: no existing field is renamed, retyped or removed, so a client written against
+ * the previous payload keeps working unchanged.
  */
 
 export const REPORTED_VECTOR_KIND = 'reported_observation_chain' as const;
@@ -104,6 +122,12 @@ export interface ReportedVectorSegment {
   to: number;
   basis: VectorSegmentBasis;
   basisLabel: string;
+  /**
+   * The class this leg reports as moving: the destination message's own `threat_type`, or the
+   * event's when that message recorded none. Never null — a leg always belongs to a classified
+   * event — so a client may render it without a fallback of its own.
+   */
+  threatType: string;
   /** Publication time of the message that produced the destination end of this segment. */
   reportedAt: string;
   /** Time between the two ends as reported. `0` when one message stated both. */
@@ -124,6 +148,8 @@ export interface ReportedVectorSegment {
 export interface ReportedVector {
   eventId: string;
   kind: typeof REPORTED_VECTOR_KIND;
+  /** `threat_events.threat_type` — the same class the event card, the icon and the bot already name. */
+  threatType: string;
   disclaimer: string;
   nodes: ReportedVectorNode[];
   segments: ReportedVectorSegment[];
@@ -147,6 +173,10 @@ export interface VectorChainRow {
   intent: string;
   direction_text: string | null;
   source_message_id: string | null;
+  /** `threat_events.threat_type` — NOT NULL in the schema, so the envelope always has a class. */
+  event_threat_type: string;
+  /** `message_classifications.threat_type` — nullable: a withdrawal raises no class of its own. */
+  classification_threat_type: string | null;
   source_id: string;
   source_name: string;
   tier: string;
@@ -370,8 +400,13 @@ const BASIS_STRENGTH: Readonly<Record<VectorSegmentBasis, number>> = {
  */
 export function buildReportedVector(eventId: string, rows: VectorChainRow[]): ReportedVector | null {
   const byClassification = new Map<string, VectorChainRow[]>();
+  // The event's own class, read off the join rather than queried again. Every row of this event
+  // carries the same value, so the first one is the whole answer; `unknown` is the catalogue's own
+  // name for "not classified" and is reachable only from a row shape a test built by hand.
+  let eventThreatType = 'unknown';
   for (const row of rows) {
     if (row.event_id !== eventId) continue;
+    if (row.event_threat_type) eventThreatType = row.event_threat_type;
     const bucket = byClassification.get(row.classification_id);
     if (bucket) bucket.push(row); else byClassification.set(row.classification_id, [row]);
   }
@@ -444,6 +479,9 @@ export function buildReportedVector(eventId: string, rows: VectorChainRow[]): Re
           to: index,
           basis,
           basisLabel: SEGMENT_BASIS_LABELS_UK[basis],
+          // The class the DESTINATION message reported, because that is the message that made this
+          // leg. A withdrawal records no class of its own, and then the event's stands in.
+          threatType: position.classification_threat_type ?? eventThreatType,
           reportedAt: step.at,
           elapsedSeconds,
           evidenceLevel,
@@ -477,6 +515,7 @@ export function buildReportedVector(eventId: string, rows: VectorChainRow[]): Re
   return {
     eventId,
     kind: REPORTED_VECTOR_KIND,
+    threatType: eventThreatType,
     disclaimer: REPORTED_VECTOR_DISCLAIMER,
     nodes,
     segments,
@@ -514,11 +553,13 @@ export function buildReportedVector(eventId: string, rows: VectorChainRow[]): Re
 const CHAIN_QUERY = `
   SELECT mc.id AS classification_id, mc.event_id, mc.published_at, mc.decision, mc.intent,
          mc.direction_text, mc.source_message_id,
+         te.threat_type AS event_threat_type, mc.threat_type AS classification_threat_type,
          s.id AS source_id, s.name AS source_name, s.tier, s.official, s.independence_group,
          sm.raw_text,
          mcl.location_id, mcl.role, mcl.relation_type,
          l.name_uk, l.type AS location_type, l.latitude, l.longitude
     FROM message_classifications mc
+    JOIN threat_events te ON te.id = mc.event_id
     JOIN sources s ON s.id = mc.source_id
     LEFT JOIN source_messages sm ON sm.id = mc.source_message_id
     JOIN message_classification_locations mcl ON mcl.classification_id = mc.id

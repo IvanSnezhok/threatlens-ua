@@ -37,6 +37,13 @@ import { THREAT_TYPES, type EvidenceLevel, type RelationType, type ThreatType } 
  * Why no arrows: an arrow drawn on a territory asserts a predicted target. This system does not
  * predict targets, and says so in eight places. Read `ballistic`'s wedge as a descending body.
  *
+ * The map does draw one arrowhead, and it is not one of these and never will be: it belongs to a
+ * threat-vector leg whose basis is `reported_transit` or `reported_direction` — a movement a source
+ * stated in so many words, between two places that source named — and it lives in `web/app.js` as
+ * its own bitmap. The difference is the whole rule: that arrow points from a reported place to
+ * another reported place, while an arrow on a *territory glyph* would point at a target nobody
+ * reported. A leg the sources did not assert (`observation_sequence`) gets no arrowhead either.
+ *
  * Дзеркальна копія цієї мапи живе у web/app.js (`threatIconPaths`). Змінюєш тут — зміни й там.
  */
 export const THREAT_ICON_PATHS: Record<ThreatType, string> = {

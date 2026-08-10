@@ -719,6 +719,38 @@ stay in the payload as stated facts with `drawable: false` — raions carry no K
 the chain falls back to the centroid of their ADM2 polygon and publishes that as
 `coordinateSource: 'raion_centroid'`, `coordinatePrecision: 'approximate'`, rendered as a hollow node.
 
+**An arrowhead is drawn only where a source asserted the movement**, and the basis grade decides it —
+the same three rungs, read as a question about honesty rather than about strength:
+
+| Basis | Did a source assert movement? | Head of the leg |
+| --- | --- | --- |
+| `reported_transit` | yes — one message named the place being passed *and* the place being approached | filled arrowhead |
+| `reported_direction` | yes, a heading; no arrival | hollow arrowhead |
+| `observation_sequence` | **no** — the ordering is ours | no arrowhead, ever: dotted line and node numbers only |
+
+The two arrow images are registered as canvas bitmaps the way the occupation hatch is, and rotated by
+`icon-rotate` from a bearing computed in the browser per leg. That bearing is a **Mercator** bearing,
+not the great-circle one `src/services/vector-projection.ts` computes: MapLibre draws a `LineString`
+as a straight line in projected space, so the angle an arrowhead must match is the angle on screen —
+90° for a due-east leg at any latitude, where the great circle would say 89.6° and leave the glyph
+visibly askew on its own line. The rule that `observation_sequence` gets no arrow is encoded as a
+two-key lookup table rather than as a condition, so a basis added later is arrow-less until somebody
+deliberately types it in, and `src/api/vector-isolation.test.ts` runs the shipped collection builder
+and fails if a weakest-rung leg ever emits an arrow feature.
+
+The chain also says **what** is moving. Both the envelope and every segment carry `threatType`, and
+the two answer different questions: the envelope's is `threat_events.threat_type`, the class the event
+is filed under everywhere else; a segment's is `message_classifications.threat_type`, the class the
+message that produced that leg's destination reported, falling back to the event's when that message
+recorded none. They agree almost always, and the case where they do not — a chain that opened as БпЛА
+and continued as ballistics — is exactly the change a flattened payload would hide. The map draws it
+as one class chip at the newest drawn point of each chain, using the same forty registered
+threat-icon images the territory stacks draw from; unlike the arrowhead the chip yields to MapLibre
+collision, because the class is already stated by the event card and by the territory stack above it.
+Both fields are **additive**: no field of the previous payload was renamed, retyped or removed, so a
+client written against it — including the SSE consumers, which never carried the chain in the first
+place — needs no change.
+
 **The extrapolation** — continue the last leg, name the locations inside the resulting cone, state the
 uncertainty — is an operator tool and is isolated the way the occupation layer is isolated, only more
 strictly, because this one would be actively harmful if published:

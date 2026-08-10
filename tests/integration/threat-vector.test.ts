@@ -91,6 +91,26 @@ describe.skipIf(!integrationDatabaseAvailable)('threat vectors', () => {
       expect(vector.disclaimer).toContain('не траєкторія');
     });
 
+    /**
+     * The class travels with the chain, and this is the only place the SQL that fetches it runs.
+     *
+     * `buildReportedVector` is pure and is pinned without a database, so a wrong column alias or a
+     * dropped join in `CHAIN_QUERY` would leave every unit test green and publish a chain that says
+     * where without saying what. Both halves are asserted: `threat_events.threat_type` on the
+     * envelope, `message_classifications.threat_type` on each leg.
+     */
+    it('names the class that is moving, on the envelope and on every leg', async () => {
+      const eventId = await seedChain();
+      const { reportedVectorForEvent } = await import('../../src/services/threat-vectors.js');
+      const vector = (await reportedVectorForEvent(eventId))!;
+      expect(vector.threatType).toBe('ballistic_missile');
+      expect(vector.segments.map((segment) => segment.threatType))
+        .toEqual(['ballistic_missile', 'ballistic_missile']);
+      // Additive: everything the payload published before is still published, unchanged.
+      expect(vector.kind).toBe('reported_observation_chain');
+      expect(vector.segments.map((segment) => segment.basis)).toEqual(['reported_transit', 'reported_transit']);
+    });
+
     it('is a projection of the classification archive, not a second copy of it', async () => {
       const eventId = await seedChain();
       const { reportedVectorForEvent } = await import('../../src/services/threat-vectors.js');
@@ -274,6 +294,8 @@ describe.skipIf(!integrationDatabaseAvailable)('threat vectors', () => {
       const chain = await app.inject({ method: 'GET', url: `/api/v1/threats/${eventId}/vector` });
       expect(chain.statusCode).toBe(200);
       expect(chain.json().segments).toHaveLength(2);
+      // The class reaches the wire, not only the service: this is what the map draws its chip from.
+      expect(chain.json().threatType).toBe('ballistic_missile');
 
       for (const path of [`/ops/threats/${eventId}/vector-projection`, '/ops/vectors']) {
         expect((await app.inject({ method: 'GET', url: path })).statusCode).toBe(401);

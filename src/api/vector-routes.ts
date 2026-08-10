@@ -56,9 +56,14 @@ const vectorRoutes: FastifyPluginAsync = async (app) => {
     if (vector) return vector;
     // "This event has no chain" and "this event does not exist" are different answers, and the
     // client renders them differently: the first is an ordinary single-message threat.
+    //
+    // `threatType` is null here for the same reason `strongestBasis` is: this envelope describes a
+    // chain that does not exist, and every field of it that describes one is empty. The class of the
+    // EVENT is not missing — it is on `/api/v1/threats/:id`, which is the payload that owns it.
     return reply.send({
       eventId: request.params.id,
       kind: 'reported_observation_chain',
+      threatType: null,
       disclaimer: REPORTED_VECTOR_DISCLAIMER,
       nodes: [], segments: [],
       span: {
