@@ -30,7 +30,8 @@ const MIGRATION_FILES = [
   '026_renamed_toponym_aliases.sql',
   '027_aerial_alert_mirror.sql',
   '028_analytics_min_pass_interval.sql',
-  '029_disabled_channel_reaudit.sql'
+  '029_disabled_channel_reaudit.sql',
+  '030_app_settings.sql'
 ];
 
 describe.skipIf(!integrationDatabaseAvailable)('migration runner against live PostgreSQL', () => {

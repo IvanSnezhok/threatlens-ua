@@ -3432,9 +3432,19 @@ const RUNTIME_FIELD_ORDER = [
 ];
 // Одиниця виміру читається із суфікса ключа, а не зі списку полів: поле, названого за тією самою
 // угодою, форма підпише правильно й без правки.
-const RUNTIME_UNIT_SUFFIXES = [['Ms', 'мс'], ['Seconds', 'с'], ['Minutes', 'хв'], ['Days', 'днів']];
+//
+// Дві угоди в одній таблиці, бо форму числового поля ділять два екрани. Рантайм називає поля
+// camelCase (`analyticsDebounceMs`), реєстр налаштувань — UPPER_SNAKE (`AI_TIMEOUT_MS`), і жодне
+// імʼя однієї угоди не може випадково закінчитися суфіксом іншої: регістр їх розводить.
+// `_PER_MINUTE` стоїть перед коротшими суфіксами, бо find() бере ПЕРШИЙ збіг.
+const RUNTIME_UNIT_SUFFIXES = [
+  ['Ms', 'мс'], ['Seconds', 'с'], ['Minutes', 'хв'], ['Days', 'днів'],
+  ['_PER_MINUTE', 'за хвилину'], ['_MS', 'мс'], ['_SECONDS', 'с'], ['_PAGE_SIZE', 'повідомлень']
+];
 const runtimeUnit = (field) => RUNTIME_UNIT_SUFFIXES.find(([suffix]) => field.endsWith(suffix))?.[1] ?? '';
-const runtimeFieldLabel = (field) => RUNTIME_FIELD_LABELS[field] ?? field;
+// Підпис шукається у двох таблицях, бо runtimeNumberField() малює поля обох екранів. Ключ, якого
+// немає в жодній, малюється сам собою — незграбний підпис кращий за невидиме налаштування.
+const runtimeFieldLabel = (field) => RUNTIME_FIELD_LABELS[field] ?? APP_SETTING_LABELS[field] ?? field;
 // 600000 читається як «600 000» — вузьким нерозривним пробілом, як велить uk-UA. Шістка нулів
 // поспіль у підказці про межі — це підказка, яку доводиться рахувати пальцем.
 const ukNumberFormat = new Intl.NumberFormat('uk-UA');
@@ -3469,7 +3479,7 @@ function runtimeNumberField(field, bound, value) {
   const unit = runtimeUnit(field);
   const suffix = unit ? ` ${unit}` : '';
   const title = runtimeFieldLabel(field);
-  const note = RUNTIME_FIELD_NOTES[field] ?? '';
+  const note = RUNTIME_FIELD_NOTES[field] ?? APP_SETTING_NOTES[field] ?? '';
   const id = escapeHtml(field);
   const current = Number.isFinite(Number(value)) ? Math.trunc(Number(value)) : min;
   const pick = (kind, edge, word) => `<button type="button" class="bound-pick" data-runtime-bound="${kind}"`
@@ -4255,21 +4265,32 @@ function opsKpiStrip(data, runtime, deploy) {
   </div>`;
 }
 
+/**
+ * Форма входу оператора, спільна для обох маршрутів консолі.
+ *
+ * Перевірка йде на `probe` — той самий маршрут, який щойно відповів 401, а не завжди `/ops/api`:
+ * інакше сторінка налаштувань підтверджувала б пароль запитом до сусіднього ендпоінта й малювала
+ * власний 401 одразу після успішного входу.
+ */
+function opsLoginForm(root, probe, retry) {
+  opsAuthorization = '';
+  root.innerHTML = `<form class="ops-login"><span>AUTH / BASIC</span><h2>Вхід оператора</h2><p>Облікові дані залишаються лише в памʼяті цієї вкладки.</p><label>Користувач<input required name="username" autocomplete="username" value="operator"></label><label>Пароль<input required name="password" type="password" autocomplete="current-password"></label><button>Увійти</button><output></output></form>`;
+  $('.ops-login', root).addEventListener('submit', async (event) => {
+    event.preventDefault(); const form = event.currentTarget; const values = new FormData(form);
+    opsAuthorization = basicAuthorization(values.get('username'), values.get('password'));
+    const check = await opsFetch(probe).catch(() => null);
+    if (check?.ok) return void retry();
+    opsAuthorization = ''; $('output', form).textContent = 'Неправильний логін або пароль.';
+  });
+}
+
 async function renderOps() {
   clearInterval(codexPollTimer);
   clearInterval(deployPollTimer);
   const root = contentShell('Закритий контур', 'Операційна консоль', 'Стан системи та керування каталогом рекомендованих Telegram-каналів.');
   const response = await opsFetch('/ops/api');
   if (response.status === 401) {
-    opsAuthorization = '';
-    root.innerHTML = `<form class="ops-login"><span>AUTH / BASIC</span><h2>Вхід оператора</h2><p>Облікові дані залишаються лише в памʼяті цієї вкладки.</p><label>Користувач<input required name="username" autocomplete="username" value="operator"></label><label>Пароль<input required name="password" type="password" autocomplete="current-password"></label><button>Увійти</button><output></output></form>`;
-    $('.ops-login', root).addEventListener('submit', async (event) => {
-      event.preventDefault(); const form = event.currentTarget; const values = new FormData(form);
-      opsAuthorization = basicAuthorization(values.get('username'), values.get('password'));
-      const check = await opsFetch('/ops/api');
-      if (check.ok) return void renderOps();
-      opsAuthorization = ''; $('output', form).textContent = 'Неправильний логін або пароль.';
-    });
+    opsLoginForm(root, '/ops/api', () => void renderOps());
     return;
   }
   if (!response.ok) { root.innerHTML = '<p>Операційна консоль тимчасово недоступна.</p>'; return; }
@@ -4301,7 +4322,15 @@ async function renderOps() {
   // сітка лишала б під кожною коротшою карткою дірку заввишки в її сусідку. Кожна смуга — власний
   // потік, який пакується щільно. Ліворуч сигнал, праворуч обслуговування; на вузькому екрані
   // `display: contents` розпускає обидві в один стовпчик, і жодне правило не дублюється.
+  // Другий екран консолі — окремий маршрут, а не ще одна картка тут. Реєстр налаштувань — це
+  // вісімдесят полів, і жодне з них не є станом: вони не оновлюються самі, їх не звіряють поглядом,
+  // і поруч із живими картками вони отримали б таймер перемалювання, який зносив би форму під
+  // пальцем. Посилання стоїть під смугою показників, бо це навігація, а не дія над системою.
   root.innerHTML = `${opsKpiStrip(data, runtime, deploy)}
+    <nav class="ops-quicklinks" aria-label="Розділи консолі">
+      <a href="/ops/settings" data-route="/ops/settings">Налаштування →</a>
+      <span>Реєстр змінних середовища: значення, походження, журнал змін.</span>
+    </nav>
     <div class="ops-grid">
     <div class="ops-col ops-col--signal">
     ${opsRuntimeSection(runtime)}
@@ -4379,6 +4408,959 @@ async function renderOps() {
   $('#ops-logout', root).addEventListener('click', () => { opsAuthorization = ''; void renderOps(); });
 }
 
+// ------------------------------------------------------------------------------------------------
+// Налаштування застосунку
+// ------------------------------------------------------------------------------------------------
+//
+// Реєстр змінних середовища, який тепер має два джерела: рядок у `app_settings` і сам процес.
+// Сторінка існує заради одного питання, на яке досі відповідала лише вправа з `docker compose exec`:
+// «яке значення діє ЗАРАЗ і звідки воно взялося». Тому походження тут — не примітка під полем, а
+// бейдж поруч зі значенням, і він має рівно три стани: БД, .env, за замовчуванням.
+//
+// Кольору на сторінці рівно стільки, скільки небезпеки: бурштин на «потребує перезапуску» (діюче
+// значення розійшлося зі збереженим) і червоний на відхиленому. Усе інше — графіт і кістка, як
+// велить решта системи: налаштування, яке просто збережене, нічого не стверджує про світ.
+//
+// Секрет ніколи не приходить із сервера — ні в `value`, ні в `envValue`, ні в `defaultValue`. Тому
+// поле секрету не «показує приховане», а чесно каже дві речі, які сервер справді надіслав:
+// встановлено чи ні, і звідки. Замінити його можна, побачити — ні.
+
+// Куди веде «як отримати →».
+//
+// РІШЕННЯ, і воно не косметичне: `docs/` НЕ віддається застосунком. `fastifyStatic` змонтовано на
+// `public/`, а `/docs/TOKENS.md` не потрапив би навіть у 404 — його зʼїв би setNotFoundHandler і
+// віддав index.html, тобто карту замість інструкції. Тому основний шлях — інструкція просто тут,
+// у розгортайці біля самого поля: вона працює без мережі, без GitHub і на приватному репозиторії.
+// Посилання на blob лишається другим кроком для повного тексту, з датою перевірки.
+const TOKENS_DOC_URL = 'https://github.com/IvanSnezhok/threatlens-ua/blob/main/docs/TOKENS.md';
+
+// Порядок і назви груп. Сервер надсилає `groups` — саме він розпорядник складу; ця таблиця лише
+// підписує ідентифікатор словом і задає порядок, у якому групи стоять на сторінці.
+const APP_SETTING_GROUPS = [
+  ['telegram', 'Telegram', 'Колектор, бот і канали, з яких надходить усе живе.'],
+  ['official', 'Офіційні джерела', 'Три незалежні постачальники стану тривог і витримки навколо них.'],
+  ['publication', 'Публікація', 'Що і коли бачить читач.'],
+  ['analytics', 'Аналітика й моделі', 'Детерміновані числа не залежать від жодного з цих ключів — лише проза над ними.'],
+  ['map', 'Карта й довідники', 'Підкладка, кодифікатор і довідковий шар окупації.'],
+  ['system', 'Система', 'Доступ, розгортання й тотожність образу.']
+];
+const APP_SETTING_GROUP_NAMES = Object.fromEntries(APP_SETTING_GROUPS.map(([id, name]) => [id, name]));
+const APP_SETTING_GROUP_NOTES = Object.fromEntries(APP_SETTING_GROUPS.map(([id, , note]) => [id, note]));
+
+// Підписи ключів. Це САМЕ підписи: склад сторінки будує сервер, а ключ, підпису для якого тут
+// немає, малюється власним іменем — незграбно, але видимо. Той самий закон, що й у
+// RUNTIME_FIELD_LABELS, і з тієї самої причини: новий ключ у реєстрі мусить зʼявитися на сторінці
+// без правки цього файлу.
+const APP_SETTING_LABELS = {
+  // Telegram
+  TELEGRAM_BOT_TOKEN: 'Токен бота',
+  TELEGRAM_BOT_USERNAME: 'Username бота',
+  TELEGRAM_MODE: 'Режим бота',
+  TELEGRAM_ADMIN_CHAT_ID: 'Chat ID адміністратора',
+  TELEGRAM_API_ID: 'MTProto api_id',
+  TELEGRAM_API_HASH: 'MTProto api_hash',
+  TELEGRAM_SESSION: 'Рядок сесії MTProto',
+  ALERT_CHANNEL_ENABLED: 'Офіційні alert-канали',
+  ALERT_CHANNEL_USERNAME: 'Запасний alert-канал',
+  ALERT_CHANNEL_MAX_ALERT_SECONDS: 'Стеля тривалості тривоги з каналу',
+  ALERT_CHANNEL_BACKFILL_MESSAGES: 'Дочитування каналу: повідомлень',
+  ALERT_CHANNEL_BACKFILL_SECONDS: 'Дочитування каналу: вікно',
+  OSINT_MONITOR_ENABLED: 'Моніторингові OSINT-канали',
+  OSINT_MONITOR_COALESCE_SECONDS: 'Склеювання повторів моніторингу',
+  CLASSIFIER_BACKFILL_ENABLED: 'Дозбір після простою',
+  CLASSIFIER_BACKFILL_MIN_GAP_SECONDS: 'Поріг розриву для дозбору',
+  CLASSIFIER_BACKFILL_MAX_AGE_SECONDS: 'Глибина дозбору',
+  CLASSIFIER_BACKFILL_MAX_MESSAGES: 'Ліміт повідомлень на джерело',
+  CLASSIFIER_BACKFILL_MAX_PAGES: 'Ліміт сторінок на джерело',
+  CLASSIFIER_BACKFILL_PAGE_SIZE: 'Розмір сторінки історії',
+  CLASSIFIER_BACKFILL_MAX_SOURCES_PER_SWEEP: 'Джерел за одне сканування',
+  CLASSIFIER_BACKFILL_SOURCE_DELAY_MS: 'Пауза між джерелами',
+  CLASSIFIER_BACKFILL_MIN_RERUN_SECONDS: 'Мінімум між повторами джерела',
+  CLASSIFIER_BACKFILL_CHECK_INTERVAL_SECONDS: 'Період сканування розривів',
+  // Офіційні джерела
+  UKRAINE_ALARM_API_TOKEN: 'Токен Ukraine Alarm',
+  UKRAINE_ALARM_API_URL: 'Адреса API Ukraine Alarm',
+  ALERTS_IN_UA_TOKEN: 'Токен Alerts.in.ua',
+  ALERTS_IN_UA_URL: 'Адреса API Alerts.in.ua',
+  AERIAL_MIRROR_ENABLED: 'Громадське дзеркало тривог',
+  AERIAL_MIRROR_URL: 'Адреса дзеркала',
+  AERIAL_MIRROR_STALE_SECONDS: 'Гранична давність кеша дзеркала',
+  AERIAL_MIRROR_RAW_SOURCE: 'Наскрізне джерело дзеркала',
+  AERIAL_MIRROR_REQUEST_GAP_MS: 'Пауза між запитами до дзеркала',
+  ALERT_END_DEBOUNCE_SECONDS: 'Витримка перед відбоєм',
+  DEMO_SOURCE_ENABLED: 'Демо-джерело',
+  // Публікація
+  PUBLICATION_DELAY_SECONDS: 'Тривалість затримки показу',
+  NIGHTLY_DIGEST_TIME: 'Час нічного дайджесту',
+  APP_TIMEZONE: 'Часовий пояс застосунку',
+  // Аналітика й моделі
+  AI_BASE_URL: 'Адреса моделі',
+  AI_API_KEY: 'Ключ моделі',
+  AI_MODEL: 'Назва моделі',
+  AI_TIMEOUT_MS: 'Тайм-аут звернення до моделі',
+  ANALYTICS_EVENT_DRIVEN_ENABLED: 'Подієвий перерахунок аналітики',
+  ANALYTICS_NARRATIVE_ENABLED: 'Наратив аналітики',
+  CODEX_BASE_URL: 'Адреса Codex',
+  CODEX_API_KEY: 'Токен Codex',
+  CODEX_MODEL: 'Модель Codex',
+  CODEX_ACCOUNT_ID: 'Обліковий запис Codex',
+  CODEX_API_STYLE: 'Транспорт Codex',
+  SHADOW_CLASSIFIER_MAX_PER_MINUTE: 'Бюджет тіньової класифікації',
+  RETROSPECTIVE_GATE_TIMEOUT_MS: 'Тайм-аут підтвердження ретроспективи',
+  RETROSPECTIVE_GATE_MAX_PER_MINUTE: 'Бюджет підтвердження ретроспективи',
+  CODEX_OAUTH_ISSUER: 'Видавець OAuth Codex',
+  CODEX_OAUTH_CLIENT_ID: 'Client ID OAuth Codex',
+  CODEX_OAUTH_SCOPE: 'Обсяг доступу OAuth Codex',
+  CODEX_OAUTH_REDIRECT_PORT: 'Порт зворотного виклику',
+  CODEX_OAUTH_REDIRECT_HOST: 'Хост зворотного виклику',
+  CODEX_OAUTH_BIND_ADDRESS: 'Адреса прослуховування зворотного виклику',
+  CODEX_OAUTH_LOGIN_TIMEOUT_SECONDS: 'Час життя початого входу',
+  // Карта й довідники
+  MAP_STYLE_URL: 'Стиль підкладки карти',
+  KATOTTG_SYNC_ENABLED: 'Синхронізація КАТОТТГ',
+  KATOTTG_URL: 'Адреса кодифікатора КАТОТТГ',
+  KATOTTG_VERSION: 'Версія кодифікатора',
+  OCCUPATION_SOURCE_ENABLED: 'Шар окупованих територій',
+  DEEPSTATE_API_URL: 'Адреса DeepStateMap',
+  OCCUPATION_SYNC_INTERVAL_SECONDS: 'Період оновлення шару окупації',
+  OCCUPATION_STALE_AFTER_SECONDS: 'Термін придатності ревізії окупації',
+  // Система
+  NODE_ENV: 'Середовище',
+  PORT: 'Порт застосунку',
+  PUBLIC_URL: 'Публічна адреса',
+  DATABASE_URL: 'Підключення до PostgreSQL',
+  OPS_USER: 'Користувач консолі',
+  OPS_PASSWORD: 'Пароль консолі',
+  METRICS_TOKEN: 'Токен /metrics',
+  APP_COMMIT: 'Commit образу',
+  APP_BUILT_AT: 'Час збірки образу',
+  DEPLOY_ENABLED: 'Оновлення з консолі',
+  DEPLOY_RUNNER_URL: 'Адреса процесу оновлення',
+  DEPLOY_RUNNER_TOKEN: 'Токен процесу оновлення',
+  DEPLOY_RUNNER_TIMEOUT_MS: 'Бюджет запиту до процесу оновлення'
+};
+
+// Примітки. Не в кожного ключа — лише там, де значення без пояснення читається неправильно: межа,
+// яка є запобіжником, а не регулятором; вимикач, який не забирає вже показане; порожній рядок, що
+// має власне значення.
+const APP_SETTING_NOTES = {
+  TELEGRAM_SESSION: 'Рівноцінно входу в акаунт. Відкликається в Telegram → Пристрої.',
+  ALERT_CHANNEL_USERNAME: 'Запасний варіант: читається лише тоді, коли не вдався запит до таблиці джерел.',
+  ALERT_CHANNEL_MAX_ALERT_SECONDS: 'Запобіжник проти загубленого відбою, а не типова тривалість. Зниження до правдоподібної тривалості робить із нього генератор фальшивого «Офіційний відбій».',
+  OSINT_MONITOR_COALESCE_SECONDS: '0 — без склеювання. Придушується повторне сповіщення, а не саме повідомлення.',
+  CLASSIFIER_BACKFILL_CHECK_INTERVAL_SECONDS: '0 — лише один раз, на старті колектора.',
+  AERIAL_MIRROR_STALE_SECONDS: 'Запобіжник: за цією межею відповідь дзеркала стає помилкою джерела й нічого не пишеться. Підняти — розширити вікно, у якому вірять мертвому дзеркалу.',
+  AERIAL_MIRROR_RAW_SOURCE: 'Порожній рядок вимикає наскрізний режим і повертає поведінку «лише області» — це відступ до відомого стану, а не деградація.',
+  AERIAL_MIRROR_REQUEST_GAP_MS: 'Ендпоінт дозволяє два запити на секунду; сплеск отримує обрізане тіло.',
+  ALERT_END_DEBOUNCE_SECONDS: 'Скільки джерело може мовчати про тривогу, перш ніж її дозволено завершити. Опитування — раз на 15 с.',
+  DEMO_SOURCE_ENABLED: 'У production увімкнене демо-джерело — відмова старту.',
+  PUBLICATION_DELAY_SECONDS: 'Лише ДОВЖИНА утримання. Сам режим (наживо / із затримкою) вмикає оператор на головній сторінці консолі.',
+  APP_TIMEZONE: 'Пояс, у якому бот називає час. Форматувальники перечитують його на місці.',
+  ANALYTICS_NARRATIVE_ENABLED: 'Жодне число від цього не змінюється — лише проза над уже порахованим.',
+  CODEX_API_STYLE: '`auto` вибирає транспорт за адресою; явні значення — для проксі на оманливому URL.',
+  SHADOW_CLASSIFIER_MAX_PER_MINUTE: 'Стеля витрат, а не пропускна здатність. Понадбюджетні повідомлення відкидаються, а не стають у чергу.',
+  RETROSPECTIVE_GATE_TIMEOUT_MS: 'Виклик усередині конвеєра: повідомлення, яке чекає на модель, — це повідомлення, якого ще немає на карті.',
+  RETROSPECTIVE_GATE_MAX_PER_MINUTE: 'Понад бюджет ворота публікують. Вичерпана квота може коштувати придушення, ніколи — попередження.',
+  OCCUPATION_SYNC_INTERVAL_SECONDS: 'Постачальник публікує приблизно раз на добу; частіше за годину відхиляється.',
+  DEEPSTATE_API_URL: 'Дані не під відкритою ліцензією. Атрибуція обовʼязкова.',
+  MAP_STYLE_URL: 'Читає браузер відвідувача. Для production — власна підкладка.',
+  OPS_PASSWORD: 'У production — щонайменше 16 символів, інакше застосунок не стартує.',
+  METRICS_TOKEN: 'У production — щонайменше 16 символів.',
+  DEPLOY_RUNNER_TOKEN: 'Спільний секрет із контейнером `deployer`. У production при увімкненому оновленні — від 32 символів.',
+  APP_COMMIT: 'Запікається в образ під час збірки. `unknown` означає образ, зібраний поза compose.'
+};
+
+// Якір у docs/TOKENS.md. Не в кожного ключа — лише в того, який десь ЗДОБУВАЮТЬ: реєструють,
+// подають заявку, генерують або натискають кнопку.
+const APP_SETTING_DOC_ANCHORS = {
+  TELEGRAM_API_ID: 'telegram-mtproto', TELEGRAM_API_HASH: 'telegram-mtproto',
+  TELEGRAM_SESSION: 'telegram-mtproto',
+  TELEGRAM_BOT_TOKEN: 'telegram-bot', TELEGRAM_BOT_USERNAME: 'telegram-bot',
+  TELEGRAM_ADMIN_CHAT_ID: 'telegram-bot',
+  UKRAINE_ALARM_API_TOKEN: 'ukrainealarm', UKRAINE_ALARM_API_URL: 'ukrainealarm',
+  ALERTS_IN_UA_TOKEN: 'alerts-in-ua', ALERTS_IN_UA_URL: 'alerts-in-ua',
+  AERIAL_MIRROR_ENABLED: 'aerial-mirror', AERIAL_MIRROR_URL: 'aerial-mirror',
+  AERIAL_MIRROR_RAW_SOURCE: 'aerial-mirror',
+  AI_BASE_URL: 'ai-platform', AI_API_KEY: 'ai-platform', AI_MODEL: 'ai-platform',
+  CODEX_BASE_URL: 'codex', CODEX_API_KEY: 'codex', CODEX_MODEL: 'codex',
+  CODEX_ACCOUNT_ID: 'codex', CODEX_API_STYLE: 'codex',
+  CODEX_OAUTH_ISSUER: 'codex', CODEX_OAUTH_CLIENT_ID: 'codex', CODEX_OAUTH_SCOPE: 'codex',
+  CODEX_OAUTH_REDIRECT_PORT: 'codex', CODEX_OAUTH_REDIRECT_HOST: 'codex',
+  CODEX_OAUTH_BIND_ADDRESS: 'codex', CODEX_OAUTH_LOGIN_TIMEOUT_SECONDS: 'codex',
+  OPS_USER: 'self-generated', OPS_PASSWORD: 'self-generated', METRICS_TOKEN: 'self-generated',
+  DEPLOY_RUNNER_TOKEN: 'self-generated', DATABASE_URL: 'self-generated',
+  KATOTTG_SYNC_ENABLED: 'katottg', KATOTTG_URL: 'katottg', KATOTTG_VERSION: 'katottg',
+  OCCUPATION_SOURCE_ENABLED: 'deepstate', DEEPSTATE_API_URL: 'deepstate',
+  MAP_STYLE_URL: 'basemap', PUBLIC_URL: 'domain'
+};
+
+// Здобуття, вкладене в саму сторінку. Три-пʼять кроків — не переказ TOKENS.md, а те, що потрібно
+// біля поля, у яке зараз вставляють значення. Повний текст із датами перевірки — за посиланням.
+const APP_SETTING_HOWTO = {
+  'telegram-mtproto': [
+    'my.telegram.org → увійти телефоном ТОГО акаунта, який читатиме канали.',
+    'API development tools → заповнити форму (назва будь-яка, платформа Other, URL можна лишити порожнім).',
+    'Сторінка покаже App api_id (число) і App api_hash (32 hex-символи).',
+    'node scripts/telegram-session.mjs — запитає ці два значення, телефон, код і пароль двоетапної перевірки, після чого надрукує рядок TELEGRAM_SESSION=…'
+  ],
+  'telegram-bot': [
+    '@BotFather у Telegram → /newbot.',
+    'Назва, потім username, що закінчується на bot.',
+    'BotFather віддасть токен виду 123456789:AAF… Відкликати — /revoke там само.',
+    'Chat ID адміністратора: написати @userinfobot.'
+  ],
+  ukrainealarm: [
+    'api.ukrainealarm.com — заявка через форму в браузері.',
+    'Автоматичне звернення по токен відповідає 403: форму заповнює людина.',
+    'Погодження триває стільки, скільки триває. Джерело не обовʼязкове — офіційні тривоги вже працюють через Telegram-колектор.'
+  ],
+  'alerts-in-ua': [
+    'alerts.in.ua, розділ для розробників — письмова заявка.',
+    'Ліміт запитів указано у відповіді видавця; опитування частіше за нього повертає 429.',
+    'Перед довірою перевірити на стенді: ідентифікатори регіонів мусять лягти на місцевий каталог.'
+  ],
+  'aerial-mirror': [
+    'Нічого здобувати не треба: джерело без токена й без заявки.',
+    'Єдиний «вимкнено» цього джерела — цей перемикач.'
+  ],
+  'ai-platform': [
+    'platform.openai.com → API keys → створити ключ.',
+    'На акаунті платформи має бути налаштована оплата: підписка ChatGPT доступу до API не дає.',
+    'Підходить будь-який OpenAI-сумісний ендпоінт — локальний сервер, проксі, інший постачальник.'
+  ],
+  codex: [
+    'Кнопка «Увійти через ChatGPT» на головній сторінці консолі — сесія збережеться в PostgreSQL і оновлюватиметься сама.',
+    'Зворотний виклик іде на http://localhost:1455/auth/callback і іншого редиректу той клієнт не приймає.',
+    'На віддаленому хості за Caddy кнопка не завершиться, доки порт не протунельовано: ssh -L 1455:localhost:1455 …',
+    'Ручний шлях: codex login, потім токен і account id із ~/.codex/auth.json. Він не оновлюється сам.'
+  ],
+  'self-generated': [
+    'Ніхто їх не видає: openssl rand -base64 24 (для токена процесу оновлення — openssl rand -hex 32).',
+    'Пароль консолі й токен /metrics у production — від 16 символів, інакше застосунок не стартує.'
+  ],
+  katottg: ['Публікація міністерства, без реєстрації. Змінюється лише коли виходить новий кодифікатор.'],
+  deepstate: [
+    'Публічний ендпоінт, токена немає.',
+    'Дані НЕ під відкритою ліцензією: атрибуція обовʼязкова, а перед публічним поширенням потрібен дозвіл — або вимкнути шар.'
+  ],
+  basemap: ['Публічний тайл-сервер. Для production — власний стиль PMTiles, див. data/map/README.md.'],
+  domain: ['Домен, A/AAAA-запис на хост, відкриті 80 і 443. Сертифікат Caddy отримує сам.']
+};
+
+const SETTING_SOURCE_NAMES = { db: 'БД', env: '.env', default: 'за замовчуванням' };
+const SETTING_SOURCE_HINTS = {
+  db: 'Значення збережено в цій консолі й переважає над .env.',
+  env: 'Значення прийшло зі змінних середовища контейнера.',
+  default: 'Значення ніде не задано — діє типове зі схеми.'
+};
+// Підпис озброєної кнопки називає НАСЛІДОК, а не дію. «Ви впевнені?» перевіряє рішучість;
+// «колектор перепідключиться» перевіряє те єдине, що варто перевірити, — чи оператор знає, що
+// зараз станеться.
+const SETTING_IMPACT_ARMED = {
+  collector: 'Підтвердити: колектор перепідключиться',
+  alerts: 'Підтвердити: торкнеться офіційних тривог',
+  publication: 'Підтвердити: торкнеться публічного показу'
+};
+const SETTING_IMPACT_NOTES = {
+  collector: 'Зміна перезапускає підписки MTProto. Поки триває перепідключення, канали не читаються.',
+  alerts: 'Зміна впливає на те, коли тривога починається і коли їй дозволено завершитися.',
+  publication: 'Зміна впливає на те, що бачить читач публічної сторінки.'
+};
+const SETTINGS_PUT_ERRORS = {
+  unknown_setting: 'Сервер не знає такого ключа або він доступний лише з .env.',
+  confirmation_required: 'Ключ потребує підтвердження. Натисніть кнопку збереження ще раз.',
+  publication_delayed: 'Показ зараз затримано. Довжину затримки не можна змінювати, доки діє режим «із затримкою»: перемкніть показ на «наживо» на головній сторінці консолі.'
+};
+// Стан колектора одним словом — той самий словник, що й у решті консолі.
+const COLLECTOR_STATE_NAMES = {
+  disabled: 'вимкнено', starting: 'запускається', ready: 'читає',
+  degraded: 'частково', flood_wait: 'flood wait', failed: 'збій'
+};
+const COLLECTOR_STATE_TONES = {
+  disabled: 'off', starting: 'warn', ready: 'ok', degraded: 'warn', flood_wait: 'bad', failed: 'bad'
+};
+
+const settingLabel = (key) => APP_SETTING_LABELS[key] ?? key;
+
+/** Живий стан колектора поруч із ключем, який його перезапустить. */
+function settingCollectorPill(collector) {
+  if (!collector?.state) return '';
+  const tone = COLLECTOR_STATE_TONES[collector.state] ?? 'off';
+  const name = COLLECTOR_STATE_NAMES[collector.state] ?? collector.state;
+  const bound = Number.isFinite(Number(collector.resolved)) && Number.isFinite(Number(collector.channels))
+    ? ` ${collector.resolved}/${collector.channels}`
+    : '';
+  return `<span class="codex-state is-${tone}" title="Стан колектора на момент читання сторінки">колектор: ${escapeHtml(name)}${escapeHtml(bound)}</span>`;
+}
+
+/**
+ * Значення для показу і для пошуку.
+ *
+ * Секрет не має тут жодного значення взагалі — сервер його не надсилає, і вигадувати заглушку, яка
+ * виглядає як значення, було б гірше за порожнечу.
+ */
+const settingIsSecret = (setting) => setting.isSecret === true || setting.ui?.kind === 'secret';
+
+function settingDisplayValue(setting) {
+  if (settingIsSecret(setting)) return setting.isSet ? '•••••••' : 'не встановлено';
+  const applied = setting.applied ?? setting.stored ?? setting.envValue ?? setting.defaultValue;
+  if (applied === null || applied === undefined || applied === '') return '';
+  return String(applied);
+}
+
+/** Рядок, який шукає пошук: ключ, підпис і значення разом. */
+function settingSearchIndex(setting) {
+  return [setting.key, settingLabel(setting.key), settingIsSecret(setting) ? '' : settingDisplayValue(setting)]
+    .join(' ').toLowerCase();
+}
+
+function settingBadges(setting) {
+  const source = setting.source ?? 'default';
+  const badges = [`<span class="settings-badge is-${escapeHtml(source)}" title="${escapeHtml(SETTING_SOURCE_HINTS[source] ?? '')}">${escapeHtml(SETTING_SOURCE_NAMES[source] ?? source)}</span>`];
+  if (setting.pendingRestart) {
+    badges.push('<span class="settings-badge is-pending" title="Збережене значення відрізняється від того, з яким процес стартував">потребує перезапуску</span>');
+  } else if (setting.apply === 'restart') {
+    badges.push('<span class="settings-badge is-restart" title="Зміна цього ключа набуде чинності лише після перезапуску контейнера">лише після перезапуску</span>');
+  }
+  if (setting.scope === 'env') badges.push('<span class="settings-badge is-locked" title="Ключ доступний лише зі змінних середовища">тільки .env</span>');
+  if (settingIsSecret(setting)) badges.push('<span class="settings-badge is-secret">секрет</span>');
+  return badges.join('');
+}
+
+/** «Як отримати →»: кроки просто тут, повний текст — за посиланням. Див. TOKENS_DOC_URL. */
+function settingHowTo(key) {
+  const anchor = APP_SETTING_DOC_ANCHORS[key];
+  const steps = anchor ? APP_SETTING_HOWTO[anchor] : null;
+  if (!anchor || !steps) return '';
+  return `<details class="setting-howto">
+    <summary>як отримати →</summary>
+    <ol>${steps.map((step) => `<li>${escapeHtml(step)}</li>`).join('')}</ol>
+    <p class="legend-note"><a href="${escapeHtml(`${TOKENS_DOC_URL}#${anchor}`)}" target="_blank" rel="noreferrer">docs/TOKENS.md#${escapeHtml(anchor)} ↗</a> — повний текст із датами перевірки й порядком заміни.</p>
+  </details>`;
+}
+
+/** Керувальний орган поля. Числове бере готову форму рантайму разом із її натискними межами. */
+function settingControl(setting) {
+  const key = setting.key;
+  const id = escapeHtml(key);
+  const ui = setting.ui ?? {};
+  const kind = (setting.isSecret || ui.kind === 'secret') ? 'secret' : (ui.kind ?? 'text');
+  // `env` — не «поле, яке не можна змінити», а поле, змінювати яке звідси означало б зачинити двері
+  // зсередини або порушити те, чим сама сторінка тримається. Показуємо його разом із причиною й без
+  // жодного органа керування, який щось обіцяв би.
+  const locked = setting.scope === 'env';
+  const note = APP_SETTING_NOTES[key] ?? '';
+  const noteHtml = note ? `<p class="codex-feature-note">${escapeHtml(note)}</p>` : '';
+  const applyNote = setting.applyNote ? `<p class="codex-feature-note">${escapeHtml(setting.applyNote)}</p>` : '';
+  const envReason = locked && setting.envReason
+    ? `<p class="codex-feature-note setting-envreason">${escapeHtml(setting.envReason)}</p>` : '';
+  const error = `<p class="runtime-field-error" id="runtime-error-${id}" data-runtime-error hidden></p>`;
+  const title = `${settingLabel(key)}`;
+
+  if (kind === 'number') {
+    const min = ui.min ?? ui.bound?.min;
+    const max = ui.max ?? ui.bound?.max;
+    // Межі є — віддаємо полю рантайму цілком: підпис, одиниця, натискні мінімум і максимум,
+    // місце під помилку. Немає меж — це просто число без діапазону, і вигадувати діапазон не можна.
+    if (!locked && Number.isFinite(Number(min)) && Number.isFinite(Number(max))) {
+      return runtimeNumberField(key, { min, max }, settingDisplayValue(setting));
+    }
+    return `<div class="codex-feature runtime-field" data-runtime-row="${id}">
+      <label class="codex-feature-title" for="set-${id}">${escapeHtml(title)}${escapeHtml(runtimeUnit(key) ? `, ${runtimeUnit(key)}` : '')}</label>
+      <input id="set-${id}" type="number" step="1" inputmode="numeric" data-setting-input="${id}"
+        value="${escapeHtml(settingDisplayValue(setting))}"${locked ? ' disabled' : ''}>
+      ${noteHtml}${applyNote}${envReason}${error}
+    </div>`;
+  }
+
+  if (kind === 'boolean') {
+    const on = String(settingDisplayValue(setting)) === 'true';
+    return `<div class="codex-feature runtime-field setting-boolean" data-runtime-row="${id}">
+      <label class="codex-feature-title" for="set-${id}">${escapeHtml(title)}</label>
+      <label class="setting-switch"><input id="set-${id}" type="checkbox" data-setting-input="${id}"${on ? ' checked' : ''}${locked ? ' disabled' : ''}>
+        <span data-setting-switch-text>${on ? 'увімкнено' : 'вимкнено'}</span></label>
+      ${noteHtml}${applyNote}${envReason}${error}
+    </div>`;
+  }
+
+  if (kind === 'select' || kind === 'enum') {
+    const options = ui.options ?? ui.values ?? ui.choices ?? [];
+    const current = settingDisplayValue(setting);
+    const list = options.map((option) => {
+      const value = typeof option === 'string' ? option : option.value;
+      const name = typeof option === 'string' ? option : (option.label ?? option.value);
+      return `<option value="${escapeHtml(String(value))}"${String(value) === current ? ' selected' : ''}>${escapeHtml(String(name))}</option>`;
+    }).join('');
+    return `<div class="codex-feature runtime-field" data-runtime-row="${id}">
+      <label class="codex-feature-title" for="set-${id}">${escapeHtml(title)}</label>
+      <select id="set-${id}" data-setting-input="${id}"${locked ? ' disabled' : ''}>${list}</select>
+      ${noteHtml}${applyNote}${error}
+    </div>`;
+  }
+
+  if (kind === 'secret') {
+    // Маска — не «приховане значення», а рівно те, що сервер надіслав: встановлено чи ні, і звідки.
+    // Поля для введення тут спершу немає взагалі: воно зʼявляється на «Замінити», бо порожній
+    // password-інпут поруч зі встановленим секретом читається як «секрет стерли».
+    return `<div class="codex-feature runtime-field setting-secret" data-runtime-row="${id}">
+      <span class="codex-feature-title">${escapeHtml(title)}</span>
+      <p class="setting-mask" data-setting-mask>${setting.isSet ? '•••••••' : '<i>не встановлено</i>'}</p>
+      ${locked ? '' : `<div class="setting-secret-input" data-setting-secret-input hidden>
+        <label class="visually-hidden" for="set-${id}">Нове значення: ${escapeHtml(title)}</label>
+        <input id="set-${id}" type="password" autocomplete="new-password" spellcheck="false"
+          data-setting-input="${id}" placeholder="вставити нове значення">
+      </div>`}
+      ${noteHtml}${applyNote}${envReason}${error}
+    </div>`;
+  }
+
+  const value = settingDisplayValue(setting);
+  const multiline = value.length > 120;
+  const placeholder = ui.placeholder ? ` placeholder="${escapeHtml(String(ui.placeholder))}"` : '';
+  const control = multiline
+    ? `<textarea id="set-${id}" rows="2" spellcheck="false" data-setting-input="${id}"${locked ? ' disabled' : ''}>${escapeHtml(value)}</textarea>`
+    : `<input id="set-${id}" type="${kind === 'url' ? 'url' : 'text'}" spellcheck="false" autocomplete="off"
+        data-setting-input="${id}" value="${escapeHtml(value)}"${placeholder}${locked ? ' disabled' : ''}>`;
+  return `<div class="codex-feature runtime-field" data-runtime-row="${id}">
+    <label class="codex-feature-title" for="set-${id}">${escapeHtml(title)}</label>
+    ${control}
+    ${noteHtml}${applyNote}${envReason}${error}
+  </div>`;
+}
+
+/**
+ * Один рядок реєстру.
+ *
+ * `data-initial` — те, що сервер вважає діючим ЗАРАЗ. Уся брудність сторінки міряється від нього,
+ * а не від значення, з яким поле намалювали: це те саме, доки ніхто не друкував.
+ */
+function opsSettingRow(setting, collector) {
+  const key = setting.key;
+  const id = escapeHtml(key);
+  const confirm = setting.confirm === true;
+  const impact = setting.impact ?? '';
+  const impactNote = impact && SETTING_IMPACT_NOTES[impact]
+    ? `<p class="setting-impact">${escapeHtml(SETTING_IMPACT_NOTES[impact])}</p>` : '';
+  const locked = setting.scope === 'env';
+  const secret = setting.isSecret || setting.ui?.kind === 'secret';
+  const actions = locked
+    ? '<span class="legend-note">Змінюється лише у <code>.env</code> і перезапуском.</span>'
+    : secret
+      ? `<button type="button" data-setting-replace="${id}">Замінити</button>
+         <button type="button" data-setting-save="${id}" hidden disabled>Зберегти</button>
+         <button type="button" data-setting-cancel="${id}" hidden>Скасувати</button>
+         ${setting.source === 'db' ? `<button type="button" class="setting-danger" data-setting-clear="${id}">Очистити</button>` : ''}`
+      : `<button type="button" data-setting-save="${id}" disabled>Зберегти</button>
+         ${setting.source === 'db' ? `<button type="button" class="setting-danger" data-setting-clear="${id}">Скинути</button>` : ''}`;
+  return `<article class="setting-row${locked ? ' is-locked' : ''}" data-setting-row="${id}" data-setting-key="${id}"
+      data-search="${escapeHtml(settingSearchIndex(setting))}"
+      data-initial="${escapeHtml(secret ? '' : settingDisplayValue(setting))}"
+      data-secret="${secret ? 'true' : 'false'}" data-locked="${locked ? 'true' : 'false'}"
+      data-confirm="${confirm ? 'true' : 'false'}" data-impact="${escapeHtml(impact)}">
+    <div class="setting-field">
+      ${settingControl(setting)}
+      ${impactNote}
+      <p class="setting-key"><code>${id}</code>${setting.updatedAt ? ` · змінено ${escapeHtml(new Date(setting.updatedAt).toLocaleString('uk-UA'))}${setting.updatedBy ? ` · ${escapeHtml(setting.updatedBy)}` : ''}` : ''}</p>
+      ${settingHowTo(key)}
+      <details class="setting-audit" data-setting-audit="${id}">
+        <summary>Журнал змін ключа</summary>
+        <div data-setting-audit-body><p class="legend-note">Читаємо…</p></div>
+      </details>
+    </div>
+    <div class="setting-side">
+      <div class="settings-badges">${settingBadges(setting)}${confirm && impact === 'collector' ? settingCollectorPill(collector) : ''}</div>
+      <div class="ops-channel-actions setting-actions">${actions}</div>
+      <output class="setting-status" data-setting-status="${id}"></output>
+    </div>
+  </article>`;
+}
+
+/** Група — розгортайка, бо шість груп на вісімдесят полів інакше стають одним нескінченним списком. */
+function opsSettingsGroup(group, settings, collector) {
+  const id = typeof group === 'string' ? group : (group.id ?? group.key ?? group.group);
+  const name = (typeof group === 'object' && (group.label ?? group.name ?? group.title))
+    || APP_SETTING_GROUP_NAMES[id] || id;
+  const note = (typeof group === 'object' && group.note) || APP_SETTING_GROUP_NOTES[id] || '';
+  const rows = settings.filter((setting) => setting.group === id);
+  if (!rows.length) return '';
+  const pending = rows.filter((setting) => setting.pendingRestart).length;
+  return `<details class="settings-group" data-settings-group="${escapeHtml(id)}" open>
+    <summary>
+      <span class="settings-group-name">${escapeHtml(name)}</span>
+      <span class="settings-group-count" data-settings-group-count>${rows.length}</span>
+      ${pending ? `<span class="settings-badge is-pending">${pending} чекає перезапуску</span>` : ''}
+      <span class="legend-caret" aria-hidden="true">▾</span>
+    </summary>
+    ${note ? `<p class="legend-note settings-group-note">${escapeHtml(note)}</p>` : ''}
+    <div class="settings-rows">${rows.map((setting) => opsSettingRow(setting, collector)).join('')}</div>
+  </details>`;
+}
+
+function settingsAuditRow(row) {
+  return `<article>
+    <div>
+      <span>${escapeHtml(new Date(row.changedAt).toLocaleString('uk-UA'))} · ${escapeHtml(row.changedBy ?? '—')} · ${escapeHtml(row.source ?? '—')}</span>
+      <h3>${escapeHtml(settingLabel(row.field))}</h3>
+      <p><code>${escapeHtml(row.field ?? '')}</code>: ${escapeHtml(row.previousValue ?? '—')} → ${escapeHtml(row.newValue ?? '—')}</p>
+    </div>
+  </article>`;
+}
+
+/**
+ * Банер перезапуску називає обидва справжні шляхи, а не «перезапустіть застосунок».
+ *
+ * Кнопка на головній сторінці консолі підписана «Оновити до <commit>» і робить повне оновлення з
+ * main; `docker compose restart app` перезапускає той самий образ. Це різні дії з різними
+ * наслідками, і оператор мусить бачити обидві названими, а не вгадувати, яку мали на увазі.
+ */
+function settingsRestartBanner(restartPending) {
+  const keys = restartPending?.keys ?? [];
+  const count = Number(restartPending?.count ?? keys.length ?? 0);
+  if (!count) return '';
+  return `<div class="settings-restart" role="status">
+    <p><strong>${count} ${pluralUk(count, 'ключ чекає', 'ключі чекають', 'ключів чекає')} перезапуску.</strong>
+      Значення збережено, але процес досі працює з тим, з яким стартував.</p>
+    ${keys.length ? `<p class="settings-restart-keys">${keys.map((key) => `<code>${escapeHtml(key)}</code>`).join(' ')}</p>` : ''}
+    <p class="legend-note">Застосувати можна двома шляхами, і вони різні: кнопка «Оновити до …» в
+      картці «Оновлення з main» на головній сторінці консолі збирає й розгортає новий commit, а на
+      хості <code>docker compose restart app</code> перезапускає той самий образ із новими
+      значеннями.</p>
+  </div>`;
+}
+
+async function renderOpsSettings() {
+  clearInterval(codexPollTimer);
+  clearInterval(deployPollTimer);
+  const root = contentShell('Закритий контур', 'Налаштування застосунку',
+    'Реєстр змінних середовища: що діє зараз, звідки воно взялося і хто це змінив.');
+  const response = await opsFetch('/ops/api/settings').catch(() => null);
+  if (response?.status === 401) {
+    opsLoginForm(root, '/ops/api/settings', () => void renderOpsSettings());
+    return;
+  }
+  root.classList.add('ops-console');
+  root.parentElement?.classList.add('ops-shell');
+  if (!response?.ok) {
+    // Легітимний проміжний стан, а не збій сторінки: маршрут може ще не існувати в цьому образі.
+    root.innerHTML = `<nav class="ops-quicklinks"><a href="/ops" data-route="/ops">← Операційна консоль</a></nav>
+      <section class="ops-section"><header class="ops-section-head"><div><p>Реєстр</p><h2>Налаштування недоступні</h2></div></header>
+      <p class="legend-note">Сервер не віддав реєстр налаштувань${response ? ` (HTTP ${response.status})` : ''}. Значення далі читаються з <code>.env</code>, і жодне з них від цього не змінилося.</p></section>`;
+    return;
+  }
+  const data = await response.json().catch(() => null);
+  if (!data) { root.innerHTML = '<p class="legend-note">Реєстр налаштувань нечитний.</p>'; return; }
+
+  const groups = data.groups?.length ? data.groups : APP_SETTING_GROUPS.map(([id]) => id);
+  const envOnly = data.envOnly ?? [];
+  const rejected = data.rejected ?? [];
+  const orphans = data.orphans ?? [];
+  const blocked = data.blocked ?? [];
+  const audit = data.audit ?? [];
+  // «Чому лише в .env» сервер надсилає один раз, списком, а не повторює в кожному рядку. Розкладаємо
+  // його по ключах тут: причина потрібна БІЛЯ поля, бо саме там оператор питає «а чому воно сіре».
+  const envReasons = new Map(envOnly.map((item) => [
+    typeof item === 'string' ? item : item.key,
+    typeof item === 'object' ? (item.reason ?? '') : ''
+  ]));
+  const settings = (data.settings ?? []).map((setting) => (
+    envReasons.has(setting.key) ? { ...setting, envReason: envReasons.get(setting.key) } : setting
+  ));
+
+  root.innerHTML = `<nav class="ops-quicklinks" aria-label="Розділи консолі">
+      <a href="/ops" data-route="/ops">← Операційна консоль</a>
+      <span>${settings.length} ${pluralUk(settings.length, 'ключ', 'ключі', 'ключів')} у реєстрі · ${envOnly.length} лише з <code>.env</code></span>
+    </nav>
+    ${data.degraded ? `<div class="settings-rejected" role="alert">
+      <p><strong>Реєстр не прочитався на старті.</strong> Усе, що показано нижче як діюче, зараз
+        приходить зі змінних середовища: збережені значення не застосовано жодне.</p>
+      <p class="legend-note">Це навмисна поведінка — читання реєстру відмовляє «відкрито», щоб збій
+        бази не залишив застосунок без конфігурації взагалі. Але доки цей рядок тут, сторінка
+        показує намір, а не дійсність. Перевірте журнал застосунку й
+        <code>threatlens_app_settings_read_failures_total</code>.</p>
+    </div>` : ''}
+    ${settingsRestartBanner(data.restartPending)}
+    ${rejected.length ? `<div class="settings-rejected" role="alert">
+      <p><strong>Сервер відхилив ${rejected.length} ${pluralUk(rejected.length, 'збережене значення', 'збережені значення', 'збережених значень')}</strong> і читає їх з <code>.env</code>.</p>
+      <p class="settings-restart-keys">${rejected.map((item) => `<code>${escapeHtml(typeof item === 'string' ? item : (item.key ?? ''))}</code>${typeof item === 'object' && item.reason ? ` — ${escapeHtml(item.reason)}` : ''}`).join(' · ')}</p>
+    </div>` : ''}
+    ${orphans.length ? `<p class="legend-note">У таблиці лишилися ключі, яких реєстр більше не знає: ${orphans.map((key) => `<code>${escapeHtml(typeof key === 'string' ? key : (key.key ?? ''))}</code>`).join(' ')}. Вони ні на що не впливають — це слід перейменування або відкату на старіший образ.</p>` : ''}
+    ${blocked.length ? `<p class="legend-note">У таблиці є рядки для ключів, які читаються лише з <code>.env</code>: ${blocked.map((key) => `<code>${escapeHtml(typeof key === 'string' ? key : (key.key ?? ''))}</code>`).join(' ')}. Їх туди міг вписати лише хтось руками, і вони не діють.</p>` : ''}
+    <section class="ops-section settings-console" id="settings-section">
+      <header class="ops-section-head">
+        <div><p>Реєстр · ${escapeHtml(String(settings.length))} ключів</p><h2>Значення й походження</h2></div>
+        <div class="ops-channel-actions">
+          <output id="settings-status"></output>
+          <button type="button" data-settings-save-all disabled>Зберегти всі зміни</button>
+        </div>
+      </header>
+      <div class="settings-toolbar">
+        <label class="settings-search">Пошук
+          <input type="search" data-settings-search placeholder="ключ, підпис або значення"
+            autocomplete="off" spellcheck="false">
+        </label>
+        <output class="settings-count" data-settings-count></output>
+      </div>
+      <div class="settings-groups">
+        ${groups.map((group) => opsSettingsGroup(group, settings, data.collector)).join('')}
+      </div>
+      ${data.notice ? `<details class="safety-note ops-fold"><summary><strong>Що ця сторінка не робить</strong></summary><p>${escapeHtml(data.notice)}</p></details>` : ''}
+    </section>
+    <details class="ops-fold settings-envonly">
+      <summary><strong>Тільки в <code>.env</code> — ${envOnly.length} ${pluralUk(envOnly.length, 'ключ', 'ключі', 'ключів')}</strong></summary>
+      <p class="legend-note">Ці ключі свідомо не можна змінити звідси. Кожен із них потрібен раніше
+        за базу, читається compose, або є тим самим замком, крізь який відкрито цю сторінку.</p>
+      <dl class="codex-facts settings-envonly-list">
+        ${envOnly.map((item) => `<div><dt>${escapeHtml(typeof item === 'string' ? item : (item.key ?? ''))}</dt>
+          <dd>${escapeHtml(typeof item === 'object' ? (item.reason ?? '') : '')}</dd></div>`).join('')}
+      </dl>
+    </details>
+    <section class="ops-section" id="settings-audit-section">
+      <header class="ops-section-head"><div><p>Журнал</p><h2>Останні зміни</h2></div></header>
+      ${audit.length
+        ? `<div class="ops-channel-list">${audit.map(settingsAuditRow).join('')}</div>`
+        : '<p class="legend-note">Змін ще не було: усе діюче прийшло з <code>.env</code> або з типових значень.</p>'}
+    </section>`;
+  wireOpsSettings(root, data);
+}
+
+/**
+ * Уся сторінка на одній делегації плюс кілька точкових слухачів.
+ *
+ * Перемальовування тут коштує дорожче, ніж деінде в консолі: вісімдесят полів, з яких половина може
+ * бути напівнабрана, і розгорнутий журнал ключа, який щойно прочитали. Тому збереження оновлює
+ * рядок на місці — бейдж, підпис і стан кнопки, — а повний перечит робиться лише тоді, коли
+ * оператор попросив зберегти все.
+ */
+function wireOpsSettings(root, data) {
+  const section = $('#settings-section', root);
+  if (!section) return;
+  const status = $('#settings-status', section);
+  const saveAll = $('[data-settings-save-all]', section);
+  const search = $('[data-settings-search]', section);
+  const counter = $('[data-settings-count]', section);
+  const settingsByKey = new Map((data.settings ?? []).map((setting) => [setting.key, setting]));
+
+  // Числове поле рантайму не знає про реєстр і підписує інпут своїм атрибутом. Замість того щоб
+  // дублювати розмітку, позначаємо його тут — одна петля замість другої форми того самого поля.
+  section.querySelectorAll('input[type="number"][data-runtime-field]').forEach((input) => {
+    input.dataset.settingInput = input.dataset.runtimeField;
+  });
+
+  const rows = () => [...section.querySelectorAll('[data-setting-row]')];
+  const rowOf = (key) => section.querySelector(`[data-setting-row="${key}"]`);
+  const inputOf = (row) => row?.querySelector('[data-setting-input]');
+
+  const currentValue = (row) => {
+    const input = inputOf(row);
+    if (!input) return null;
+    if (input.type === 'checkbox') return input.checked ? 'true' : 'false';
+    return input.value;
+  };
+
+  // Брудність секрету — це не «значення відрізняється», бо порівнювати нема з чим. Це «оператор
+  // відкрив поле заміни й щось у нього вписав».
+  const isDirty = (row) => {
+    if (row.dataset.locked === 'true') return false;
+    const value = currentValue(row);
+    if (value === null) return false;
+    if (row.dataset.secret === 'true') return row.dataset.replacing === 'true' && value !== '';
+    return value !== row.dataset.initial;
+  };
+
+  const dirtyRows = () => rows().filter(isDirty);
+
+  const paintRow = (row) => {
+    const dirty = isDirty(row);
+    row.classList.toggle('is-dirty', dirty);
+    const save = row.querySelector('[data-setting-save]');
+    if (save) save.disabled = !dirty;
+    if (!dirty) disarm(row.querySelector('[data-setting-save]'));
+  };
+
+  const refreshTotals = () => {
+    const dirty = dirtyRows();
+    saveAll.disabled = dirty.length === 0;
+    saveAll.textContent = dirty.length
+      ? `Зберегти всі зміни (${dirty.length})`
+      : 'Зберегти всі зміни';
+    disarm(saveAll);
+  };
+
+  // Два кроки на одній кнопці — той самий механізм, що й у кнопки оновлення: перше натискання лише
+  // перейменовує кнопку наслідком, друге надсилає, і через десять секунд озброєння спадає само.
+  const disarm = (button) => {
+    if (!button || button.dataset.armed !== 'true') return;
+    button.dataset.armed = 'false';
+    if (button.dataset.restLabel) button.textContent = button.dataset.restLabel;
+  };
+  const arm = (button, armedLabel) => {
+    button.dataset.restLabel = button.dataset.restLabel ?? button.textContent;
+    button.dataset.armed = 'true';
+    button.textContent = armedLabel;
+    setTimeout(() => {
+      if (!button.isConnected) return;
+      disarm(button);
+    }, 10_000);
+  };
+
+  const applyView = () => {
+    const query = (search?.value ?? '').trim().toLowerCase();
+    let shown = 0;
+    let total = 0;
+    for (const group of section.querySelectorAll('[data-settings-group]')) {
+      let visible = 0;
+      for (const row of group.querySelectorAll('[data-setting-row]')) {
+        total += 1;
+        const match = !query || (row.dataset.search ?? '').includes(query);
+        row.hidden = !match;
+        if (match) { visible += 1; shown += 1; }
+      }
+      group.hidden = visible === 0;
+      const count = group.querySelector('[data-settings-group-count]');
+      if (count) count.textContent = String(visible);
+      // Пошук, який знайшов збіг у згорнутій групі й лишив її згорнутою, — це пошук, який збрехав.
+      if (query && visible) group.open = true;
+    }
+    counter.textContent = query
+      ? `Показано ${shown} із ${total} ${pluralUk(total, 'ключа', 'ключів', 'ключів')}`
+      : `${total} ${pluralUk(total, 'ключ', 'ключі', 'ключів')} у реєстрі`;
+  };
+
+  /** Одна відповідь сервера — одне тлумачення, для всіх кнопок сторінки. */
+  const explainFailure = async (result, keys) => {
+    const payload = await result.json().catch(() => null);
+    const issues = Array.isArray(payload?.issues) ? payload.issues : [];
+    if (issues.length) {
+      const orphaned = showRuntimeFieldErrors(section, issues.map((key) => ({
+        field: key,
+        message: `${settingLabel(key)}: сервер відхилив це значення.`
+      })));
+      return `Сервер відхилив ${issues.length} ${pluralUk(issues.length, 'ключ', 'ключі', 'ключів')}.`
+        + (orphaned.length ? ` Поза формою: ${orphaned.map((problem) => problem.field).join(', ')}.` : ' Виправте позначене.');
+    }
+    const named = SETTINGS_PUT_ERRORS[payload?.error];
+    // Сервер називає винні ключі в `keys` — і `unknown_setting`, і `confirmation_required`. Показати
+    // текст без них означало б лишити оператора з правильним поясненням і без адреси.
+    const blamed = Array.isArray(payload?.keys) && payload.keys.length ? ` (${payload.keys.join(', ')})` : '';
+    if (named) return `${named}${blamed}`;
+    return `Не вдалося зберегти (HTTP ${result.status})${blamed || (keys.length ? `: ${keys.join(', ')}` : '')}.`;
+  };
+
+  const put = async (values, confirmKeys) => {
+    const body = { values, confirm: confirmKeys ?? [] };
+    return opsFetch('/ops/api/settings', {
+      method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body)
+    }).catch(() => null);
+  };
+
+  /** Оновлює один рядок за свіжою відповіддю, не чіпаючи решти сторінки. */
+  const repaintRow = (fresh, collector) => {
+    const row = rowOf(fresh.key);
+    if (!row) return;
+    settingsByKey.set(fresh.key, fresh);
+    row.dataset.initial = settingIsSecret(fresh) ? '' : settingDisplayValue(fresh);
+    row.dataset.search = settingSearchIndex(fresh);
+    row.dataset.replacing = 'false';
+    const badges = row.querySelector('.settings-badges');
+    if (badges) {
+      badges.innerHTML = settingBadges(fresh)
+        + (fresh.confirm === true && fresh.impact === 'collector' ? settingCollectorPill(collector) : '');
+    }
+    if (settingIsSecret(fresh)) {
+      const mask = row.querySelector('[data-setting-mask]');
+      if (mask) mask.innerHTML = fresh.isSet ? '•••••••' : '<i>не встановлено</i>';
+      const holder = row.querySelector('[data-setting-secret-input]');
+      if (holder) { holder.hidden = true; const input = inputOf(row); if (input) input.value = ''; }
+      row.querySelector('[data-setting-replace]')?.removeAttribute('hidden');
+      row.querySelector('[data-setting-save]')?.setAttribute('hidden', '');
+      row.querySelector('[data-setting-cancel]')?.setAttribute('hidden', '');
+    } else {
+      const input = inputOf(row);
+      if (input) {
+        if (input.type === 'checkbox') {
+          input.checked = settingDisplayValue(fresh) === 'true';
+          const text = row.querySelector('[data-setting-switch-text]');
+          if (text) text.textContent = input.checked ? 'увімкнено' : 'вимкнено';
+        } else input.value = settingDisplayValue(fresh);
+      }
+    }
+    paintRow(row);
+  };
+
+  const absorb = (payload) => {
+    for (const fresh of payload.settings ?? []) repaintRow(fresh, payload.collector);
+    const banner = $('.settings-restart', root);
+    const markup = settingsRestartBanner(payload.restartPending);
+    if (banner) banner.outerHTML = markup || '';
+    else if (markup) $('.ops-quicklinks', root)?.insertAdjacentHTML('afterend', markup);
+    refreshTotals();
+    applyView();
+  };
+
+  const submit = async (keysWanted, valuesOverride) => {
+    const keys = keysWanted;
+    const values = valuesOverride ?? Object.fromEntries(keys.map((key) => [key, currentValue(rowOf(key))]));
+    const confirmKeys = keys.filter((key) => rowOf(key)?.dataset.confirm === 'true');
+    const problems = validateRuntimeForm(section).filter((problem) => keys.includes(problem.field));
+    if (problems.length) {
+      showRuntimeFieldErrors(section, problems);
+      status.textContent = `Не надіслано: ${problems.length} ${pluralUk(problems.length, 'поле', 'поля', 'полів')} поза межами.`;
+      return false;
+    }
+    showRuntimeFieldErrors(section, []);
+    status.textContent = 'Зберігаємо…';
+    const result = await put(values, confirmKeys);
+    if (!result) { status.textContent = 'Сервер недоступний. Нічого не збережено.'; return false; }
+    if (!result.ok) { status.textContent = await explainFailure(result, keys); return false; }
+    const payload = await result.json().catch(() => null);
+    if (payload) absorb(payload);
+    status.textContent = `Збережено: ${keys.length} ${pluralUk(keys.length, 'ключ', 'ключі', 'ключів')}.`;
+    return true;
+  };
+
+  section.addEventListener('input', (event) => {
+    const row = event.target.closest?.('[data-setting-row]');
+    if (!row) return;
+    const text = row.querySelector('[data-setting-switch-text]');
+    if (text && event.target.type === 'checkbox') text.textContent = event.target.checked ? 'увімкнено' : 'вимкнено';
+    paintRow(row);
+    refreshTotals();
+  });
+  section.addEventListener('change', (event) => {
+    const row = event.target.closest?.('[data-setting-row]');
+    if (!row) return;
+    paintRow(row);
+    refreshTotals();
+  });
+  search?.addEventListener('input', applyView);
+
+  // Натискні межі числових полів: делегація, бо кількість полів наперед невідома. Той самий
+  // механізм, що й у формі рантайму.
+  section.addEventListener('click', (event) => {
+    const bound = event.target.closest('[data-runtime-bound]');
+    if (!bound || !section.contains(bound)) return;
+    const input = section.querySelector(`[data-runtime-field="${bound.dataset.runtimeFor}"]`);
+    if (!input) return;
+    input.value = bound.dataset.runtimeBound === 'max' ? input.max : input.min;
+    input.dispatchEvent(new Event('input', { bubbles: true }));
+    input.focus();
+  });
+
+  section.addEventListener('click', async (event) => {
+    const button = event.target.closest('button');
+    if (!button || !section.contains(button)) return;
+    const row = button.closest('[data-setting-row]');
+    if (!row) return;
+    const key = row.dataset.settingKey;
+    const rowStatus = row.querySelector('[data-setting-status]');
+
+    if (button.dataset.settingReplace !== undefined) {
+      row.dataset.replacing = 'true';
+      row.querySelector('[data-setting-secret-input]')?.removeAttribute('hidden');
+      button.setAttribute('hidden', '');
+      row.querySelector('[data-setting-save]')?.removeAttribute('hidden');
+      row.querySelector('[data-setting-cancel]')?.removeAttribute('hidden');
+      inputOf(row)?.focus();
+      return;
+    }
+    if (button.dataset.settingCancel !== undefined) {
+      row.dataset.replacing = 'false';
+      const input = inputOf(row);
+      if (input) input.value = '';
+      row.querySelector('[data-setting-secret-input]')?.setAttribute('hidden', '');
+      row.querySelector('[data-setting-replace]')?.removeAttribute('hidden');
+      row.querySelector('[data-setting-save]')?.setAttribute('hidden', '');
+      button.setAttribute('hidden', '');
+      paintRow(row); refreshTotals();
+      return;
+    }
+    if (button.dataset.settingSave !== undefined) {
+      if (row.dataset.confirm === 'true' && button.dataset.armed !== 'true') {
+        arm(button, SETTING_IMPACT_ARMED[row.dataset.impact] ?? 'Підтвердити зміну');
+        return;
+      }
+      disarm(button);
+      rowStatus.textContent = '';
+      await submit([key]);
+      return;
+    }
+    if (button.dataset.settingClear !== undefined) {
+      // Скидання завжди у два кроки: воно ВИДАЛЯЄ збережений рядок, і повернути його можна лише
+      // набравши значення заново — а для секрету значення набрати нема звідки.
+      if (button.dataset.armed !== 'true') {
+        arm(button, row.dataset.secret === 'true'
+          ? 'Підтвердити: секрет буде знято'
+          : 'Підтвердити: повернути до .env');
+        return;
+      }
+      disarm(button);
+      status.textContent = 'Скидаємо…';
+      const result = await put({ [key]: null }, row.dataset.confirm === 'true' ? [key] : []);
+      if (!result) { status.textContent = 'Сервер недоступний. Нічого не змінено.'; return; }
+      if (!result.ok) { status.textContent = await explainFailure(result, [key]); return; }
+      const payload = await result.json().catch(() => null);
+      if (payload) absorb(payload);
+      status.textContent = `Скинуто: ${key}.`;
+    }
+  });
+
+  saveAll.addEventListener('click', async () => {
+    const dirty = dirtyRows();
+    if (!dirty.length) return;
+    const needsConfirm = dirty.filter((row) => row.dataset.confirm === 'true');
+    if (needsConfirm.length && saveAll.dataset.armed !== 'true') {
+      arm(saveAll, `Підтвердити ${needsConfirm.length} ${pluralUk(needsConfirm.length, 'ключ', 'ключі', 'ключів')} з наслідками`);
+      return;
+    }
+    disarm(saveAll);
+    await submit(dirty.map((row) => row.dataset.settingKey));
+  });
+
+  // Журнал ключа читається на перше розгортання і більше не перечитується: він описує минуле, а
+  // минуле не змінюється, доки цієї сторінки не чіпали.
+  section.querySelectorAll('[data-setting-audit]').forEach((details) => {
+    details.addEventListener('toggle', async () => {
+      if (!details.open || details.dataset.loaded === 'true') return;
+      details.dataset.loaded = 'true';
+      const key = details.dataset.settingAudit;
+      const body = details.querySelector('[data-setting-audit-body]');
+      const result = await opsFetch(`/ops/api/settings/audit?key=${encodeURIComponent(key)}&limit=50`)
+        .then((response) => response.ok ? response.json() : null).catch(() => null);
+      const entries = result?.audit ?? result?.entries ?? (Array.isArray(result) ? result : []);
+      body.innerHTML = entries.length
+        ? `<div class="ops-channel-list">${entries.map(settingsAuditRow).join('')}</div>`
+        : '<p class="legend-note">Цей ключ ще ніхто не змінював звідси.</p>';
+    });
+  });
+
+  // Ретракційний люк, показаний ДО натискання. Сервер відповість 409, і відповість правильно, але
+  // кнопка, яка виглядає доступною й гарантовано відмовить, — це кнопка, яка бреше. Режим показу
+  // приходить у тому самому payload, тож умову видно наперед.
+  if (data.publicationMode && data.publicationMode !== 'live') {
+    const row = rowOf('PUBLICATION_DELAY_SECONDS');
+    if (row) {
+      // Замикаємо саме ПОЛЕ, а не кнопку. Замкнена кнопка над полем, яке приймає набране число,
+      // лишає оператора з правкою, якої нікуди подіти; замкнене поле не може стати брудним, тож
+      // ані «Зберегти», ані «Зберегти всі» не поїдуть по гарантовану 409.
+      row.dataset.locked = 'true';
+      row.classList.add('is-locked');
+      const input = inputOf(row);
+      if (input) input.disabled = true;
+      const output = row.querySelector('[data-setting-status]');
+      if (output) {
+        output.textContent = 'Показ затримано — довжину затримки зараз змінити не можна. '
+          + 'Перемкніть показ на «наживо» на головній сторінці консолі.';
+      }
+      row.querySelectorAll('[data-setting-save], [data-setting-clear]')
+        .forEach((button) => { button.disabled = true; });
+    }
+  }
+
+  rows().forEach(paintRow);
+  refreshTotals();
+  applyView();
+}
+
 // `fromSnapshot` ставить лише loadSnapshot(). Обробник посилань і popstate викликають функцію
 // голяка — popstate ще й передає власний Event, у якого цього поля просто немає, тож перевірка
 // свідомо шукає рівно true, а не істинність.
@@ -4406,6 +5388,11 @@ function renderCurrentRoute(options = {}) {
   // Виняток — перший рендер: прямий вхід на /ops проходить через boot() -> loadSnapshot(), тобто
   // саме зі знімка, і без цієї умови #app лишився б порожнім.
   else if (route === '/ops') { if (!fromSnapshot || renderedRoute !== '/ops') void renderOps(); }
+  // Реєстр налаштувань підпорядковується тому самому правилу й з тієї самої причини: сторінка
+  // будується з нуля через contentShell(), а на ній може стояти вісімдесят полів, половина з яких
+  // напівнабрана, і розгорнутий пароль у полі заміни секрету. Кадр потоку, який перемалював би її,
+  // мовчки повернув би все до збереженого.
+  else if (route === '/ops/settings') { if (!fromSnapshot || renderedRoute !== '/ops/settings') void renderOpsSettings(); }
   else void renderAbout();
   renderedRoute = route;
 }

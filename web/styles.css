@@ -2603,6 +2603,262 @@ code {
 .ops-fold > summary strong { margin: 0; font: 600 12px/1.4 var(--body); letter-spacing: 0; }
 .ops-fold > p { margin-top: 9px; font-size: 12px; }
 
+/* ---- Реєстр налаштувань -------------------------------------------------------------------------
+
+   Вісімдесят полів — це не панель, це відомість, і поводиться вона як відомість: рядок, а не
+   картка. Кожен рядок відповідає на два питання одночасно — «яке значення» і «звідки воно», — і
+   саме тому походження стоїть ПОРУЧ зі значенням, у власній колонці, а не приміткою під ним.
+   Примітка під полем читається як пояснення до значення; бейдж поруч читається як його паспорт.
+
+   Кольору тут рівно стільки, скільки небезпеки, як і всюди: бурштин на «потребує перезапуску» —
+   бо діюче значення розійшлося зі збереженим і хтось мусить це закрити — і червоний на відхиленому.
+   Незбережена зміна кольору НЕ отримує: правка — не аварія. Її позначає кістяна засічка ліворуч,
+   тобто вага, а не відтінок.
+
+   Усе живе під `.ops-console`, як і решта консолі: за його межами жодне з цих правил не діє. */
+
+.ops-console .ops-quicklinks {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: 6px 14px;
+  margin: 12px 0 0;
+  padding: 9px 12px;
+  border: 1px solid var(--rule-2);
+  background: var(--surface);
+}
+.ops-console .ops-quicklinks a {
+  color: var(--bone);
+  font: 500 10px/1 var(--mono);
+  letter-spacing: .12em;
+  text-transform: uppercase;
+  text-decoration: none;
+  padding-bottom: 3px;
+  border-bottom: 1px solid var(--rule-3);
+  transition: border-color .16s var(--ease), color .16s var(--ease);
+}
+.ops-console .ops-quicklinks a:hover { border-bottom-color: var(--bone); }
+.ops-console .ops-quicklinks span { color: var(--bone-4); font-size: 11.5px; line-height: 1.5; }
+.ops-console .ops-quicklinks code { font-size: 10.5px; }
+
+/* Банер перезапуску. Бурштин ліворуч, бо це стан, який хтось мусить закрити рукою, а не помилка. */
+.ops-console .settings-restart, .ops-console .settings-rejected {
+  margin-top: 12px;
+  padding: 12px 14px;
+  border: 1px solid var(--rule-2);
+  background: var(--surface);
+}
+.ops-console .settings-restart { box-shadow: inset 3px 0 0 var(--risk); }
+.ops-console .settings-rejected { box-shadow: inset 3px 0 0 var(--alert); }
+.ops-console .settings-restart p, .ops-console .settings-rejected p { margin: 0; font-size: 12.5px; line-height: 1.6; }
+.ops-console .settings-restart p + p, .ops-console .settings-rejected p + p { margin-top: 7px; }
+.ops-console .settings-restart strong { color: var(--risk); font-weight: 600; }
+.ops-console .settings-rejected strong { color: #ff9a86; font-weight: 600; }
+.ops-console .settings-restart-keys { color: var(--bone-2); font: 400 11px/1.7 var(--mono); overflow-wrap: anywhere; }
+
+.ops-console .settings-console { margin-top: 14px; }
+.ops-console .settings-toolbar {
+  display: flex;
+  align-items: flex-end;
+  flex-wrap: wrap;
+  gap: 10px 16px;
+  margin-bottom: 14px;
+}
+.ops-console .settings-search { flex: 1 1 280px; max-width: 420px; }
+.ops-console .settings-search input { width: 100%; margin-top: 7px; }
+.ops-console .settings-count {
+  color: var(--bone-4);
+  font: 400 10px/1 var(--mono);
+  letter-spacing: .08em;
+  text-transform: uppercase;
+  padding-bottom: 11px;
+}
+.ops-console #settings-status { align-self: center; color: var(--bone-3); font-size: 12px; }
+
+/* Група — планка того самого крою, що й планка модуля: рубрика, лічильник, дії праворуч. */
+.ops-console .settings-group { border-top: 1px solid var(--rule-2); }
+.ops-console .settings-group:last-child { border-bottom: 1px solid var(--rule-2); }
+.ops-console .settings-group > summary {
+  list-style: none;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 2px;
+}
+.ops-console .settings-group > summary::-webkit-details-marker { display: none; }
+.ops-console .settings-group > summary:hover .settings-group-name { color: #fff; }
+.ops-console .settings-group-name {
+  font: 700 13px/1.2 var(--display);
+  letter-spacing: -.02em;
+  color: var(--bone);
+  transition: color .16s var(--ease);
+}
+.ops-console .settings-group-count {
+  color: var(--bone-4);
+  font: 400 10px/1 var(--mono);
+  font-variant-numeric: tabular-nums;
+}
+.ops-console .settings-group > summary .legend-caret { margin-left: auto; }
+.ops-console .settings-group[open] > summary .legend-caret { transform: rotate(180deg); }
+.ops-console .settings-group-note { margin: 0 0 6px; padding-top: 0; border-top: 0; }
+.ops-console .settings-rows { padding-bottom: 8px; }
+
+/* Рядок. Дві колонки: поле і його паспорт. На вузькому екрані паспорт іде під поле, бо порівнювати
+   бейджі стовпчиком там усе одно нема з чим. */
+.ops-console .setting-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 10px;
+  padding: 12px 0 12px 11px;
+  border-top: 1px solid var(--rule);
+}
+.ops-console .setting-row:first-child { border-top: 0; }
+.ops-console .setting-row[hidden] { display: none; }
+/* Незбережена правка — вага, а не колір. */
+.ops-console .setting-row.is-dirty { box-shadow: inset 2px 0 0 var(--bone-2); }
+.ops-console .setting-row.is-locked { opacity: .78; }
+.ops-console .setting-row.is-locked:hover { opacity: 1; }
+@media (min-width: 900px) {
+  .ops-console .setting-row { grid-template-columns: minmax(0, 1fr) minmax(190px, 262px); gap: 16px; }
+}
+.ops-console .setting-field { min-width: 0; }
+.ops-console .setting-side {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 8px;
+  min-width: 0;
+}
+.ops-console .setting-side .legend-note { padding-top: 0; border-top: 0; }
+.ops-console .settings-badges { display: flex; flex-wrap: wrap; gap: 5px; }
+.ops-console .setting-actions { margin: 0; }
+.ops-console .setting-status:not(:empty) { color: var(--bone-3); font-size: 11px; line-height: 1.5; }
+
+/* Поле всередині рядка успадковує плитку рантайму, але без її власного тла: рамка навколо рамки
+   в відомості з вісімдесяти рядків — це вісімдесят зайвих ліній. */
+.ops-console .setting-row .codex-feature {
+  flex: 1 1 100%;
+  padding: 0;
+  background: none;
+  border: 0;
+}
+.ops-console .setting-row .codex-feature-title { margin-bottom: 7px; }
+.ops-console .setting-row input[type="text"], .ops-console .setting-row input[type="url"], .ops-console .setting-row input[type="password"],
+.ops-console .setting-row textarea, .ops-console .setting-row select {
+  width: 100%;
+  padding: 9px 10px;
+  border: 1px solid var(--rule-2);
+  background: var(--surface);
+  color: var(--bone);
+  font: 400 12.5px/1.4 var(--mono);
+}
+.ops-console .setting-row textarea { resize: vertical; }
+.ops-console .setting-row input:disabled, .ops-console .setting-row textarea:disabled, .ops-console .setting-row select:disabled {
+  color: var(--bone-3);
+  background: var(--ink-deep);
+  cursor: not-allowed;
+}
+.ops-console .setting-row .codex-feature-note { margin-top: 7px; }
+.ops-console .setting-envreason { color: var(--bone-4); }
+.ops-console .setting-impact { margin: 8px 0 0; color: var(--risk); font-size: 11.5px; line-height: 1.55; }
+.ops-console .setting-key {
+  margin: 9px 0 0;
+  color: var(--bone-4);
+  font: 400 10px/1.5 var(--mono);
+  letter-spacing: .04em;
+  overflow-wrap: anywhere;
+}
+.ops-console .setting-key code { color: var(--bone-2); }
+
+/* Перемикач: слово поруч із прапорцем, бо «увімкнено» читається швидше за положення квадратика. */
+.ops-console .setting-switch { display: flex; align-items: center; gap: 9px; cursor: pointer; }
+.ops-console .setting-switch input { width: 16px; height: 16px; margin: 0; accent-color: var(--bone); }
+.ops-console .setting-switch span {
+  color: var(--bone-2);
+  font: 400 11px/1 var(--mono);
+  letter-spacing: .1em;
+  text-transform: uppercase;
+}
+
+/* Секрет. Маска моноширинна й того самого кегля, що й значення поруч: вона стоїть на місці
+   значення, а не замість підпису. */
+.ops-console .setting-mask {
+  margin: 0;
+  color: var(--bone-2);
+  font: 400 13px/1.3 var(--mono);
+  letter-spacing: .22em;
+}
+.ops-console .setting-mask i { color: var(--bone-4); font-style: normal; letter-spacing: .04em; font-size: 11.5px; }
+.ops-console .setting-secret-input { margin-top: 9px; }
+
+/* Бейдж походження. Мова та сама, що й у `.codex-state`, але дрібніша: це паспорт значення, а не
+   стан підсистеми, і він не має права важити стільки ж. */
+.ops-console .settings-badge {
+  display: inline-block;
+  padding: 4px 7px;
+  border: 1px solid var(--rule-2);
+  color: var(--bone-3);
+  font: 400 9px/1 var(--mono);
+  letter-spacing: .1em;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+.ops-console .settings-badge.is-db { border-color: var(--bone-3); color: var(--bone); }
+.ops-console .settings-badge.is-env { color: var(--bone-2); }
+.ops-console .settings-badge.is-default { color: var(--bone-4); }
+.ops-console .settings-badge.is-pending { border-color: rgba(227, 179, 65, .5); background: var(--risk-soft); color: var(--risk); }
+.ops-console .settings-badge.is-restart, .ops-console .settings-badge.is-locked, .ops-console .settings-badge.is-secret { color: var(--bone-4); }
+.ops-console .settings-badge.is-secret { border-style: dashed; }
+
+.ops-console .setting-danger { border-color: rgba(255, 71, 71, .4) !important; color: #ff9a86 !important; }
+.ops-console .setting-danger:hover { border-color: var(--alert) !important; color: #ff9a86 !important; }
+.ops-console .setting-actions [data-armed="true"] {
+  border-color: var(--risk) !important;
+  background: var(--risk-soft) !important;
+  color: var(--risk) !important;
+}
+.ops-console [data-settings-save-all][data-armed="true"] {
+  border-color: var(--risk) !important;
+  background: var(--risk-soft) !important;
+  color: var(--risk) !important;
+}
+
+/* Здобуття й журнал — обидва розгортайки, обидві другого ряду. Вони не змагаються з полем за увагу:
+   інструкція потрібна один раз, а журнал — тоді, коли щось не сходиться. */
+.ops-console .setting-howto, .ops-console .setting-audit { margin-top: 9px; }
+.ops-console .setting-howto > summary, .ops-console .setting-audit > summary {
+  cursor: pointer;
+  color: var(--bone-4);
+  font: 400 10px/1 var(--mono);
+  letter-spacing: .1em;
+  text-transform: uppercase;
+}
+.ops-console .setting-howto > summary:hover, .ops-console .setting-audit > summary:hover { color: var(--bone-2); }
+.ops-console .setting-howto ol {
+  margin: 9px 0 0;
+  padding-left: 18px;
+  color: var(--bone-2);
+  font-size: 12px;
+  line-height: 1.65;
+}
+.ops-console .setting-howto .legend-note { margin-top: 8px; padding-top: 0; border-top: 0; }
+.ops-console .setting-howto a { color: var(--bone-2); text-decoration: none; border-bottom: 1px solid var(--rule-2); }
+.ops-console .setting-howto a:hover { color: var(--bone); border-bottom-color: var(--bone); }
+.ops-console .setting-audit .ops-channel-list { margin-top: 9px; border-top: 0; }
+.ops-console .setting-audit .ops-channel-list article { padding: 8px 0; }
+
+.ops-console .settings-envonly { margin-top: 16px; }
+.ops-console .settings-envonly-list { margin-top: 12px; }
+.ops-console .settings-envonly-list dt {
+  color: var(--bone-2);
+  font: 400 10px/1.3 var(--mono);
+  letter-spacing: .04em;
+  text-transform: none;
+}
+.ops-console .settings-envonly-list dd { color: var(--bone-4); }
+.ops-console #settings-audit-section { margin-top: 14px; }
+
 /* ---- Покриття по областях ----------------------------------------------------------------------
 
    Двадцять сім рядків і рядок «Загальнодержавні». Форма — відомість, як і в довіри до джерел, з

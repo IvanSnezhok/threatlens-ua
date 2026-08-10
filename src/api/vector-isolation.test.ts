@@ -875,7 +875,8 @@ describe('snapshot refresh and the operations console', () => {
   const source = lazy(() => `function renderCurrentRoute(options = {}) ${bodyOf('renderCurrentRoute')}`);
   const parameters = ['snapshot', 'activePage', 'map', 'mapLayersReady', 'codexPollTimer', 'deployPollTimer',
     'renderedRoute',
-    'renderMapPage', 'renderHistory', 'renderAttacks', 'renderAnalytics', 'renderSources', 'renderOps', 'renderAbout'];
+    'renderMapPage', 'renderHistory', 'renderAttacks', 'renderAnalytics', 'renderSources', 'renderOps',
+    'renderOpsSettings', 'renderAbout'];
 
   /**
    * `renderedRoute`, `map` and `mapLayersReady` are module-level `let`s that the function assigns
@@ -891,7 +892,8 @@ describe('snapshot refresh and the operations console', () => {
       // The deployment card polls `/ops/api/deploy` on its own three-second timer, and leaving `/ops`
       // has to stop it: the node it repaints does not exist on any other route.
       { version: 1 }, () => route, null, false, null, null, null,
-      stub('map'), stub('history'), stub('attacks'), stub('analytics'), stub('sources'), stub('ops'), stub('about')
+      stub('map'), stub('history'), stub('attacks'), stub('analytics'), stub('sources'), stub('ops'),
+      stub('settings'), stub('about')
     );
     return { render, calls };
   }
@@ -935,6 +937,135 @@ describe('snapshot refresh and the operations console', () => {
       render({ fromSnapshot: true });
       expect(calls, `route ${route}`).toEqual([rendered, rendered]);
     }
+  });
+
+  /**
+   * The settings registry is the second console screen and carries the same hazard, magnified.
+   *
+   * `renderOpsSettings()` also opens with `contentShell(…)`, and what it wipes is up to eighty
+   * fields — a half-typed bound, a password typed into a secret's replacement input that the server
+   * will never send back. Driving that from the snapshot would revert all of it on the 60 s belt.
+   * So it takes the same guard as `/ops`, and these cases are what stop the guard being dropped by
+   * somebody who reads the branch as a copy of its neighbour.
+   */
+  it('renders the settings registry once on a direct load and then leaves the operator alone', () => {
+    const { render, calls } = router('/ops/settings');
+    render({ fromSnapshot: true });         // boot() -> loadSnapshot()
+    expect(calls).toEqual(['settings']);
+    render({ fromSnapshot: true });         // the 60 s belt
+    render({ fromSnapshot: true });         // an SSE frame, debounced 250 ms
+    expect(calls).toEqual(['settings']);
+  });
+
+  it('still renders the settings registry when the operator navigates to it', () => {
+    const { render, calls } = router('/ops/settings');
+    render({ fromSnapshot: true });
+    render();                                // the a[data-route] click handler calls it bare
+    render({ type: 'popstate' });            // and the back button passes an Event
+    expect(calls).toEqual(['settings', 'settings', 'settings']);
+  });
+
+  /**
+   * `/ops/settings` is not `/ops`, and neither route may answer for the other.
+   *
+   * Both halves are one edit away from breaking: a `startsWith('/ops')` written for tidiness would
+   * make the console answer for the registry, and a settings branch placed after the `else` would
+   * make «Методологія» answer for both.
+   */
+  it('keeps the two console routes apart', () => {
+    const console_ = router('/ops');
+    console_.render({ fromSnapshot: true });
+    expect(console_.calls).toEqual(['ops']);
+
+    const settings = router('/ops/settings');
+    settings.render({ fromSnapshot: true });
+    expect(settings.calls).toEqual(['settings']);
+
+    // Neither falls through to the about page, which is what the bare `else` would have done.
+    for (const route of ['/ops', '/ops/settings']) {
+      const { render, calls } = router(route);
+      render({ fromSnapshot: true });
+      expect(calls, `route ${route}`).not.toContain('about');
+    }
+  });
+
+  /**
+   * Leaving the console stops both of its timers, and `/ops/settings` counts as leaving.
+   *
+   * The deployment card repaints `#deploy-section` every three seconds and the Codex poll watches a
+   * node that only `/ops` builds. Neither exists on the registry page, so both must be cleared on
+   * the way in — the guard is `route !== '/ops'`, and this is the case that proves the settings
+   * route was not quietly folded into it.
+   */
+  it('stops the console timers when the operator opens the registry', () => {
+    const cleared: number[] = [];
+    const source_ = `function renderCurrentRoute(options = {}) ${bodyOf('renderCurrentRoute')}`;
+    const names = [...parameters, 'clearInterval'];
+    const render = compileSlice<(options?: unknown) => void>(source_, 'renderCurrentRoute', names)(
+      { version: 1 }, () => '/ops/settings', null, false, 41, 42, null,
+      () => {}, () => {}, () => {}, () => {}, () => {}, () => {}, () => {}, () => {},
+      (id: number) => { cleared.push(id); }
+    );
+    render({ fromSnapshot: true });
+    expect(cleared).toEqual([41, 42]);
+  });
+});
+
+/**
+ * The settings page's lookup tables, and the one link on it that leaves the application.
+ *
+ * `docs/` is NOT served: `fastifyStatic` is mounted on `public/`, and `/docs/TOKENS.md` would not
+ * even 404 — the SPA not-found handler would answer it with `index.html`, i.e. with the map. So the
+ * acquisition steps live inline on the page and the deep link goes to the repository blob. That
+ * makes the anchor a real dependency between two files nobody edits together, which is exactly the
+ * kind of link that rots in silence: the page would keep rendering «як отримати →» and land the
+ * operator at the top of a nine-section document.
+ */
+describe('the settings registry tables', () => {
+  const labels = lazy(() => evaluateSlice<Record<string, string>>(
+    constDeclaration('APP_SETTING_LABELS'), 'APP_SETTING_LABELS'));
+  const anchors = lazy(() => evaluateSlice<Record<string, string>>(
+    constDeclaration('APP_SETTING_DOC_ANCHORS'), 'APP_SETTING_DOC_ANCHORS'));
+  const howto = lazy(() => evaluateSlice<Record<string, string[]>>(
+    constDeclaration('APP_SETTING_HOWTO'), 'APP_SETTING_HOWTO'));
+
+  it('labels every key by its environment-variable name', () => {
+    const keys = Object.keys(labels());
+    expect(keys.length).toBeGreaterThan(60);
+    for (const key of keys) {
+      expect(key, `${key} is not an env-variable name`).toMatch(/^[A-Z][A-Z0-9_]*$/);
+      expect(labels()[key]!.trim().length, `${key} has an empty label`).toBeGreaterThan(0);
+    }
+  });
+
+  it('points every «як отримати →» at an anchor docs/TOKENS.md actually carries', () => {
+    const tokens = read('docs/TOKENS.md');
+    const targets = [...new Set(Object.values(anchors()))];
+    expect(targets.length).toBeGreaterThan(0);
+    for (const anchor of targets) {
+      // An explicit HTML anchor, not a heading slug: the link is followed on the repository blob,
+      // and a heading rewritten in Ukrainian would silently change a slug that nothing checks.
+      expect(tokens, `docs/TOKENS.md has no <a id="${anchor}">`).toContain(`<a id="${anchor}">`);
+      expect(howto()[anchor], `no inline steps for ${anchor}`).toBeTruthy();
+      expect(howto()[anchor]!.length, `${anchor} has no steps`).toBeGreaterThan(0);
+    }
+  });
+
+  it('gives every inline instruction block a key that reaches it', () => {
+    // The reverse direction. A block nothing points at is dead text that reads as coverage.
+    const reachable = new Set(Object.values(anchors()));
+    for (const anchor of Object.keys(howto())) {
+      expect(reachable.has(anchor), `nothing in APP_SETTING_DOC_ANCHORS reaches ${anchor}`).toBe(true);
+    }
+  });
+
+  it('labels only keys the registry declares', () => {
+    // The tables are labels, not a second registry: the page is built from what the server sends.
+    // A label for a key `src/config.ts` no longer has is a label nothing will ever render.
+    const config = read('src/config.ts');
+    const declared = new Set([...config.matchAll(/^ {2}([A-Z][A-Z0-9_]+):/gm)].map((match) => match[1]!));
+    const stray = Object.keys(labels()).filter((key) => !declared.has(key));
+    expect(stray, 'labels for keys the schema does not declare').toEqual([]);
   });
 });
 

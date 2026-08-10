@@ -57,6 +57,11 @@ const VOLATILE_TABLES = [
   // Append-only and per-test: every save an ops test performs leaves rows here, and the newest-20
   // assertions would otherwise read another file's history.
   'runtime_settings_audit',
+  // Both truncated, unlike `runtime_settings`: migration 030 seeds NOTHING, and an absent row is a
+  // meaningful state — «this key is whatever .env says». Resetting by UPDATE would be resetting a
+  // row that is not supposed to exist. Truncating the overrides without truncating their trail would
+  // leave the newest-20 assertion reading another file's history, so both go, parent last.
+  'app_settings_audit', 'app_settings',
   // Child before parent. TRUNCATE … CASCADE would reach the events anyway, but naming them in this
   // order keeps the statement honest about what it destroys and does not depend on the cascade.
   'deployment_run_events', 'deployment_runs',
@@ -83,6 +88,14 @@ const VOLATILE_TABLES = [
  *   resetAnalyticsScheduler();     // src/services/analytics-scheduler.ts
  *   resetRiskRunGuard();           // src/services/risk.ts
  *   resetAnalyticsNarrativeMemo(); // src/services/analytics-narrative.ts
+ *   resetAppSettingsCache();       // src/services/app-settings.ts — REQUIRED for any file that
+ *                                  // writes app_settings: the TRUNCATE above removes the rows, but
+ *                                  // the rows were applied by `Object.assign(config, next)` and
+ *                                  // TRUNCATE cannot undo that. The integration project runs every
+ *                                  // file in ONE fork, so a settings test that raised
+ *                                  // AI_TIMEOUT_MS would leave it raised for every file after it.
+ *                                  // The seam restores `config` from the boot snapshot, which is
+ *                                  // the exact inverse of the only mutation that module performs.
  * });
  * ```
  *

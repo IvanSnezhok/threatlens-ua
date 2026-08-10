@@ -13,6 +13,7 @@ import { delaySecondsFor, observeSseDeliveryLag, publicationSlice, registerPubli
 import { registerAnalyticsSchedulerMetrics } from '../services/analytics-scheduler.js';
 import { registerDeploymentMetrics } from '../services/deployment.js';
 import { registerBackfillMetrics } from '../services/source-backfill.js';
+import { registerAppSettingsMetrics } from '../services/app-settings.js';
 import { registerOutboxMetrics } from '../bot/outbox.js';
 import { resolveRuntimeSettings } from '../services/runtime-settings.js';
 import { registerAlertChannelMetrics } from '../services/ingestion.js';
@@ -27,6 +28,7 @@ import opsBackfillRoutes from './ops-backfill-routes.js';
 import opsCoverageRoutes from './ops-coverage-routes.js';
 import opsDeployRoutes from './ops-deploy-routes.js';
 import opsRuntimeRoutes from './ops-runtime-routes.js';
+import opsSettingsRoutes from './ops-settings-routes.js';
 import opsSourceTrustRoutes from './ops-source-trust-routes.js';
 import opsVectorRoutes from './ops-vector-routes.js';
 import vectorRoutes from './vector-routes.js';
@@ -139,6 +141,11 @@ export async function buildServer() {
   registerTelegramCollectorMetrics(registry);
   registerDeploymentMetrics(registry);
   registerBackfillMetrics(registry);
+  // `threatlens_app_settings_read_failures_total` (a boot that fell back to `.env`) and
+  // `threatlens_app_settings_overrides` (how many settings the database is currently deciding).
+  // `docs/OPERATIONS.md` names the first as an incident condition and the second as the number that
+  // explains why a deployment does not behave like its own `.env`.
+  registerAppSettingsMetrics(registry);
   // Without this line `threatlens_notifications_suppressed_total` never appears on /metrics, and
   // `docs/OPERATIONS.md` names an incident condition — a fanout more than thirty minutes behind the
   // events it is reading — that nobody could observe.
@@ -248,6 +255,7 @@ export async function buildServer() {
   await app.register(opsAiRunsRoutes);
   await app.register(opsSourceTrustRoutes);
   await app.register(opsRuntimeRoutes);
+  await app.register(opsSettingsRoutes);
   await app.register(opsDeployRoutes);
   await app.register(opsBackfillRoutes);
   await app.register(opsCoverageRoutes);
@@ -563,6 +571,17 @@ export async function buildServer() {
     if (!hasValidOpsAuth(request.headers.authorization)) return opsUnauthorized(request, reply);
     return { published: await runRiskAssessments() };
   });
+
+  /**
+   * The settings console is a route of the single-page app, and it has to be declared BEFORE
+   * `setNotFoundHandler` below.
+   *
+   * `/ops/settings` starts with `/ops/`, and the not-found handler JSON-404s exactly those prefixes
+   * — so without this line a direct load or a browser refresh of the settings page would be answered
+   * with `{"error":"not_found"}` instead of the application, while in-app navigation worked fine.
+   * That is the shape of bug nobody meets until an operator bookmarks the page.
+   */
+  app.get('/ops/settings', async (_request, reply) => reply.type('text/html').sendFile('index.html'));
 
   app.setNotFoundHandler(async (request, reply) => {
     if (request.raw.url?.startsWith('/api/') || request.raw.url?.startsWith('/health/') || request.raw.url?.startsWith('/ops/')) {

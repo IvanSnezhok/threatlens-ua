@@ -20,6 +20,139 @@ docker compose exec -T app curl -fsS http://localhost:3000/health/ready
 docker compose exec -T postgres psql -U threatlens -d threatlens -c 'TABLE schema_migrations'
 ```
 
+## Settings from /ops (operator only)
+
+Since migration `030` the environment has two layers. `app_settings` holds one row per overridden
+key; everything else falls through to `.env` and then to the schema default. A stored value **wins**
+over the environment, which is the whole point: a token, a poll interval or a model name is changed
+from `/ops/settings` on a running deployment, without editing a file and without a restart.
+
+Thirty-odd keys deliberately refuse to be stored. They are needed before the database is open, are
+consumed by compose, are the lock on the page that would edit them, or are shared with a container
+that never reads this database. The page lists them under «Тільки в .env» with the reason per key,
+and `.env.example` marks them in place. That list is generated from `src/config.ts`, so it cannot
+drift from the code.
+
+```bash
+# Everything: values, provenance, bounds, what is waiting for a restart, the last twenty changes.
+curl -fsS -u "$OPS_USER:$OPS_PASSWORD" http://localhost:3000/ops/api/settings
+
+# Change one key. Values are strings, exactly as the environment would carry them.
+curl -fsS -u "$OPS_USER:$OPS_PASSWORD" -X PUT -H 'Content-Type: application/json' \
+  -d '{"values":{"AI_MODEL":"gpt-4.1-mini"}}' http://localhost:3000/ops/api/settings
+
+# A key that declares consequences has to be named twice — once in `values`, once in `confirm`.
+curl -fsS -u "$OPS_USER:$OPS_PASSWORD" -X PUT -H 'Content-Type: application/json' \
+  -d '{"values":{"ALERT_END_DEBOUNCE_SECONDS":"90"},"confirm":["ALERT_END_DEBOUNCE_SECONDS"]}' \
+  http://localhost:3000/ops/api/settings
+
+# null is a RESET, not an empty string: the row is deleted and .env (or the default) takes over.
+curl -fsS -u "$OPS_USER:$OPS_PASSWORD" -X PUT -H 'Content-Type: application/json' \
+  -d '{"values":{"AI_MODEL":null}}' http://localhost:3000/ops/api/settings
+
+# Who changed one key, and when. Secrets record «замінено»/«знято», never a value.
+curl -fsS -u "$OPS_USER:$OPS_PASSWORD" \
+  'http://localhost:3000/ops/api/settings/audit?key=TELEGRAM_SESSION&limit=50'
+```
+
+Reading it:
+
+- **`source` is the answer, `stored` is only half of it.** Each key reports `db`, `env` or
+  `default`. A key whose `stored` value is set but whose `source` is not `db` is the state this
+  field exists to make impossible to miss — it means the stored value was rejected at load and the
+  environment is being read instead. Those keys are also listed in `rejected`.
+- **A secret never appears in the payload.** `value`, `stored`, `applied`, `envValue` and
+  `defaultValue` are always `null` for the nine `db_secret` keys and for the four `.env`-only
+  credentials; `isSet` and `source` are all that is served. One serialiser decides that and one test
+  searches the entire response body for the value, so a new secret cannot be added and forgotten.
+- **`pendingRestart` is a real divergence, not a warning label.** It is true when the effective
+  value differs from the one this process booted with, for a key whose `apply` is `restart`. The
+  count is also in `restartPending`, and the page names it in a banner.
+
+### Which changes need a restart, and how to apply one
+
+`apply: 'hot'` keys take effect on the next use — `Object.assign(config, next)` runs inside the same
+request. `apply: 'restart'` keys are stored and audited immediately but the running process keeps
+using what it booted with. Those are, by category:
+
+- **Process identity and binding:** `NODE_ENV`, `PORT`, `PUBLIC_URL`, `DATABASE_URL`, `APP_COMMIT`,
+  `APP_BUILT_AT` — all `.env`-only anyway, so a restart is implied by editing them at all.
+- **Access:** `OPS_USER`, `OPS_PASSWORD`, `METRICS_TOKEN`, `DEPLOY_*` — likewise `.env`-only.
+- **The collector's credentials:** `TELEGRAM_API_ID`, `TELEGRAM_API_HASH`, `TELEGRAM_SESSION`. These
+  *are* storable, and replacing one reconnects MTProto. The page shows the live collector state
+  beside the confirmation button for exactly this reason.
+- **`PUBLICATION_DELAY_SECONDS`** — see the retraction hatch below.
+
+Two ways to apply, and they are not the same action:
+
+```bash
+# Same image, new values. This is what a restart-marked setting change needs.
+docker compose restart app
+
+# Different image. The «Оновити до <commit>» button in /ops does this; it also runs migrations.
+# Reach for it when you want new CODE, not when you want a stored value to take effect.
+```
+
+`docker compose restart app` does **not** re-read `.env` — for a change made in that file use
+`docker compose up -d app`. For a change made through the settings page a `restart` is enough,
+because the value is in the database the new process reads at boot.
+
+### `409 publication_delayed` is the retraction hatch working
+
+`PUBLICATION_DELAY_SECONDS` cannot be changed while `publication_mode` is `delayed_15s`. The API
+answers `409 {"error":"publication_delayed"}` and writes nothing.
+
+This is not a lock to route around. The delay is the length of a hold that is *currently applied* to
+what readers are being shown; changing it mid-hold moves the cutoff under rows that were already
+released, which is the one thing the publication design refuses to do. Release the hold first:
+
+```bash
+curl -fsS -u "$OPS_USER:$OPS_PASSWORD" -X PUT -H 'Content-Type: application/json' \
+  -d '{"publicationMode":"live"}' http://localhost:3000/ops/api/runtime
+
+curl -fsS -u "$OPS_USER:$OPS_PASSWORD" -X PUT -H 'Content-Type: application/json' \
+  -d '{"values":{"PUBLICATION_DELAY_SECONDS":"20"},"confirm":["PUBLICATION_DELAY_SECONDS"]}' \
+  http://localhost:3000/ops/api/settings
+
+docker compose restart app     # the length is a restart-apply key
+
+curl -fsS -u "$OPS_USER:$OPS_PASSWORD" -X PUT -H 'Content-Type: application/json' \
+  -d '{"publicationMode":"delayed_15s"}' http://localhost:3000/ops/api/runtime
+```
+
+### The other refusals
+
+| Response | Meaning | What to do |
+|---|---|---|
+| `400 unknown_setting` | The key is not in the registry, or it is `.env`-scoped | Check the spelling against `/ops/api/settings`; if it is `.env`-scoped, edit `.env` and recreate the container |
+| `400 confirmation_required` | A `confirm` key was in `values` but not in `confirm` | Name it in both |
+| `400 invalid_settings` | `issues` carries the rejected keys | The whole patch was refused, not part of it — the parse is all-or-nothing inside one transaction |
+| `409 publication_delayed` | See above | Release the hold first |
+
+### Incident conditions
+
+```promql
+# The settings table could not be read. The process is running on .env alone, which is a COMPLETE
+# and correct configuration — the read is fail-open by design — but every override is silently
+# absent, and an operator who set one an hour ago is looking at a page that disagrees with reality.
+increase(threatlens_app_settings_read_failures_total[15m]) > 0
+
+# How many keys are currently overridden. This is not an alert on a threshold; it is the number that
+# should not change when nobody changed anything. A drop to 0 after a deployment means the table was
+# not carried across — the same failure as above, seen from the other side.
+threatlens_app_settings_overrides
+```
+
+Both are conditions, not thresholds. The first firing at all is the incident: a fail-open read means
+nothing else reports the problem, and the deployment will keep serving correctly-but-differently
+until somebody looks. Response, in order:
+
+1. `docker compose exec -T postgres psql -U threatlens -d threatlens -c 'TABLE app_settings'` — is
+   the table there, and does it have the rows you expect?
+2. `docker compose logs app | grep app_settings` — the failure is logged with its cause.
+3. If the table is intact and the read is failing, the pool is the problem, not the feature. Nothing
+   about the settings layer needs to be undone: `.env` is already what the process is using.
+
 ## Publication mode (operator only)
 
 The public presentation can be held back by `PUBLICATION_DELAY_SECONDS` (default 15). The mode lives

@@ -1,6 +1,13 @@
 import { z } from 'zod';
 
-const envSchema = z.object({
+/**
+ * Exported since migration 030: this schema is no longer only the boot check, it is the ONE
+ * validator every write to `app_settings` has to pass, run inside the advisory-lock transaction that
+ * performs the write (`saveAppSettings`, `src/services/app-settings.ts`). Nothing else in the
+ * codebase is allowed to decide whether a setting is legal, which is why the table has no CHECK
+ * constraints — see the header of `migrations/030_app_settings.sql`.
+ */
+export const envSchema = z.object({
   NODE_ENV: z.enum(['development', 'test', 'production']).default('development'),
   PORT: z.coerce.number().int().positive().default(3000),
   APP_TIMEZONE: z.string().default('Europe/Kyiv'),
@@ -352,4 +359,430 @@ const envSchema = z.object({
 });
 
 export type AppConfig = z.infer<typeof envSchema>;
-export const config = envSchema.parse(process.env);
+
+/**
+ * Parse an environment-shaped object into a configuration, or throw `ZodError`.
+ *
+ * Extracted from the `config` initialiser below so that the boot parse and the validation of an
+ * operator's write are literally the same call. `saveAppSettings` runs this against
+ * `candidateEnv(process.env, {...store, ...patch})` inside its transaction and refuses the write on
+ * a `ZodError`; `loadAppSettings` runs it at boot and, on a `ZodError`, drops the offending stored
+ * keys and runs it again. Neither path has its own idea of what is valid.
+ */
+export function parseAppConfig(env: Record<string, string | undefined>): AppConfig {
+  return envSchema.parse(env);
+}
+
+// ================================================================================================
+// The settings registry
+// ================================================================================================
+//
+// Every key above, classified. This is what `GET /ops/api/settings` renders and what
+// `candidateEnv()` filters on, and it is `Record<keyof AppConfig, SettingMeta>` so that adding a
+// variable to the schema without deciding these questions does not compile.
+//
+// ---- `scope` -----------------------------------------------------------------------------------
+// `db_tunable` and `db_secret` may be overridden from /ops. `env` may not, ever, and the reason is
+// written down per key in `envReason` — the page shows it beside the value so «чому це не можна
+// змінити тут» is answered where the question is asked. The three arguments that put a key in `env`:
+//
+//   * **lockout** — a bad write locks the operator out of the page that would fix it (OPS_*), or
+//     out of the observability they would need to see that they had (METRICS_TOKEN), or out of the
+//     process entirely (DATABASE_URL, NODE_ENV).
+//   * **escalation** — the write would hand the ops session authority the ops session does not have.
+//     The whole DEPLOY_* block is this: `app` never touches the Docker socket, it proxies a bearer
+//     to a process that does, and a settings page that could repoint that proxy and mint its own
+//     bearer would BE the socket.
+//   * **compose-only** — the value is one half of a pair whose other half is in `compose.yaml` or in
+//     a build arg, so changing it here would silently desynchronise the two. `PORT` and
+//     `CODEX_OAUTH_REDIRECT_PORT` are published ports; `APP_COMMIT`/`APP_BUILT_AT` are build args
+//     the deploy gate compares against.
+//
+// ---- `apply` -----------------------------------------------------------------------------------
+// Derived from ACTUAL consumption, one grep per key, not from how the value feels:
+//
+//   * `hot` — every consumer reads `config.KEY` at the moment it uses it, so `Object.assign(config,
+//     next)` is the whole of applying it.
+//   * `restart` — at least one consumer captured the value at module load, at scheduler start or
+//     into a closure, so the running process keeps the old one. These are the keys `pendingRestart`
+//     is computed for and the banner names. Where a key is BOTH (the ingestion path reads it per
+//     call, the collector froze it at subscribe time) the answer is `restart` and `applyNote` says
+//     which half moved, because a banner that appears when nothing needed a restart is noise and a
+//     banner that fails to appear when something did is the bug.
+//
+// ---- `confirm` ---------------------------------------------------------------------------------
+// True for anything that can stop a warning or make one false. The console requires a second press
+// and the API requires the key in `confirm[]`, so «випадково натиснув» is not a way to silence an
+// air-raid channel.
+
+export type SettingScope = 'env' | 'db_tunable' | 'db_secret';
+export type SettingGroup = 'telegram' | 'official' | 'publication' | 'analytics' | 'map' | 'system';
+export type SettingApply = 'hot' | 'restart';
+/** Which subsystem an operator should watch after changing this. Rendered as a badge. */
+export type SettingImpact = 'collector' | 'alerts' | 'publication';
+
+export type SettingUi =
+  | { kind: 'boolean' }
+  | { kind: 'number'; min?: number; max?: number; unit?: string }
+  | { kind: 'text'; placeholder?: string }
+  | { kind: 'url' }
+  | { kind: 'select'; options: readonly string[] }
+  /**
+   * Never serialised. The payload carries `isSet` and `source` for these and nothing else — one
+   * function decides that (`serialiseSetting`) and one test proves it by searching the whole
+   * response body for the value. Note this is the UI kind rather than the scope: four `env`-scoped
+   * keys are credentials too (DATABASE_URL, OPS_PASSWORD, METRICS_TOKEN, DEPLOY_RUNNER_TOKEN), and
+   * being unwritable is not the same as being safe to print.
+   */
+  | { kind: 'secret' };
+
+export interface SettingMeta {
+  scope: SettingScope;
+  group: SettingGroup;
+  apply: SettingApply;
+  /** Why `restart`, or what part of a `hot` key is not as immediate as it looks. */
+  applyNote?: string;
+  ui: SettingUi;
+  confirm?: true;
+  impact?: SettingImpact;
+  /** Required for `scope: 'env'`, meaningless otherwise. One sentence, shown on the page. */
+  envReason?: string;
+}
+
+export const SETTING_GROUPS: ReadonlyArray<{ id: SettingGroup; label: string }> = [
+  { id: 'telegram', label: 'Telegram: бот і збір' },
+  { id: 'official', label: 'Джерела тривог і загроз' },
+  { id: 'publication', label: 'Публікація' },
+  { id: 'analytics', label: 'Аналітика і моделі' },
+  { id: 'map', label: 'Карта і довідники' },
+  { id: 'system', label: 'Система і доступ' }
+];
+
+export const APP_SETTINGS: Record<keyof AppConfig, SettingMeta> = {
+  // ---- system ----------------------------------------------------------------------------------
+  NODE_ENV: {
+    scope: 'env', group: 'system', apply: 'restart',
+    ui: { kind: 'select', options: ['development', 'test', 'production'] },
+    envReason: 'Вирішує, чи діють production-перевірки самої схеми — довжина OPS_PASSWORD і '
+      + 'METRICS_TOKEN, https у PUBLIC_URL, заборона демо-джерела. Значення в БД дозволило б '
+      + 'вимкнути записом у таблицю той самий захист, який цю таблицю стереже.'
+  },
+  PORT: {
+    scope: 'env', group: 'system', apply: 'restart', ui: { kind: 'number', min: 1, max: 65535 },
+    envReason: 'compose публікує «${APP_HTTP_PORT}:3000». Інший порт у БД пересунув би слухач із '
+      + '3000, а проброс лишився б на 3000: сайт зник би без жодної зміни в compose.yaml.'
+  },
+  APP_TIMEZONE: {
+    scope: 'db_tunable', group: 'system', apply: 'hot', ui: { kind: 'text', placeholder: 'Europe/Kyiv' },
+    applyNote: 'Форматувальники в src/bot/humanize.ts перебудовуються на першому виклику після зміни '
+      + '— решта споживачів (нічний дайджест, аналітика, /api/v1/config) читають зону щоразу.'
+  },
+  PUBLIC_URL: {
+    scope: 'env', group: 'publication', apply: 'restart', ui: { kind: 'url' },
+    envReason: 'Має збігатися з SITE_ADDRESS у Caddy і з сертифікатом; у production схема ще й '
+      + 'вимагає https. Розбіжність ламає кнопку «Відкрити карту» в боті, і полагодити її з /ops '
+      + 'не вийде — сторінка живе за тією ж адресою.'
+  },
+  DATABASE_URL: {
+    scope: 'env', group: 'system', apply: 'restart', ui: { kind: 'secret' },
+    envReason: 'Рядок, яким відкривається пул, що тримає саму таблицю налаштувань. Курка і яйце: '
+      + 'значення, потрібне, щоб прочитати значення.'
+  },
+  OPS_USER: {
+    scope: 'env', group: 'system', apply: 'restart', ui: { kind: 'text' },
+    envReason: 'Половина облікових даних до цієї ж сторінки. Помилковий запис зачиняє двері зсередини '
+      + '— виправити його можна лише там, де він і живе, у .env.'
+  },
+  OPS_PASSWORD: {
+    scope: 'env', group: 'system', apply: 'restart', ui: { kind: 'secret' },
+    envReason: 'Друга половина тих самих дверей, і єдиний захист /ops. Запис у БД означав би, що '
+      + 'сесія оператора може змінити умову власного входу — і, помилившись, вийти назавжди.'
+  },
+  METRICS_TOKEN: {
+    scope: 'env', group: 'system', apply: 'restart', ui: { kind: 'secret' },
+    envReason: 'Єдиний облік, яким Prometheus дістає /metrics. Помилковий запис осліплює моніторинг '
+      + 'саме тоді, коли за ним і дивляться, а докази того, що щось пішло не так, — на /metrics.'
+  },
+  APP_COMMIT: {
+    scope: 'env', group: 'system', apply: 'restart', ui: { kind: 'text' },
+    envReason: 'Build-arg, який запікає «docker compose build». Runner оновлення вважає деплой '
+      + 'успішним лише тоді, коли /health/ready віддає саме цей комміт, — значення, яке можна '
+      + 'дописати з вебсторінки, перетворило б цю перевірку на самопідтвердження.'
+  },
+  APP_BUILT_AT: {
+    scope: 'env', group: 'system', apply: 'restart', ui: { kind: 'text' },
+    envReason: 'Другий із пари build-arg. Час збірки, який контейнер може собі призначити, — не час '
+      + 'збірки.'
+  },
+  DEPLOY_ENABLED: {
+    scope: 'env', group: 'system', apply: 'restart', ui: { kind: 'boolean' },
+    envReason: 'Вмикає кнопку, що доручає оновлення процесу з Docker-сокетом хоста. Перемикач у БД '
+      + 'означав би, що сесія /ops може сама собі видати цю авторитетність.'
+  },
+  DEPLOY_RUNNER_URL: {
+    scope: 'env', group: 'system', apply: 'restart', ui: { kind: 'url' },
+    envReason: 'Адреса того самого процесу. Разом із токеном нижче це весь канал до Docker-сокета: '
+      + 'можливість перенаправити його з вебсторінки дорівнює можливості підставити свій runner.'
+  },
+  DEPLOY_RUNNER_TOKEN: {
+    scope: 'env', group: 'system', apply: 'restart', ui: { kind: 'secret' },
+    envReason: 'Спільний bearer до процесу з Docker-сокетом, з підлогою в 32 символи в production. '
+      + 'Секрет, який можна переписати через ту саму сторінку, що ним і користується, нічого не '
+      + 'стереже.'
+  },
+  DEPLOY_RUNNER_TIMEOUT_MS: {
+    scope: 'env', group: 'system', apply: 'restart', ui: { kind: 'number', min: 500, max: 30000, unit: 'мс' },
+    envReason: 'Третє з трьох значень, що описують один канал до runner-а. Розділяти їх між .env і '
+      + 'БД означало б, що частину каналу до Docker-сокета все ж таки можна переписати з вебсторінки.'
+  },
+
+  // ---- telegram: бот -----------------------------------------------------------------------------
+  TELEGRAM_BOT_TOKEN: {
+    scope: 'db_secret', group: 'telegram', apply: 'restart', confirm: true, impact: 'alerts',
+    ui: { kind: 'secret' },
+    applyNote: 'createBot() виконується один раз у src/index.ts: новий токен підхопиться лише після '
+      + 'перезапуску, до того сповіщення йдуть старим ботом.'
+  },
+  TELEGRAM_BOT_USERNAME: {
+    scope: 'db_tunable', group: 'telegram', apply: 'hot', ui: { kind: 'text' }
+  },
+  TELEGRAM_MODE: {
+    scope: 'db_tunable', group: 'telegram', apply: 'restart', confirm: true, impact: 'alerts',
+    ui: { kind: 'select', options: ['polling', 'disabled'] },
+    applyNote: 'Читається один раз, у createBot(). «disabled» після перезапуску означає, що бот не '
+      + 'створюється взагалі — жодного сповіщення.'
+  },
+  TELEGRAM_ADMIN_CHAT_ID: {
+    scope: 'db_tunable', group: 'telegram', apply: 'hot', ui: { kind: 'text' },
+    applyNote: 'Наразі не читається жодним модулем: значення зберігається й показується, але поки що '
+      + 'ні на що не впливає.'
+  },
+  TELEGRAM_API_ID: {
+    scope: 'db_secret', group: 'telegram', apply: 'restart', confirm: true, impact: 'collector',
+    ui: { kind: 'secret' },
+    applyNote: 'MTProto-клієнт будується один раз, на старті колектора.'
+  },
+  TELEGRAM_API_HASH: {
+    scope: 'db_secret', group: 'telegram', apply: 'restart', confirm: true, impact: 'collector',
+    ui: { kind: 'secret' },
+    applyNote: 'MTProto-клієнт будується один раз, на старті колектора.'
+  },
+  TELEGRAM_SESSION: {
+    scope: 'db_secret', group: 'telegram', apply: 'restart', confirm: true, impact: 'collector',
+    ui: { kind: 'secret' },
+    applyNote: 'Сесія передається в StringSession на старті колектора. Заміна на живому процесі '
+      + 'нічого не змінює до перезапуску; після нього збір іде з нового акаунта.'
+  },
+  NIGHTLY_DIGEST_TIME: {
+    scope: 'db_tunable', group: 'telegram', apply: 'hot',
+    ui: { kind: 'text', placeholder: '23:20' }
+  },
+
+  // ---- telegram: дозбір після простою ------------------------------------------------------------
+  CLASSIFIER_BACKFILL_ENABLED: {
+    scope: 'db_tunable', group: 'telegram', apply: 'hot', ui: { kind: 'boolean' }, impact: 'collector'
+  },
+  CLASSIFIER_BACKFILL_MIN_GAP_SECONDS: {
+    scope: 'db_tunable', group: 'telegram', apply: 'hot', ui: { kind: 'number', min: 300, unit: 'с' }
+  },
+  CLASSIFIER_BACKFILL_MAX_AGE_SECONDS: {
+    scope: 'db_tunable', group: 'telegram', apply: 'hot',
+    ui: { kind: 'number', min: 600, max: 172800, unit: 'с' }
+  },
+  CLASSIFIER_BACKFILL_MAX_MESSAGES: {
+    scope: 'db_tunable', group: 'telegram', apply: 'hot', ui: { kind: 'number', min: 1, max: 1000 }
+  },
+  CLASSIFIER_BACKFILL_MAX_PAGES: {
+    scope: 'db_tunable', group: 'telegram', apply: 'hot', ui: { kind: 'number', min: 1, max: 20 }
+  },
+  CLASSIFIER_BACKFILL_PAGE_SIZE: {
+    scope: 'db_tunable', group: 'telegram', apply: 'hot', ui: { kind: 'number', min: 10, max: 100 }
+  },
+  CLASSIFIER_BACKFILL_MAX_SOURCES_PER_SWEEP: {
+    scope: 'db_tunable', group: 'telegram', apply: 'hot', ui: { kind: 'number', min: 1, max: 100 }
+  },
+  CLASSIFIER_BACKFILL_SOURCE_DELAY_MS: {
+    scope: 'db_tunable', group: 'telegram', apply: 'hot',
+    ui: { kind: 'number', min: 0, max: 60000, unit: 'мс' }
+  },
+  CLASSIFIER_BACKFILL_MIN_RERUN_SECONDS: {
+    scope: 'db_tunable', group: 'telegram', apply: 'hot', ui: { kind: 'number', min: 60, unit: 'с' }
+  },
+  CLASSIFIER_BACKFILL_CHECK_INTERVAL_SECONDS: {
+    scope: 'db_tunable', group: 'telegram', apply: 'restart',
+    ui: { kind: 'number', min: 0, unit: 'с' },
+    applyNote: 'Період циклічного дозбору задається один раз, у setInterval() на старті колектора. '
+      + 'Решта меж дозбору читається щоразу — тільки цей інтервал чекає перезапуску.'
+  },
+
+  // ---- official: опитувані API -------------------------------------------------------------------
+  UKRAINE_ALARM_API_TOKEN: {
+    scope: 'db_secret', group: 'official', apply: 'hot', confirm: true, impact: 'alerts',
+    ui: { kind: 'secret' }
+  },
+  UKRAINE_ALARM_API_URL: {
+    scope: 'db_tunable', group: 'official', apply: 'hot', confirm: true, impact: 'alerts',
+    ui: { kind: 'url' }
+  },
+  ALERTS_IN_UA_TOKEN: {
+    scope: 'db_secret', group: 'official', apply: 'hot', confirm: true, impact: 'alerts',
+    ui: { kind: 'secret' }
+  },
+  ALERTS_IN_UA_URL: {
+    scope: 'db_tunable', group: 'official', apply: 'hot', confirm: true, impact: 'alerts',
+    ui: { kind: 'url' }
+  },
+  AERIAL_MIRROR_ENABLED: {
+    scope: 'db_tunable', group: 'official', apply: 'hot', confirm: true, impact: 'alerts',
+    ui: { kind: 'boolean' }
+  },
+  AERIAL_MIRROR_URL: {
+    scope: 'db_tunable', group: 'official', apply: 'hot', impact: 'alerts', ui: { kind: 'url' }
+  },
+  AERIAL_MIRROR_STALE_SECONDS: {
+    scope: 'db_tunable', group: 'official', apply: 'hot', impact: 'alerts',
+    ui: { kind: 'number', min: 60, unit: 'с' }
+  },
+  AERIAL_MIRROR_RAW_SOURCE: {
+    scope: 'db_tunable', group: 'official', apply: 'hot', impact: 'alerts',
+    ui: { kind: 'text', placeholder: 'ual' }
+  },
+  AERIAL_MIRROR_REQUEST_GAP_MS: {
+    scope: 'db_tunable', group: 'official', apply: 'hot', ui: { kind: 'number', min: 0, unit: 'мс' }
+  },
+  DEMO_SOURCE_ENABLED: {
+    scope: 'env', group: 'official', apply: 'restart', ui: { kind: 'boolean' },
+    envReason: 'У production схема відхиляє його беззастережно, тож перемикач у БД у єдиному '
+      + 'середовищі, яке має значення, не міг би зробити нічого — а те, що він вмикає, це вигадані '
+      + 'тривоги на публічній карті.'
+  },
+  ALERT_END_DEBOUNCE_SECONDS: {
+    scope: 'db_tunable', group: 'official', apply: 'hot', confirm: true, impact: 'alerts',
+    ui: { kind: 'number', min: 30, unit: 'с' }
+  },
+
+  // ---- official: канал офіційних тривог ----------------------------------------------------------
+  ALERT_CHANNEL_ENABLED: {
+    scope: 'db_tunable', group: 'official', apply: 'restart', confirm: true, impact: 'collector',
+    ui: { kind: 'boolean' },
+    applyNote: 'Обробка повідомлень зважає на прапорець одразу, але перелік каналів, на які колектор '
+      + 'підписаний, будується один раз — resolveChannelRoutes() на старті. Увімкнення без '
+      + 'перезапуску не підпише колектор на канал.'
+  },
+  ALERT_CHANNEL_USERNAME: {
+    scope: 'db_tunable', group: 'official', apply: 'restart', impact: 'collector',
+    ui: { kind: 'text', placeholder: 'air_alert_ua' },
+    applyNote: 'Резервний хендл на випадок, коли реєстр джерел не читається; підставляється при '
+      + 'побудові підписок на старті колектора.'
+  },
+  ALERT_CHANNEL_MAX_ALERT_SECONDS: {
+    scope: 'db_tunable', group: 'official', apply: 'hot', confirm: true, impact: 'alerts',
+    ui: { kind: 'number', min: 3600, unit: 'с' }
+  },
+  ALERT_CHANNEL_BACKFILL_MESSAGES: {
+    scope: 'db_tunable', group: 'official', apply: 'hot', ui: { kind: 'number', min: 0, max: 500 }
+  },
+  ALERT_CHANNEL_BACKFILL_SECONDS: {
+    scope: 'db_tunable', group: 'official', apply: 'hot', ui: { kind: 'number', min: 0, unit: 'с' }
+  },
+  OSINT_MONITOR_ENABLED: {
+    scope: 'db_tunable', group: 'official', apply: 'hot', confirm: true, impact: 'collector',
+    ui: { kind: 'boolean' }
+  },
+  OSINT_MONITOR_COALESCE_SECONDS: {
+    scope: 'db_tunable', group: 'official', apply: 'hot', ui: { kind: 'number', min: 0, max: 900, unit: 'с' }
+  },
+
+  // ---- publication -------------------------------------------------------------------------------
+  PUBLICATION_DELAY_SECONDS: {
+    scope: 'db_tunable', group: 'publication', apply: 'restart', confirm: true, impact: 'publication',
+    ui: { kind: 'number', min: 5, max: 60, unit: 'с' },
+    applyNote: 'Позначено «потребує перезапуску», хоча delaySecondsFor() читає значення щоразу: '
+      + 'ця ж тривалість уже зашита в рішення про alert_periods.published_at, ухвалені під час '
+      + 'повторних відкриттів тривог. Єдиний стан, у якому нове значення узгоджене з усім, що вже '
+      + 'записано, — свіжий процес. Змінюється лише в режимі «наживо»: у delayed_15s збільшення '
+      + 'затримки відсунуло б зріз назад і зняло б із карти вже опубліковані тривоги, тож запис '
+      + 'відхиляється з 409.'
+  },
+
+  // ---- analytics ---------------------------------------------------------------------------------
+  ANALYTICS_EVENT_DRIVEN_ENABLED: {
+    scope: 'db_tunable', group: 'analytics', apply: 'restart', confirm: true,
+    ui: { kind: 'boolean' },
+    applyNote: 'Перевіряється до підписки на шину подій: вимкнений воркер не простоює, його немає. '
+      + 'Тому і вмикання, і вимикання чекають перезапуску; п’ятнадцятихвилинні таймери працюють у '
+      + 'будь-якому разі.'
+  },
+  ANALYTICS_NARRATIVE_ENABLED: {
+    scope: 'db_tunable', group: 'analytics', apply: 'hot', ui: { kind: 'boolean' }
+  },
+  AI_BASE_URL: { scope: 'db_tunable', group: 'analytics', apply: 'hot', ui: { kind: 'text' } },
+  AI_API_KEY: { scope: 'db_secret', group: 'analytics', apply: 'hot', ui: { kind: 'secret' } },
+  AI_MODEL: { scope: 'db_tunable', group: 'analytics', apply: 'hot', ui: { kind: 'text' } },
+  AI_TIMEOUT_MS: {
+    scope: 'db_tunable', group: 'analytics', apply: 'hot', ui: { kind: 'number', min: 1, unit: 'мс' }
+  },
+  CODEX_BASE_URL: { scope: 'db_tunable', group: 'analytics', apply: 'hot', ui: { kind: 'text' } },
+  CODEX_API_KEY: { scope: 'db_secret', group: 'analytics', apply: 'hot', ui: { kind: 'secret' } },
+  CODEX_MODEL: { scope: 'db_tunable', group: 'analytics', apply: 'hot', ui: { kind: 'text' } },
+  CODEX_ACCOUNT_ID: {
+    scope: 'db_secret', group: 'analytics', apply: 'hot', ui: { kind: 'secret' }
+    // Не токен, але ідентифікатор чужого акаунта ChatGPT, який разом із токеном і становить пару.
+    // Показувати «встановлено» замість значення тут нічого не коштує, а зворотне рішення друкує
+    // чиюсь особисту прив’язку в кожному знімку сторінки.
+  },
+  CODEX_API_STYLE: {
+    scope: 'db_tunable', group: 'analytics', apply: 'hot',
+    ui: { kind: 'select', options: ['auto', 'chat', 'responses'] }
+  },
+  SHADOW_CLASSIFIER_MAX_PER_MINUTE: {
+    scope: 'db_tunable', group: 'analytics', apply: 'hot', ui: { kind: 'number', min: 0, max: 120 }
+  },
+  RETROSPECTIVE_GATE_TIMEOUT_MS: {
+    scope: 'db_tunable', group: 'analytics', apply: 'hot',
+    ui: { kind: 'number', min: 250, max: 10000, unit: 'мс' }
+  },
+  RETROSPECTIVE_GATE_MAX_PER_MINUTE: {
+    scope: 'db_tunable', group: 'analytics', apply: 'hot', ui: { kind: 'number', min: 0, max: 120 }
+  },
+  CODEX_OAUTH_ISSUER: { scope: 'db_tunable', group: 'analytics', apply: 'hot', ui: { kind: 'url' } },
+  CODEX_OAUTH_CLIENT_ID: { scope: 'db_tunable', group: 'analytics', apply: 'hot', ui: { kind: 'text' } },
+  CODEX_OAUTH_SCOPE: { scope: 'db_tunable', group: 'analytics', apply: 'hot', ui: { kind: 'text' } },
+  CODEX_OAUTH_REDIRECT_PORT: {
+    scope: 'env', group: 'analytics', apply: 'restart', ui: { kind: 'number', min: 1, max: 65535 },
+    envReason: 'compose пробрасує «${CODEX_OAUTH_REDIRECT_PORT}:${CODEX_OAUTH_REDIRECT_PORT}» — '
+      + 'обидві половини з одного значення. Інший порт у БД перевів би слухач туди, куди хост нічого '
+      + 'не пересилає, і вхід просто ніколи б не завершився.'
+  },
+  CODEX_OAUTH_REDIRECT_HOST: { scope: 'db_tunable', group: 'analytics', apply: 'hot', ui: { kind: 'text' } },
+  CODEX_OAUTH_BIND_ADDRESS: {
+    scope: 'env', group: 'analytics', apply: 'restart', ui: { kind: 'text' },
+    envReason: 'Усередині контейнера опублікований порт приходить на мостовий інтерфейс, тож '
+      + '0.0.0.0 тут — факт топології, а не вподобання. Прив’язка до loopback тихо викидала б '
+      + 'callback, і зламати це можна було б із вебсторінки.'
+  },
+  CODEX_OAUTH_LOGIN_TIMEOUT_SECONDS: {
+    scope: 'db_tunable', group: 'analytics', apply: 'hot',
+    ui: { kind: 'number', min: 30, max: 1800, unit: 'с' }
+  },
+
+  // ---- map ---------------------------------------------------------------------------------------
+  MAP_STYLE_URL: { scope: 'db_tunable', group: 'map', apply: 'hot', ui: { kind: 'text' } },
+  KATOTTG_SYNC_ENABLED: { scope: 'db_tunable', group: 'map', apply: 'hot', ui: { kind: 'boolean' } },
+  KATOTTG_URL: { scope: 'db_tunable', group: 'map', apply: 'hot', ui: { kind: 'url' } },
+  KATOTTG_VERSION: { scope: 'db_tunable', group: 'map', apply: 'hot', ui: { kind: 'text' } },
+  OCCUPATION_SOURCE_ENABLED: {
+    scope: 'db_tunable', group: 'map', apply: 'hot', confirm: true, ui: { kind: 'boolean' }
+  },
+  DEEPSTATE_API_URL: { scope: 'db_tunable', group: 'map', apply: 'hot', ui: { kind: 'url' } },
+  OCCUPATION_SYNC_INTERVAL_SECONDS: {
+    scope: 'db_tunable', group: 'map', apply: 'restart',
+    ui: { kind: 'number', min: 3600, unit: 'с' },
+    applyNote: 'Період задається один раз, у setInterval() на старті планувальника.'
+  },
+  OCCUPATION_STALE_AFTER_SECONDS: {
+    scope: 'db_tunable', group: 'map', apply: 'hot', ui: { kind: 'number', min: 1, unit: 'с' }
+  }
+};
+
+export const config = parseAppConfig(process.env);

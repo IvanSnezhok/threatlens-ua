@@ -5,6 +5,7 @@ import { config } from './config.js';
 import { migrate } from './db/migrate.js';
 import { pool } from './db/pool.js';
 import { seedDemoData, startIngestionScheduler } from './services/ingestion.js';
+import { loadAppSettings } from './services/app-settings.js';
 import { startAnalyticsScheduler } from './services/analytics.js';
 import { startAnalyticsRecomputeScheduler } from './services/analytics-scheduler.js';
 import { startRiskScheduler } from './services/risk.js';
@@ -17,6 +18,18 @@ import { eventHub } from './services/sse.js';
 import { startTelegramCollector } from './sources/telegram.js';
 
 await migrate();
+// AFTER migrate(), because the table it reads is created by 030; BEFORE buildServer(), because a
+// route that answered a request from `.env` and then from the store a moment later would be two
+// different deployments inside one boot. Fails OPEN: an unreadable store leaves the environment's
+// configuration standing and increments `threatlens_app_settings_read_failures_total`.
+//
+// `console` rather than `app.log`: the server, and therefore the pino instance, does not exist yet,
+// and a boot-time degrade that left no line in `docker compose logs` would be discoverable only on
+// /metrics.
+await loadAppSettings({
+  warn: (fields, message) => console.warn(message, fields),
+  error: (fields, message) => console.error(message, fields)
+});
 const app = await buildServer();
 await seedDemoData();
 eventHub.start();

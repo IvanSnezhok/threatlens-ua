@@ -21,18 +21,39 @@ import { config } from '../config.js';
 
 // `APP_TIMEZONE` defaults to Europe/Kyiv and exists so a deployment serving another jurisdiction can
 // move the whole product to its own clock at once, rather than having each message pick its own.
-const timeZone = config.APP_TIMEZONE;
+//
+// Memoised on the zone rather than built at module load, which is what keeps the key `hot` in
+// `APP_SETTINGS`. The three formatters were constants here, so an operator changing the timezone
+// from /ops would have moved every other surface (the digest, the analytics, `/api/v1/config`) and
+// left the bot's own messages on the old clock until a restart — a one-line difference nobody would
+// look for. Rebuilt only when the zone actually changes, so the steady state is one string compare
+// per formatted timestamp and not three `Intl.DateTimeFormat` constructions.
+let formatters: {
+  zone: string;
+  clock: Intl.DateTimeFormat;
+  day: Intl.DateTimeFormat;
+  // Calendar-day identity is compared on an ISO-ordered rendering rather than on `Date` fields,
+  // because `getDate()` answers in the *server's* zone: a container running UTC would call 01:30
+  // Kyiv "yesterday" and stamp a date on a time that is happening right now.
+  calendarDay: Intl.DateTimeFormat;
+} | null = null;
 
-const clockFormat = new Intl.DateTimeFormat('uk-UA', {
-  timeZone, hour: '2-digit', minute: '2-digit', hourCycle: 'h23'
-});
-const dayFormat = new Intl.DateTimeFormat('uk-UA', { timeZone, day: 'numeric', month: 'long' });
-// Calendar-day identity is compared on an ISO-ordered rendering rather than on `Date` fields, because
-// `getDate()` answers in the *server's* zone: a container running UTC would call 01:30 Kyiv "yesterday"
-// and stamp a date on a time that is happening right now.
-const calendarDayFormat = new Intl.DateTimeFormat('en-CA', {
-  timeZone, year: 'numeric', month: '2-digit', day: '2-digit'
-});
+function zoned() {
+  const timeZone = config.APP_TIMEZONE;
+  if (!formatters || formatters.zone !== timeZone) {
+    formatters = {
+      zone: timeZone,
+      clock: new Intl.DateTimeFormat('uk-UA', {
+        timeZone, hour: '2-digit', minute: '2-digit', hourCycle: 'h23'
+      }),
+      day: new Intl.DateTimeFormat('uk-UA', { timeZone, day: 'numeric', month: 'long' }),
+      calendarDay: new Intl.DateTimeFormat('en-CA', {
+        timeZone, year: 'numeric', month: '2-digit', day: '2-digit'
+      })
+    };
+  }
+  return formatters;
+}
 
 export const threatLabels: Record<string, string> = {
   uav: 'ударні БпЛА', ballistic_missile: 'балістичні ракети',
@@ -116,12 +137,13 @@ export function toDate(value: unknown): Date | null {
 export function humanMoment(value: unknown, now: Date = new Date()): string | null {
   const date = toDate(value);
   if (!date) return null;
-  const time = clockFormat.format(date);
-  const day = calendarDayFormat.format(date);
-  const today = calendarDayFormat.format(now);
+  const format = zoned();
+  const time = format.clock.format(date);
+  const day = format.calendarDay.format(date);
+  const today = format.calendarDay.format(now);
   if (day === today) return time;
   const year = day.slice(0, 4) === today.slice(0, 4) ? '' : ` ${day.slice(0, 4)} року`;
-  return `${dayFormat.format(date)}${year} о ${time}`;
+  return `${format.day.format(date)}${year} о ${time}`;
 }
 
 /**

@@ -185,6 +185,18 @@ Prerequisites and boundaries, in full in `docs/OPERATIONS.md`:
 
 ### Optional
 
+> **`.env` is the bootstrap, not the source of truth.** Since migration `030` most of the variables
+> in this table also live in PostgreSQL and are changed from **`/ops/settings`** on a running
+> deployment — no file edit, and for `apply: hot` keys no restart. A stored value **wins** over the
+> environment. Sixteen keys deliberately refuse to be stored, because they are needed before the
+> database is open, are consumed by compose, are the lock on the page that would edit them, or are
+> shared with a container that never reads this database; `.env.example` marks each of them
+> `[тільки .env]` in place, and the page lists them with a reason per key.
+>
+> How to obtain each credential, where it lives afterwards and how to rotate it:
+> [`docs/TOKENS.md`](docs/TOKENS.md). The `curl` equivalents, the restart rules and the two incident
+> conditions: [`docs/OPERATIONS.md`](docs/OPERATIONS.md), "Settings from /ops".
+
 | What | Why |
 |---|---|
 | `UKRAINE_ALARM_API_TOKEN` / `ALERTS_IN_UA_TOKEN` | A second independent official source. Issued on written application; corroboration, not a prerequisite. |
