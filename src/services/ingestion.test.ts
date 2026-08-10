@@ -1,7 +1,10 @@
 import { Registry } from 'prom-client';
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it } from 'vitest';
+import { config } from '../config.js';
 import {
-  escapeLikePattern, normalizeAlarmResponse, pickLocationMatch, registerAlertChannelMetrics
+  AERIAL_MIRROR_MIN_POLL_SECONDS, ALERTS_IN_UA_MIN_POLL_SECONDS, SLOW_LEG_INTERVAL_SECONDS,
+  UKRAINE_ALARM_MIN_POLL_SECONDS, alertLegIntervalMs, escapeLikePattern, ingestionLegs,
+  normalizeAlarmResponse, pickLocationMatch, registerAlertChannelMetrics
 } from './ingestion.js';
 
 describe('official alert normalization', () => {
@@ -108,7 +111,10 @@ describe('metric registration', () => {
     'threatlens_shadow_attempts_total',
     'threatlens_shadow_outcomes_total',
     'threatlens_retrospective_gate_attempts_total',
-    'threatlens_retrospective_gate_outcomes_total'
+    'threatlens_retrospective_gate_outcomes_total',
+    'threatlens_ingestion_leg_runs_total',
+    'threatlens_ingestion_leg_interval_seconds',
+    'threatlens_alert_pokes_total'
   ];
 
   it('attaches every counter this module owns, model-layer ones included', () => {
@@ -123,5 +129,83 @@ describe('metric registration', () => {
     registerAlertChannelMetrics(registry);
     expect(() => registerAlertChannelMetrics(registry)).not.toThrow();
     expect(registry.getMetricsAsArray()).toHaveLength(expected.length);
+  });
+});
+
+/**
+ * The floors, and the fact that no setting can reach past them.
+ *
+ * `ALERT_POLL_INTERVAL_SECONDS` is bounded by the schema at 2..60, and an operator writing 2 is the
+ * whole point of this block: the schema accepts it, `alertLegIntervalMs` clamps it up per provider,
+ * and no path exists between the two that could skip the clamp. Each floor is somebody else's
+ * published limit — see the block comment beside the constants — so «за скільки секунд» must not be
+ * answerable from `/ops` for any of them.
+ */
+describe('per-provider polling floors', () => {
+  const booted = config.ALERT_POLL_INTERVAL_SECONDS;
+  afterEach(() => { config.ALERT_POLL_INTERVAL_SECONDS = booted; });
+
+  it('clamps the operator cadence up to each provider floor', () => {
+    config.ALERT_POLL_INTERVAL_SECONDS = 2;                // the schema's own minimum
+    expect(alertLegIntervalMs(AERIAL_MIRROR_MIN_POLL_SECONDS)).toBe(3000);
+    expect(alertLegIntervalMs(ALERTS_IN_UA_MIN_POLL_SECONDS)).toBe(7000);
+    expect(alertLegIntervalMs(UKRAINE_ALARM_MIN_POLL_SECONDS)).toBe(15_000);
+  });
+
+  it('cannot be configured away by any value the schema accepts', () => {
+    for (let seconds = 2; seconds <= 60; seconds += 1) {
+      config.ALERT_POLL_INTERVAL_SECONDS = seconds;
+      expect(alertLegIntervalMs(AERIAL_MIRROR_MIN_POLL_SECONDS)).toBeGreaterThanOrEqual(3000);
+      expect(alertLegIntervalMs(ALERTS_IN_UA_MIN_POLL_SECONDS)).toBeGreaterThanOrEqual(7000);
+      expect(alertLegIntervalMs(UKRAINE_ALARM_MIN_POLL_SECONDS)).toBeGreaterThanOrEqual(15_000);
+    }
+  });
+
+  it('lets an operator slow every leg down past its floor', () => {
+    // The clamp is one-directional: floors stop a leg being sped up, never being throttled. An
+    // operator responding to a rate-limit incident has to be able to reach 60 s on all three.
+    config.ALERT_POLL_INTERVAL_SECONDS = 60;
+    expect(alertLegIntervalMs(AERIAL_MIRROR_MIN_POLL_SECONDS)).toBe(60_000);
+    expect(alertLegIntervalMs(ALERTS_IN_UA_MIN_POLL_SECONDS)).toBe(60_000);
+    expect(alertLegIntervalMs(UKRAINE_ALARM_MIN_POLL_SECONDS)).toBe(60_000);
+  });
+
+  it('reads the setting per call, which is what makes the key hot', () => {
+    config.ALERT_POLL_INTERVAL_SECONDS = 4;
+    expect(alertLegIntervalMs(AERIAL_MIRROR_MIN_POLL_SECONDS)).toBe(4000);
+    config.ALERT_POLL_INTERVAL_SECONDS = 30;
+    expect(alertLegIntervalMs(AERIAL_MIRROR_MIN_POLL_SECONDS)).toBe(30_000);
+  });
+});
+
+describe('the leg split', () => {
+  const booted = config.ALERT_POLL_INTERVAL_SECONDS;
+  const silent = { info: () => undefined, warn: () => undefined, error: () => undefined };
+  afterEach(() => { config.ALERT_POLL_INTERVAL_SECONDS = booted; });
+
+  const intervals = () => Object.fromEntries(
+    ingestionLegs(silent).map((leg) => [leg.name, leg.intervalMs() / 1000])
+  );
+
+  it('puts the three alert-state legs on the fast cadence and leaves the backstop at fifteen', () => {
+    config.ALERT_POLL_INTERVAL_SECONDS = 4;                // the default
+    expect(intervals()).toEqual({
+      'aerial-mirror': 4,
+      'alerts-in-ua': 7,
+      'ukraine-alarm': 15,
+      'alert-channel-backstop': SLOW_LEG_INTERVAL_SECONDS
+    });
+  });
+
+  it('does not move the slow leg when the alert cadence changes', () => {
+    config.ALERT_POLL_INTERVAL_SECONDS = 2;
+    expect(intervals()['alert-channel-backstop']).toBe(15);
+    config.ALERT_POLL_INTERVAL_SECONDS = 60;
+    expect(intervals()['alert-channel-backstop']).toBe(15);
+  });
+
+  it('names every leg exactly once, because the names are metric labels', () => {
+    const names = ingestionLegs(silent).map((leg) => leg.name);
+    expect(new Set(names).size).toBe(names.length);
   });
 });

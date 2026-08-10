@@ -2,7 +2,9 @@ import type { FastifyPluginAsync, FastifyRequest } from 'fastify';
 import { z } from 'zod';
 import { config } from '../config.js';
 import { PUBLICATION_MODES } from '../types.js';
-import { publicationSlice, sliceMeta, type PublicationSlice } from '../services/publication.js';
+import {
+  lastAlertPropagation, publicationSlice, sliceMeta, type PublicationSlice
+} from '../services/publication.js';
 import {
   RUNTIME_SETTINGS_BOUNDS,
   RuntimeSettingsRangeError,
@@ -107,7 +109,13 @@ const opsRuntimeRoutes: FastifyPluginAsync = async (app) => {
     const [settings, audit, slice] = await Promise.all([
       readRuntimeSettings(), readRuntimeSettingsAudit(20), publicationSlice()
     ]);
-    return { settings, effective: effectiveOf(slice, new Date()), bounds: BOUNDS, audit, notice: NOTICE };
+    return {
+      settings, effective: effectiveOf(slice, new Date()), bounds: BOUNDS, audit, notice: NOTICE,
+      // Additive, and read from process memory rather than from a query — see
+      // `lastAlertPropagation`. `null` on a quiet night and after every restart, which the console
+      // renders as a dash rather than as a zero.
+      propagation: lastAlertPropagation()
+    };
   });
 
   app.put('/ops/api/runtime', async (request, reply) => {
@@ -148,7 +156,13 @@ const opsRuntimeRoutes: FastifyPluginAsync = async (app) => {
     // session" state this endpoint exists to prevent. `saveRuntimeSettings` primes the settings
     // memo, so the slice below already reads the mode that was just written.
     const [audit, slice] = await Promise.all([readRuntimeSettingsAudit(20), publicationSlice()]);
-    return { settings, effective: effectiveOf(slice, new Date()), bounds: BOUNDS, audit, notice: NOTICE };
+    return {
+      settings, effective: effectiveOf(slice, new Date()), bounds: BOUNDS, audit, notice: NOTICE,
+      // Additive, and read from process memory rather than from a query — see
+      // `lastAlertPropagation`. `null` on a quiet night and after every restart, which the console
+      // renders as a dash rather than as a zero.
+      propagation: lastAlertPropagation()
+    };
   });
 };
 

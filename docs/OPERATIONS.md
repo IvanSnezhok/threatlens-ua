@@ -153,6 +153,182 @@ until somebody looks. Response, in order:
 3. If the table is intact and the read is failing, the pool is the problem, not the feature. Nothing
    about the settings layer needs to be undone: `.env` is already what the process is using.
 
+## Alert cadence and instant propagation
+
+The end-to-end question this section answers: **an oblast, raion or hromada goes under alert
+upstream — how long before it is red on the map and in a subscriber's Telegram?**
+
+### The cadence model
+
+Alert-STATE collection is split from everything else. Each leg is its own self-rescheduling chain
+(`src/services/leg-scheduler.ts`) with its own interval, its own overlap guard and its own failure
+backoff; nothing about one leg can delay another. Before this split all four legs shared one
+fifteen-second `setInterval` and one boolean, so a single hung upstream suppressed the other three
+for as long as it hung.
+
+| Leg | Interval | Floor | Why the floor |
+|---|---|---|---|
+| `aerial-mirror` | `ALERT_POLL_INTERVAL_SECONDS` (default 4 s) | **3 s** | The mirror's own documented cache: «таймаут кешування сирих даних… 3 секунди». A faster poll returns the byte-identical body. |
+| `alerts-in-ua` | `max(ALERT_POLL_INTERVAL_SECONDS, 7)` | **7 s** | 8.6 req/min against a published hard limit of 12/min and a soft band of 8–10/min. |
+| `ukraine-alarm` | `max(ALERT_POLL_INTERVAL_SECONDS, 15)` | **15 s** | Nothing is documented for that API — no rate limit, no cache guidance. An undocumented budget is not a budget to spend against. |
+| `alert-channel-backstop` | 15 s, fixed | — | A sweep over `alert_source_states`, not a request to anybody. It catches a 🟢 that never arrived, bounded by `ALERT_CHANNEL_MAX_ALERT_SECONDS` (a full day); running it faster would change nothing. |
+
+Two properties worth stating because they are easy to assume wrong:
+
+- **The interval is a GAP, not a period.** The next pass is armed when the previous one *finishes*,
+  so a poll that takes two seconds at a four-second interval runs every six. That is deliberate: the
+  alternative subtracts the elapsed time and therefore fires the next request the instant a slow one
+  returns — a burst, at exactly the moment the upstream is already struggling. A gap can never issue
+  two requests closer together than the interval, so the floors above are floors on the real request
+  spacing.
+- **The floors cannot be configured away.** They are compiled constants, not settings. `/ops` can
+  slow every leg down to 60 s and cannot speed any of them past its provider's number.
+
+### `ALERT_POLL_INTERVAL_SECONDS`
+
+`db_tunable`, `hot`, confirm-gated. The scheduler reads it on **every** tick, so no restart is
+needed — but a change takes effect from the NEXT pass, not from the one already being waited out.
+
+```bash
+# What each leg is actually waiting, backoff included. This is the number to read after a change,
+# not the setting: it is what the scheduler armed.
+curl -fsS -H "Authorization: Bearer $METRICS_TOKEN" http://localhost:3000/metrics \
+  | grep threatlens_ingestion_leg_interval_seconds
+
+# Slow every alert leg down — the response to a 429 or to pool contention.
+curl -fsS -u "$OPS_USER:$OPS_PASSWORD" -X PUT -H 'Content-Type: application/json' \
+  -d '{"values":{"ALERT_POLL_INTERVAL_SECONDS":"15"},"confirm":["ALERT_POLL_INTERVAL_SECONDS"]}' \
+  http://localhost:3000/ops/api/settings
+```
+
+### The request budget, per host
+
+Worst case, single replica, computed at the FLOOR of every setting — i.e. the most this deployment
+can ever ask for. The mirror is the only leg that can issue two requests in one pass (the raw feed
+plus the aggregated cross-check, sequenced `AERIAL_MIRROR_REQUEST_GAP_MS` apart), and it does so only
+on the polls where the raw feed reported nothing or was refused.
+
+| Host | Legs on it | Requests per pass | At the floor | At the default (4 s) | Published limit | Worst-case use |
+|---|---|---|---|---|---|---|
+| `ubilling.net.ua` | mirror (raw + cross-check) | 1 typical, 2 worst | 3 s → **0.67 rps** | 4 s → 0.50 rps | 2 rps per host | **33 %** |
+| `api.alerts.in.ua` | alerts.in.ua | 1 | 7 s → **8.6 req/min** | 7 s → 8.6 req/min | 12/min hard, 8–10/min soft | **71 %** of hard |
+| `api.ukrainealarm.com` | Ukraine Alarm | 1 | 15 s → **4 req/min** | 15 s → 4 req/min | none published | — |
+
+Three things this table is load-bearing for:
+
+- **The 2 rps is per HOST and is shared.** Everything this deployment sends to `ubilling.net.ua`
+  counts against it: the raw poll, the cross-check, and anything else on the same egress IP. At the
+  3 s floor we use a third of it. That is also why a 429 from the mirror is treated as a *source
+  error* and never as a reason to touch alert state — it means something else is sharing the address.
+- **The alerts.in.ua headroom is deliberate.** 8.6 of 12 leaves 3.4 req/min for a direct
+  `alerts.in.ua` call once its token arrives, and their documentation carries a second, undefined
+  clause — «при аномальній кількості запитів на день, Ваш токен може бути заблокований» — which is
+  the real reason not to spend the remaining margin on a faster poll.
+- **Two replicas double every number in this table.** Every guard here is in-process. Running a
+  second `app` container is not a supported configuration for that reason among others.
+
+**The documented ways to go faster than these floors, when the tokens arrive.** Neither is
+implemented, because neither can be exercised without a token: Ukraine Alarm publishes
+`GET /api/v3/alerts/status`, which returns one `lastActionIndex` and is described as «використовувати
+для перевірки необхідності оновлювати дані» — a cheap change-detection poll in front of the expensive
+one — and a v3 webhook API that removes polling entirely. alerts.in.ua documents conditional requests
+(`If-Modified-Since` → `304`) rather than a cache TTL, which makes a faster poll cheap on their side
+but does not raise the 12/min limit.
+
+### Backoff
+
+A leg that throws increments its own failure count and waits `interval × 2^failures`, capped at
+**120 s** and never shorter than its configured interval. The first success resets it to zero and
+logs `collection leg recovered; backoff reset`. From a four-second mirror: 8 s, 16 s, 32 s, 64 s,
+then 120 s for as long as the upstream stays down — half a request a minute instead of fifteen.
+
+The backoff is invisible in the settings and visible in two places:
+
+```promql
+# A leg sitting well above its configured interval is a leg in backoff.
+threatlens_ingestion_leg_interval_seconds
+
+# What put it there.
+rate(threatlens_ingestion_leg_runs_total{outcome="failed"}[5m])
+```
+
+Nothing needs to be done to release a leg from backoff; it is not a state it has to be let out of.
+If a leg is in backoff and the source card says `error`, the source is the problem. If a leg is in
+backoff and the source card says `current`, the failure is downstream of the fetch — read
+`threatlens_channel_errors_total{stage=…}` for which stage.
+
+### Instant propagation of an alert start
+
+An `alert.started` row committed to `system_event_log` used to wait for two one-second pollers: the
+SSE hub and the notification fan-out. Both are now poked directly after the writing transaction
+commits (`src/services/alert-poke.ts`), which removes that wait and nothing else.
+
+- **Starts only.** `alert.ended`, `threat.*` and everything else ride the ordinary tick. Starts fast,
+  ends unhurried — the same asymmetry `ALERT_END_DEBOUNCE_SECONDS` already takes.
+- **The publication hold is untouched.** A poked hub pass runs the same version-bounded SELECT the
+  timer would have run, so in `delayed_15s` the fresh row is above the bound and is not emitted. The
+  poke removes polling lag; it can never remove the hold. Pinned by
+  `tests/integration/alert-poke.test.ts`.
+- **Telegram is unaffected in principle.** The fan-out has never consulted the publication cutoff —
+  the documented exemption — so a subscriber was already being told about an alert the public map was
+  holding. The poke moves that by at most one second.
+- **Storm-proof by three bounds**: one poke per COMMIT rather than per row (a twenty-five-oblast
+  snapshot is one poke), one pending poke at a time, and both consumers refuse a re-entrant pass and
+  re-arm once instead.
+
+```promql
+# Pokes raised. `coalesced` is the second bound working and is not a fault; a coalesced rate that
+# dwarfs `fired` means several writers are committing inside one macrotask turn.
+rate(threatlens_alert_pokes_total[5m])
+```
+
+### The end-to-end metric
+
+`threatlens_alert_propagation_seconds{source}` is a histogram of **the provider's own timestamp for
+an alert start, subtracted from the `system_event_log.created_at` of the row we wrote from it**.
+For the mirror that is its `changed` / `lastUpdate` field; for an alert channel it is the Telegram
+publication time.
+
+It composes with `threatlens_sse_delivery_lag_seconds`, which starts from the same `created_at`: the
+two summed are «from the authority's clock to the browser». That is the graph to build.
+
+```promql
+# The number the cadence change was made for.
+histogram_quantile(0.95, sum by (le, source) (rate(threatlens_alert_propagation_seconds_bucket[15m])))
+
+# The whole chain, upstream to released frame.
+histogram_quantile(0.95, sum by (le) (rate(threatlens_alert_propagation_seconds_bucket[15m])))
+  + histogram_quantile(0.95, sum by (le) (rate(threatlens_sse_delivery_lag_seconds_bucket{kind="live"}[15m])))
+```
+
+Two clamps, and knowing about them is the difference between reading the graph and misreading it:
+
+- **Negative → 0.** The upstream stamp is a third party's clock. The mirror prints a bare Europe/Kyiv
+  wall clock, and a DST resolution one hour the wrong way or a provider simply running fast both
+  produce a start timestamp in our future.
+- **Capped at 300 s.** A provider that re-lists an alert with the start timestamp it used four hours
+  ago reopens the same `alert_periods` row, and a channel reconnect replays a six-hour window by
+  design. Unclamped, one of those puts a five-figure sample in `+Inf` and drags every average.
+  A p95 pinned at exactly 300 therefore means «щось дуже старе», not «п'ять хвилин затримки» — look
+  at `alert_periods.started_at` for the alerts in that window before treating it as latency.
+
+The last reading is also served at `GET /ops/api/runtime` as `propagation` and rendered as the
+«Затримка тривоги» chip on the console. It is **process state**: `null` after every restart and on
+any night with no alerts, which is why the chip shows a dash rather than a zero and carries the age
+of the measurement in its tooltip. `/metrics` is the durable record; the chip is a glance.
+
+### Incident conditions
+
+```promql
+# The acquisition path is slower than the cadence can explain. At the default floors the p95 should
+# sit inside ~10 s; sustained above 30 s means a leg is in backoff, an upstream is stalling, or the
+# snapshot transaction is contending for the pool.
+histogram_quantile(0.95, sum by (le) (rate(threatlens_alert_propagation_seconds_bucket[15m]))) > 30
+
+# A leg has been failing long enough to be in the backoff cap.
+threatlens_ingestion_leg_interval_seconds >= 120
+```
+
 ## Publication mode (operator only)
 
 The public presentation can be held back by `PUBLICATION_DELAY_SECONDS` (default 15). The mode lives
@@ -1108,7 +1284,8 @@ Production backups must additionally be encrypted and copied to independent obje
   Telegram subscribers were notified on time, and the backlog drains as soon as the mode is `live`.
 - **Recompute storm, or the debounce collapsed.** Symptom: `threatlens_analytics_recompute_total`
   climbing steeply, `threatlens_analytics_recompute_duration_seconds` widening, and the pool visibly
-  contended — the 15-second ingestion tick, the one-second event poll and every snapshot share twelve
+  contended — the alert legs (the mirror every `ALERT_POLL_INTERVAL_SECONDS`, alerts.in.ua every 7 s,
+  Ukraine Alarm every 15 s), the one-second event poll and every snapshot share twelve
   connections under a 15-second `statement_timeout`, and a `REFRESH MATERIALIZED VIEW CONCURRENTLY`
   that exceeds the timeout dies, counts as `view_refresh_failed`, and is retried at floor cadence.
 

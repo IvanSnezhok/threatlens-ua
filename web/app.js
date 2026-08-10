@@ -4498,6 +4498,12 @@ function opsKpiStrip(data, runtime, deploy) {
   const delaySeconds = runtime?.effective?.delaySeconds ?? 0;
   const pill = deploy ? deployPill(deploy) : { label: 'невідомо', tone: 'off' };
   const behind = Number(runtime?.effective?.behindSeconds ?? 0);
+  // Скільки секунд минуло від часу, який назвало джерело, до нашого запису — на останній тривозі.
+  // Значення живе в памʼяті процесу і зʼявляється лише тоді, коли тривога справді почалася, тож
+  // поруч завжди стоїть вік вимірювання: число без нього виглядало б як «зараз», хоча може бути
+  // з минулої ночі. Порожньо — це чесно, а не помилка.
+  const propagation = runtime?.propagation ?? null;
+  const propagationAge = propagation ? Math.max(0, Math.round((Date.now() - Date.parse(propagation.at)) / 60000)) : 0;
   return `<div class="ops-kpis">
     ${opsKpiChip('Джерела', data.sources.length, '', 'Джерел у каталозі')}
     ${opsKpiChip('Черга', queued, queued ? 'warn' : '', 'Повідомлень в outbox')}
@@ -4505,6 +4511,14 @@ function opsKpiStrip(data, runtime, deploy) {
     ${opsKpiChip('PostgreSQL', escapeHtml(data.database.size), '', 'Розмір бази')}
     ${opsKpiChip('Розгортання', escapeHtml(pill.label), pill.tone === 'ok' ? '' : pill.tone, 'Стан оновлення з main')}
     ${opsKpiChip('Показ', mode === 'delayed_15s' ? `+${delaySeconds} с` : 'наживо', mode === 'delayed_15s' ? 'warn' : '', behind ? `Відставання ${behind} с` : 'Режим публікації')}
+    ${opsKpiChip(
+    'Затримка тривоги',
+    propagation ? `${escapeHtml(propagation.seconds.toFixed(1))} с` : '—',
+    propagation && propagation.seconds >= 20 ? 'warn' : '',
+    propagation
+      ? `Остання тривога: ${propagation.seconds.toFixed(1)} с від часу джерела до нашого запису · ${escapeHtml(propagation.source)} · ${propagationAge} хв тому`
+      : 'Від часу, який назвало джерело, до нашого запису. Порожньо, доки не почалася жодна тривога після запуску'
+  )}
   </div>`;
 }
 

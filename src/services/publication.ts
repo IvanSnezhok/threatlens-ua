@@ -117,6 +117,27 @@ const channelErrors = new Counter({
   help: 'Errors attributed to one collection channel, by the stage that failed',
   labelNames: ['source', 'stage'], registers: []
 });
+/**
+ * The end-to-end acquisition number: upstream said «тривога» at T, we recorded it at T+x.
+ *
+ * This is the ONE series that answers the question the whole fast-cadence delivery exists for, and
+ * it answers it about the real world rather than about our own timers: `threatlens_ingestion_lag_seconds`
+ * measures a *message's* age and only Telegram sources produce one, while this measures the distance
+ * between a provider's own `changed`/`lastUpdate` stamp and the `system_event_log` row we wrote from
+ * it. It composes with `threatlens_sse_delivery_lag_seconds`, which starts from the same
+ * `created_at`, so the two summed are «from the authority's clock to the browser».
+ *
+ * Buckets straddle both cadences deliberately: 5 s is roughly the floor cadence's typical case, 20 s
+ * is roughly the old fifteen-second scheduler's worst case, and a dashboard comparing before and
+ * after wants both sides of that on one graph.
+ *
+ * `alert.started` only. Ends are unhurried by design and would only dilute the histogram.
+ */
+const alertPropagation = new Histogram({
+  name: 'threatlens_alert_propagation_seconds',
+  help: 'Seconds between an upstream reporting an alert start and our system_event_log row for it',
+  labelNames: ['source'], buckets: [1, 2, 3, 5, 8, 12, 20, 30, 60, 120, 300], registers: []
+});
 
 const METRICS: ReadonlyArray<[string, Counter<string> | Gauge<string> | Histogram<string>]> = [
   ['threatlens_ingestion_lag_seconds', ingestionLag],
@@ -127,6 +148,7 @@ const METRICS: ReadonlyArray<[string, Counter<string> | Gauge<string> | Histogra
   ['threatlens_publication_delay_seconds', publicationDelay],
   ['threatlens_sse_delivery_lag_seconds', sseDeliveryLag],
   ['threatlens_channel_errors_total', channelErrors],
+  ['threatlens_alert_propagation_seconds', alertPropagation],
   // Declared in `runtime-settings.ts` — the failure it counts happens inside
   // `resolveRuntimeSettings()`, and declaring it here would close an import cycle. Registered here
   // because this is the registrar `buildServer()` calls; without this row the series never appears
@@ -176,6 +198,81 @@ export function countChannelError(sourceId: string, stage: 'collect' | 'parse' |
   channelErrors.inc({ source: sourceId, stage });
 }
 
+// ------------------------------------------------------------------------------------------------
+// Alert propagation
+// ------------------------------------------------------------------------------------------------
+
+/**
+ * Ceiling on one propagation observation.
+ *
+ * Not a bucket boundary — a CLAMP, and the difference matters. Two things produce values far above
+ * any real acquisition lag and neither is the thing being measured:
+ *
+ *  * a provider that back-dates. `reconcileAggregateAlert` reopens an `alert_periods` row on its
+ *    unique `(location, type, started_at)`, so a provider re-listing an alert with the start
+ *    timestamp it used four hours ago produces a four-hour "propagation".
+ *  * a catch-up. The alert-channel reconnect backfill replays a bounded history window, and the
+ *    first message in it can be six hours old by design (`ALERT_CHANNEL_BACKFILL_SECONDS`).
+ *
+ * Left unclamped, one of those puts a five-figure sample in the +Inf bucket and drags every average
+ * a dashboard draws. Clamping saturates the top finite bucket instead, which reads honestly as
+ * «щось дуже старе» without pretending to a number. Five minutes is comfortably above every legitimate
+ * case: the slowest leg polls at 15 s and the widest end debounce is 60 s.
+ */
+export const ALERT_PROPAGATION_CAP_SECONDS = 300;
+
+/**
+ * Pure. Seconds from the upstream's instant to ours, clamped at both ends, or `null` when there is
+ * nothing to measure.
+ *
+ * The negative clamp is not defensive noise. `publishedAt` is Postgres `now()` at the start of the
+ * writing transaction and `upstreamAt` is a THIRD party's clock — the mirror's `changed` field is a
+ * bare Europe/Kyiv wall clock, and `kyivWallClockToUtc` resolving it one DST hour the wrong way,
+ * or a provider simply running fast, both produce a start timestamp in our future. A histogram
+ * cannot represent that and `prom-client` would happily record it, so it becomes 0: «наскільки ми
+ * встигли» is never less than none.
+ */
+export function alertPropagationSeconds(publishedAt: Date, upstreamAt: Date | null): number | null {
+  if (!upstreamAt) return null;
+  const seconds = (publishedAt.getTime() - upstreamAt.getTime()) / 1000;
+  if (!Number.isFinite(seconds)) return null;
+  return Math.min(Math.max(0, seconds), ALERT_PROPAGATION_CAP_SECONDS);
+}
+
+/**
+ * The last observation, kept so `/ops` can print one number without scraping Prometheus.
+ *
+ * In-process and therefore lost on restart, and only written when an alert actually starts — which
+ * on a quiet night is never. That is why the KPI chip renders the age beside the value and shows a
+ * dash when there is nothing: a stale number presented as current would be worse than no number.
+ */
+export interface AlertPropagationReading {
+  seconds: number;
+  source: string;
+  /** ISO 8601 — when the observation was taken, i.e. when that alert was recorded. */
+  at: string;
+}
+
+let lastPropagation: AlertPropagationReading | null = null;
+
+export function lastAlertPropagation(): AlertPropagationReading | null {
+  return lastPropagation ? { ...lastPropagation } : null;
+}
+
+/**
+ * Records one `alert.started`. Total: never throws, and returns what it observed so a test does not
+ * have to read the registry to find out.
+ */
+export function observeAlertPropagation(
+  sourceId: string, publishedAt: Date, upstreamAt: Date | null
+): number | null {
+  const seconds = alertPropagationSeconds(publishedAt, upstreamAt);
+  if (seconds === null) return null;
+  alertPropagation.observe({ source: sourceId }, seconds);
+  lastPropagation = { seconds, source: sourceId, at: publishedAt.toISOString() };
+  return seconds;
+}
+
 /**
  * Test seam. There is no slice memo to clear — the gauges are the only state this module keeps, and
  * a suite that asserts on `/metrics` must be able to put them back to their zero reading.
@@ -185,6 +282,10 @@ export function resetPublicationCache(): void {
   publicationBacklog.set(0);
   publicationDelay.set(0);
   publicationMode.reset();
+  // The last propagation reading is module state that outlives a TRUNCATE, exactly like the gauges
+  // above, and `/ops/api/runtime` serves it — so one file's alert must not become the next file's
+  // KPI chip.
+  lastPropagation = null;
 }
 
 // ------------------------------------------------------------------------------------------------

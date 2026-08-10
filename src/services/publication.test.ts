@@ -14,7 +14,10 @@ import { describe, expect, it, vi } from 'vitest';
 vi.mock('../db/pool.js', () => ({ pool: { query: vi.fn(), connect: vi.fn() } }));
 
 const { config } = await import('../config.js');
-const { delaySecondsFor, sliceMeta } = await import('./publication.js');
+const {
+  ALERT_PROPAGATION_CAP_SECONDS, alertPropagationSeconds, delaySecondsFor, lastAlertPropagation,
+  observeAlertPropagation, resetPublicationCache, sliceMeta
+} = await import('./publication.js');
 
 type Slice = Parameters<typeof sliceMeta>[0];
 
@@ -83,5 +86,69 @@ describe('sliceMeta', () => {
     const meta = sliceMeta(slice(), NOW);
     expect(meta.cutoffAt).toBe('2026-08-08T10:00:00.000Z');
     expect(new Date(Date.parse(meta.cutoffAt)).toISOString()).toBe(meta.cutoffAt);
+  });
+});
+
+/**
+ * The end-to-end acquisition number, and the two clamps that keep it from lying.
+ *
+ * `upstreamAt` is a THIRD party's clock — the mirror prints a bare Europe/Kyiv wall clock and the
+ * alert channels print Telegram's publication time — so both directions of disagreement are real
+ * inputs, not hypotheticals, and a histogram can represent neither.
+ */
+describe('alert propagation', () => {
+  const published = (offsetSeconds: number) => new Date(NOW.getTime() + offsetSeconds * 1000);
+
+  it('is the distance from the upstream instant to ours', () => {
+    expect(alertPropagationSeconds(published(4.2), NOW)).toBeCloseTo(4.2, 6);
+    expect(alertPropagationSeconds(published(0), NOW)).toBe(0);
+  });
+
+  it('clamps a future upstream stamp to zero rather than recording a negative', () => {
+    // A DST resolution that lands an hour the wrong way, or a provider simply running fast.
+    expect(alertPropagationSeconds(NOW, published(3600))).toBe(0);
+    expect(alertPropagationSeconds(NOW, published(0.4))).toBe(0);
+  });
+
+  it('saturates at the cap instead of putting a four-hour sample in +Inf', () => {
+    // A provider re-listing an alert with the start timestamp it used four hours ago reopens the
+    // same `alert_periods` row; a reconnect backfill replays a six-hour window by design.
+    expect(alertPropagationSeconds(published(4 * 3600), NOW)).toBe(ALERT_PROPAGATION_CAP_SECONDS);
+    expect(alertPropagationSeconds(published(301), NOW)).toBe(ALERT_PROPAGATION_CAP_SECONDS);
+    expect(alertPropagationSeconds(published(299), NOW)).toBe(299);
+  });
+
+  it('measures nothing when no source offered a start timestamp', () => {
+    // `reconcileAggregateAlert` stamps the period `now()` in that case, so the difference would be a
+    // meaningless zero rather than a fast acquisition.
+    expect(alertPropagationSeconds(published(10), null)).toBeNull();
+  });
+
+  it('refuses an unreadable instant instead of observing NaN', () => {
+    expect(alertPropagationSeconds(published(10), new Date('nonsense'))).toBeNull();
+    expect(alertPropagationSeconds(new Date('nonsense'), NOW)).toBeNull();
+  });
+
+  it('records the last reading for the ops chip, and the reset seam clears it', () => {
+    resetPublicationCache();
+    expect(lastAlertPropagation()).toBeNull();
+    expect(observeAlertPropagation('aerial-alerts-mirror', published(3.5), NOW)).toBeCloseTo(3.5, 6);
+    expect(lastAlertPropagation()).toEqual({
+      seconds: 3.5, source: 'aerial-alerts-mirror', at: published(3.5).toISOString()
+    });
+    // An unmeasurable start must not overwrite the last real reading with nothing.
+    expect(observeAlertPropagation('ukraine-alarm', published(9), null)).toBeNull();
+    expect(lastAlertPropagation()?.source).toBe('aerial-alerts-mirror');
+    resetPublicationCache();
+    expect(lastAlertPropagation()).toBeNull();
+  });
+
+  it('hands back a copy, so a caller cannot rewrite what /ops serves next', () => {
+    resetPublicationCache();
+    observeAlertPropagation('aerial-alerts-mirror', published(2), NOW);
+    const reading = lastAlertPropagation()!;
+    reading.seconds = 999;
+    expect(lastAlertPropagation()!.seconds).toBe(2);
+    resetPublicationCache();
   });
 });

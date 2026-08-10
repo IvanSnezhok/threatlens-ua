@@ -354,9 +354,13 @@ export async function loadAppSettings(logger?: SettingsLogger): Promise<AppSetti
 
 /**
  * The hot application. `config` is a plain object and every consumer reads `config.KEY` at the
- * moment it needs it, so this one assignment is the whole of "applied" for the fifty-three keys
- * classified `hot`. The eleven classified `restart` are exactly the ones for which it is not enough,
- * and `pendingRestartKeys()` is how the page says so.
+ * moment it needs it, so this one assignment is the whole of "applied" for the fifty-four keys
+ * classified `hot`. The twenty-seven classified `restart` are exactly the ones for which it is not
+ * enough, and `pendingRestartKeys()` is how the page says so.
+ *
+ * One `hot` key is hot in a way worth naming: `ALERT_POLL_INTERVAL_SECONDS` is read by the
+ * scheduler on every tick rather than at the moment of use, so it applies from the NEXT pass rather
+ * than instantly. Its `applyNote` says so on the page.
  */
 export function applyAppSettings(next: AppConfig): void {
   Object.assign(config, next);

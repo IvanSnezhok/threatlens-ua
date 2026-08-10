@@ -1,6 +1,7 @@
 import { EventEmitter } from 'node:events';
 import { pool } from '../db/pool.js';
 import type { PublicationMode } from '../types.js';
+import { onAlertPoke } from './alert-poke.js';
 import { delaySecondsFor, observeSseDeliveryLag } from './publication.js';
 import { resolveRuntimeSettingsWithStatus } from './runtime-settings.js';
 
@@ -99,6 +100,8 @@ class EventHub extends EventEmitter {
   private lastVersion: number | null = null;
   private internalVersion: number | null = null;
   private timer?: NodeJS.Timeout;
+  /** Detaches this hub from the instant-propagation signal. Set by `start`, called by `stop`. */
+  private detachPoke?: () => void;
 
   /** Cleared to `null`, never to `0`: `null` is what makes the next tick re-derive the cursor under
    *  the mode in force. Reached through the exported {@link resetEventHubCursor}. */
@@ -117,6 +120,16 @@ class EventHub extends EventEmitter {
   start() {
     if (this.timer) return;
     let polling = false;
+    /**
+     * A poke that arrived while a pass was in flight.
+     *
+     * The re-arm, not a second concurrent pass — the shape `analytics-scheduler.ts` calls `rearm`.
+     * Without it a poke landing mid-pass would be *lost*, because the pass may already have run its
+     * SELECT before the poking transaction became visible, and the event would then wait for the
+     * ordinary tick after all. Set only by the poke handler: the one-second timer needs no re-arm,
+     * it is coming round anyway.
+     */
+    let repoll = false;
     const poll = async () => {
       if (polling) return;
       polling = true;
@@ -237,16 +250,33 @@ class EventHub extends EventEmitter {
         // of replaying the whole log as live events.
       } finally {
         polling = false;
+        if (repoll) { repoll = false; void poll(); }
       }
     };
     void poll();
     this.timer = setInterval(poll, 1000);
     this.timer.unref();
+    /**
+     * The instant-propagation path. It runs THIS poll — the same statement, the same head bound,
+     * the same cursor — only sooner, which is the entire contract: `src/services/alert-poke.ts`
+     * removes the wait for the timer and can never remove the hold, because the hold is the
+     * `WHERE l.version <= head.v` above and a fresh row in `delayed_15s` is not below it. The
+     * cursor cannot advance past a held row on a poked pass any more than on a timed one.
+     */
+    this.detachPoke = onAlertPoke(() => {
+      if (polling) { repoll = true; return; }
+      void poll();
+    });
   }
 
   stop() {
     if (this.timer) clearInterval(this.timer);
     this.timer = undefined;
+    // Before the timer would matter: a listener left attached to a stopped hub would keep running
+    // `poll()` against a pool `src/index.ts` is about to end, and would keep every later
+    // integration file's events flowing into the previous file's cursor.
+    this.detachPoke?.();
+    this.detachPoke = undefined;
   }
 }
 

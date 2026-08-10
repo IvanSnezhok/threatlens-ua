@@ -1071,11 +1071,16 @@ describe.skipIf(!integrationDatabaseAvailable)('publication mode', () => {
       expect(rows.rows.map((row) => row.external_id)).toEqual(externalIds);
     }, 60_000);
 
-    it('refuses a re-entrant official-API tick while a leg is still in flight', async () => {
-      // `Promise.all` settles at the FIRST rejection and leaves the other legs running, so the
-      // `finally { running = false }` would release the guard with a nationwide snapshot half
-      // applied — and a rejection is the NORMAL case, because both sync functions rethrow after
-      // `markSourceError`. `Promise.allSettled` is what makes the guard mean anything.
+    it('cannot re-enter a hung leg, and no longer lets it stall the others', async () => {
+      // The hazard is unchanged from the days of one shared `setInterval`: two
+      // `persistOfficialAlertSnapshot` passes of the SAME source interleaving their
+      // `alert_source_states` writes can reconcile from a half-applied picture and produce a
+      // spurious «Офіційний відбій» / re-open pair. What changed is the mechanism and its blast
+      // radius. Each leg now arms its next pass in the `finally` of its previous one, so while a
+      // pass is in flight there is no timer that could start a second — the guard is the absence of
+      // a handle rather than a boolean. And the boolean used to be SHARED: one hung upstream
+      // suppressed every other leg for as long as it hung, which is the second half of this
+      // assertion and the whole reason the scheduler was split.
       const alertsInUaUrl = 'https://api.alerts.in.ua/v1/alerts/active.json';
       const calls = { ukraineAlarm: 0, alertsInUa: 0 };
       const pending: { release: (() => void) | null } = { release: null };
@@ -1084,7 +1089,7 @@ describe.skipIf(!integrationDatabaseAvailable)('publication mode', () => {
         const url = String(input);
         if (url === UKRAINE_ALARM_URL) {
           calls.ukraineAlarm += 1;
-          throw new Error('ukraine-alarm is down');
+          return { ok: true, status: 200, json: async () => [] } as unknown as Response;
         }
         if (url === alertsInUaUrl) {
           calls.alertsInUa += 1;
@@ -1094,19 +1099,43 @@ describe.skipIf(!integrationDatabaseAvailable)('publication mode', () => {
         return realFetch(input, init);
       });
 
+      const { config } = await import('../../src/config.js');
+      const mirrorWas = config.AERIAL_MIRROR_ENABLED;
+      // The mirror leg is the fastest of the three and the only one with no stub URL here; leaving
+      // it on would send real requests to ubilling.net.ua from the test suite.
+      config.AERIAL_MIRROR_ENABLED = false;
       const { startIngestionScheduler } = await import('../../src/services/ingestion.js');
-      const stop = startIngestionScheduler({ info: () => undefined, warn: () => undefined, error: () => undefined });
+      // The timer seam, compressed a hundredfold. The property under test needs several of the
+      // slowest leg's intervals to elapse while a pass hangs, and at the real fifteen seconds that
+      // is a minute of waiting for one assertion. `leg.run()` is entirely real — only the clock
+      // between passes is not.
+      const stop = startIngestionScheduler(
+        { info: () => undefined, warn: () => undefined, error: () => undefined },
+        {
+          timers: {
+            set(fn: () => void, ms: number): unknown {
+              const handle = setTimeout(fn, Math.max(1, Math.round(ms / 100)));
+              handle.unref();
+              return handle;
+            },
+            clear(handle: unknown): void { if (handle) clearTimeout(handle as NodeJS.Timeout); }
+          }
+        }
+      );
       try {
-        await waitFor(async () => calls.alertsInUa === 1, 'the first tick to reach both legs');
-        expect(calls.ukraineAlarm).toBe(1);
+        await waitFor(async () => calls.alertsInUa === 1, 'the first pass of each leg');
 
-        // The scheduler ticks every 15 s. One tick has to actually land while the second leg is
-        // still pending, and there is no seam to reach `run()` directly.
-        await delay(17_000);
+        // Ten compressed Ukraine Alarm intervals. In real time this is 150 seconds of cadence.
+        await delay(1500);
 
-        expect(calls).toEqual({ ukraineAlarm: 1, alertsInUa: 1 });
+        // The hung leg was never re-entered, however many of its intervals went by.
+        expect(calls.alertsInUa).toBe(1);
+        // …and the healthy leg kept its own cadence throughout, which is exactly what the shared
+        // guard used to make impossible.
+        expect(calls.ukraineAlarm).toBeGreaterThan(4);
       } finally {
         stop();
+        config.AERIAL_MIRROR_ENABLED = mirrorWas;
         pending.release?.();
         // The leg has to finish before `afterEach` pulls the stub out from under it and the next
         // test truncates the tables it is writing to.

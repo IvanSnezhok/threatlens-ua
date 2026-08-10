@@ -15,11 +15,13 @@ import {
   type AerialMirrorRawSnapshot, type AerialMirrorSnapshot
 } from '../sources/aerial-mirror.js';
 import type { NormalizedMessage } from '../types.js';
+import { alertPokeMetrics, pokeAlertStarted } from './alert-poke.js';
+import { legSchedulerMetrics, startLegScheduler, type SchedulerLeg } from './leg-scheduler.js';
 import { markSourceError, markSourceSuccess } from './operations.js';
 // One-way import, on purpose: the observations are ops instrumentation and this file stays free of
-// ops code by calling three named functions rather than by growing a second metrics block.
+// ops code by calling four named functions rather than by growing a second metrics block.
 import {
-  countChannelError, observeClassificationDuration, observeIngestionLag
+  countChannelError, observeAlertPropagation, observeClassificationDuration, observeIngestionLag
 } from './publication.js';
 import { retrospectiveGate, retrospectiveGateMetrics } from './retrospective-gate.js';
 import { scheduleShadowClassification, shadowClassifierMetrics } from './shadow-classifier.js';
@@ -241,9 +243,31 @@ function recordUnresolvedLocations(sourceId: string, unresolved: string[], log?:
  * channel — so the two-source rule has exactly one implementation. Must run inside a transaction
  * that has already written the source state it is meant to observe.
  */
+/**
+ * One `alert.started` row, as its writer saw it — the two instants the propagation metric is the
+ * difference between.
+ *
+ * Reported rather than observed in place because both are true only after the COMMIT: a metric
+ * recorded inside the transaction would count an alert that was rolled back, and a poke raised
+ * inside it would send the hub to read a row it cannot see yet.
+ */
+export interface AlertStartRecord {
+  alertId: string;
+  locationId: string;
+  /**
+   * `min(provider_started_at)` over the source rows that hold this alert — i.e. the moment the
+   * UPSTREAM says the alert began, which for the mirror is the `changed`/`lastUpdate` stamp its
+   * payload carries and for an alert channel is the Telegram publication time. `null` when no source
+   * offered one and the period was stamped `now()`; there is then nothing to measure.
+   */
+  upstreamStartedAt: Date | null;
+  /** `system_event_log.created_at` of the row just appended — our publication instant. */
+  publishedAt: Date;
+}
+
 async function reconcileAggregateAlert(
   client: PoolClient, locationId: string, alertType: string, sourceId: string
-): Promise<void> {
+): Promise<AlertStartRecord | null> {
   // A source still holds the alert while it reports it, and for ALERT_END_DEBOUNCE_SECONDS after
   // it stops: one missed poll must never produce an "Офіційний відбій". The two-source rule is
   // unchanged — bool_or still means "no configured source holds it any more".
@@ -306,8 +330,20 @@ async function reconcileAggregateAlert(
         config.PUBLICATION_DELAY_SECONDS]
     );
     if (created.rowCount) {
-      await client.query(`INSERT INTO system_event_log(event_type,payload) VALUES ('alert.started',$1)`,
-        [JSON.stringify({ alertId: created.rows[0]!.id, locationId, sourceId })]);
+      // `RETURNING created_at` rather than a second read or a `Date.now()`: this column IS the
+      // instant every downstream bound is measured from — the hub's head query, the publication
+      // cutoff and `threatlens_sse_delivery_lag_seconds` all read it — so taking the propagation
+      // metric from anything else would produce two numbers that do not compose.
+      const logged = await client.query<{ created_at: Date }>(
+        `INSERT INTO system_event_log(event_type,payload) VALUES ('alert.started',$1) RETURNING created_at`,
+        [JSON.stringify({ alertId: created.rows[0]!.id, locationId, sourceId })]
+      );
+      return {
+        alertId: created.rows[0]!.id,
+        locationId,
+        upstreamStartedAt: aggregate.rows[0].started_at,
+        publishedAt: logged.rows[0]!.created_at
+      };
     }
   } else if (!aggregate.rows[0]?.active && global.rowCount) {
     const ended = await client.query<{ id: string }>(
@@ -319,6 +355,29 @@ async function reconcileAggregateAlert(
         [JSON.stringify({ alertId: row.id, locationId, sourceId })]);
     }
   }
+  // Ends deliberately report nothing. They are not poked and not measured: the asymmetry — starts
+  // fast, ends unhurried — is the product decision this whole path implements, and it is the same
+  // direction `ALERT_END_DEBOUNCE_SECONDS` already takes. See `src/services/alert-poke.ts`.
+  return null;
+}
+
+/**
+ * What a committed reconcile pass owes the rest of the process: one metric per start, and at most
+ * one poke for the batch.
+ *
+ * Both callers of `reconcileAggregateAlert` funnel through here so the "after COMMIT, never inside"
+ * rule has one implementation rather than two that drift. Nothing here can throw into a caller that
+ * has already committed: `observeAlertPropagation` is total, and `pokeAlertStarted` only arms a
+ * timer.
+ */
+function announceAlertStarts(sourceId: string, started: readonly AlertStartRecord[]): void {
+  if (!started.length) return;
+  for (const record of started) {
+    observeAlertPropagation(sourceId, record.publishedAt, record.upstreamStartedAt);
+  }
+  // ONE poke for the whole transaction, however many oblasts it raised. Bound 1 of the three in
+  // `src/services/alert-poke.ts`.
+  pokeAlertStarted();
 }
 
 /**
@@ -406,11 +465,14 @@ async function persistOfficialAlertSnapshot(sourceId: string, body: unknown): Pr
         [sourceId, record.locationId, record.alertType, record.active, record.startedAt, record.externalId]
       );
     }
+    const started: AlertStartRecord[] = [];
     for (const key of affectedKeys) {
       const [locationId, alertType] = key.split(':');
-      await reconcileAggregateAlert(client, locationId!, alertType!, sourceId);
+      const record = await reconcileAggregateAlert(client, locationId!, alertType!, sourceId);
+      if (record) started.push(record);
     }
     await client.query('COMMIT');
+    announceAlertStarts(sourceId, started);
   } catch (error) {
     await client.query('ROLLBACK');
     throw error;
@@ -521,9 +583,9 @@ async function fetchAerialMirror(url: string): Promise<unknown> {
     headers: { Accept: 'application/json', 'User-Agent': AERIAL_MIRROR_USER_AGENT },
     signal: AbortSignal.timeout(10_000)
   });
-  // 429 included: the published limit is two requests per second per host and the scheduler polls
-  // every fifteen, so a 429 means something else is sharing the egress IP — a source error, not a
-  // reason to touch alert state.
+  // 429 included: the published limit is two requests per second per host and this leg's worst case
+  // at its three-second floor is 0.67 rps, so a 429 means something else is sharing the egress IP —
+  // a source error, not a reason to touch alert state.
   if (!response.ok) throw new Error(`Aerial alert mirror ${response.status}`);
   return response.json();
 }
@@ -799,7 +861,11 @@ export function registerAlertChannelMetrics(registry: Registry): void {
     ['threatlens_classification_rejections_total', classificationRejections],
     ['threatlens_threat_to_de_escalation_total', threatToDeEscalation],
     ...shadowClassifierMetrics(),
-    ...retrospectiveGateMetrics()
+    ...retrospectiveGateMetrics(),
+    // Same rule as the two above: both modules are reached only through this one, and a second call
+    // site in `buildServer()` would be a second place to forget.
+    ...legSchedulerMetrics(),
+    ...alertPokeMetrics()
   ];
   for (const [name, metric] of metrics) {
     if (!registry.getSingleMetric(name)) registry.registerMetric(metric);
@@ -868,6 +934,7 @@ async function applyAlertChannelStates(
     await client.query('BEGIN');
     let applied = 0;
     let skippedStale = 0;
+    const started: AlertStartRecord[] = [];
     for (const state of states) {
       // The `WHERE` on the conflict branch is the ordering guard. Channel messages can arrive out of
       // order after a reconnect, and an all-clear from an hour ago must never overwrite an alert
@@ -898,9 +965,15 @@ async function applyAlertChannelStates(
       );
       if (!upsert.rowCount) { skippedStale += 1; continue; }
       applied += 1;
-      await reconcileAggregateAlert(client, state.locationId, state.alertType, sourceId);
+      const record = await reconcileAggregateAlert(client, state.locationId, state.alertType, sourceId);
+      if (record) started.push(record);
     }
     await client.query('COMMIT');
+    // The channel path has no acquisition lag to remove — it is pushed to, not polled — but the two
+    // one-second workers downstream are the same two, and a 🔴 arriving over MTProto pays them
+    // exactly as a snapshot does. `provider_started_at` here is the Telegram publication time, so
+    // the propagation metric measures the same thing under a different `source` label.
+    announceAlertStarts(sourceId, started);
     return { applied, skippedStale };
   } catch (error) {
     await client.query('ROLLBACK');
@@ -1026,8 +1099,15 @@ export async function expireStuckAlertChannelAlerts(log?: { warn: Function }): P
                   COALESCE(provider_started_at,last_event_at,updated_at)::text AS started_at`,
       [ALERT_CHANNEL_ADAPTER_TYPE, config.ALERT_CHANNEL_MAX_ALERT_SECONDS]
     );
+    // A backstop pass only ever LOWERS a source row, so it normally reconciles alerts to an end and
+    // reports nothing. It is not structurally incapable of the other direction: clearing one
+    // administration's stuck row re-runs the aggregate, and if a second source still holds that
+    // location while no global period is open, the same call opens one. Rare, and cheaper to handle
+    // than to argue away.
+    const started: Array<{ sourceId: string; record: AlertStartRecord }> = [];
     for (const row of stuck.rows) {
-      await reconcileAggregateAlert(client, row.location_id, row.alert_type, row.source_id);
+      const record = await reconcileAggregateAlert(client, row.location_id, row.alert_type, row.source_id);
+      if (record) started.push({ sourceId: row.source_id, record });
       alertChannelStuckAlerts.inc({ source: row.source_id });
       log?.warn({
         sourceId: row.source_id, locationId: row.location_id, alertType: row.alert_type,
@@ -1035,6 +1115,7 @@ export async function expireStuckAlertChannelAlerts(log?: { warn: Function }): P
       }, 'alert channel state cleared by the maximum alert duration guard: an all-clear was missed');
     }
     await client.query('COMMIT');
+    for (const entry of started) announceAlertStarts(entry.sourceId, [entry.record]);
     return stuck.rowCount ?? 0;
   } catch (error) {
     await client.query('ROLLBACK');
@@ -1451,43 +1532,112 @@ export async function seedDemoData(): Promise<void> {
   await markSourceSuccess('demo');
 }
 
-export function startIngestionScheduler(log: { info: Function; warn: Function; error: Function }): () => void {
-  let running = false;
-  const run = async () => {
-    if (running) return;
-    running = true;
-    try {
-      // `allSettled`, not `all`: `all` settles at the FIRST rejection and leaves the other legs
-      // running, so `finally { running = false }` would release the overlap guard with a nationwide
-      // snapshot still half-applied — and a rejection is the *normal* case, because both sync
-      // functions rethrow after `markSourceError`. The next tick would then start a second
-      // `persistOfficialAlertSnapshot` concurrently with the first, and two snapshots interleaving
-      // their `alert_source_states` writes can compute the aggregate from a half-applied snapshot
-      // and produce a spurious «Офіційний відбій» / re-open pair. Each rejected result is logged
-      // individually; `markSourceError` has already run inside the leg that produced it, so nothing
-      // is lost by not rethrowing.
-      const results = await Promise.allSettled([
-        syncOfficialAlerts(log), syncAlertsInUa(log),
-        // Same fifteen-second cadence and the same overlap guard as the two token APIs, for the same
-        // reason: it is a snapshot source, and two snapshots interleaving their writes can reconcile
-        // from a half-applied picture. The published rate limit is two requests per second per host,
-        // so fifteen seconds is three orders of magnitude inside it.
-        syncAerialMirror(log),
-        // The channel is pushed to, not polled; the only thing the scheduler owes it is the
-        // maximum-duration backstop, which has to run whether or not any message arrives.
-        expireStuckAlertChannelAlerts(log)
-      ]);
-      for (const result of results) {
-        if (result.status === 'rejected') {
-          log.error({ error: result.reason }, 'official alert synchronization leg failed');
-        }
-      }
+// ------------------------------------------------------------------------------------------------
+// The collection scheduler
+// ------------------------------------------------------------------------------------------------
+
+/**
+ * Per-provider polling floors, in seconds. Compiled constants, deliberately NOT settings.
+ *
+ * Each one is a property of somebody else's server: a published rate limit, or a published cache
+ * duration past which a faster poll returns the byte-identical body. An operator may slow the alert
+ * legs down with `ALERT_POLL_INTERVAL_SECONDS` and may not speed any of them past its provider's
+ * floor, because the consequence of getting that wrong is a 429 — or a blocked token — during the
+ * one hour of the year the source matters. The provenance of each number is written out beside
+ * `ALERT_POLL_INTERVAL_SECONDS` in `src/config.ts`; the summary is:
+ *
+ *   * mirror — 3 s, its own documented cache TTL (2 rps/host published separately).
+ *   * alerts.in.ua — 7 s = 8.6 req/min, inside the 8–10 soft band and the 12/min hard limit.
+ *   * Ukraine Alarm — 15 s, because NOTHING is documented and an undocumented budget is not a budget
+ *     to spend against.
+ */
+export const AERIAL_MIRROR_MIN_POLL_SECONDS = 3;
+export const ALERTS_IN_UA_MIN_POLL_SECONDS = 7;
+export const UKRAINE_ALARM_MIN_POLL_SECONDS = 15;
+
+/**
+ * Cadence of the legs that are not alert STATE.
+ *
+ * The alert-channel backstop is a sweep over `alert_source_states`, not a request to anybody: it
+ * costs one statement and it exists to catch a 🟢 that never arrived, bounded by
+ * `ALERT_CHANNEL_MAX_ALERT_SECONDS` — a full day. Running it four times faster would change nothing
+ * about when it fires and would add a statement to the pool the fast legs now share. It stays where
+ * the old shared interval had it.
+ */
+export const SLOW_LEG_INTERVAL_SECONDS = 15;
+
+/**
+ * Pure. The gap in force for one alert leg: the operator's cadence, clamped up by that provider's
+ * floor.
+ *
+ * Exported because it is the whole of «чому дзеркало опитується частіше за Ukraine Alarm» and the
+ * one thing a test of the floors has to be able to call without a scheduler.
+ */
+export function alertLegIntervalMs(floorSeconds: number): number {
+  return Math.max(config.ALERT_POLL_INTERVAL_SECONDS, floorSeconds) * 1000;
+}
+
+/**
+ * The legs, split by what they are: alert STATE on a fast per-provider cadence, everything else at
+ * fifteen seconds.
+ *
+ * Exported for the unit tests, which assert the split and the floors without arming a timer.
+ */
+export function ingestionLegs(log: { info: Function; warn: Function; error: Function }): SchedulerLeg[] {
+  return [
+    // ---- alert state, fast --------------------------------------------------------------------
+    {
+      name: 'aerial-mirror',
+      run: () => syncAerialMirror(log),
+      intervalMs: () => alertLegIntervalMs(AERIAL_MIRROR_MIN_POLL_SECONDS)
+    },
+    {
+      name: 'alerts-in-ua',
+      run: () => syncAlertsInUa(log),
+      intervalMs: () => alertLegIntervalMs(ALERTS_IN_UA_MIN_POLL_SECONDS)
+    },
+    {
+      name: 'ukraine-alarm',
+      run: () => syncOfficialAlerts(log),
+      intervalMs: () => alertLegIntervalMs(UKRAINE_ALARM_MIN_POLL_SECONDS)
+    },
+    // ---- everything else, unchanged ------------------------------------------------------------
+    // The channel is pushed to, not polled; the only thing the scheduler owes it is the
+    // maximum-duration backstop, which has to run whether or not any message arrives.
+    {
+      name: 'alert-channel-backstop',
+      run: () => expireStuckAlertChannelAlerts(log),
+      intervalMs: () => SLOW_LEG_INTERVAL_SECONDS * 1000
     }
-    catch (error) { log.error({ error }, 'official alert synchronization failed'); }
-    finally { running = false; }
-  };
-  const timer = setInterval(run, 15_000);
-  timer.unref();
-  void run();
-  return () => clearInterval(timer);
+  ];
+}
+
+/**
+ * Starts one self-rescheduling chain per leg.
+ *
+ * ## What replaced `Promise.allSettled` over one `setInterval`, and why the guarantee survived
+ *
+ * The old shape ran all four legs inside one tick and needed `allSettled` rather than `all` for a
+ * specific reason: `all` settles at the FIRST rejection and leaves the others running, so the shared
+ * `finally { running = false }` released the overlap guard with a nationwide snapshot still
+ * half-applied — and a rejection is the *normal* case here, because every sync function rethrows
+ * after `markSourceError`. A second `persistOfficialAlertSnapshot` starting concurrently with the
+ * first can compute the aggregate from a half-applied snapshot and produce a spurious «Офіційний
+ * відбій» / re-open pair.
+ *
+ * That hazard is unchanged and so is the protection, by a stronger mechanism: each leg's next pass
+ * is armed in the `finally` of its previous one, so no timer exists while a pass is in flight and a
+ * second pass of the same leg is unrepresentable rather than merely refused. What the split removes
+ * is the accidental half of the old guard — one leg's slow upstream no longer suppresses the other
+ * three, which is exactly the case that used to cost fifteen seconds of every leg's freshness.
+ *
+ * Two legs of DIFFERENT sources can now overlap, and that is safe for the reason it always was:
+ * `persistOfficialAlertSnapshot` is scoped `WHERE source_id=$1`, and the only shared row is the
+ * `alert_periods` one, which every path takes `FOR UPDATE` before reading the aggregate.
+ */
+export function startIngestionScheduler(
+  log: { info: Function; warn: Function; error: Function },
+  deps: Parameters<typeof startLegScheduler>[2] = {}
+): () => void {
+  return startLegScheduler(ingestionLegs(log), log, deps);
 }

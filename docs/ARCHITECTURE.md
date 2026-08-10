@@ -118,8 +118,10 @@ a group so a repost cannot corroborate itself.
 
 One official-family source is neither an API with a contract nor a body with a mandate:
 [ubilling.net.ua/aerialalerts](https://ubilling.net.ua/aerialalerts/), registered by
-`migrations/027_aerial_alert_mirror.sql` as `aerial-alerts-mirror` and polled on the same
-fifteen-second snapshot path as the two APIs. It republishes the same executive-authority air-raid
+`migrations/027_aerial_alert_mirror.sql` as `aerial-alerts-mirror` and polled on the same snapshot
+path as the two APIs — on the FASTEST cadence of the three, because it is tokenless, publishes all
+three administrative levels and is the only one of them this deployment can read today. It
+republishes the same executive-authority air-raid
 state for free, with no key and no application. It exists in the catalogue because it is the only
 HTTPS alert source this deployment can read while both API applications are pending, and it is
 registered `enabled=true` because a source that carries the live picture and is switched off carries
@@ -969,9 +971,13 @@ flowchart LR
   **holds** it, and a *polled* source holds an alert while it reports it *and* for
   `ALERT_END_DEBOUNCE_SECONDS` after it stops. A source that publishes an explicit all-clear stops
   holding the alert the moment that all-clear lands; the window is for silence, not for statements.
-  Providers are polled every 15 seconds, so a single incomplete response or one failed
-  call can no longer produce an "Офіційний відбій"; the alert ends on the first poll after the window
-  elapses. The asymmetry is deliberate: a delayed all-clear is recoverable, a false one is not. The
+  Providers are polled on a per-provider cadence — the community mirror every
+  `ALERT_POLL_INTERVAL_SECONDS` (4 s by default, floor 3 s), alerts.in.ua no faster than 7 s, Ukraine
+  Alarm no faster than 15 s — and `ALERT_END_DEBOUNCE_SECONDS` is measured against the SLOWEST of
+  them, so the 60 s default is four missed polls of Ukraine Alarm and correspondingly more of the
+  others. A single incomplete response or one failed call therefore cannot produce an "Офіційний
+  відбій"; the alert ends on the first poll after the window elapses. The asymmetry is deliberate: a
+  delayed all-clear is recoverable, a false one is not. The
   debounce is an additional condition, not a replacement — one source going quiet still cannot end an
   alert another source is reporting. A provider that stops answering altogether therefore holds its
   alerts open indefinitely; that boundary and its operator response are documented in

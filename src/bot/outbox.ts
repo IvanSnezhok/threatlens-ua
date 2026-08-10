@@ -2,6 +2,7 @@ import type { Bot } from 'grammy';
 import { Counter, type Registry } from 'prom-client';
 import { pool } from '../db/pool.js';
 import { relatedLocationsCte } from '../repositories/events.js';
+import { onAlertPoke } from '../services/alert-poke.js';
 import {
   cleanSummary, confidenceLabel, evidenceRaisedLine, evidenceStatement, extensionLine,
   geographyChangedLine, humanMoment, levelLabel, riskLevelChangedLine, threatLabel,
@@ -649,10 +650,57 @@ async function deliverBatch(bot: Bot, log: { warn: Function }) {
   } finally { client.release(); }
 }
 
+/**
+ * The two workers, plus the one signal that can make the fan-out run early.
+ *
+ * ## Why the fan-out is poked and the delivery worker is not
+ *
+ * The fan-out is the step that turns a committed `alert.started` into outbox rows, and it is pure
+ * database work with no external service in it — running it a second earlier costs one statement
+ * and buys a second off every subscriber's warning. The delivery worker is the step that talks to
+ * Telegram: it is rate-limited by somebody else, it already batches twenty-five at a time, and
+ * poking it would spend that budget to save a fraction of the second the API itself takes.
+ *
+ * ## The publication hold does not apply here, and that is not new
+ *
+ * This worker reads `system_event_log` through its own durable cursor in `worker_state` and has
+ * never consulted the publication cutoff — the Telegram exemption of CONTRACT §2.4 and
+ * `docs/METHODOLOGY.md` §Publication: «Збір, класифікація, аудит, /ops, метрики та
+ * Telegram-сповіщення не затримуються». The poke changes when this worker runs, never what it is
+ * allowed to see, so `delayed_15s` behaves exactly as it did — a subscriber was already being told
+ * about an alert the public map was still holding, at most one second later than now.
+ *
+ * ## The overlap guard is new, and is a precondition of the poke
+ *
+ * `fanoutNewEvents` had no re-entrancy protection: two concurrent passes read the same cursor
+ * `FOR UPDATE` inside a transaction that then COMMITs before the enqueue loop runs, so the second
+ * pass can select the same window and re-enqueue it — harmless today only because
+ * `idempotency_key` absorbs it and because a one-second interval rarely overlaps. Adding a second
+ * trigger makes that collision routine, so the guard comes with it, and it re-arms once rather than
+ * queueing: a poke that lands mid-pass must not be lost, because the running pass may already have
+ * read its window before the poking transaction was visible.
+ */
 export function startNotificationWorkers(bot: Bot | null, log: { warn: Function; error: Function }) {
-  const fanoutRun = () => fanoutNewEvents().catch((error) => log.error({ error }, 'notification fanout failed'));
-  const fanout = setInterval(fanoutRun, 1_000); fanout.unref(); void fanoutRun();
+  let fanoutRunning = false;
+  let fanoutRearm = false;
+  const fanoutRun = async (): Promise<void> => {
+    if (fanoutRunning) return;
+    fanoutRunning = true;
+    try {
+      await fanoutNewEvents();
+    } catch (error) {
+      log.error({ error }, 'notification fanout failed');
+    } finally {
+      fanoutRunning = false;
+      if (fanoutRearm) { fanoutRearm = false; void fanoutRun(); }
+    }
+  };
+  const fanout = setInterval(() => void fanoutRun(), 1_000); fanout.unref(); void fanoutRun();
+  const detachPoke = onAlertPoke(() => {
+    if (fanoutRunning) { fanoutRearm = true; return; }
+    void fanoutRun();
+  });
   const deliveryRun = () => bot && deliverBatch(bot, log).catch((error) => log.error({ error }, 'notification delivery failed'));
   const delivery = bot ? setInterval(deliveryRun, 1_000) : undefined; delivery?.unref(); if (bot) void deliveryRun();
-  return () => { clearInterval(fanout); if (delivery) clearInterval(delivery); };
+  return () => { clearInterval(fanout); if (delivery) clearInterval(delivery); detachPoke(); };
 }

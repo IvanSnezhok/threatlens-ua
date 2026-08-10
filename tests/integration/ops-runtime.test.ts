@@ -157,7 +157,8 @@ describe.skipIf(!integrationDatabaseAvailable)('ops runtime settings', () => {
       expect(response.statusCode).toBe(200);
       const body = response.json();
 
-      expect(Object.keys(body).sort()).toEqual(['audit', 'bounds', 'effective', 'notice', 'settings']);
+      expect(Object.keys(body).sort())
+        .toEqual(['audit', 'bounds', 'effective', 'notice', 'propagation', 'settings']);
       expect(body.settings).toMatchObject({
         publicationMode: 'live', analyticsEventDriven: true,
         analyticsDebounceMs: 20_000, analyticsMaxDelayMs: 120_000,
@@ -168,6 +169,19 @@ describe.skipIf(!integrationDatabaseAvailable)('ops runtime settings', () => {
       expect(Date.parse(body.settings.modeChangedAt)).not.toBeNaN();
       expect(body.effective).toMatchObject({ delaySeconds: 0, behindSeconds: 0, backlogEvents: 0 });
       expect(Date.parse(body.effective.cutoffAt)).not.toBeNaN();
+      // The end-to-end acquisition reading behind the «Затримка тривоги» chip. It is PROCESS state,
+      // written only when an alert actually starts, so `null` is the correct answer on a fresh
+      // deployment and on a quiet night — the console renders a dash rather than a zero, because a
+      // zero would read as «нуль секунд» rather than as «ще нічого не вимірювали». Asserted as a
+      // shape rather than as `null` for the same reason it is process state: the integration project
+      // runs every file in ONE fork, and any earlier file that started an alert has legitimately
+      // left a reading behind.
+      expect(body.propagation === null || typeof body.propagation === 'object').toBe(true);
+      if (body.propagation) {
+        expect(Object.keys(body.propagation).sort()).toEqual(['at', 'seconds', 'source']);
+        expect(Number.isFinite(body.propagation.seconds)).toBe(true);
+        expect(Date.parse(body.propagation.at)).not.toBeNaN();
+      }
       // Every numeric field the PUT accepts carries a range, which is the reported bug's fix on the
       // API side: the console can render «мін … макс» beside each input instead of discovering the
       // bounds from a 400 that names nothing. `analyticsDebounceMs.min` is 0 since migration 028.
@@ -322,7 +336,8 @@ describe.skipIf(!integrationDatabaseAvailable)('ops runtime settings', () => {
       // The response is the same shape as GET, `effective` included — the console re-renders from
       // it, and a form showing the new mode beside the previous slice is the "switch on beside a
       // dead session" state this endpoint exists to prevent.
-      expect(Object.keys(response.json()).sort()).toEqual(['audit', 'bounds', 'effective', 'notice', 'settings']);
+      expect(Object.keys(response.json()).sort())
+        .toEqual(['audit', 'bounds', 'effective', 'notice', 'propagation', 'settings']);
       expect(response.json().settings.publicationMode).toBe('delayed_15s');
       expect(response.json().effective.delaySeconds).toBe(15);
     } finally {

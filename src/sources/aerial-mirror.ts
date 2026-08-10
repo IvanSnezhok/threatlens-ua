@@ -45,9 +45,12 @@ export const AERIAL_MIRROR_ALERT_TYPE = 'air_raid';
 /**
  * Identifies the poller to the operator of a free, unauthenticated endpoint.
  *
- * The published limit is two requests per second per host and the scheduler polls every fifteen
- * seconds, so this deployment is three orders of magnitude inside it; the header is there so that if
- * that ever stops being true the operator can see who to contact rather than only what to block.
+ * The published limit is two requests per second per host. This leg polls every
+ * `ALERT_POLL_INTERVAL_SECONDS` with a compiled floor of three seconds — the mirror's own documented
+ * cache duration, past which a faster poll returns the byte-identical body — and issues at most two
+ * requests per poll, so the worst case is a third of the published budget. See docs/OPERATIONS.md
+ * §«The request budget, per host» for the arithmetic. The header is there so that if that ever stops
+ * being true the operator can see who to contact rather than only what to block.
  */
 export const AERIAL_MIRROR_USER_AGENT = 'ThreatLensUA/1.0 (+https://github.com/threatlens-ua)';
 
@@ -309,8 +312,9 @@ function levelOf(value: unknown): AerialMirrorLevel {
  * exactly the treatment an explicit `active:false` would, so nothing about ending an alert changes;
  * what is lost is the aggregated feed's incidental property that name resolution was exercised for
  * all twenty-five labels on every poll. It could not survive the upgrade in any case: the label
- * space here is the whole country's raions and hromadas, far too large to re-resolve every fifteen
- * seconds, and the unresolved-location warning still names anything new the moment it goes alight.
+ * space here is the whole country's raions and hromadas, far too large to re-resolve on every poll —
+ * and this is now the FASTEST leg of the three — and the unresolved-location warning still names
+ * anything new the moment it goes alight.
  *
  * ## What is refused, and what is merely empty
  *

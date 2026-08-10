@@ -43,8 +43,10 @@ export const envSchema = z.object({
   // ERROR and nothing is written, so the alerts the mirror is holding stay on the map; the failure
   // it exists to prevent is a frozen mirror serving `alertnow: false` for the whole country and the
   // snapshot reconciler dutifully clearing it. Measured behaviour: the feed regenerates on demand
-  // behind a three-second cache, and across thirteen consecutive fifteen-second polls `cachedat` was
-  // never more than two seconds behind the request. 300s is therefore roughly a hundred times the
+  // behind a three-second cache, and across thirteen consecutive polls (at the fifteen-second
+  // cadence in force when that was measured; see ALERT_POLL_INTERVAL_SECONDS for the current one)
+  // `cachedat` was never more than two seconds behind the request. Nothing about the bound changes
+  // with a faster poll — it is measured against the cache, not against us. 300s is roughly a hundred times the
   // observed lag — wide enough that ordinary upstream churn cannot trip it, narrow enough that a
   // genuine freeze is caught inside five minutes. The floor is one minute: below that the mirror's
   // own cache and a slow upstream switch would start reading as an outage.
@@ -71,7 +73,10 @@ export const envSchema = z.object({
   // put two requests inside one second was answered with a truncated body — the exact failure the
   // parser now refuses. The two requests this adapter can make in one poll are therefore SEQUENCED,
   // never fired together, and this is the gap between them. 600ms is comfortably over the 500ms the
-  // limit implies without approaching the 15s poll interval. Zero is allowed so tests need not wait.
+  // limit implies while staying well inside the poll interval itself: even at the mirror's 3s floor
+  // a worst-case poll spends 600ms of a 3000ms gap, and the gap is measured from the END of the poll
+  // (see `src/services/leg-scheduler.ts`), so the cross-check can never crowd the next one. Zero is
+  // allowed so tests need not wait.
   AERIAL_MIRROR_REQUEST_GAP_MS: z.coerce.number().int()
     .min(0, 'Aerial mirror request gap cannot be negative').default(600),
   DEMO_SOURCE_ENABLED: z.string().default('true').transform((v) => v === 'true'),
@@ -92,12 +97,59 @@ export const envSchema = z.object({
   OCCUPATION_SYNC_INTERVAL_SECONDS: z.coerce.number().int()
     .min(3600, 'Occupation source must not be polled more than once per hour').default(10800),
   OCCUPATION_STALE_AFTER_SECONDS: z.coerce.number().int().positive().default(21600),
+  // ---- Alert acquisition cadence -----------------------------------------------------------------
+  // How long the scheduler waits between two passes of an alert-STATE leg — the two token APIs and
+  // the community mirror. It is the front of the end-to-end budget: everything downstream of it (the
+  // 1 s event hub, the 1 s fan-out, the browser's 250 ms debounce) is already inside two seconds,
+  // and before this setting existed the acquisition step alone was worth up to fifteen.
+  //
+  // It is a REQUEST GAP, not a period: `startLegScheduler` arms the next pass when the previous one
+  // finishes, so a slow poll pushes the next one out instead of firing it immediately. See
+  // `src/services/leg-scheduler.ts` for why the conservative direction is the right one against a
+  // rate limit.
+  //
+  // **Per-provider floors clamp this from below and cannot be configured away.** They are compiled
+  // constants in `src/services/ingestion.ts`, not settings, because each of them is a published
+  // property of somebody else's server rather than a preference of ours:
+  //
+  //   * the community mirror — 3 s. «Наразі таймаут кешування сирих даних з боку нашої імплементації
+  //     - 3 секунди», wiki.ubilling.net.ua/doku.php?id=aerialalertsapi. Polling faster than the
+  //     upstream regenerates buys a repeat of the byte-identical body and spends the published
+  //     two-requests-per-second-per-host budget from the same page to learn nothing.
+  //   * alerts.in.ua — 7 s, i.e. 8.6 requests a minute against the hard limit of 12 and inside the
+  //     8–10 soft band published at devs.alerts.in.ua. Note what that floor is NOT derived from:
+  //     the vendor documents no cache TTL at all, only conditional requests
+  //     (`If-Modified-Since`/`Last-Modified` → 304). The remaining 3.4 req/min of the hard limit are
+  //     deliberate headroom, and the reason to leave them is a second, undefined clause on the same
+  //     page — «при аномальній кількості запитів на день, Ваш токен може бути заблокований».
+  //   * Ukraine Alarm — 15 s. Unlike the other two this is not derived from a published number: the
+  //     v3 API documents no rate limit and no cache guidance anywhere in its OpenAPI spec, and a
+  //     floor invented against an undocumented budget is a floor that finds out it was wrong by
+  //     being throttled during an attack. It stays where the old shared `setInterval` had it until
+  //     there is evidence to move it. There IS a documented cheaper way to go faster on that API
+  //     when its token arrives — `GET /api/v3/alerts/status` returns one `lastActionIndex` and is
+  //     described as «використовувати для перевірки необхідності оновлювати дані», and the v3
+  //     webhook endpoints remove polling altogether. Both are noted in docs/OPERATIONS.md as the
+  //     next step rather than implemented here, because neither can be exercised without the token.
+  //
+  // The default of 4 s is the mirror's cadence in practice (its floor is 3), which is the leg that
+  // actually decides how fast an oblast, raion or hromada turns red: it is tokenless, it publishes
+  // all three administrative levels, and it is the only one of the three this deployment can read
+  // today. The floor of 2 s exists so an operator cannot set a value below every provider floor and
+  // conclude the setting does nothing; the ceiling of 60 s is the point at which the acquisition lag
+  // would exceed `ALERT_END_DEBOUNCE_SECONDS` and a single missed poll could end an alert.
+  ALERT_POLL_INTERVAL_SECONDS: z.coerce.number().int()
+    .min(2, 'Alert poll interval must be at least 2 seconds')
+    .max(60, 'An alert poll interval above 60s would exceed the end debounce it is measured against')
+    .default(4),
   // How long a source may stay silent about an alert it was holding before that alert is allowed to
-  // end. Official providers are polled every 15 seconds, so the default tolerates three consecutive
-  // missed polls and ends the alert on the fourth. The floor is two polls: anything shorter would
-  // let a single incomplete response trigger a false "Офіційний відбій" again.
+  // end. The SLOWEST alert leg is Ukraine Alarm at 15 seconds, so the default tolerates three
+  // consecutive missed polls of the slowest source — and correspondingly more of the faster ones —
+  // and ends the alert on the fourth. The floor is two of those polls: anything shorter would let a
+  // single incomplete response trigger a false "Офіційний відбій" again.
   ALERT_END_DEBOUNCE_SECONDS: z.coerce.number().int()
-    .min(30, 'Alert end debounce must span at least two 15-second polls').default(60),
+    .min(30, 'Alert end debounce must span at least two 15-second polls of the slowest alert leg')
+    .default(60),
 
   // ---- Official alert channels, collected over MTProto -----------------------------------------
   // These sources publish events, not snapshots, so they have their own reconciliation path and
@@ -655,6 +707,16 @@ export const APP_SETTINGS: Record<keyof AppConfig, SettingMeta> = {
     envReason: 'У production схема відхиляє його беззастережно, тож перемикач у БД у єдиному '
       + 'середовищі, яке має значення, не міг би зробити нічого — а те, що він вмикає, це вигадані '
       + 'тривоги на публічній карті.'
+  },
+  ALERT_POLL_INTERVAL_SECONDS: {
+    scope: 'db_tunable', group: 'official', apply: 'hot', confirm: true, impact: 'alerts',
+    ui: { kind: 'number', min: 2, max: 60, unit: 'с' },
+    applyNote: 'Планувальник читає значення на КОЖНОМУ такті, тож перезапуск не потрібен — але '
+      + 'нове число діє з наступного такту, а не миттєво: пауза, яку зараз відлічують, доходить до '
+      + 'кінця за старим значенням. Нижче за поріг провайдера опуститися не можна: дзеркало — 3 с '
+      + '(його власний кеш), alerts.in.ua — 7 с (жорсткий ліміт 12 запитів/хв), Ukraine Alarm — '
+      + '15 с. Пороги зашиті в код, а не в налаштування. Поточну паузу кожної ноги видно на '
+      + '/metrics: threatlens_ingestion_leg_interval_seconds.'
   },
   ALERT_END_DEBOUNCE_SECONDS: {
     scope: 'db_tunable', group: 'official', apply: 'hot', confirm: true, impact: 'alerts',
