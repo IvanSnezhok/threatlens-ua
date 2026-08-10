@@ -2619,16 +2619,28 @@ async function renderAnalytics() {
 }
 
 // ------------------------------------------------------------------------------------------------
-// Аналіз атак — агрегати з відкритих джерел за добу, тиждень і місяць
+// Аналіз атак — що змінилось за добу, і що показують агрегати за період
 // ------------------------------------------------------------------------------------------------
 //
 // Сторінка навмисно не має жодного кольору, крім бурштинового застереження. Решта інтерфейсу
 // домовилася, що колір означає небезпеку; тут небезпеки немає — тут ретроспектива, і зафарбована
-// стовпчикова діаграма читалася б як сигнал, якого вона не несе. Довжина смуги вже кодує величину.
+// стовпчикова діаграма читалася б як сигнал, якого вона не несе. Величину кодує довжина, зміну —
+// зсув уздовж доріжки, а вагу — кегль. Жодного відтінку.
 //
-// Графіки — на CSS, без жодної бібліотеки. Не з ідеології, а тому, що всі три потрібні форми
-// (горизонтальна смуга, добовий гребінець, шкала хвиль) — це прямокутник заданої довжини, а
-// підключення бібліотеки заради прямокутника коштувало б більше, ніж уся сторінка важить зараз.
+// Порядок екранів — це порядок питань, які ставить читач. ПЕРШИМ іде «що змінилось за 24 години»:
+// саме по це відкривають сторінку вночі, і саме це неможливо було зібрати самотужки з трьох
+// вкладок періодів, бо їхні вікна перекриваються, а знаменники різні. Агрегати за період ідуть
+// нижче — вони описують вікно, а не різницю, і читаються вже спокійно.
+//
+// Головна нова форма — доріжка зсуву: тонка риска, на якій базове значення стоїть засічкою, а
+// поточне — заповненою голівкою. Два числа поруч читаються як два числа; та сама пара на одній
+// осі читається як рух, і саме рух тут є твердженням. Напрямок кодується боком голівки відносно
+// засічки, а не кольором — інакше сторінка почала б сигналити.
+//
+// Графіки — на CSS, без жодної бібліотеки. Не з ідеології, а тому, що всі потрібні форми
+// (горизонтальна смуга, добовий гребінець, шкала хвиль, доріжка зсуву) — це прямокутник заданої
+// довжини, а підключення бібліотеки заради прямокутника коштувало б більше, ніж уся сторінка
+// важить зараз.
 
 const attackPeriodNames = { day: 'Доба', week: 'Тиждень', month: 'Місяць' };
 
@@ -2655,6 +2667,151 @@ function attackDelta(row) {
   return `<em class="trend ${row.trend}" title="проти попереднього періоду">${mark} ${row.deltaPercent > 0 ? '+' : ''}${Math.round(row.deltaPercent)}%</em>`;
 }
 
+// ---- Тактичний блок: що змінилось за 24 години -------------------------------------------------
+
+const tacticsKindNames = {
+  weapon_mix_shift: 'частка засобу',
+  new_weapon_class: 'новий клас',
+  launch_hour_shift: 'години',
+  territory_expansion: 'нова територія',
+  territory_concentration: 'концентрація',
+  wave_cadence_change: 'ритм хвиль',
+  redirect_corridor: 'перенацілення'
+};
+
+// Одиниця вимірювання вирішує, як число ПИШЕТЬСЯ. Сервер лишає його числом і не форматує нічого:
+// «0.52» на сторінці означало б, що ніхто не подумав, а «52 хв» замість «52%» — що подумали
+// неправильно.
+function tacticsValue(value, unit) {
+  if (value === null || value === undefined) return '—';
+  if (unit === 'share') return `${Math.round(value * 1000) / 10}%`;
+  if (unit === 'minutes') return `${Math.round(value)} хв`;
+  return String(Math.round(value * 10) / 10);
+}
+
+// Домени доріжок. Частка — завжди [0,1], щоб дві частки на різних рядках порівнювалися між собою.
+// Лічба й хвилини спільної шкали з часткою не мають, але мають її МІЖ СОБОЮ: якби кожен рядок
+// нормувався на власне значення, «9 повідомлень» і «7 повідомлень» дали б однакову довжину, і
+// доріжка почала б брехати саме там, де вона єдине, що видно здалеку.
+function tacticsDomains(detections) {
+  const peak = (unit) => detections
+    .filter((row) => row.unit === unit)
+    .reduce((max, row) => Math.max(max, row.currentValue, row.baselineValue ?? 0), 0);
+  return { share: 1, count: (peak('count') || 1) * 1.15, minutes: (peak('minutes') || 1) * 1.15 };
+}
+
+// Доріжка зсуву: засічка — звідки, заповнена голівка — куди, відрізок між ними — величина зміни.
+function tacticsTrack(row, index, domains) {
+  const span = domains[row.unit] ?? 1;
+  const place = (value) => `${Math.min(100, Math.max(0, (value / span) * 100))}%`;
+  const now = place(row.currentValue);
+  const hasBase = row.baselineValue !== null && row.baselineValue !== undefined;
+  const from = hasBase ? place(row.baselineValue) : '0%';
+  const left = hasBase ? Math.min(parseFloat(now), parseFloat(from)) : 0;
+  const width = Math.abs(parseFloat(now) - (hasBase ? parseFloat(from) : 0));
+  return `<div class="shift" style="--row:${index}">
+      <span class="shift-track" role="img"
+        aria-label="було ${hasBase ? tacticsValue(row.baselineValue, row.unit) : 'нічого'}, стало ${tacticsValue(row.currentValue, row.unit)}">
+        <i class="shift-span" style="left:${left}%;width:${Math.max(width, 0.6)}%"></i>
+        ${hasBase ? `<i class="shift-tick" style="left:${from}"></i>` : ''}
+        <i class="shift-head" style="left:${now}"></i>
+      </span>
+      <span class="shift-values">
+        ${hasBase
+    ? `<em>${tacticsValue(row.baselineValue, row.unit)}</em><span class="shift-arrow">→</span>`
+    : '<em class="shift-none">не було</em><span class="shift-arrow">→</span>'}
+        <strong>${tacticsValue(row.currentValue, row.unit)}</strong>
+      </span>
+    </div>`;
+}
+
+// Дослівні формулювання напрямку показуються лише там, де сервер їх приніс, і лише як цитати.
+// Це не маршрут: система не будує з них траєкторію й ніде не каже, куди «далі».
+function tacticsQuotes(row) {
+  const quotes = Array.isArray(row.evidence?.directions) ? row.evidence.directions : [];
+  if (!quotes.length) return '';
+  return `<p class="ledger-quotes">${quotes.map((quote) =>
+    `<span>«${escapeHtml(quote.text)}» <b>×${quote.messages}</b></span>`).join('')}</p>`;
+}
+
+function tacticsLedger(detections) {
+  if (!detections.length) {
+    return `<p class="ledger-empty">Жодне з семи порівнянь не перетнуло свого порога. Це не означає,
+      що нічого не відбувалося — це означає, що добу від попередніх двох тижнів не відрізняє нічого
+      з того, що ми вміємо вимірювати.</p>`;
+  }
+  const domains = tacticsDomains(detections);
+  return `<ol class="ledger">${detections.map((row, index) => `<li class="ledger-row" style="--row:${index}">
+      <span class="ledger-index">${String(row.rank).padStart(2, '0')}</span>
+      <div class="ledger-subject">
+        <b>${escapeHtml(row.subjectLabel)}</b>
+        <span class="ledger-kind">${escapeHtml(tacticsKindNames[row.detectionType] ?? row.detectionType)}</span>
+        <span class="ledger-support">${row.currentSupport} ${attackMessagesWord(row.currentSupport)} за добу</span>
+      </div>
+      ${tacticsTrack(row, index, domains)}
+      <p class="ledger-sentence">${escapeHtml(row.sentence)}</p>
+      ${tacticsQuotes(row)}
+    </li>`).join('')}</ol>`;
+}
+
+// Позначка походження тексту. Публічна сторінка мусить казати, хто написав абзац, ДО того, як його
+// прочитають, а не після — тому чип стоїть у шапці врізки, а не в примітці під нею.
+function tacticsCommentaryBlock(commentary) {
+  if (!commentary || !commentary.aiGenerated) return '';
+  return `<section class="commentary">
+      <header class="commentary-head">
+        <p>Переказ моделі</p>
+        <span class="origin-chip">Написала мовна модель${commentary.model ? ` · ${escapeHtml(commentary.model)}` : ''}</span>
+      </header>
+      <p class="commentary-lead">${escapeHtml(commentary.headline)}</p>
+      <ul class="commentary-list">${commentary.findings.map((line) =>
+    `<li>${escapeHtml(line)}</li>`).join('')}</ul>
+    </section>`;
+}
+
+function tacticsMeta(tactics) {
+  const cells = [
+    ['Вікна', `${tactics.windows.currentHours} год проти ${tactics.windows.baselineDays} діб`],
+    ['Повідомлень', `${tactics.totals.currentMessages} / ${tactics.totals.baselineMessages}`],
+    ['Порахували', shortDateTime(tactics.computedAt)],
+    ['Підтверджено', shortDateTime(tactics.lastConfirmedAt)],
+    ['Правила', tactics.classifierVersions.join(', ') || '—']
+  ];
+  return `<dl class="tactics-meta">${cells.map(([term, value]) =>
+    `<div><dt>${term}</dt><dd>${escapeHtml(String(value))}</dd></div>`).join('')}</dl>`;
+}
+
+function shortDateTime(iso) {
+  if (!iso) return '—';
+  const at = new Date(iso);
+  return `${at.toLocaleDateString('uk-UA', { day: '2-digit', month: '2-digit' })} ${shortTime(iso)}`;
+}
+
+function tacticsBand(tactics) {
+  const unavailable = !tactics || !tactics.available;
+  return `<section class="tactics-band${unavailable ? ' is-empty' : ''}" aria-labelledby="tactics-title">
+      <header class="tactics-head">
+        <p class="tactics-kicker">Що змінилось за добу</p>
+        <h2 class="tactics-title" id="tactics-title">${unavailable
+    ? 'Поки нема з чим порівнювати'
+    : escapeHtml(tactics.commentary?.headline ?? '')}</h2>
+        ${unavailable
+    ? `<p class="tactics-empty">За останню добу у відкритих джерелах замало повідомлень, щоб
+         порівнювати частки: система радше промовчить, ніж покаже впевнений відсоток, порахований
+         на кількох повідомленнях. Агрегати за період нижче лишаються повними.</p>`
+    : tacticsMeta(tactics)}
+      </header>
+      ${unavailable ? '' : tacticsLedger(tactics.detections)}
+      ${unavailable ? '' : tacticsCommentaryBlock(tactics.commentary)}
+      ${unavailable || !tactics.commentary?.caveats?.length ? '' : `<details class="caveat-fold">
+        <summary>Як це читати</summary>
+        <ul>${tactics.commentary.caveats.map((line) => `<li>${escapeHtml(line)}</li>`).join('')}</ul>
+      </details>`}
+    </section>`;
+}
+
+// ---- Агрегати за період -------------------------------------------------------------------------
+
 // Смуги нормуються на максимум ряду, а не на суму: ряд читають, щоб порівняти позиції між собою,
 // і за часткою від суми найбільша смуга на трьох позиціях зайняла б третину доріжки й перестала б
 // показувати різницю з другою.
@@ -2673,7 +2830,7 @@ function attackHourChart(hours) {
       title="${String(row.hour).padStart(2, '0')}:00 — ${row.messages} повідомл.">
       <i style="height:${row.messages ? Math.max(2, (row.messages / peak) * 100) : 0}%"></i>
       <small>${row.hour % 3 === 0 ? String(row.hour).padStart(2, '0') : ''}</small></span>`).join('')}
-    </div><p class="chart-foot">Київський час. Затемнені колонки — нічні години 22:00–06:00.</p>`;
+    </div><p class="chart-foot">Київський час. Світліші колонки — нічні години 22:00–06:00.</p>`;
 }
 
 function attackWaveList(waves) {
@@ -2692,28 +2849,49 @@ function attackWaveList(waves) {
       : ''}</p></article>`).join('')}</div>`;
 }
 
-function attackSummary(data) {
+// Стрічка показників замість трьох коробок: коробка навколо числа обіцяє, що число самодостатнє,
+// а тут кожне з трьох має сенс лише поруч із двома іншими. Волосяні лінії тримають ритм і нічого
+// не обіцяють.
+function attackReadout(data) {
   const topTarget = data.targets[0];
   const peak = data.hours.reduce((best, row) => (!best || row.messages > best.messages ? row : best), null);
   const night = data.hours.reduce((sum, row) => sum + (row.hour >= 22 || row.hour < 6 ? row.messages : 0), 0);
   const total = data.hours.reduce((sum, row) => sum + row.messages, 0);
-  return `<div class="metric-grid">
-    <div><span>Повідомлень про загрозу</span><strong>${data.totals.messages}</strong>
-      <small>${data.totals.eventsRaised} ${attackPlural(data.totals.eventsRaised, 'окрема', 'окремі', 'окремих')} ${attackEventsWord(data.totals.eventsRaised)} · було ${data.totals.previousMessages}</small></div>
-    <div><span>Найбільше згадок</span><strong class="metric-word">${escapeHtml(topTarget?.oblastName ?? '—')}</strong>
-      <small>${topTarget ? `${topTarget.messages} ${attackMessagesWord(topTarget.messages)} · ${Math.round(topTarget.share * 100)}% усіх` : 'немає даних'}</small></div>
-    <div><span>Пікова година</span><strong>${peak && peak.messages ? `${String(peak.hour).padStart(2, '0')}:00` : '—'}</strong>
-      <small>${total ? `${peak.messages} ${attackMessagesWord(peak.messages)} · вночі ${Math.round((night / total) * 100)}%` : 'немає даних'}</small></div>
-  </div>`;
+  const cells = [
+    ['Повідомлень про загрозу', String(data.totals.messages), 'num',
+      `${data.totals.eventsRaised} ${attackPlural(data.totals.eventsRaised, 'окрема', 'окремі', 'окремих')} `
+      + `${attackEventsWord(data.totals.eventsRaised)} · було ${data.totals.previousMessages}`],
+    ['Найбільше згадок', topTarget?.oblastName ?? '—', 'word',
+      topTarget ? `${topTarget.messages} ${attackMessagesWord(topTarget.messages)} · ${Math.round(topTarget.share * 100)}% усіх` : 'немає даних'],
+    ['Пікова година', peak && peak.messages ? `${String(peak.hour).padStart(2, '0')}:00` : '—', 'num',
+      total ? `${peak.messages} ${attackMessagesWord(peak.messages)} · вночі ${Math.round((night / total) * 100)}%` : 'немає даних']
+  ];
+  return `<div class="readout">${cells.map(([term, value, kind, foot]) => `<div class="readout-cell">
+      <span>${term}</span><strong class="is-${kind}">${escapeHtml(value)}</strong><small>${escapeHtml(foot)}</small>
+    </div>`).join('')}</div>`;
 }
 
-function attackPatternsBlock(patterns) {
-  return `<section class="pattern-block">
-    <header><p>Висновок</p><h2>Патерни та ймовірна стратегія</h2></header>
-    <p class="pattern-headline">${escapeHtml(patterns.headline)}</p>
-    <ul class="pattern-list">${patterns.findings.map((line) => `<li>${escapeHtml(line)}</li>`).join('')}</ul>
-    <div class="analytics-note"><strong>Як це читати</strong>
-      <ul>${patterns.caveats.map((line) => `<li>${escapeHtml(line)}</li>`).join('')}</ul></div>
+// Нумерована фігура — редакційний прийом, а не прикраса: підпис «Рис. 2» дає читачеві спосіб
+// послатися на конкретний графік, а сторінці — хребет, уздовж якого вона читається згори вниз.
+function attackFigure(number, kicker, title, body, foot) {
+  return `<figure class="figure">
+      <figcaption class="figure-head">
+        <span class="figure-number">Рис. ${number}</span>
+        <p>${kicker}</p>
+        <h2>${title}</h2>
+      </figcaption>
+      ${body}
+      ${foot ? `<p class="chart-foot">${foot}</p>` : ''}
+    </figure>`;
+}
+
+function attackConclusion(patterns) {
+  return `<section class="conclusion">
+    <header><p>Висновок за період</p><h2>Патерни, які повторюються</h2></header>
+    <p class="conclusion-lead">${escapeHtml(patterns.headline)}</p>
+    <ul class="conclusion-list">${patterns.findings.map((line) => `<li>${escapeHtml(line)}</li>`).join('')}</ul>
+    <details class="caveat-fold" open><summary>Як це читати</summary>
+      <ul>${patterns.caveats.map((line) => `<li>${escapeHtml(line)}</li>`).join('')}</ul></details>
   </section>`;
 }
 
@@ -2721,19 +2899,32 @@ async function renderAttacks() {
   const root = contentShell(
     'Відкриті джерела',
     'Аналіз атак',
-    'Що повідомляли моніторингові канали за добу, тиждень і місяць: типи засобів, території, час доби та хвилі. Це опис минулого, а не прогноз.'
+    'Спершу — чим остання доба відрізняється від попередніх двох тижнів. Нижче — агрегати за добу, '
+    + 'тиждень і місяць: типи засобів, території, час доби та хвилі. Це опис минулого, а не прогноз.'
   );
   const requested = new URLSearchParams(location.search).get('period');
   let period = ['day', 'week', 'month'].includes(requested) ? requested : 'day';
 
-  root.innerHTML = `<div class="period-switch" role="group" aria-label="Період аналізу">
-      ${Object.entries(attackPeriodNames).map(([value, label]) =>
+  root.innerHTML = `<div id="tactics-slot"></div>
+    <div class="period-bar">
+      <div class="period-bar-label"><p>Агрегати за період</p>
+        <span>Вікно рухоме: відлік ведеться від цієї хвилини назад, а не від початку доби.</span></div>
+      <div class="period-switch" role="group" aria-label="Період аналізу">
+        ${Object.entries(attackPeriodNames).map(([value, label]) =>
     `<button type="button" data-period="${value}"${value === period ? ' class="is-active" aria-pressed="true"' : ' aria-pressed="false"'}>${label}</button>`).join('')}
-    </div><div id="attacks-body"><p>Завантаження…</p></div>`;
+      </div>
+    </div>
+    <div id="attacks-body"><p class="chart-foot">Завантаження…</p></div>`;
 
+  const slot = $('#tactics-slot', root);
   const body = $('#attacks-body', root);
+  // Тактичний блок не залежить від вибраного періоду — він завжди про останні 24 години. Тому він
+  // малюється один раз, першим завантаженням, і перемикач періодів під ним його не перемальовує:
+  // блимання блоку, який не змінився, читалося б як зміна даних.
+  let tacticsDrawn = false;
+
   const load = async () => {
-    body.innerHTML = '<p>Завантаження…</p>';
+    body.innerHTML = '<p class="chart-foot">Завантаження…</p>';
     let data;
     try {
       const response = await fetch(`/api/v1/analytics/attacks?period=${period}`);
@@ -2743,29 +2934,47 @@ async function renderAttacks() {
       body.innerHTML = '<p class="chart-foot">Не вдалося отримати аналітику. Спробуйте оновити сторінку.</p>';
       return;
     }
+    if (!tacticsDrawn) {
+      slot.innerHTML = tacticsBand(data.tactics);
+      tacticsDrawn = true;
+    }
     const means = data.means.filter((row) => row.messages > 0);
     const targets = data.targets.filter((row) => row.messages > 0).slice(0, 12);
-    body.innerHTML = `${attackSummary(data)}
-      <section class="chart-block"><header><p>Засоби</p><h2>Типи засобів у повідомленнях</h2></header>
-        ${means.length ? attackBars(means, (row) => row.label) : '<p class="chart-foot">Немає повідомлень за цей період.</p>'}
-        <p class="chart-foot">Одне повідомлення про комбінований удар потрапляє в кілька рядків — воно згадує кілька типів.</p></section>
-      <section class="chart-block"><header><p>Час</p><h2>Розподіл за годинами доби</h2></header>
-        ${attackHourChart(data.hours)}</section>
-      <!-- «Території», а не «Області»: повідомлення про загрозу для всієї країни підіймається до
-           рядка «Україна», і назвати його областю було б неправдою просто в заголовку. -->
-      <section class="chart-block"><header><p>Території</p><h2>Території, які згадують найчастіше</h2></header>
-        ${targets.length ? attackBars(targets, (row) => row.oblastName) : '<p class="chart-foot">Жодна територія не названа.</p>'}
-        <p class="chart-foot">Згадка області ≠ влучання по ній: це територія, названа в повідомленні про загрозу.</p></section>
-      <section class="chart-block"><header><p>Групування</p><h2>Хвилі атак</h2></header>
-        ${attackWaveList(data.waves)}
-        ${data.combinations.length ? `<p class="chart-foot">Повторювані поєднання в одній хвилі: ${data.combinations
-    .map((pair) => `${escapeHtml(pair.labels[0])} + ${escapeHtml(pair.labels[1])} (${pair.waves} ${attackPlural(pair.waves, 'хвиля', 'хвилі', 'хвиль')})`).join('; ')}.</p>` : ''}</section>
-      ${data.directions.length ? `<section class="chart-block"><header><p>Напрямки</p><h2>Формулювання напрямку, які повторюються</h2></header>
-        <div class="bar-rows">${data.directions.map((row) => `<div class="bar-row">
+    const figures = [
+      [
+        'Засоби', 'Типи засобів у повідомленнях',
+        means.length ? attackBars(means, (row) => row.label) : '<p class="chart-foot">Немає повідомлень за цей період.</p>',
+        'Одне повідомлення про комбінований удар потрапляє в кілька рядків — воно згадує кілька типів.'
+      ],
+      ['Час', 'Розподіл за годинами доби', attackHourChart(data.hours), ''],
+      // «Території», а не «Області»: повідомлення про загрозу для всієї країни підіймається до
+      // рядка «Україна», і назвати його областю було б неправдою просто в заголовку.
+      [
+        'Території', 'Території, які згадують найчастіше',
+        targets.length ? attackBars(targets, (row) => row.oblastName) : '<p class="chart-foot">Жодна територія не названа.</p>',
+        'Згадка області ≠ влучання по ній: це територія, названа в повідомленні про загрозу.'
+      ],
+      [
+        'Групування', 'Хвилі атак', attackWaveList(data.waves),
+        data.combinations.length
+          ? `Повторювані поєднання в одній хвилі: ${data.combinations.map((pair) =>
+            `${escapeHtml(pair.labels[0])} + ${escapeHtml(pair.labels[1])} (${pair.waves} ${attackPlural(pair.waves, 'хвиля', 'хвилі', 'хвиль')})`).join('; ')}.`
+          : ''
+      ]
+    ];
+    if (data.directions.length) {
+      figures.push([
+        'Напрямки', 'Формулювання напрямку, які повторюються',
+        `<div class="bar-rows">${data.directions.map((row) => `<div class="bar-row">
           <span class="bar-label bar-label-wide">«${escapeHtml(row.direction)}»</span>
-          <b>${row.messages}</b></div>`).join('')}</div>
-        <p class="chart-foot">Дослівні цитати з повідомлень. Система не будує з них маршрут і не екстраполює траєкторію.</p></section>` : ''}
-      ${attackPatternsBlock(data.patterns)}`;
+          <b>${row.messages}</b></div>`).join('')}</div>`,
+        'Дослівні цитати з повідомлень. Система не будує з них маршрут і не екстраполює траєкторію.'
+      ]);
+    }
+    body.innerHTML = `${attackReadout(data)}
+      ${figures.map(([kicker, title, content, foot], index) =>
+    attackFigure(index + 1, kicker, title, content, foot)).join('')}
+      ${attackConclusion(data.patterns)}`;
   };
 
   root.querySelectorAll('[data-period]').forEach((button) => button.addEventListener('click', () => {

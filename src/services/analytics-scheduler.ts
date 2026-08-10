@@ -4,6 +4,9 @@ import { pool } from '../db/pool.js';
 import { refreshMonthlyAnalytics } from './analytics.js';
 import { codexCooldownSkips, warmNarrative } from './analytics-narrative.js';
 import { resetAttackAnalyticsCache } from './attack-analytics.js';
+import {
+  TACTICS_PASS_FLOOR_MS, runTacticsPass, tacticsDetectionsGauge, tacticsPassTotal
+} from './attack-tactics.js';
 import { runRiskAssessmentsGuarded } from './risk.js';
 import { RUNTIME_SETTINGS_DEFAULTS, resolveRuntimeSettings, type RuntimeSettings } from './runtime-settings.js';
 import { eventHub, type SystemEvent } from './sse.js';
@@ -188,7 +191,11 @@ export function registerAnalyticsSchedulerMetrics(registry: Registry): void {
     ['threatlens_analytics_recompute_duration_seconds', recomputeDuration],
     // Defined next to the cooldown it counts (`analytics-narrative.ts`) and registered here, because
     // an import the other way round would close a cycle: this module already imports the narrative.
-    ['threatlens_codex_cooldown_skips_total', codexCooldownSkips]
+    ['threatlens_codex_cooldown_skips_total', codexCooldownSkips],
+    // Same arrangement, one module over: the tactical pass declares its counter and its gauge beside
+    // the code that moves them, and this is the only place that knows about a registry.
+    ['threatlens_attack_tactics_pass_total', tacticsPassTotal],
+    ['threatlens_attack_tactics_detections', tacticsDetectionsGauge]
   ];
   for (const [name, metric] of metrics) {
     if (!registry.getSingleMetric(name)) registry.registerMetric(metric);
@@ -208,6 +215,7 @@ let running = false;                    // OWNED BY execute(); recomputeAnalytic
 let lastCompletedAt = 0;
 let lastViewRefreshAt = 0;              // the materialised views run at floor cadence, not per pass
 let lastRiskModelAt = 0;                // and so does the risk leg's MODEL call — see the pass below
+let lastTacticsPassAt = 0;              // and so does the tactical comparison, on a shorter floor
 let lastSettings: RuntimeSettings = RUNTIME_SETTINGS_DEFAULTS;
 let lastResult: RecomputeResult | null = null;
 
@@ -310,6 +318,7 @@ export function resetAnalyticsScheduler(): void {
   lastCompletedAt = 0;
   lastViewRefreshAt = 0;
   lastRiskModelAt = 0;
+  lastTacticsPassAt = 0;
   lastSettings = RUNTIME_SETTINGS_DEFAULTS;
   lastResult = null;
   generation += 1;
@@ -676,12 +685,27 @@ export async function recomputeAnalytics(
     if (risk.skipped) recomputeTotal.inc({ trigger, outcome: 'skipped_overlap' });
     else if (allowModel) lastRiskModelAt = startedAt;
 
-    // 4. Codex leg: the cooldown is checked first, so a mass attack cannot turn a debounce into a
+    // 4. The tactical comparison — what the last day is doing differently from the fortnight before
+    //    it. Its own floor and its own clock, five minutes rather than fifteen: the block is the
+    //    first screen of a PUBLIC page and a reader who opens it during a wave should not be reading
+    //    a quarter-hour-old comparison, while three recursive oblast climbs on every debounce window
+    //    is exactly the standing load the risk leg's floor exists to prevent. A manual «Оновити
+    //    зараз» always runs it, like every other leg here.
+    //
+    //    Never throws — see `runTacticsPass` — so a tactical pass that fails cannot cost this pass
+    //    the narrative below it or the `analytics.updated` row after that.
+    if (trigger === 'manual' || startedAt - lastTacticsPassAt >= TACTICS_PASS_FLOOR_MS) {
+      lastTacticsPassAt = startedAt;
+      const tactics = await runTacticsPass(trigger);
+      log.info({ ...tactics }, 'attack tactics pass finished');
+    }
+
+    // 5. Codex leg: the cooldown is checked first, so a mass attack cannot turn a debounce into a
     //    model-call storm.
     const leg = await warmNarrative({ cooldownMs: settings.codexCooldownMs });
 
     const durationMs = clock() - startedAt;
-    // 5. One row, so the browser, the ops console and any future consumer learn about the recompute
+    // 6. One row, so the browser, the ops console and any future consumer learn about the recompute
     //    through the same ordered log everything else uses.
     await pool.query(
       `INSERT INTO system_event_log(event_type,payload) VALUES ('analytics.updated',$1::jsonb)`,

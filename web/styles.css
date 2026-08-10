@@ -1101,12 +1101,336 @@ body { overflow-x: hidden; }
 /* ---- 9б. Аналіз атак -------------------------------------------------------------------------- */
 
 /* Ретроспектива — не сигнал, тому на всій сторінці немає жодного кольору, крім бурштинового
-   застереження внизу. Величину кодує довжина смуги; якби смуга ще й була помаранчевою, око читало б
-   її як «зафіксована загроза», тобто як щось, що відбувається просто зараз. */
+   застереження. Величину кодує довжина смуги, зміну — зсув уздовж доріжки, вагу — кегль. Якби
+   смуга ще й була помаранчевою, око читало б її як «зафіксована загроза», тобто як щось, що
+   відбувається просто зараз.
+
+   Сторінка складається з двох різних за характером половин, і вони мусять виглядати по-різному:
+   вгорі — тактична смуга («що змінилось за добу»), внизу — агрегати за період. Верхня половина
+   набрана як шпальта: великий заголовок Unbounded, нумерований реєстр спостережень, широкі поля.
+   Нижня — як довідник: рівний ритм фігур із номерами «Рис. N». Читач, який гортає, має бачити
+   межу між твердженням і довідкою, не читаючи жодного слова. */
+
+/* --- Тактична смуга ---------------------------------------------------------------------------- */
+
+/* Тло — міліметрівка з майже нульовим контрастом. Це не декор: уся візуальна система названа
+   «вимірювальний прилад», і сітка під числами — єдина текстура, яка щось про них стверджує. */
+.tactics-band {
+  position: relative;
+  margin-bottom: clamp(46px, 6vw, 82px);
+  padding: clamp(26px, 3.4vw, 46px) clamp(20px, 3vw, 40px) clamp(6px, 1.2vw, 16px);
+  border: 1px solid var(--rule-2);
+  background:
+    repeating-linear-gradient(90deg, rgba(233, 231, 224, .022) 0 1px, transparent 1px 46px),
+    repeating-linear-gradient(0deg, rgba(233, 231, 224, .022) 0 1px, transparent 1px 46px),
+    linear-gradient(166deg, var(--surface-2) 0%, var(--surface) 44%, var(--ink) 100%);
+}
+/* Реєстраційна засічка на рамці — те саме, що риска «0» на шкалі приладу: показує, де починається
+   відлік, і коштує два пікселі. */
+.tactics-band::before {
+  content: '';
+  position: absolute;
+  top: -1px;
+  left: -1px;
+  width: 56px;
+  height: 2px;
+  background: var(--bone);
+}
+
+.tactics-kicker {
+  margin: 0;
+  color: var(--bone-4);
+  font: 400 10px/1 var(--mono);
+  letter-spacing: .17em;
+  text-transform: uppercase;
+}
+/* Єдиний по-справжньому великий кегль на сторінці. Він має право бути таким лише тут: це одне
+   речення, зібране з двох знаменників, і воно є відповіддю на питання, по яке сюди приходять. */
+.tactics-title {
+  margin: 16px 0 0;
+  max-width: 26ch;
+  font: 700 clamp(25px, 3.6vw, 46px)/1.08 var(--display);
+  letter-spacing: -.042em;
+}
+.tactics-empty {
+  margin: 20px 0 6px;
+  max-width: 64ch;
+  color: var(--bone-2);
+  font-size: 13.5px;
+  line-height: 1.65;
+}
+
+.tactics-meta {
+  display: flex;
+  flex-wrap: wrap;
+  margin: 28px 0 0;
+  border-top: 1px solid var(--rule);
+}
+.tactics-meta > div {
+  padding: 13px 22px 13px 0;
+  margin-right: 22px;
+  border-right: 1px solid var(--rule);
+}
+.tactics-meta > div:last-child { margin-right: 0; border-right: 0; }
+.tactics-meta dt {
+  color: var(--bone-4);
+  font: 400 9px/1 var(--mono);
+  letter-spacing: .15em;
+  text-transform: uppercase;
+}
+.tactics-meta dd {
+  margin: 7px 0 0;
+  color: var(--bone-2);
+  font: 400 12.5px/1 var(--mono);
+  font-variant-numeric: tabular-nums;
+}
+
+/* --- Реєстр спостережень ----------------------------------------------------------------------- */
+
+/* Номер стоїть у лівому полі, поза мірою тексту: він потрібен, щоб на спостереження можна було
+   послатися, і не потрібен, щоб його читали. */
+.ledger { margin: 10px 0 0; padding: 0; list-style: none; }
+/* Друга колонка — фіксовані 210 px, а не minmax: за minmax кожен рядок дістав би ширину під власну
+   назву, доріжки почалися б із різних місць, і порівняння довжин перетворилося б на порівняння
+   відступів. Той самий аргумент, що й у .bar-label нижче. */
+.ledger-row {
+  display: grid;
+  grid-template-columns: 42px 210px minmax(170px, 1fr);
+  column-gap: clamp(14px, 2.2vw, 32px);
+  row-gap: 12px;
+  padding: 22px 0;
+  border-top: 1px solid var(--rule);
+  opacity: 0;
+  animation: ledger-in .42s var(--ease) forwards;
+  animation-delay: calc(var(--row, 0) * 70ms + 60ms);
+}
+.ledger-index {
+  grid-column: 1;
+  grid-row: 1 / span 3;
+  padding-top: 4px;
+  color: var(--bone-4);
+  font: 400 11px/1 var(--mono);
+  letter-spacing: .08em;
+}
+.ledger-subject { grid-column: 2; grid-row: 1; }
+.ledger-subject b {
+  display: block;
+  font: 600 15.5px/1.3 var(--body);
+  letter-spacing: -.015em;
+}
+.ledger-kind {
+  display: block;
+  margin-top: 7px;
+  color: var(--bone-4);
+  font: 400 9px/1 var(--mono);
+  letter-spacing: .14em;
+  text-transform: uppercase;
+}
+.ledger-support {
+  display: block;
+  margin-top: 5px;
+  color: var(--bone-3);
+  font: 400 10.5px/1.4 var(--mono);
+  font-variant-numeric: tabular-nums;
+}
+.ledger-sentence {
+  grid-column: 2 / -1;
+  grid-row: 2;
+  margin: 0;
+  max-width: 74ch;
+  color: var(--bone-2);
+  font-size: 13.5px;
+  line-height: 1.65;
+}
+.ledger-quotes {
+  grid-column: 2 / -1;
+  grid-row: 3;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 10px;
+  margin: -2px 0 0;
+}
+.ledger-quotes span {
+  padding: 5px 10px;
+  border: 1px solid var(--rule);
+  color: var(--bone-3);
+  font: 400 11px/1 var(--mono);
+}
+.ledger-quotes b { color: var(--bone-2); font-weight: 400; }
+.ledger-empty {
+  margin: 24px 0 6px;
+  max-width: 70ch;
+  color: var(--bone-2);
+  font-size: 13.5px;
+  line-height: 1.65;
+}
+
+/* --- Доріжка зсуву ----------------------------------------------------------------------------- */
+
+/* Два числа поруч читаються як два числа; та сама пара на одній осі читається як РУХ, а рух тут і
+   є твердженням. Засічка — звідки, заповнена голівка — куди, відрізок між ними — величина зміни.
+   Напрямок закодовано боком голівки відносно засічки, а не відтінком: щойно ця сторінка почне
+   фарбувати зростання, вона почне сигналити, а сигналити їй нема про що. */
+.shift {
+  grid-column: 3;
+  grid-row: 1;
+  display: grid;
+  align-content: start;
+  gap: 11px;
+  padding-top: 3px;
+}
+.shift-track { position: relative; display: block; height: 14px; }
+.shift-track::before {
+  content: '';
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: 6px;
+  height: 1px;
+  background: var(--rule-2);
+}
+.shift-span {
+  position: absolute;
+  top: 5px;
+  height: 3px;
+  background: var(--bone-3);
+  transform: scaleX(0);
+  transform-origin: left center;
+  animation: shift-draw .5s var(--ease) forwards;
+  animation-delay: calc(var(--row, 0) * 70ms + 240ms);
+}
+.shift-tick {
+  position: absolute;
+  top: 0;
+  width: 1px;
+  height: 13px;
+  background: var(--rule-3);
+}
+.shift-head {
+  position: absolute;
+  top: 2px;
+  width: 9px;
+  height: 9px;
+  margin-left: -4px;
+  background: var(--bone);
+  opacity: 0;
+  animation: shift-land .28s var(--ease) forwards;
+  animation-delay: calc(var(--row, 0) * 70ms + 580ms);
+}
+.shift-values {
+  display: flex;
+  align-items: baseline;
+  gap: 9px;
+  font-variant-numeric: tabular-nums;
+}
+.shift-values em {
+  color: var(--bone-4);
+  font: 400 12px/1 var(--mono);
+  font-style: normal;
+}
+.shift-arrow { color: var(--bone-4); font: 400 11px/1 var(--mono); }
+.shift-values strong { color: var(--bone); font: 500 17px/1 var(--mono); }
+
+@keyframes ledger-in {
+  from { opacity: 0; transform: translateY(6px); }
+  to   { opacity: 1; transform: none; }
+}
+@keyframes shift-draw { to { transform: scaleX(1); } }
+@keyframes shift-land { to { opacity: 1; } }
+
+/* --- Переказ моделі ---------------------------------------------------------------------------- */
+
+/* Врізка з іншим набором: абзац, який написала модель, не має виглядати як число, поруч із яким він
+   стоїть. Позначка походження — у шапці, ДО тексту: сказати «це написала модель» після того, як
+   абзац прочитали, означає не сказати нічого. */
+.commentary {
+  margin: 30px 0 0;
+  padding: 24px 26px;
+  border-left: 2px solid var(--rule-3);
+  background: rgba(233, 231, 224, .025);
+}
+.commentary-head {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 14px;
+}
+.commentary-head p {
+  margin: 0;
+  color: var(--bone-4);
+  font: 400 10px/1 var(--mono);
+  letter-spacing: .15em;
+  text-transform: uppercase;
+}
+.origin-chip {
+  padding: 5px 10px;
+  border: 1px solid var(--rule-2);
+  color: var(--bone-2);
+  font: 400 9.5px/1 var(--mono);
+  letter-spacing: .1em;
+  text-transform: uppercase;
+}
+.commentary-lead {
+  margin: 17px 0 0;
+  max-width: 60ch;
+  color: var(--bone);
+  font: 300 17px/1.5 var(--body);
+}
+.commentary-list { margin: 14px 0 0; padding-left: 18px; max-width: 72ch; }
+.commentary-list li { margin-top: 8px; color: var(--bone-2); font-size: 13.5px; line-height: 1.65; }
+
+/* --- Застереження ------------------------------------------------------------------------------ */
+
+/* Згортка, а не банер. Застереження мусить бути на сторінці завжди й ніколи не має бути тим, що
+   читач бачить замість чисел; бурштин у підписі — єдиний колір цієї сторінки, і він означає рівно
+   те саме, що й скрізь: «це межа достовірності». */
+.caveat-fold {
+  margin: 28px 0 0;
+  border-top: 1px solid var(--rule);
+}
+.caveat-fold summary {
+  padding: 15px 0;
+  color: var(--risk);
+  font: 400 10px/1 var(--mono);
+  letter-spacing: .15em;
+  text-transform: uppercase;
+  cursor: pointer;
+  list-style: none;
+}
+.caveat-fold summary::-webkit-details-marker { display: none; }
+.caveat-fold summary::after { content: ' ▸'; }
+.caveat-fold[open] summary::after { content: ' ▾'; }
+.caveat-fold ul { margin: 0 0 20px; padding-left: 18px; max-width: 76ch; }
+.caveat-fold li { margin-top: 8px; color: var(--bone-3); font-size: 12.5px; line-height: 1.65; }
+
+/* --- Панель періоду ---------------------------------------------------------------------------- */
+
+.period-bar {
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 18px 26px;
+  margin: 0 0 4px;
+  padding-bottom: 18px;
+  border-bottom: 1px solid var(--rule-2);
+}
+.period-bar-label p {
+  margin: 0;
+  font: 600 19px/1.2 var(--body);
+  letter-spacing: -.02em;
+}
+.period-bar-label span {
+  display: block;
+  margin-top: 7px;
+  max-width: 58ch;
+  color: var(--bone-4);
+  font-size: 12.5px;
+  line-height: 1.55;
+}
 
 .period-switch {
   display: inline-flex;
-  margin-bottom: 26px;
   border: 1px solid var(--rule-2);
   background: var(--surface);
 }
@@ -1127,23 +1451,78 @@ body { overflow-x: hidden; }
 .period-switch button:hover { color: var(--bone); background: rgba(233, 231, 224, .04); }
 .period-switch button.is-active { background: var(--bone); color: var(--ink); font-weight: 600; }
 
-/* Слово замість числа в тій самій комірці зведення: «Полтавська» набране цифровим кеглем
-   Unbounded розповзлося б на два рядки й зламало ритм сітки. */
-.metric-grid strong.metric-word {
-  font: 600 clamp(20px, 2.2vw, 26px)/1.15 var(--body);
-  letter-spacing: -.02em;
+/* --- Стрічка показників ------------------------------------------------------------------------ */
+
+/* Не коробки: коробка навколо числа обіцяє, що число самодостатнє, а тут кожне з трьох має сенс
+   лише поруч із двома іншими. Волосяні лінії тримають ритм і нічого не обіцяють. */
+.readout {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  margin: 28px 0 0;
+  border-top: 1px solid var(--rule-2);
+  border-bottom: 1px solid var(--rule-2);
+}
+.readout-cell { padding: 22px 26px 24px 0; border-right: 1px solid var(--rule); }
+.readout-cell:last-child { border-right: 0; }
+.readout-cell + .readout-cell { padding-left: 26px; }
+.readout-cell > span {
+  display: block;
+  color: var(--bone-4);
+  font: 400 9px/1 var(--mono);
+  letter-spacing: .15em;
+  text-transform: uppercase;
+}
+.readout-cell strong { display: block; margin: 13px 0 0; color: var(--bone); }
+.readout-cell strong.is-num {
+  font: 400 clamp(30px, 4.4vw, 52px)/1 var(--display);
+  letter-spacing: -.05em;
+  font-variant-numeric: tabular-nums;
+}
+/* Слово замість числа в тій самій комірці: «Полтавська» набране цифровим кеглем Unbounded
+   розповзлося б на два рядки й зламало ритм стрічки. */
+.readout-cell strong.is-word {
+  font: 600 clamp(19px, 2.3vw, 27px)/1.15 var(--body);
+  letter-spacing: -.025em;
+}
+.readout-cell small {
+  display: block;
+  margin-top: 11px;
+  color: var(--bone-3);
+  font-size: 12px;
+  line-height: 1.5;
 }
 
-.chart-block { margin-top: 42px; }
-.chart-block > header { margin-bottom: 18px; }
-.chart-block > header p {
+/* --- Фігури ------------------------------------------------------------------------------------ */
+
+/* Номер «Рис. N» — редакційний прийом, а не прикраса: він дає читачеві спосіб послатися на
+   конкретний графік, а сторінці — хребет, уздовж якого вона читається згори вниз. */
+.figure { margin: clamp(38px, 5vw, 62px) 0 0; }
+.figure-head {
+  display: grid;
+  grid-template-columns: 62px 1fr;
+  column-gap: 18px;
+  margin-bottom: 20px;
+}
+.figure-number {
+  grid-column: 1;
+  grid-row: 1 / span 2;
+  padding-top: 3px;
+  color: var(--bone-4);
+  font: 400 10px/1 var(--mono);
+  letter-spacing: .1em;
+}
+.figure-head p {
+  grid-column: 2;
+  grid-row: 1;
   margin: 0;
   color: var(--bone-4);
   font: 400 10px/1.4 var(--mono);
-  letter-spacing: .13em;
+  letter-spacing: .14em;
   text-transform: uppercase;
 }
-.chart-block > header h2 {
+.figure-head h2 {
+  grid-column: 2;
+  grid-row: 2;
   margin: 9px 0 0;
   font: 600 21px/1.25 var(--body);
   letter-spacing: -.02em;
@@ -1259,63 +1638,83 @@ body { overflow-x: hidden; }
   line-height: 1.6;
 }
 
-.pattern-block {
-  margin-top: 52px;
-  padding-top: 30px;
+/* --- Висновок за період ------------------------------------------------------------------------ */
+
+.conclusion {
+  margin-top: 56px;
+  padding-top: 32px;
   border-top: 1px solid var(--rule-2);
 }
-.pattern-block > header p {
+.conclusion > header p {
   margin: 0;
   color: var(--bone-4);
   font: 400 10px/1.4 var(--mono);
-  letter-spacing: .13em;
+  letter-spacing: .14em;
   text-transform: uppercase;
 }
-.pattern-block > header h2 {
+.conclusion > header h2 {
   margin: 9px 0 0;
   font: 700 clamp(22px, 2.8vw, 30px)/1.15 var(--display);
   letter-spacing: -.035em;
 }
-.pattern-headline {
+.conclusion-lead {
   margin: 22px 0 0;
   max-width: 62ch;
   color: var(--bone);
   font: 300 18px/1.55 var(--body);
 }
-.pattern-list {
+.conclusion-list {
   margin: 20px 0 0;
   padding: 0;
   max-width: 72ch;
   list-style: none;
   border-top: 1px solid var(--rule);
 }
-.pattern-list li {
-  padding: 13px 0 13px 22px;
+.conclusion-list li {
   position: relative;
+  padding: 13px 0 13px 22px;
   border-bottom: 1px solid var(--rule);
   color: var(--bone-2);
   font-size: 14px;
   line-height: 1.65;
 }
-.pattern-list li::before {
+.conclusion-list li::before {
   content: '';
   position: absolute;
-  left: 0; top: 22px;
+  left: 0;
+  top: 22px;
   width: 10px;
   height: 1px;
   background: var(--rule-3);
 }
 
-/* Застереження — єдине бурштинове місце сторінки, і воно завжди останнє: спершу числа, потім
-   межі їхньої достовірності. Читач, який дійшов сюди, вже бачив усе, про що йдеться. */
-.analytics-note strong {
-  display: block;
-  margin-bottom: 8px;
-  color: var(--bone);
-  font: 600 13px/1.3 var(--body);
+/* --- Вузькі екрани та зменшений рух ------------------------------------------------------------ */
+
+@media (max-width: 860px) {
+  /* Номер спостереження переїжджає в рядок із назвою: у 42 px лівого поля на телефоні немає, а
+     доріжка зсуву без ширини перестає бути доріжкою. */
+  .ledger-row { grid-template-columns: 34px 1fr; row-gap: 14px; }
+  .ledger-subject { grid-column: 2; }
+  .shift { grid-column: 2; grid-row: 2; }
+  .ledger-sentence { grid-row: 3; }
+  .ledger-quotes { grid-row: 4; }
+  .readout { grid-template-columns: 1fr; }
+  .readout-cell { padding: 18px 0; border-right: 0; border-bottom: 1px solid var(--rule); }
+  .readout-cell:last-child { border-bottom: 0; }
+  .readout-cell + .readout-cell { padding-left: 0; }
+  .figure-head { grid-template-columns: 1fr; }
+  .figure-number { grid-column: 1; grid-row: 1; }
+  .figure-head p { grid-column: 1; grid-row: 2; margin-top: 8px; }
+  .figure-head h2 { grid-column: 1; grid-row: 3; }
+  .tactics-meta > div { padding-right: 16px; margin-right: 16px; }
 }
-.analytics-note ul { margin: 0; padding-left: 18px; }
-.analytics-note li { margin-top: 6px; }
+
+@media (prefers-reduced-motion: reduce) {
+  .ledger-row, .shift-span, .shift-head { animation: none; }
+  .ledger-row { opacity: 1; }
+  .shift-span { transform: scaleX(1); }
+  .shift-head { opacity: 1; }
+}
 
 /* ---- 10. Форми та кнопки ---------------------------------------------------------------------- */
 

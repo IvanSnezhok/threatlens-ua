@@ -1,6 +1,7 @@
 import type { FastifyPluginAsync, FastifyReply } from 'fastify';
 import { publicationSlice } from '../services/publication.js';
 import { ATTACK_PERIODS, attackAnalytics, isAttackPeriod } from '../services/attack-analytics.js';
+import { readTacticsBlock } from '../services/attack-tactics.js';
 
 /**
  * The public «Аналіз атак» endpoint.
@@ -64,14 +65,30 @@ const attackAnalyticsRoutes: FastifyPluginAsync = async (app) => {
     // ingested it is already older than a `now()-15s` window end and is counted the instant it is
     // classified — the same mistake `/api/v1/history` avoids by gating `created_at` and never
     // `started_at`.
-    const payload = await attackAnalytics(period, asOf, slice.mode, slice.cutoffAt);
+    // The tactical block rides on this endpoint rather than on a second one, and is read here
+    // rather than inside `attackAnalytics()`, for two separate reasons.
+    //
+    // One endpoint: the block and the period aggregates are the same page and are always fetched
+    // together, so a second endpoint would only buy a second round trip and a second chance for the
+    // two halves to disagree about which instant they describe.
+    //
+    // Outside the memo: `attackAnalytics()` memoises on `${period}|${mode}` for two minutes, and
+    // the block does not vary with `period` at all — it is always the last 24 hours against the
+    // fortnight before them. Reading it here keeps that memo key exactly as it was, and costs one
+    // indexed statement that returns at most one row with its detections attached.
+    const [payload, tactics] = await Promise.all([
+      attackAnalytics(period, asOf, slice.mode, slice.cutoffAt),
+      // `slice.cutoffAt`, not `asOf`: a pass computed five seconds ago must not be visible while the
+      // console is holding publication, and `computed_at <= cutoff` is the whole of that rule.
+      readTacticsBlock(slice.cutoffAt)
+    ]);
     // The memo key fixes only the server side. A body produced in `live` mode sits in browser and
     // CDN caches and is replayed for 120 s fresh and up to an hour stale AFTER the operator flips —
     // on this surface the hold would simply not take effect, which fails «у delayed_15s — не раніше
     // 15 секунд». `no-store`, not `max-age=15`: `stale-while-revalidate` is what makes the hour-long
     // tail possible, and an already-issued `s-maxage` cannot be expired on a flip.
     setCacheControl(reply, slice.mode === 'delayed_15s' ? 'no-store' : CACHEABLE);
-    return payload;
+    return { ...payload, tactics };
   });
 };
 

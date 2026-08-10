@@ -918,6 +918,52 @@ Nothing in this module reads the database, `src/config.ts` or `pg`, and nothing 
 back: the aggregate is a presentation of numbers the risk engine has already computed, and feeding it
 into the engine would count the same reports twice.
 
+### The tactical comparison engine
+
+`src/services/attack-tactics.ts` is a fifth reader of the classification archive, and the only one
+whose question is a *difference* rather than a *description*: what the last twenty-four hours are
+doing that the fortnight before them was not. Its thresholds and its seven comparisons are documented
+in «Tactical comparison» in `docs/METHODOLOGY.md`; what belongs here is the shape.
+
+**Where it runs.** As a leg of `recomputeAnalytics()`, between the risk engine and the narrative,
+behind its own five-minute floor and its own clock — the same arrangement the risk leg's model call
+has, and for the same reason. The recompute is debounced by events, a mass attack makes events
+continuous, and a leg without a floor of its own would run three recursive oblast climbs a minute for
+as long as the attack lasts. Five minutes is far shorter than anything a 24-hour window can express
+and far longer than a debounce. A manual «Оновити зараз» overrides it, like every other leg.
+
+**Insert-on-change, not insert-per-pass.** The pass fingerprints its detection set —
+order-independent, so a reshuffle is not a change; value-sensitive to four decimals, so a moved share
+is — and compares it with the newest stored pass. A different digest inserts a row with its
+detections; an identical one moves `last_confirmed_at` and writes nothing else. At the busiest cadence
+that is the difference between 288 rows a day and one row per genuine change, and it gives the page
+two timestamps a table of identical rows could not express: when this picture first appeared, and when
+it was last re-derived and found unchanged.
+
+**The hold is a read predicate.** The pass computes over unheld data, because it is internal work and
+internal recomputation is never delayed. The publication cutoff is applied on the way out, by
+`readTacticsBlock()`, as `computed_at <= cutoff` — one indexed statement returning at most one row
+with its detections attached as JSON. There is no held/unheld flag and no second copy of a pass: in
+`delayed_15s` a pass computed five seconds ago is simply not the newest row the reader's query can
+see.
+
+**Where it is published.** As a `tactics` block on the existing `GET /api/v1/analytics/attacks`,
+merged in the route rather than inside `attackAnalytics()`. Two reasons: the block does not vary with
+`period` at all, so putting it inside the `${period}|${mode}` memo would key it on something it does
+not depend on; and the route already holds the publication slice the read needs. The page is a single
+request either way, and the period aggregates are untouched by it.
+
+**Two new model surfaces.** `codex_settings` gained `tactics_enabled` and `attack_research_enabled` in
+migration 033, and `CodexChatRequest.surface` gained the matching two values, so every call either
+feature spends is filed under its own label in `ai_runs`. `tactics` is the first switch whose text
+reaches a public page directly rather than through Telegram — the commentary under the tactical block,
+rejected wholesale if it invents a digit, a class, an oblast or a forecast, and replaced by the
+deterministic sentences whenever it is. `attack_research` is the opposite extreme: an operator-only
+memo, never scheduled, produced only on an explicit request. Both default to false. Neither can
+create, widen or restore a threat, an alert, a risk signal or a geography — the same warranty every
+switch carries except `retrospective_gate`, which remains the only one with authority over the
+pipeline.
+
 ## Event flow
 
 ```mermaid

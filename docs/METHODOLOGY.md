@@ -99,6 +99,71 @@ visible, but not as a weapon-class glyph. The oblast above the raion is an ances
 territory, which receives neither an icon nor a fill: the lit raion inside it has already said
 everything the source said, and filling the oblast would say more.
 
+## Tactical comparison
+
+The attacks page opens with a block that answers one question the three period tabs could not: **what
+is different about the last day**. The tabs each describe a window, they overlap, and their
+denominators differ, so a reader comparing «доба» with «місяць» is doing arithmetic the page never
+did. `src/services/attack-tactics.ts` does it once, in SQL, and publishes the result.
+
+**Two windows, no overlap.** CURRENT is `[now − 24h, now)`; BASELINE is `[now − 15d, now − 24h)` —
+fourteen whole days ending exactly where the current window starts. Both count `message_classifications`
+whose `decision` asserts a threat (`event_created`, `event_merged`, `redirect`), which is the same line
+between an assertion and a refusal the rest of the analytics draw. Methodology version `tactics-v1`.
+
+**Three floors, chosen before the data was looked at.**
+
+- Fewer than **12** asserting messages in the current window and the pass emits nothing at all — not
+  an empty block, not a "quiet day" row. Under that, every share is a fraction with a single-digit
+  denominator and the detections would be firing on the difference between two monitoring channels
+  being awake and one of them being asleep.
+- A detection about a *share* needs **5** current messages behind it before it is named.
+- Fewer than **20** baseline messages and only the `new_*` detections survive: a thin baseline makes
+  every current share look like a change, and "this class was never named before" is still true when
+  the archive is young because it is a statement about absence rather than about a proportion.
+
+**Seven comparisons, each with a threshold and a sentence.**
+
+| detection | fires when |
+| --- | --- |
+| `weapon_mix_shift` | a class's share of weapon mentions moved by ≥ 0.15 between the windows |
+| `new_weapon_class` | a class with 0 baseline messages reaches 5 in the current window |
+| `launch_hour_shift` | the 22:00–06:00 share moved by ≥ 0.20, **or** the busiest fixed three-hour band moved by ≥ 3 hours while carrying ≥ 25 % of the day |
+| `territory_expansion` | an oblast with 0 baseline mentions is named ≥ 3 times today |
+| `territory_concentration` | the busiest oblast's share of territory mentions moved by ≥ 0.20 |
+| `wave_cadence_change` | the median wave duration moved by ≥ 40 % with ≥ 3 waves on each side, **or** waves per day moved by ≥ 1.0 |
+| `redirect_corridor` | an ordered oblast pair (withdrawn → asserted, `decision='redirect'`) repeats ≥ 3 times today while the baseline daily rate is at most half of today's |
+
+Waves are clustered by the same `clusterWaves()` the period tabs use — imported, not reimplemented, so
+a night cannot contain one number of waves in one block and another number two screens below it.
+
+**Every sentence is re-derivable from the row beside it.** Each detection stores the two values it
+compared, the message counts underneath them, the signed movement and the evidence the sentence
+quotes; the sentence itself contains no number that is not in that record. The unit suite asserts
+exactly that, with the same grounding walk that guards the analytics narrative.
+
+### The vocabulary: observed, derived, calculated
+
+Three words, and only the first two may ever reach a reader.
+
+- **observed** — a source said it. The threat feed, the direction quotations, the alert state.
+- **derived** — we counted what already happened. The attacks page, and both tactical tables, which
+  carry `data_nature = 'derived'` as a CHECK rather than as a convention.
+- **calculated** — an extrapolation forward. Operator-only by construction, stored behind its own
+  table prefix and its own isolation test, and absent from the tactical migration entirely.
+
+### What the tactical block is not
+
+It is not a forecast, and the distinction is a matter of tense rather than of confidence. Every
+detection is a statement about two windows that have already closed. Nothing here names a next target,
+computes a probability, or describes an interval that has not happened. The prose beneath the
+detections — deterministic by default, a model's rewording only when an operator switches
+`codex_settings.tactics_enabled` on — is passed through the closed forecasting lexicon in
+`src/domain/forecast-guard.ts` and discarded whole if it slips into the future tense, alongside three
+other checks: a number the detections do not contain, a weapon class they do not name, and an oblast
+they do not name. Any one of them rejects the entire paragraph, never the offending sentence, and the
+page falls back to the deterministic text that was written before the model was asked.
+
 ## Publication
 
 Assessments are recomputed when something they describe actually changes: a relevant recorded event
