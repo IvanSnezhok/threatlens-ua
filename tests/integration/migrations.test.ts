@@ -34,7 +34,9 @@ const MIGRATION_FILES = [
   '030_app_settings.sql',
   '031_homonym_settlement_gaps.sql',
   '032_silent_drop_and_audited_homonyms.sql',
-  '033_tactics_and_research_switches.sql'
+  '033_tactics_and_research_switches.sql',
+  '034_attack_tactics.sql',
+  '035_attack_research.sql'
 ];
 
 /**

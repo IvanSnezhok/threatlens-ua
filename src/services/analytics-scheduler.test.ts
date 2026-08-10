@@ -9,7 +9,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
  * cadence of one of them would move that statement into the callers.
  */
 const legs = vi.hoisted(() => ({
-  refresh: 0, risk: 0, warm: 0, eventRows: [] as unknown[][],
+  refresh: 0, risk: 0, warm: 0, tactics: 0, eventRows: [] as unknown[][],
   /** Set to make the materialised-view refresh reject, the way a 15 s `statement_timeout` does. */
   refreshError: null as Error | null,
   /** One entry per risk leg: whether that pass was allowed to spend the model. */
@@ -33,6 +33,15 @@ vi.mock('./risk.js', () => ({
 vi.mock('./attack-analytics.js', () => ({ resetAttackAnalyticsCache: () => undefined }));
 vi.mock('../db/pool.js', () => ({
   pool: { query: async (...args: unknown[]) => { legs.eventRows.push(args); return { rows: [], rowCount: 0 }; } }
+}));
+vi.mock('./attack-tactics.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('./attack-tactics.js')>()),
+  runTacticsPass: async () => {
+    legs.tactics += 1;
+    return {
+      outcome: 'insufficient' as const, passId: null, digest: null, detections: 0, currentMessages: 0
+    };
+  }
 }));
 vi.mock('./analytics-narrative.js', async (importOriginal) => ({
   ...(await importOriginal<typeof import('./analytics-narrative.js')>()),
@@ -192,7 +201,7 @@ async function emit(h: ReturnType<typeof harness>, eventType: string, version = 
 
 beforeEach(() => {
   resetAnalyticsScheduler();
-  legs.refresh = 0; legs.risk = 0; legs.warm = 0; legs.eventRows = [];
+  legs.refresh = 0; legs.risk = 0; legs.warm = 0; legs.tactics = 0; legs.eventRows = [];
   legs.refreshError = null; legs.riskModel = [];
 });
 afterEach(() => { resetAnalyticsScheduler(); });
@@ -752,7 +761,7 @@ describe('the guards inside one pass', () => {
     });
 
     expect(result).toMatchObject({ skipped: null, published: 3, codex: 'disabled', fallback: false });
-    expect([legs.refresh, legs.risk, legs.warm]).toEqual([1, 1, 1]);
+    expect([legs.refresh, legs.risk, legs.warm, legs.tactics]).toEqual([1, 1, 1, 1]);
     expect(legs.eventRows).toHaveLength(1);
   });
 
