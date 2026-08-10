@@ -67,7 +67,13 @@ const VOLATILE_TABLES = [
   'deployment_run_events', 'deployment_runs',
   // Per-source catch-up telemetry. `deployment_state` is deliberately NOT here — it is a
   // migration-seeded singleton and is reset by UPDATE below, exactly like `runtime_settings`.
-  'source_backfill_state'
+  'source_backfill_state',
+  // Operator research (migration 035), children first. The requests table is the one that matters:
+  // the daily cap and the per-oblast cooldown are counted FROM it, so a file that left its rows
+  // behind would spend the next file's allowance and refuse its first request with
+  // `refused_cooldown` — a failure that reads as a bug in the governance rather than as leakage
+  // between test files.
+  'ops_attack_research_classes', 'ops_attack_research_memos', 'ops_attack_research_requests'
 ];
 
 /**
@@ -127,6 +133,16 @@ export async function resetDatabase(): Promise<void> {
   await sql(`UPDATE deployment_state SET remote_url=NULL, remote_commit=NULL,
              working_tree_commit=NULL, working_tree_dirty=false, last_checked_at=NULL,
              last_check_ok=NULL, last_check_error=NULL, runner_version=NULL, updated_at=now()`);
+  // Third singleton, same argument as the two above, and the first one whose stale value can change
+  // what the code under test DOES rather than what it reports. Every switch is off by default; a
+  // file that turned one on to exercise a model path would leave it on for every file after it, and
+  // those files would start calling `codexChat` on surfaces they never opted into. The row is
+  // seeded-or-absent by migration 018 rather than truncated, because «no row» already means «all
+  // switches off» and truncating would be resetting a row that is not supposed to exist.
+  await sql(`UPDATE codex_settings SET model=NULL, narrative_enabled=false, digest_enabled=false,
+             attacks_enabled=false, shadow_enabled=false, retrospective_gate_enabled=false,
+             tactics_enabled=false, attack_research_enabled=false, updated_at=now()
+             WHERE singleton`);
 }
 
 /**

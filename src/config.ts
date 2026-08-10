@@ -283,6 +283,25 @@ export const envSchema = z.object({
   // of quota must never be a way to lose a warning, only a way to lose a suppression.
   RETROSPECTIVE_GATE_MAX_PER_MINUTE: z.coerce.number().int().min(0).max(120).default(6),
 
+  // ---- Operator research governance ------------------------------------------------------------
+  // The two bounds on the operator-only oblast research memo. Both are counted from the request
+  // table migration 035 creates rather than from a module variable, which is the whole reason they
+  // are settings and not constants: a cap that a `docker compose restart` resets is not a cap, and
+  // the moment somebody would want to change either of these is the middle of an attack, when
+  // editing `.env` and restarting is the worst available move.
+  //
+  // Twenty a day is the number of oblasts a single operator can meaningfully read memos for in one
+  // shift. The ceiling of 200 is not a recommendation: it is high enough that an installation with
+  // several operators is not silently throttled, and low enough that a stuck client cannot spend a
+  // quota overnight. Zero means the surface is closed — every request refuses with `refused_daily_cap`
+  // — which is a deliberate second off-switch beside the Codex one.
+  ATTACK_RESEARCH_MAX_PER_DAY: z.coerce.number().int().min(0).max(200).default(20),
+  // Per (oblast, window), not global: two operators researching two different oblasts are not
+  // competing, and a cooldown that made them wait for each other would be measuring the wrong thing.
+  // Two minutes is longer than reading one memo takes and shorter than a wave, so the second press is
+  // usually a genuinely new question rather than an impatient repeat of the same one. 0 disables it.
+  ATTACK_RESEARCH_COOLDOWN_SECONDS: z.coerce.number().int().min(0).max(3600).default(120),
+
   // ---- Codex sign-in over OAuth ----------------------------------------------------------------
   // The operator presses a button in `/ops` instead of copying a token out of `~/.codex/auth.json`.
   // Everything here describes *where* the browser is sent and *where it comes back to*; whether a
@@ -806,6 +825,17 @@ export const APP_SETTINGS: Record<keyof AppConfig, SettingMeta> = {
   },
   RETROSPECTIVE_GATE_MAX_PER_MINUTE: {
     scope: 'db_tunable', group: 'analytics', apply: 'hot', ui: { kind: 'number', min: 0, max: 120 }
+  },
+  ATTACK_RESEARCH_MAX_PER_DAY: {
+    scope: 'db_tunable', group: 'analytics', apply: 'hot', ui: { kind: 'number', min: 0, max: 200 },
+    applyNote: 'Ліміт рахується з таблиці запитів, а не з лічильника в пам’яті, тож зміна діє з '
+      + 'наступного натискання й переживає перезапуск. 0 закриває поверхню повністю.'
+  },
+  ATTACK_RESEARCH_COOLDOWN_SECONDS: {
+    scope: 'db_tunable', group: 'analytics', apply: 'hot',
+    ui: { kind: 'number', min: 0, max: 3600, unit: 'с' },
+    applyNote: 'Пауза рахується для пари «область + вікно» з часу останнього запиту в таблиці, '
+      + 'тож зменшення ліміту одразу відкриває ті пари, які вже його вичекали.'
   },
   CODEX_OAUTH_ISSUER: { scope: 'db_tunable', group: 'analytics', apply: 'hot', ui: { kind: 'url' } },
   CODEX_OAUTH_CLIENT_ID: { scope: 'db_tunable', group: 'analytics', apply: 'hot', ui: { kind: 'text' } },

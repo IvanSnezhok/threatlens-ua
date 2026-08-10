@@ -15,6 +15,7 @@ import { registerDeploymentMetrics } from '../services/deployment.js';
 import { registerBackfillMetrics } from '../services/source-backfill.js';
 import { registerAppSettingsMetrics } from '../services/app-settings.js';
 import { registerAdminNoticeMetrics } from '../bot/admin-notice.js';
+import { registerAttackResearchMetrics } from '../services/attack-research.js';
 import { registerOutboxMetrics } from '../bot/outbox.js';
 import { resolveRuntimeSettings } from '../services/runtime-settings.js';
 import { registerAlertChannelMetrics } from '../services/ingestion.js';
@@ -25,6 +26,7 @@ import attackAnalyticsRoutes from './attack-analytics-routes.js';
 import occupationRoutes from './occupation-routes.js';
 import opsAiRunsRoutes from './ops-ai-runs-routes.js';
 import opsCodexRoutes from './ops-codex-routes.js';
+import opsAttackResearchRoutes from './ops-attack-research-routes.js';
 import opsBackfillRoutes from './ops-backfill-routes.js';
 import opsCoverageRoutes from './ops-coverage-routes.js';
 import opsDeployRoutes from './ops-deploy-routes.js';
@@ -156,6 +158,11 @@ export async function buildServer() {
   // and the `failed` one is the only trace of a notice Telegram refused — both are invisible
   // without this line.
   registerAdminNoticeMetrics(registry);
+  // `threatlens_attack_research_runs_total{outcome}`: how the operator research surface answered.
+  // The refusal series are the point — `refused_daily_cap` and `refused_cooldown` are the governance
+  // working and are the only way to see that a console is pressing the button harder than the caps
+  // allow, while `model_rejected` is the verifier turning down a memo the model wrote.
+  registerAttackResearchMetrics(registry);
 
   const app = Fastify({ logger: { level: config.NODE_ENV === 'development' ? 'debug' : 'info' }, trustProxy: true });
   await app.register(rateLimit, { max: 300, timeWindow: '1 minute' });
@@ -257,6 +264,7 @@ export async function buildServer() {
   await app.register(attackAnalyticsRoutes);
   await app.register(vectorRoutes);
   await app.register(opsVectorRoutes);
+  await app.register(opsAttackResearchRoutes);
   await app.register(opsCodexRoutes);
   await app.register(opsAiRunsRoutes);
   await app.register(opsSourceTrustRoutes);

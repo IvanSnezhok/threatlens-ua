@@ -29,7 +29,14 @@ const ROOT = resolve(import.meta.dirname, '../..');
 
 const OPS_ONLY_MODULES = [
   'src/services/vector-projection.ts',
-  'src/api/ops-vector-routes.ts'
+  'src/api/ops-vector-routes.ts',
+  // The second `calculated` family. Migration 035 puts the operator research memo in `ops_`-prefixed
+  // tables for exactly the reason migration 016 did, and it earns its place in this list rather than
+  // a list of its own: the property being proved — «no module that builds a public response may reach
+  // this code, at any depth» — is one property, and splitting it in two would eventually leave one
+  // half maintained.
+  'src/services/attack-research.ts',
+  'src/api/ops-attack-research-routes.ts'
 ];
 
 /**
@@ -57,7 +64,20 @@ const PUBLIC_ENTRY_POINTS = [
   'src/services/location-catalog.ts',
   'src/services/recommended-channels.ts',
   'src/bot/bot.ts',
-  'src/bot/outbox.ts'
+  'src/bot/outbox.ts',
+  // The public attacks page and the tactical block on it. `attack-analytics-routes.ts` serves
+  // `/api/v1/analytics/attacks`, which is the closest public surface to the operator research memo —
+  // same archive, same oblasts, same classes — and is therefore the entry point whose reachability
+  // matters most.
+  //
+  // `attack-tactics.ts` and `attack-tactics-commentary.ts` arrive with migration 034 and do not exist
+  // in this tree yet. Listing them early is safe and not a false green: `reachableFrom` cannot read a
+  // module that is not there, so the walk reaches nothing, and a module that reaches nothing reaches
+  // no ops module either. The moment the files land the walk becomes real without anybody having to
+  // remember this list.
+  'src/api/attack-analytics-routes.ts',
+  'src/services/attack-tactics.ts',
+  'src/services/attack-tactics-commentary.ts'
 ];
 
 function read(relativePath: string): string {
@@ -159,6 +179,100 @@ describe('extrapolation storage', () => {
     expect(checks.length).toBe(2);
     // An extrapolation is never allowed to describe itself as high-confidence.
     expect(migration).toContain(`CHECK (confidence IN ('low','medium'))`);
+  });
+});
+
+/**
+ * The same three proofs for the second `calculated` family, deliberately as a mirror rather than as
+ * a widened allow-list.
+ *
+ * Reusing the block above by adding this family's prefix to `ALLOWED` would have made one test say
+ * "these ops tables are named only by these ops modules" for a growing set of both, and the first
+ * time a research module named a projection table — or the reverse — the test would have stayed
+ * green. Two families, two blocks, each naming its own prefix, its own migration and its own module
+ * pair: the failure message then says which boundary moved.
+ */
+describe('attack research storage', () => {
+  // Assembled, so this file does not itself match the search it performs.
+  const TABLE_PREFIX = `ops_${'attack_research'}`;
+  const ALLOWED = new Set([
+    'src/services/attack-research.ts',
+    'src/api/ops-attack-research-routes.ts'
+  ]);
+
+  it('is named only by the two ops modules', () => {
+    const offenders = walk('src', ['.ts'])
+      .filter((file) => !ALLOWED.has(file))
+      .filter((file) => read(file).includes(TABLE_PREFIX));
+    expect(offenders, `${TABLE_PREFIX}* tables named outside the research modules`).toEqual([]);
+  });
+
+  it('is unknown to the browser bundle source', () => {
+    // The console renders memos, and it reads them from `/ops/attack-research`. A table name in the
+    // bundle would mean somebody had started shaping the browser around the schema, which is the step
+    // before a public page reads it.
+    expect(read('web/app.js')).not.toContain(TABLE_PREFIX);
+  });
+
+  it('is created by migration 035 and by no other migration', () => {
+    const creating = walk('migrations', ['.sql'])
+      .filter((file) => read(file).includes(`CREATE TABLE IF NOT EXISTS ${TABLE_PREFIX}`));
+    expect(creating).toEqual(['migrations/035_attack_research.sql']);
+  });
+
+  it('marks every stored row as a calculation by constraint, not by convention', () => {
+    const migration = read('migrations/035_attack_research.sql');
+    const checks = migration.match(/CHECK \(data_nature = 'calculated'\)/g) ?? [];
+    // Once on the memo, once on each per-class row. The request row carries no `data_nature`: it
+    // records that somebody asked, which is an event and not a calculation.
+    expect(checks.length).toBe(2);
+    // A memo about an unreported window is never high-confidence, and the word is not in the schema.
+    expect(migration).toContain(`CHECK (confidence IN ('low','medium'))`);
+  });
+
+  /**
+   * The four band phrases, in the migration and in the module, checked against each other.
+   *
+   * This is the pin that matters most in this block. The band enum IS the promise this surface makes
+   * — four sentences about the past, no probability among them — and it exists in two places that
+   * can drift: a CHECK constraint the database enforces, and a TypeScript array the verifier compares
+   * a model reply against. A phrase added to one and not the other would either be a band the
+   * verifier accepts and the database rejects (a memo that fails to save) or one the database accepts
+   * and the verifier has never heard of (a band nobody checks).
+   */
+  it('keeps the four band literals identical in the migration and in the module', () => {
+    const migration = read('migrations/035_attack_research.sql');
+    const service = read('src/services/attack-research.ts');
+    const literals = [
+      'спостерігається',
+      'типово для цього вікна',
+      'нетипово, але траплялося',
+      'у цьому вікні не фіксували'
+    ];
+    for (const literal of literals) {
+      expect(migration, `migration 035 is missing the band «${literal}»`).toContain(`'${literal}'`);
+      expect(service, `attack-research.ts is missing the band «${literal}»`).toContain(`'${literal}'`);
+    }
+    // And no fifth one: a band list that grew without this test being edited is the failure mode.
+    const banded = migration.slice(migration.indexOf('band text NOT NULL CHECK'));
+    const quoted = banded.slice(0, banded.indexOf(')')).match(/'[^']+'/g) ?? [];
+    expect(quoted.length, 'migration 035 declares a number of bands other than four').toBe(4);
+  });
+
+  /**
+   * A probability is the one output this surface exists to refuse, so the words that would carry one
+   * are searched for in the module that writes memos.
+   *
+   * Only the deterministic vocabulary is checked — a model reply is guarded at runtime by
+   * `verifyResearchMemo`, which this cannot stand in for — but the fallback text and the prompt are
+   * written in this file, and a percent-of-a-strike phrase appearing here would be a design change
+   * committed as a typo.
+   */
+  it('never words the memo as a likelihood of a strike', () => {
+    const service = read('src/services/attack-research.ts');
+    for (const forbidden of ['ймовірність удару', 'шанс удару', 'з ймовірністю']) {
+      expect(service, `attack-research.ts contains «${forbidden}»`).not.toContain(forbidden);
+    }
   });
 });
 

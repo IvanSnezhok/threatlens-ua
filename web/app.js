@@ -2833,6 +2833,194 @@ function opsVectorSection(payload) {
 }
 
 // ------------------------------------------------------------------------------------------------
+// Закритий контур: дослідження області
+// ------------------------------------------------------------------------------------------------
+//
+// Друга поверхня в цьому файлі, яка нічого не публікує. Меморандум відповідає на питання «що взагалі
+// можливе цієї ночі по області» — і відповідає на нього ЛИШЕ минулим: замість імовірності кожен клас
+// дістає одну з чотирьох закритих фраз, які говорять про архів, а не про майбутнє. Рамка зверху не
+// згортається саме тому: згорнута рамка — це рамка, якої на екрані немає.
+const researchBandTone = {
+  'спостерігається': 'confirmed',
+  'типово для цього вікна': 'monitoring',
+  'нетипово, але траплялося': 'unverified',
+  'у цьому вікні не фіксували': 'unverified'
+};
+
+const researchOriginNames = { deterministic: 'детермінований текст', model: 'текст моделі' };
+const researchVerificationNames = {
+  passed: 'звірку пройдено', rejected: 'звірку не пройдено', skipped: 'звірка не застосовна'
+};
+const researchStatusNames = {
+  completed: 'меморандум складено',
+  refused_disabled: 'відмова: перемикач вимкнено',
+  refused_cooldown: 'відмова: пауза між запитами',
+  refused_daily_cap: 'відмова: денний ліміт',
+  failed: 'помилка розрахунку'
+};
+
+function researchMemoHtml(payload) {
+  if (!payload) return '';
+  const memo = payload.memo ?? {};
+  const bands = (payload.bands ?? []).map((entry) =>
+    `<li><span class="evidence ${researchBandTone[entry.band] ?? 'unverified'}">${escapeHtml(entry.band)}</span> ${escapeHtml(entry.label)}</li>`).join('');
+  const classes = (memo.classes ?? []).map((entry) =>
+    `<li>${escapeHtml(entry.rationale)}</li>`).join('');
+  const indicators = (memo.watchIndicators ?? []).map((entry) => `<code>${escapeHtml(entry)}</code>`).join(' ');
+  const caveats = (memo.caveats ?? []).map((entry) => `<li>${escapeHtml(entry)}</li>`).join('');
+  // Походження і звірка — один рядок, бо разом вони й читаються: «текст моделі, звірку пройдено» і
+  // «детермінований текст, звірка не застосовна» — це два різні документи, а не два значки.
+  const provenance = [
+    researchOriginNames[payload.memoOrigin] ?? payload.memoOrigin,
+    researchVerificationNames[payload.verification] ?? payload.verification,
+    payload.modelVersion ? `модель ${payload.modelVersion}` : null,
+    `впевненість ${payload.confidence}`,
+    `методологія ${payload.methodologyVersion}`
+  ].filter(Boolean).map((part) => escapeHtml(String(part))).join(' · ');
+  return `<div class="safety-note"><strong>${escapeHtml(String(payload.dataNature ?? 'calculated')).toUpperCase()} — дослідження, не прогноз</strong>
+      <p>${escapeHtml(payload.framing ?? '')}</p>
+      <p>${escapeHtml(payload.notice ?? '')}</p></div>
+    <p class="legend-note">${escapeHtml(payload.oblast?.name ?? '')} · ${escapeHtml(payload.windowLabel ?? '')} · ${provenance}</p>
+    ${payload.rejectionReason ? `<p class="ai-run-error">Текст моделі відхилено: ${escapeHtml(payload.rejectionReason)}. Показано детермінований.</p>` : ''}
+    <p>${escapeHtml(memo.summary ?? '').split('\n').map((line) => escapeHtml(line)).join('<br>')}</p>
+    ${bands ? `<h3>Класи в цій смузі</h3><ul class="research-bands">${bands}</ul>` : ''}
+    ${classes ? `<h3>Що каже архів</h3><ul>${classes}</ul>` : '<p class="legend-note">Архів не має жодного класу в цій смузі.</p>'}
+    ${indicators ? `<h3>Індикатори</h3><p>${indicators}</p>` : ''}
+    ${caveats ? `<h3>Застереження</h3><ul>${caveats}</ul>` : ''}
+    ${payload.aiRunId ? `<p class="legend-note"><a href="/ops#ai-runs-section" data-research-run="${escapeHtml(payload.aiRunId)}">Журнал звернення до моделі ↗</a></p>` : ''}`;
+}
+
+function researchHistoryHtml(recent) {
+  if (!recent?.length) {
+    return '<p class="legend-note">Жодного запиту. Відмови тут теж будуть видні — саме заради них ця історія й ведеться.</p>';
+  }
+  return `<div class="ops-channel-list">${recent.map((entry) => {
+    const refused = entry.status !== 'completed';
+    const technical = [
+      new Date(entry.requestedAt).toLocaleString('uk-UA'),
+      entry.memoOrigin ? researchOriginNames[entry.memoOrigin] ?? entry.memoOrigin : null,
+      entry.verification ? researchVerificationNames[entry.verification] ?? entry.verification : null,
+      entry.rejectionReason
+    ].filter(Boolean).map((part) => escapeHtml(String(part))).join(' · ');
+    return `<article>
+      <div><span>${escapeHtml(researchStatusNames[entry.status] ?? entry.status)}</span>
+        <h3>${escapeHtml(entry.oblastName)}</h3>
+        <p>${technical}</p>
+        ${entry.refusalDetail ? `<p class="ai-run-error">${escapeHtml(entry.refusalDetail)}</p>` : ''}</div>
+      <div class="ops-channel-actions">
+        <span class="evidence ${refused ? 'unverified' : 'confirmed'}">${escapeHtml(entry.window)}</span>
+        ${entry.memoId ? `<button data-research-open="${escapeHtml(entry.memoId)}">Відкрити</button>` : ''}
+      </div>
+    </article>`;
+  }).join('')}</div>`;
+}
+
+function opsResearchSection(payload) {
+  if (!payload) {
+    return `<section class="ops-section" id="research-section"><header class="ops-section-head"><div><p>Тільки для оператора</p><h2>Дослідження області</h2></div></header>
+      <p class="legend-note">Поверхня досліджень недоступна.</p></section>`;
+  }
+  const oblasts = (payload.oblasts ?? []).map((oblast) =>
+    `<option value="${escapeHtml(oblast.id)}">${escapeHtml(oblast.name)}</option>`).join('');
+  const windows = (payload.windows ?? []).map((window) =>
+    `<option value="${escapeHtml(window.id)}">${escapeHtml(window.label)}</option>`).join('');
+  const caps = payload.caps ?? {};
+  const enabled = payload.feature?.enabled === true;
+  return `<section class="ops-section" id="research-section"
+      data-research-cooldown="${Number(caps.cooldownSeconds ?? 0)}">
+    <header class="ops-section-head">
+      <div><p>Тільки для оператора · ${escapeHtml(String(payload.methodologyVersion ?? ''))}</p>
+        <h2>Дослідження області</h2></div>
+    </header>
+    <div class="safety-note">
+      <strong>Це не прогноз</strong>
+      <p>${escapeHtml(payload.framing ?? '')}</p>
+      <p>${escapeHtml(payload.notice ?? '')}</p>
+    </div>
+    ${enabled ? '' : '<p class="legend-note">Перемикач «Дослідження області» вимкнено в налаштуваннях Codex. Кнопка нижче поверне відмову і запише її в історію — це нормальний стан, а не поломка.</p>'}
+    <div class="trust-controls">
+      <label class="trust-filter">Область<select data-research-oblast>${oblasts}</select></label>
+      <label class="trust-order">Вікно<select data-research-window>${windows}</select></label>
+      <button data-research-run-button>Дослідити</button>
+      <output class="trust-count" data-research-caps>${Number(caps.usedToday ?? 0)} з ${Number(caps.perDay ?? 0)} на сьогодні</output>
+    </div>
+    <div class="ops-projection" data-research-output></div>
+    <h3>Останні запити</h3>
+    ${researchHistoryHtml(payload.recent)}
+  </section>`;
+}
+
+/**
+ * Кнопка, зворотний відлік і одна відповідь на дві різні відмови.
+ *
+ * 409 — це вимкнений перемикач, і чекати тут нема чого; 429 — це пауза або денний ліміт, і лише
+ * перше з них має скільки-секунд. Тому відлік запускається тільки тоді, коли сервер справді назвав
+ * число: таймер під станом, який час не змінює, — це обіцянка, якої інтерфейс не виконає.
+ */
+function wireResearchSection(root, reload) {
+  const section = $('#research-section', root);
+  if (!section) return;
+  const button = $('[data-research-run-button]', section);
+  const output = $('[data-research-output]', section);
+  if (!button || !output) return;
+  let countdown = null;
+
+  const stopCountdown = () => { if (countdown) { clearInterval(countdown); countdown = null; } };
+  const startCountdown = (seconds) => {
+    stopCountdown();
+    let left = Math.max(0, Math.ceil(seconds));
+    const label = () => {
+      button.disabled = left > 0;
+      button.textContent = left > 0 ? `Дослідити (${left} с)` : 'Дослідити';
+      if (left <= 0) stopCountdown();
+      left -= 1;
+    };
+    label();
+    countdown = setInterval(label, 1000);
+  };
+
+  section.addEventListener('click', async (event) => {
+    const open = event.target.closest('[data-research-open]');
+    if (open) {
+      output.innerHTML = '<p class="legend-note">Завантажуємо меморандум…</p>';
+      const stored = await opsFetch(`/ops/attack-research/${encodeURIComponent(open.dataset.researchOpen)}`)
+        .then((result) => result.ok ? result.json() : null).catch(() => null);
+      output.innerHTML = stored
+        ? researchMemoHtml(stored)
+        : '<p class="legend-note">Меморандум не знайдено — можливо, його вже видалено за строком зберігання.</p>';
+    }
+  });
+
+  button.addEventListener('click', async () => {
+    const oblastId = $('[data-research-oblast]', section)?.value;
+    const window_ = $('[data-research-window]', section)?.value;
+    if (!oblastId || !window_) return;
+    button.disabled = true;
+    output.innerHTML = '<p class="legend-note">Читаємо архів…</p>';
+    const result = await opsFetch('/ops/attack-research', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ oblastId, window: window_ })
+    });
+    const payload = await result.json().catch(() => null);
+    button.disabled = false;
+    if (result.ok) {
+      output.innerHTML = researchMemoHtml(payload);
+      // Перемальовуємо секцію тільки заради історії й лічильника: сам меморандум уже на екрані, і
+      // втратити його через оновлення сусіднього блока було б найдурнішою можливою поведінкою.
+      const cooldown = Number(section.dataset.researchCooldown ?? 0);
+      if (cooldown > 0) startCountdown(cooldown);
+      return;
+    }
+    const detail = escapeHtml(payload?.detail ?? 'причину не названо');
+    output.innerHTML = `<p class="legend-note">Відмова: ${detail}</p>`;
+    if (result.status === 429 && payload?.retryAfterSeconds) startCountdown(payload.retryAfterSeconds);
+    if (result.status === 409 && typeof reload === 'function') {
+      output.innerHTML += '<p class="legend-note">Увімкнути можна в блоці «Codex-аналітика» вище, перемикачем «Дослідження області».</p>';
+    }
+  });
+}
+
+// ------------------------------------------------------------------------------------------------
 // Журнал моделі: що саме її просили і що вона відповіла
 // ------------------------------------------------------------------------------------------------
 //
@@ -4583,8 +4771,11 @@ async function renderOps() {
   // Стан входу приходить у складі налаштувань, а не окремим запитом: перемикач «увімкнено» поруч
   // із мертвою сесією — найзаплутаніший стан цієї функції, і показати їх із двох різних моментів
   // означало б зробити його ще заплутанішим.
-  const [vectorOps, codexSettings, aiRuns, shadow, sourceTrust, runtime, deploy, backfill, coverage] = await Promise.all([
+  const [vectorOps, research, codexSettings, aiRuns, shadow, sourceTrust, runtime, deploy, backfill, coverage] = await Promise.all([
     opsFetch('/ops/vectors').then((result) => result.ok ? result.json() : null).catch(() => null),
+    // Тільки перелік і ліміти. Жодного меморандуму тут не рахується: він зʼявляється лише після
+    // натискання, і саме тому відкриття консолі нічого не витрачає.
+    opsFetch('/ops/attack-research').then((result) => result.ok ? result.json() : null).catch(() => null),
     opsFetch('/ops/codex/settings').then((result) => result.ok ? result.json() : null).catch(() => null),
     opsFetch(aiRunsUrl()).then((result) => result.ok ? result.json() : null).catch(() => null),
     opsFetch('/ops/shadow-classifier?hours=24').then((result) => result.ok ? result.json() : null).catch(() => null),
@@ -4647,6 +4838,7 @@ async function renderOps() {
       ${opsAiRunsSection(aiRuns, codex, codexSettings?.settings ?? null)}
     </div>
     ${opsVectorSection(vectorOps)}
+    ${opsResearchSection(research)}
     <details class="ops-raw"><summary>Технічний стан і журнали</summary><pre class="ops-json">${escapeHtml(JSON.stringify({ sources: data.sources, outbox: data.outbox, aiRuns: data.aiRuns, database: data.database }, null, 2))}</pre></details>
     </div>
     </div>`;
@@ -4660,6 +4852,7 @@ async function renderOps() {
   wireAiRunsSection(root, codex, codexSettings?.settings ?? null);
   wireSourceTrustSection(root);
   wireCoverageSection(root);
+  wireResearchSection(root, () => renderOps());
   root.querySelectorAll('[data-project-vector]').forEach((button) => button.addEventListener('click', async () => {
     const output = $(`#projection-${button.dataset.projectVector}`, root);
     output.textContent = 'Рахуємо…';

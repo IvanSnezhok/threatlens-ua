@@ -518,12 +518,100 @@ coordinate at both ends (hromadas, and raions missing from the ADM2 file); `no_e
 message stated both ends, which gives a heading but no speed; `implausible_speed` means two reports
 landed close enough together that the ratio is an artefact.
 
+## Oblast research (operator only)
+
+The question this answers is «що взагалі можливе цієї ночі по Полтавщині», and the shape of the
+answer is the whole design: **there is no probability in it**. Every threat class in a memo carries
+one of four closed phrases instead, each of them a statement about the past or the present —
+`спостерігається`, `типово для цього вікна`, `нетипово, але траплялося`,
+`у цьому вікні не фіксували` — computed in SQL from counts and pinned as a CHECK constraint in
+`migrations/035_attack_research.sql`.
+
+Like the extrapolation above it, this lives behind the same Basic auth, in its own `ops_`-prefixed
+tables, and **must not be quoted publicly, forwarded to a channel or pasted into a message to the
+public**. It is `calculated` by constraint: it reasons about a band of hours nobody has reported on
+yet. Unlike the extrapolation, it is never produced by a timer, a leg or a scheduler — a memo exists
+because an operator pressed a button.
+
+```bash
+# What may be asked, today's allowance, the framing sentence, and the last twenty requests
+# INCLUDING the refusals.
+curl -fsS -u "$OPS_USER:$OPS_PASSWORD" http://localhost:3000/ops/attack-research
+
+# One memo. window is night | day | next12h.
+curl -fsS -u "$OPS_USER:$OPS_PASSWORD" -X POST -H 'Content-Type: application/json' \
+  -d '{"oblastId":"ua-53","window":"night"}' http://localhost:3000/ops/attack-research
+
+# One memo again, with the whole evidence pack it was written from.
+curl -fsS -u "$OPS_USER:$OPS_PASSWORD" http://localhost:3000/ops/attack-research/<memo-id>
+```
+
+The same panel is rendered inside `/ops` in the browser, directly under the extrapolation. Reading
+it:
+
+- **The window is a band of HOURS in the archive, not an interval in which something will happen.**
+  `night` reads 22:00–06:00 Kyiv across the last thirty days; `day` reads 06:00–22:00; `next12h` maps
+  the coming twelve hours onto the twelve Kyiv hours they fall in. Naming the window after the coming
+  night is a convenience for the reader and is the only thing about the future in the whole surface.
+- **`memoOrigin` and `verification` are read together.** `deterministic` + `skipped` means no model
+  was ever asked (no session, no model selected, or the switch is off). `model` + `passed` means a
+  model wrote the prose and the verifier accepted it. `deterministic` + `rejected` means a model
+  wrote something and was turned down — `rejectionReason` names which of the five rules it broke:
+  an invented number, an unknown threat class, a band moved by one rung, an indicator that is not
+  verbatim from the pack, or a forecast lexeme.
+- **The deterministic memo deliberately contains no band word.** The bands are still written to
+  `ops_attack_research_classes` for the audit; the fallback prose states the counts and lets the
+  reader draw the line, so two memos side by side can be told apart by reading them.
+- **A refusal is the governance working, not a fault.** `409 refused_disabled` is the Codex switch
+  and no amount of waiting changes it. `429 refused_cooldown` carries `retryAfterSeconds` and is per
+  (oblast, window). `429 refused_daily_cap` carries no countdown, because there is nothing to wait
+  for until tomorrow.
+- **Both bounds are counted from the request table, so a restart does not reset them** — and they
+  deliberately count different things. `ATTACK_RESEARCH_MAX_PER_DAY` (default 20) counts EVERY press
+  including refused ones; `ATTACK_RESEARCH_COOLDOWN_SECONDS` (default 120) counts only requests that
+  actually produced a memo, so pressing the button while the switch was off does not make you wait
+  for a computation that never ran.
+
+```bash
+# Outcomes, refusals included. The refusal series are the ones worth watching.
+curl -fsS -H "Authorization: Bearer $METRICS_TOKEN" localhost:3000/metrics |
+  grep threatlens_attack_research_runs_total
+```
+
+Rows are pruned after 90 days; the memos and their per-class rows go with the request row they hang
+off.
+
 ## Codex analytics (operator only)
 
 The whole lifecycle lives in one `/ops` group — «Codex-аналітика»: session status, the sign-in
-button, the model dropdown, the four surface switches (narrative, digest, attacks, shadow
-classification) and the `ai_runs` audit viewer. Nothing about it requires editing `.env` or
-restarting, except `CODEX_BASE_URL` itself.
+button, the model dropdown, the seven surface switches and the `ai_runs` audit viewer. Nothing about
+it requires editing `.env` or restarting, except `CODEX_BASE_URL` itself.
+
+The seven, in the order the console shows them and in ascending order of how much authority they
+grant:
+
+| switch | what it buys | where the text lands |
+| --- | --- | --- |
+| `narrative` | prose over the analytics aggregates | public analytics |
+| `digest` | prose in the nightly digest | Telegram |
+| `attacks` | **«Формулювання екстраполяції вектора»** | operator only |
+| `shadow` | nothing anybody reads — a comparison table | `/ops` |
+| `retrospective_gate` | a verdict, not text | the pipeline |
+| `tactics` | commentary under the public tactical block | public attacks page |
+| `attack_research` | the oblast research memo | operator only |
+
+`attacks` is the one whose name has outlived its meaning, and the console label now says so. It has
+**never** gated the public attacks page: its single reader is `refineWithCodex()` in
+`src/services/vector-projection.ts`, which rewords the note on an operator-only vector extrapolation.
+An operator who switched it off believing they had silenced a public page would have silenced only a
+paragraph they are the only person who can see. The public tactical block has its own switch,
+`tactics`, and that switch gates only the commentary — the detections underneath it are computed in
+SQL and published either way. `migrations/033_tactics_and_research_switches.sql` carries the same
+sentence as a column comment for anybody who arrives through `psql`.
+
+`retrospective_gate` remains the only switch in the list with authority over the pipeline: every
+other one buys *text*, and turning it off removes a paragraph while the numbers underneath stay the
+same.
 
 ```bash
 # Session: is there one, whose is it, when does it die. Never returns a token.
@@ -534,7 +622,7 @@ curl -fsS -u "$OPS_USER:$OPS_PASSWORD" http://localhost:3000/ops/codex/settings
 
 # Pick a model and switch surfaces. Any subset of fields; omitted ones keep their value.
 curl -fsS -u "$OPS_USER:$OPS_PASSWORD" -X PUT -H 'Content-Type: application/json' \
-  -d '{"model":"gpt-5.6-luna","features":{"narrative":true,"digest":true,"attacks":true,"shadow":true}}' \
+  -d '{"model":"gpt-5.6-luna","features":{"narrative":true,"digest":true,"attacks":true,"shadow":true,"tactics":false,"attack_research":false}}' \
   http://localhost:3000/ops/codex/settings
 
 # The audit log: every call, including the ones that never left the process.
