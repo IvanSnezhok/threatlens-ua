@@ -2,7 +2,7 @@ import { config } from '../config.js';
 import { pool } from '../db/pool.js';
 
 /**
- * What the operator chose in `/ops`: one model, four switches.
+ * What the operator chose in `/ops`: one model, seven switches.
  *
  * ================================================================================================
  * Why this is separate from `codex-auth.ts`
@@ -41,8 +41,23 @@ import { pool } from '../db/pool.js';
  * default, it is bounded by a per-minute budget and a hard timeout, and every one of its failure
  * modes resolves to the deterministic verdict. An operator reading this list from the top is
  * reading it in order of how much authority they are granting.
+ *
+ * `tactics` and `attack_research` joined them in migration 033 and are placed after the gate rather
+ * than beside their neighbours, because the ordering claim above is about authority and neither of
+ * them has any: both buy text over numbers that were computed without a model. What separates them
+ * from each other is the audience. `tactics` is the first switch whose text lands on a PUBLIC page
+ * directly — the tactical block on `/attacks`, whose detections are published either way and whose
+ * commentary is rejected wholesale if it invents a digit, a threat class, an oblast or a forecast.
+ * `attack_research` is the opposite extreme: an operator-only memo, never scheduled, produced only
+ * when somebody presses a button, and never quotable outside the console.
+ *
+ * Note what `attacks` is NOT, since its name has outlived its meaning: it gates `refineWithCodex()`
+ * in `vector-projection.ts` and nothing else, which is the operator-only extrapolation note. It has
+ * never gated the public attacks page — `tactics` does, and only the commentary on it.
  */
-export const CODEX_FEATURES = ['narrative', 'digest', 'attacks', 'shadow', 'retrospective_gate'] as const;
+export const CODEX_FEATURES = [
+  'narrative', 'digest', 'attacks', 'shadow', 'retrospective_gate', 'tactics', 'attack_research'
+] as const;
 export type CodexFeature = (typeof CODEX_FEATURES)[number];
 
 export type CodexFeatureFlags = Record<CodexFeature, boolean>;
@@ -77,13 +92,16 @@ interface SettingsRow {
   attacks_enabled: boolean;
   shadow_enabled: boolean;
   retrospective_gate_enabled: boolean;
+  tactics_enabled: boolean;
+  attack_research_enabled: boolean;
   updated_at: Date;
 }
 
 const DEFAULTS: CodexSettings = {
   model: null,
   features: {
-    narrative: false, digest: false, attacks: false, shadow: false, retrospective_gate: false
+    narrative: false, digest: false, attacks: false, shadow: false, retrospective_gate: false,
+    tactics: false, attack_research: false
   },
   updatedAt: null
 };
@@ -96,7 +114,9 @@ function fromRow(row: SettingsRow): CodexSettings {
       digest: row.digest_enabled,
       attacks: row.attacks_enabled,
       shadow: row.shadow_enabled,
-      retrospective_gate: row.retrospective_gate_enabled
+      retrospective_gate: row.retrospective_gate_enabled,
+      tactics: row.tactics_enabled,
+      attack_research: row.attack_research_enabled
     },
     updatedAt: row.updated_at.toISOString()
   };
@@ -159,7 +179,9 @@ export function applySettingsPatch(current: CodexSettings, patch: CodexSettingsP
       digest: patch.features?.digest ?? current.features.digest,
       attacks: patch.features?.attacks ?? current.features.attacks,
       shadow: patch.features?.shadow ?? current.features.shadow,
-      retrospective_gate: patch.features?.retrospective_gate ?? current.features.retrospective_gate
+      retrospective_gate: patch.features?.retrospective_gate ?? current.features.retrospective_gate,
+      tactics: patch.features?.tactics ?? current.features.tactics,
+      attack_research: patch.features?.attack_research ?? current.features.attack_research
     },
     updatedAt: current.updatedAt
   };
@@ -168,7 +190,7 @@ export function applySettingsPatch(current: CodexSettings, patch: CodexSettingsP
 export async function readCodexSettings(): Promise<CodexSettings> {
   const result = await pool.query<SettingsRow>(
     `SELECT model,narrative_enabled,digest_enabled,attacks_enabled,shadow_enabled,
-            retrospective_gate_enabled,updated_at
+            retrospective_gate_enabled,tactics_enabled,attack_research_enabled,updated_at
        FROM codex_settings WHERE singleton`
   );
   const row = result.rows[0];
@@ -185,17 +207,21 @@ export async function saveCodexSettings(patch: CodexSettingsPatch): Promise<Code
   const next = applySettingsPatch(await readCodexSettings(), patch);
   const result = await pool.query<SettingsRow>(
     `INSERT INTO codex_settings(singleton,model,narrative_enabled,digest_enabled,attacks_enabled,
-                                shadow_enabled,retrospective_gate_enabled,updated_at)
-     VALUES (true,$1,$2,$3,$4,$5,$6,now())
+                                shadow_enabled,retrospective_gate_enabled,tactics_enabled,
+                                attack_research_enabled,updated_at)
+     VALUES (true,$1,$2,$3,$4,$5,$6,$7,$8,now())
      ON CONFLICT (singleton) DO UPDATE SET
        model=EXCLUDED.model, narrative_enabled=EXCLUDED.narrative_enabled,
        digest_enabled=EXCLUDED.digest_enabled, attacks_enabled=EXCLUDED.attacks_enabled,
        shadow_enabled=EXCLUDED.shadow_enabled,
-       retrospective_gate_enabled=EXCLUDED.retrospective_gate_enabled, updated_at=now()
+       retrospective_gate_enabled=EXCLUDED.retrospective_gate_enabled,
+       tactics_enabled=EXCLUDED.tactics_enabled,
+       attack_research_enabled=EXCLUDED.attack_research_enabled, updated_at=now()
      RETURNING model,narrative_enabled,digest_enabled,attacks_enabled,shadow_enabled,
-               retrospective_gate_enabled,updated_at`,
+               retrospective_gate_enabled,tactics_enabled,attack_research_enabled,updated_at`,
     [next.model, next.features.narrative, next.features.digest, next.features.attacks,
-      next.features.shadow, next.features.retrospective_gate]
+      next.features.shadow, next.features.retrospective_gate, next.features.tactics,
+      next.features.attack_research]
   );
   return fromRow(result.rows[0]!);
 }

@@ -84,7 +84,8 @@ export interface CodexChatRequest {
    * an operator goes looking for. Making the field required means every construction site moves in
    * the same commit or the build does not pass.
    */
-  surface: 'narrative' | 'digest' | 'attacks' | 'shadow' | 'risk' | 'retrospective_gate';
+  surface: 'narrative' | 'digest' | 'attacks' | 'shadow' | 'risk' | 'retrospective_gate'
+    | 'tactics' | 'attack_research';
   /** Recorded as `ai_runs.classifier_version` when the caller knows which rules produced its input. */
   classifierVersion?: string;
   system: string;

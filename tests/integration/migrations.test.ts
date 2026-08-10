@@ -33,7 +33,8 @@ const MIGRATION_FILES = [
   '029_disabled_channel_reaudit.sql',
   '030_app_settings.sql',
   '031_homonym_settlement_gaps.sql',
-  '032_silent_drop_and_audited_homonyms.sql'
+  '032_silent_drop_and_audited_homonyms.sql',
+  '033_tactics_and_research_switches.sql'
 ];
 
 /**
@@ -205,6 +206,21 @@ describe.skipIf(!integrationDatabaseAvailable)('migration runner against live Po
     // other settlement that happens to sit in the same oblast.
     expect(SEEDED_SETTLEMENT_OBLASTS.map(([code]) => byCode.get(code)?.name_uk))
       .toEqual(SEEDED_SETTLEMENT_OBLASTS.map(([, name]) => name));
+  });
+
+  it('gives the codex switch row every switch, all of them off', async () => {
+    // The singleton is seeded by migration 018 and every later migration widens it with ADD COLUMN.
+    // A column added without a DEFAULT — or with a default of true — would reach an existing
+    // installation as either a NULL an operator cannot read as "off" or a model that switched itself
+    // on during an upgrade. `tactics_enabled` (033) is the one that would be visible to the public
+    // if that happened, so the assertion is about the values, not merely about the columns existing.
+    const row = await sql<Record<string, boolean>>(
+      `SELECT narrative_enabled,digest_enabled,attacks_enabled,shadow_enabled,
+              retrospective_gate_enabled,tactics_enabled,attack_research_enabled
+         FROM codex_settings WHERE singleton`
+    );
+    expect(row.rowCount).toBe(1);
+    expect(Object.values(row.rows[0]!)).toEqual([false, false, false, false, false, false, false]);
   });
 
   it('registers the occupation snapshot table with its revision uniqueness guarantee', async () => {

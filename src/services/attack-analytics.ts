@@ -672,8 +672,16 @@ export function describeAttacks(input: DescribeInput): AttackPatterns {
 // SQL
 // ------------------------------------------------------------------------------------------------
 
-/** Decisions that mean "this message asserted a threat". Mirrors `analytics-archive.ts`. */
-const ASSERTING_DECISIONS = ['event_created', 'event_merged', 'redirect'];
+/**
+ * Decisions that mean "this message asserted a threat". Mirrors `analytics-archive.ts`.
+ *
+ * Exported because a second reader of the same archive arrived: anything that counts what the
+ * channels asserted over a window has to draw the same line between an assertion and a refusal, and
+ * a second literal list would be a second definition of "attack" that drifts silently. Whoever adds
+ * a decision word to `message_classifications.decision` changes the meaning of every number on the
+ * attacks page, and this is the one place that says so.
+ */
+export const ASSERTING_DECISIONS = ['event_created', 'event_merged', 'redirect'];
 
 /**
  * Rolls the places named inside the window up to their oblast.

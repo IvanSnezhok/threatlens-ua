@@ -17,7 +17,8 @@ import {
 const stored: CodexSettings = {
   model: null,
   features: {
-    narrative: false, digest: false, attacks: false, shadow: false, retrospective_gate: false
+    narrative: false, digest: false, attacks: false, shadow: false, retrospective_gate: false,
+    tactics: false, attack_research: false
   },
   updatedAt: '2026-08-08T00:00:00.000Z'
 };
@@ -70,13 +71,15 @@ describe('applying a patch', () => {
       ...stored,
       model: 'o5',
       features: {
-        narrative: true, digest: true, attacks: false, shadow: true, retrospective_gate: true
+        narrative: true, digest: true, attacks: false, shadow: true, retrospective_gate: true,
+        tactics: true, attack_research: false
       }
     };
     const next = applySettingsPatch(current, { features: { digest: false } });
     expect(next.model).toBe('o5');
     expect(next.features).toEqual({
-      narrative: true, digest: false, attacks: false, shadow: true, retrospective_gate: true
+      narrative: true, digest: false, attacks: false, shadow: true, retrospective_gate: true,
+      tactics: true, attack_research: false
     });
   });
 
@@ -93,15 +96,16 @@ describe('applying a patch', () => {
   it('switches a feature on without touching the others', () => {
     const next = applySettingsPatch(stored, { features: { attacks: true } });
     expect(next.features).toEqual({
-      narrative: false, digest: false, attacks: true, shadow: false, retrospective_gate: false
+      narrative: false, digest: false, attacks: true, shadow: false, retrospective_gate: false,
+      tactics: false, attack_research: false
     });
   });
 
   it('treats every switch the same way, however late it arrived', () => {
-    // `shadow` arrived in migration 020 and `retrospective_gate` in 025, and both are per-message
-    // call sites rather than per-page ones — which is precisely why they must go through the same
-    // patch path as the first three. A switch with its own code path is a switch that will one day
-    // be forgotten by a change made to the rest.
+    // `shadow` arrived in migration 020, `retrospective_gate` in 025, and `tactics` and
+    // `attack_research` in 033. None of them is a per-page call site like the first three — which is
+    // precisely why they must go through the same patch path. A switch with its own code path is a
+    // switch that will one day be forgotten by a change made to the rest.
     for (const feature of CODEX_FEATURES) {
       const next = applySettingsPatch(stored, { features: { [feature]: true } });
       expect(next.features[feature], feature).toBe(true);
@@ -116,6 +120,17 @@ describe('applying a patch', () => {
     // find it off — see `src/services/retrospective-gate.ts`.
     expect(stored.features.retrospective_gate).toBe(false);
     expect(applySettingsPatch(stored, { features: { narrative: true } }).features.retrospective_gate)
+      .toBe(false);
+  });
+
+  it('defaults the tactical commentary off, because it is the only switch that writes in public', () => {
+    // `tactics` (migration 033) is the first switch whose text lands on a public page directly
+    // rather than in the console or in Telegram. An installation that upgrades into that migration
+    // must not discover a model writing on its attacks page; the detections underneath are published
+    // either way.
+    expect(stored.features.tactics).toBe(false);
+    expect(stored.features.attack_research).toBe(false);
+    expect(applySettingsPatch(stored, { features: { attack_research: true } }).features.tactics)
       .toBe(false);
   });
 });

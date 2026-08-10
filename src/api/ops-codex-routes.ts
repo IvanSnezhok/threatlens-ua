@@ -17,7 +17,7 @@ function authorised(request: FastifyRequest): boolean {
  * returns a token. `GET` answers "is there a session, whose is it, and when does it die"; that is
  * what an operator needs to decide whether to press the button, and it is all a compromised ops
  * password would yield beyond what it already yields. `/ops/codex/settings` adds the other half —
- * which model, and for which of the three surfaces — and holds nothing secret at all.
+ * which model, and for which of the surfaces — and holds nothing secret at all.
  *
  * The OAuth callback itself is deliberately *not* a route on this server. It arrives on the
  * loopback listener that `beginCodexLogin` binds, because the redirect must be
@@ -106,7 +106,16 @@ const opsCodexRoutes: FastifyPluginAsync = async (app) => {
       // the same form for the same reason as `shadow` — the operator turning model use off in a
       // hurry must find every switch in one place — and its blast radius is documented beside it in
       // `src/services/retrospective-gate.ts`.
-      retrospective_gate: z.boolean()
+      retrospective_gate: z.boolean(),
+      // The commentary under the public tactical block (migration 033), off by default. The first
+      // switch on this form whose text reaches a public page directly: the detections themselves are
+      // computed in SQL and published whatever this says, and the prose above them is rejected whole
+      // if it names a number, a threat class or an oblast the detections do not, or if it slips into
+      // forecasting (`src/domain/forecast-guard.ts`).
+      tactics: z.boolean(),
+      // The operator-only oblast research memo (migration 033), off by default. Never scheduled and
+      // never published — it exists only while an operator is looking at it in this console.
+      attack_research: z.boolean()
     }).partial().optional()
   });
 
