@@ -1,4 +1,4 @@
-import type { FastifyPluginAsync, FastifyReply, FastifyRequest } from 'fastify';
+import type { FastifyPluginAsync, FastifyRequest } from 'fastify';
 import { z } from 'zod';
 import { config } from '../config.js';
 import { PUBLICATION_MODES } from '../types.js';
@@ -12,14 +12,10 @@ import {
   saveRuntimeSettings,
   validateRuntimeSettings
 } from '../services/runtime-settings.js';
-import { hasValidOpsAuth } from './ops-auth.js';
+import { hasValidOpsAuth, opsUnauthorized } from './ops-auth.js';
 
 function authorised(request: FastifyRequest): boolean {
   return hasValidOpsAuth(request.headers.authorization);
-}
-
-function unauthorized(reply: FastifyReply) {
-  return reply.header('WWW-Authenticate', 'Basic realm="ThreatLens Ops"').code(401).send({ error: 'unauthorized' });
 }
 
 /**
@@ -107,7 +103,7 @@ const opsRuntimeRoutes: FastifyPluginAsync = async (app) => {
    * is stored, not what a two-second cache remembers.
    */
   app.get('/ops/api/runtime', async (request, reply) => {
-    if (!authorised(request)) return unauthorized(reply);
+    if (!authorised(request)) return opsUnauthorized(request, reply);
     const [settings, audit, slice] = await Promise.all([
       readRuntimeSettings(), readRuntimeSettingsAudit(20), publicationSlice()
     ]);
@@ -115,7 +111,7 @@ const opsRuntimeRoutes: FastifyPluginAsync = async (app) => {
   });
 
   app.put('/ops/api/runtime', async (request, reply) => {
-    if (!authorised(request)) return unauthorized(reply);
+    if (!authorised(request)) return opsUnauthorized(request, reply);
     const parsed = runtimeSettingsBody.safeParse(request.body);
     if (!parsed.success) {
       return reply.code(400).send({

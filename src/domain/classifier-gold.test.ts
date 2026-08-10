@@ -44,6 +44,17 @@ import { classifyMessage, significanceRejection, type LocationLexeme } from './c
  * the message that names it is now `significant`. The header records both the move and the two
  * label corrections it turned up, so the fixture still says exactly where each number came from.
  *
+ * ## What is deliberately not in this file
+ *
+ * The corpus is a labelled sample of a specific archive snapshot: every entry carries a real
+ * `sourceMessageId` and the decision the archive actually recorded for it, and the header pins the
+ * window, the sample size and the distribution those entries produce. A synthetic message has
+ * neither an id nor an archived decision, so inventing an `archived` block for one would be putting
+ * fabricated history into the file whose only value is that its history is real. The two `v6`
+ * false-positive reproductions — «Кабмін ухвалив постанову про виплати для Харківщини» and «Кабінет
+ * Міністрів затвердив бюджет для Одещини» — are therefore pinned in `classifier.test.ts` instead,
+ * beside the verbatim archived message that reproduces the same defect with a real id.
+ *
  * ## `v5` changed no label in this file
  *
  * The retrospective veto is measured entirely against labels the reviewer wrote in 2026-08-08, when
@@ -197,6 +208,15 @@ describe('classifier against the hand-labelled gold corpus', () => {
   // Recall did not move, and must not have: the veto is only allowed to subtract from what `v4`
   // published, so a recall floor that rose here would be evidence of a bug rather than of an
   // improvement. The thirteen misses are unchanged and are still vocabulary the rules do not read.
+  //
+  // `v6` measures identically — P=100.0% / R=90.4% / F1=95.0% on significance, 100.0% threat-class
+  // accuracy over the same 123 messages, locations P=99.6% / R=93.1% — and no floor moves. That is
+  // the expected result rather than a disappointing one: the two `guided_air_bomb` entries in this
+  // corpus are «Пуск КАБ» and «🚀 КАБи на Запоріжжі», both real weapon forms that must keep their
+  // class, and the words `v6` stops matching («Кабмін», «кабельні», «декабре») are not in the
+  // sample at all. The corpus's job here is to prove the narrowing cost nothing; the false positive
+  // it closed is pinned in `classifier.test.ts`, which is where a message that is not in this
+  // snapshot belongs.
   //
   // See the module comment before changing one.
   // ----------------------------------------------------------------------------------------------

@@ -230,6 +230,10 @@ let deployPollTimer = null;
 // Останнє, що картка оновлення бачила. Потрібне рівно для одного стану: опит зірвався, і треба
 // вирішити, чи це «сервер лежить», чи «сервер саме перезапускається, бо оновлення триває».
 let lastDeployData = null;
+// Порядок і вікно відомості покриття. На рівні модуля, а не в DOM, бо секція перемальовується
+// цілком (кнопка «Оновити», зміна вікна), і вибір оператора не має права зникати разом із нею.
+let coverageSort = 'messages-desc';
+let coverageWindowDays = 7;
 let lastReceived = null;
 let refreshTimer = null;
 let backendStatus = 'current';
@@ -242,8 +246,19 @@ function escapeHtml(value = '') {
   return String(value).replace(/[&<>'"]/g, (char) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', "'": '&#39;', '"': '&quot;' })[char]);
 }
 
+// Єдиний шлях, яким консоль ходить у /ops/*. Обидва заголовки ставляться тут, і тільки тут.
+//
+// X-Requested-With — не автентифікація, а позначка «це запит застосунку, а не адресного рядка». За
+// нею сервер (див. opsUnauthorized у src/api/ops-auth.ts) вирішує, чи додавати до 401 заголовок
+// WWW-Authenticate. Без цієї позначки Chrome перехоплює 401 навіть на fetch(): показує власне сіре
+// вікно логіна, промис не повертається до renderOps(), і форма «Вхід оператора» ніколи не
+// малюється — прямий вхід на /ops лишався порожньою сторінкою за системним запитом пароля.
+//
+// Ставиться завжди, у тому числі на найпершому запиті без opsAuthorization: саме той 401 і був
+// причиною вікна.
 function opsFetch(url, options = {}) {
   const headers = new Headers(options.headers ?? {});
+  headers.set('X-Requested-With', 'XMLHttpRequest');
   if (opsAuthorization) headers.set('Authorization', opsAuthorization);
   return fetch(url, { ...options, headers });
 }
@@ -2569,8 +2584,8 @@ function opsVectorSection(payload) {
       <div class="ops-channel-actions"><button data-project-vector="${escapeHtml(event.id)}">Порахувати екстраполяцію</button></div>
       <div id="projection-${escapeHtml(event.id)}" class="ops-projection"></div>
     </article>`).join('') || '<p>Немає активних подій із ланцюгом повідомлень.</p>';
-  return `<section class="ops-section"><header class="ops-section-head"><div><p>Тільки для оператора</p><h2>Вектори загроз: екстраполяція</h2></div></header>
-    <div class="safety-note"><strong>Не для публікації</strong><p>${escapeHtml(payload.notice ?? '')}</p></div>
+  return `<section class="ops-section" id="vector-section"><header class="ops-section-head"><div><p>Тільки для оператора</p><h2>Вектори загроз: екстраполяція</h2></div></header>
+    <details class="safety-note ops-fold"><summary><strong>Не для публікації</strong></summary><p>${escapeHtml(payload.notice ?? '')}</p></details>
     <div class="ops-channel-list">${events}</div></section>`;
 }
 
@@ -2974,7 +2989,7 @@ function opsSourceTrustSection(data) {
       <div><dt>Період напіврозпаду</dt><dd>${trustCount(methodology.halfLifeDays)} днів</dd></div>
       <div><dt>Нейтральний старт до</dt><dd>${trustCount(methodology.minSampleSize)} подій</dd></div>
     </dl>
-    <div class="safety-note"><strong>Довіра не змінює рівень джерела</strong><p>${escapeHtml(methodology.notice ?? '')}</p></div>
+    <details class="safety-note ops-fold"><summary><strong>Довіра не змінює рівень джерела</strong></summary><p>${escapeHtml(methodology.notice ?? '')}</p></details>
     <div class="trust-controls">
       <label class="trust-filter">Фільтр за назвою
         <input type="search" data-trust-filter placeholder="назва або ідентифікатор" autocomplete="off" spellcheck="false">
@@ -3129,10 +3144,10 @@ function opsCodexSection(status, settings) {
       <button data-codex-refresh>Оновити стан</button>
     </div>
     <div id="codex-login-hint"></div>
-    <div class="safety-note">
-      <strong>Повернення можливе лише на localhost</strong>
+    <details class="safety-note ops-fold">
+      <summary><strong>Повернення можливе лише на localhost</strong></summary>
       <p>Клієнт Codex приймає єдину адресу повернення — <code>${escapeHtml(status.redirectUri)}</code>. Вхід завершиться тільки тоді, коли браузер і застосунок бачать один і той самий <code>localhost</code>: на вашій машині так, на віддаленому сервері за Caddy — ні. Крім того, вхід Codex призначено для клієнта Codex, а не для стороннього сервера, який працює цілодобово; ризик санкцій до облікового запису лишається на вас.</p>
-    </div>
+    </details>
   </section>`;
 }
 
@@ -3606,10 +3621,10 @@ function opsRuntimeSection(data) {
     <output id="analytics-recalculate-status"></output>
     <p class="legend-note">Модель і доступні аналітичні функції — у картці «Codex-аналітика» нижче.</p>
     <div class="ops-channel-list">${(data.audit ?? []).map(runtimeAuditRow).join('')}</div>
-    <div class="safety-note">
-      <strong>Затримка не стосується Telegram-сповіщень.</strong>
+    <details class="safety-note ops-fold">
+      <summary><strong>Затримка не стосується Telegram-сповіщень.</strong></summary>
       <p>${escapeHtml(data.notice ?? '')}</p>
-    </div>
+    </details>
   </section>`;
 }
 
@@ -3870,10 +3885,10 @@ function opsDeploySection(data) {
     <output id="deploy-status"></output>
     ${data.current ? deployStageStrip(data.current) : ''}
     <div class="ops-channel-list">${(data.history ?? []).map(deployRunRow).join('')}</div>
-    <div class="safety-note">
-      <strong>Оновлення незворотне</strong>
+    <details class="safety-note ops-fold">
+      <summary><strong>Оновлення незворотне</strong></summary>
       <p>Міграції не відкочуються: код їде вперед, схема — лише вперед. Повернення коду — ручна дія на хості (<code>git checkout &lt;commit&gt;</code> і повторна збірка), і вона не скасовує вже застосованих міграцій. Перезапускаються тільки <code>${escapeHtml((data.limits?.services ?? ['app', 'caddy']).join('</code>, <code>'))}</code>; <code>${escapeHtml((data.limits?.manualServices ?? ['postgres', 'backup', 'deployer']).join('</code>, <code>'))}</code> лишаються на місці й оновлюються руками.</p>
-    </div>
+    </details>
   </section>`;
 }
 
@@ -4047,6 +4062,199 @@ function opsBackfillSection(data) {
   </section>`;
 }
 
+// ------------------------------------------------------------------------------------------------
+// Покриття по областях
+// ------------------------------------------------------------------------------------------------
+//
+// Відомість, яка відповідає на питання «з яких областей до нас узагалі щось надходить». Двадцять
+// сім рядків — стільки ж, скільки областей; жоден не зникає через те, що в ньому нуль, бо саме
+// нуль і є знахідкою.
+//
+// Головне, що мусить бути видно з самої картки: покриття тут ВИВЕДЕНЕ зі спостереженої поведінки,
+// а не оголошене в схемі — таблиці «джерело обслуговує область» не існує (див. коментар у
+// src/api/ops-coverage-routes.ts). Тому текст застереження приходить із сервера разом із числами,
+// а не лежить у документації: число, походження якого невидиме, — це число, якому довіряють не з
+// тієї причини.
+//
+// Колір у цій таблиці підпорядковується тій самій домовленості, що й карта: червоне означає
+// офіційну тривогу, помаранчеве — загрозу, жовте — прогалину, яка вимагає дії («жодного активного
+// каналу»). Потік повідомлень кольору не має взагалі — його кодує довжина смуги, бо обсяг трафіку
+// не є небезпекою.
+
+const COVERAGE_COLUMNS = [
+  ['sources', 'Канали', 'Активних джерел, які за вікно спостереження поставили в область повідомлення або тримають у ній стан тривоги. Через дріб — вимкнені.'],
+  ['messages', 'Повідомлень / год', 'Класифікованих повідомлень за останню годину. Повідомлення, яке назвало кілька міст однієї області, рахується один раз.'],
+  ['alerts', 'Тривога', 'Активних періодів офіційної тривоги в області просто зараз.'],
+  ['threats', 'Загрози', 'Живих подій загроз, привʼязаних до області (останні 12 годин).']
+];
+const COVERAGE_WINDOWS = [1, 3, 7, 14, 30];
+
+function coverageRow(row, peak) {
+  const uncovered = row.sourcesEnabled === 0;
+  const national = row.kind === 'country';
+  // Смуга росте від правого краю, під самим числом: колонка вирівняна праворуч, і смуга, що
+  // росла б ліворуч, відірвалася б від величини, яку кодує.
+  const heat = peak > 0 ? Math.round((row.messagesLastHour / peak) * 100) : 0;
+  const seen = row.lastMessageAt
+    ? `остання згадка ${timeAgo(row.lastMessageAt)} · за вікно ${row.messagesWindow}`
+    : 'за вікно спостереження жодного повідомлення';
+  return `<tr class="coverage-row${uncovered ? ' is-uncovered' : ''}${national ? ' is-national' : ''}"
+      data-coverage-row data-name="${escapeHtml(row.name.toLowerCase())}"
+      data-sort-name="${escapeHtml(row.name)}"
+      data-sort-sources="${row.sourcesEnabled}" data-sort-messages="${row.messagesLastHour}"
+      data-sort-alerts="${row.activeAlerts}" data-sort-threats="${row.activeThreats}">
+    <th scope="row" class="coverage-name">
+      <span class="coverage-oblast">${escapeHtml(row.name)}</span>
+      <span class="coverage-id">${escapeHtml(row.locationId)}</span>
+    </th>
+    <td class="td-num coverage-sources" data-label="Канали">
+      <b>${row.sourcesEnabled}</b><span class="coverage-off" title="вимкнених джерел із покриттям">/${row.sourcesDisabled}</span>
+    </td>
+    <td class="td-num coverage-flow" data-label="Повідомлень / год" style="--heat:${heat}%" title="${escapeHtml(seen)}">${row.messagesLastHour}</td>
+    <td class="td-num coverage-alerts" data-label="Тривога">${row.activeAlerts ? `<b>${row.activeAlerts}</b>` : '<span class="coverage-nil">—</span>'}</td>
+    <td class="td-num coverage-threats" data-label="Загрози">${row.activeThreats ? `<b>${row.activeThreats}</b>` : '<span class="coverage-nil">—</span>'}</td>
+  </tr>`;
+}
+
+function opsCoverageSection(data) {
+  if (!data) {
+    return '<section class="ops-section" id="coverage-section"><header class="ops-section-head"><div><p>Області</p><h2>Покриття по областях</h2></div></header><p class="legend-note">Зведення по областях недоступне.</p></section>';
+  }
+  const rows = data.rows ?? [];
+  const totals = data.totals ?? {};
+  // Шкала смуги міряється лише областями. «Загальнодержавні» — не область, а решта scope, і його
+  // трафік регулярно найбільший: узяти його за сто відсотків означало б розчавити всі двадцять сім
+  // смуг заради рядка, який із ними не змагається. Смуги в нього немає й на рівні CSS.
+  const peak = rows.reduce((max, row) => row.kind === 'country'
+    ? max : Math.max(max, Number(row.messagesLastHour ?? 0)), 0);
+  const [sortKey, sortDirection] = coverageSort.split('-');
+  const head = COVERAGE_COLUMNS.map(([key, label, hint]) => `<th scope="col" class="th-num"
+      ${sortKey === key ? `aria-sort="${sortDirection === 'desc' ? 'descending' : 'ascending'}"` : 'aria-sort="none"'}>
+      <button type="button" data-coverage-sort="${key}" title="${escapeHtml(hint)}">${escapeHtml(label)}</button>
+    </th>`).join('');
+  const windowOptions = COVERAGE_WINDOWS
+    .map((days) => `<option value="${days}"${Number(data.windowDays) === days ? ' selected' : ''}>вікно ${days} дн.</option>`)
+    .join('');
+  return `<section class="ops-section" id="coverage-section">
+    <header class="ops-section-head">
+      <div><p>Області · ${escapeHtml(String(totals.regions ?? rows.length))} рядків</p><h2>Покриття по областях</h2></div>
+      <div class="ops-channel-actions">
+        <span class="codex-state${totals.uncovered ? ' is-warn' : ''}">${totals.uncovered ? `${totals.uncovered} без каналів` : 'усі області покрито'}</span>
+        <select data-coverage-window aria-label="Вікно спостереження">${windowOptions}</select>
+        <button type="button" data-coverage-refresh>Оновити</button>
+      </div>
+    </header>
+    <details class="safety-note ops-fold">
+      <summary><strong>Покриття виведене, а не оголошене</strong></summary>
+      <p>${escapeHtml(data.notice ?? '')}</p>
+    </details>
+    <div class="coverage-table-wrap">
+      <table class="coverage-table">
+        <thead><tr>
+          <th scope="col" class="th-name">
+            <button type="button" data-coverage-sort="name" title="За назвою області">Область</button>
+          </th>
+          ${head}
+        </tr></thead>
+        <tbody data-coverage-body>${rows.map((row) => coverageRow(row, peak)).join('')}</tbody>
+      </table>
+    </div>
+    <p class="legend-note">${escapeHtml(String(totals.messagesLastHour ?? 0))} ${pluralUk(Number(totals.messagesLastHour ?? 0), 'повідомлення', 'повідомлення', 'повідомлень')} за годину · ${escapeHtml(String(totals.activeAlerts ?? 0))} ${pluralUk(Number(totals.activeAlerts ?? 0), 'область під тривогою', 'області під тривогою', 'областей під тривогою')} · ${escapeHtml(String(totals.activeThreats ?? 0))} ${pluralUk(Number(totals.activeThreats ?? 0), 'жива загроза', 'живі загрози', 'живих загроз')} · зріз ${escapeHtml(deployMoment(data.generatedAt))}</p>
+  </section>`;
+}
+
+/**
+ * Порядок — по DOM, як у відомості довіри.
+ *
+ * Перемальовувати секцію заради сортування означало б заново тягнути запит, який рахує чотири
+ * агрегати по всій базі, щоб переставити двадцять сім рядків, які вже тут лежать.
+ */
+function applyCoverageView(section) {
+  const [key, direction] = coverageSort.split('-');
+  const body = $('[data-coverage-body]', section);
+  if (!body) return;
+  const attribute = `sort${key[0].toUpperCase()}${key.slice(1)}`;
+  const rows = [...body.querySelectorAll('[data-coverage-row]')];
+  rows.sort((left, right) => {
+    if (key === 'name') {
+      const compared = String(left.dataset.sortName ?? '').localeCompare(String(right.dataset.sortName ?? ''), 'uk');
+      return direction === 'desc' ? -compared : compared;
+    }
+    const a = Number(left.dataset[attribute] ?? 0);
+    const b = Number(right.dataset[attribute] ?? 0);
+    // Рівні числа не мають права переставлятися випадково: за однакового трафіку рядки лишаються
+    // в алфавітному порядку, інакше кожне сортування давало б іншу таблицю з тих самих даних.
+    if (a === b) return String(left.dataset.sortName ?? '').localeCompare(String(right.dataset.sortName ?? ''), 'uk');
+    return direction === 'desc' ? b - a : a - b;
+  });
+  rows.forEach((row) => body.append(row));
+  section.querySelectorAll('[data-coverage-sort]').forEach((button) => {
+    const active = button.dataset.coverageSort === key;
+    button.closest('th')?.setAttribute('aria-sort', active ? (direction === 'desc' ? 'descending' : 'ascending') : 'none');
+    button.classList.toggle('is-sorted', active);
+  });
+}
+
+function wireCoverageSection(root) {
+  const section = $('#coverage-section', root);
+  if (!section) return;
+  applyCoverageView(section);
+
+  const rerender = async () => {
+    const data = await opsFetch(`/ops/api/coverage?windowDays=${coverageWindowDays}`)
+      .then((result) => result.ok ? result.json() : null).catch(() => null);
+    const current = $('#coverage-section', root);
+    if (!current) return;
+    current.outerHTML = opsCoverageSection(data);
+    wireCoverageSection(root);
+  };
+
+  // Одна делегація на секцію: заголовків стільки, скільки колонок, і кожен із них — кнопка.
+  section.addEventListener('click', (event) => {
+    const button = event.target.closest('[data-coverage-sort]');
+    if (!button || !section.contains(button)) return;
+    const key = button.dataset.coverageSort;
+    const [currentKey, currentDirection] = coverageSort.split('-');
+    // Назва починається за зростанням, числа — за спаданням: «найбільше зверху» — це те, заради
+    // чого числову колонку взагалі натискають.
+    const next = key === currentKey
+      ? (currentDirection === 'desc' ? 'asc' : 'desc')
+      : (key === 'name' ? 'asc' : 'desc');
+    coverageSort = `${key}-${next}`;
+    applyCoverageView(section);
+  });
+
+  $('[data-coverage-window]', section)?.addEventListener('change', (event) => {
+    coverageWindowDays = Number(event.currentTarget.value) || 7;
+    void rerender();
+  });
+  $('[data-coverage-refresh]', section)?.addEventListener('click', () => void rerender());
+}
+
+// Смуга показників. Шість фішок в один рядок замість чотирьох карток заввишки в сто пікселів:
+// консоль починається з відповіді на «чи все живе», а не з чотирьох цифр кеглем 32.
+function opsKpiChip(label, value, tone = '', hint = '') {
+  return `<article class="ops-kpi${tone ? ` is-${tone}` : ''}"${hint ? ` title="${escapeHtml(hint)}"` : ''}>
+    <span>${escapeHtml(label)}</span><strong>${value}</strong>
+  </article>`;
+}
+
+function opsKpiStrip(data, runtime, deploy) {
+  const queued = data.outbox.reduce((sum, item) => sum + Number(item.count), 0);
+  const mode = runtime?.settings?.publicationMode;
+  const delaySeconds = runtime?.effective?.delaySeconds ?? 0;
+  const pill = deploy ? deployPill(deploy) : { label: 'невідомо', tone: 'off' };
+  const behind = Number(runtime?.effective?.behindSeconds ?? 0);
+  return `<div class="ops-kpis">
+    ${opsKpiChip('Джерела', data.sources.length, '', 'Джерел у каталозі')}
+    ${opsKpiChip('Черга', queued, queued ? 'warn' : '', 'Повідомлень в outbox')}
+    ${opsKpiChip('Канали', data.channels.filter((item) => item.active).length, '', 'Активних у каталозі рекомендованих')}
+    ${opsKpiChip('PostgreSQL', escapeHtml(data.database.size), '', 'Розмір бази')}
+    ${opsKpiChip('Розгортання', escapeHtml(pill.label), pill.tone === 'ok' ? '' : pill.tone, 'Стан оновлення з main')}
+    ${opsKpiChip('Показ', mode === 'delayed_15s' ? `+${delaySeconds} с` : 'наживо', mode === 'delayed_15s' ? 'warn' : '', behind ? `Відставання ${behind} с` : 'Режим публікації')}
+  </div>`;
+}
+
 async function renderOps() {
   clearInterval(codexPollTimer);
   clearInterval(deployPollTimer);
@@ -4071,7 +4279,7 @@ async function renderOps() {
   // Стан входу приходить у складі налаштувань, а не окремим запитом: перемикач «увімкнено» поруч
   // із мертвою сесією — найзаплутаніший стан цієї функції, і показати їх із двох різних моментів
   // означало б зробити його ще заплутанішим.
-  const [vectorOps, codexSettings, aiRuns, shadow, sourceTrust, runtime, deploy, backfill] = await Promise.all([
+  const [vectorOps, codexSettings, aiRuns, shadow, sourceTrust, runtime, deploy, backfill, coverage] = await Promise.all([
     opsFetch('/ops/vectors').then((result) => result.ok ? result.json() : null).catch(() => null),
     opsFetch('/ops/codex/settings').then((result) => result.ok ? result.json() : null).catch(() => null),
     opsFetch(aiRunsUrl()).then((result) => result.ok ? result.json() : null).catch(() => null),
@@ -4079,15 +4287,31 @@ async function renderOps() {
     opsFetch('/ops/api/source-trust').then((result) => result.ok ? result.json() : null).catch(() => null),
     opsFetch('/ops/api/runtime').then((result) => result.ok ? result.json() : null).catch(() => null),
     opsFetch('/ops/api/deploy').then((result) => result.ok ? result.json() : null).catch(() => null),
-    opsFetch('/ops/api/backfill').then((result) => result.ok ? result.json() : null).catch(() => null)
+    opsFetch('/ops/api/backfill').then((result) => result.ok ? result.json() : null).catch(() => null),
+    opsFetch(`/ops/api/coverage?windowDays=${coverageWindowDays}`).then((result) => result.ok ? result.json() : null).catch(() => null)
   ]);
   lastDeployData = deploy;
   const codex = codexSettings?.status ?? null;
-  const queued = data.outbox.reduce((sum, item) => sum + Number(item.count), 0);
-  root.innerHTML = `<div class="ops-metrics"><article><span>Джерела</span><strong>${data.sources.length}</strong></article><article><span>Черга</span><strong>${queued}</strong></article><article><span>Канали</span><strong>${data.channels.filter((item) => item.active).length}</strong></article><article><span>PostgreSQL</span><strong>${escapeHtml(data.database.size)}</strong></article></div>
+  // Консоль — єдина сторінка, яка НЕ підпорядковується мірі рядка: тут не читають, тут звіряють,
+  // і колонка завширшки 1240 px на моніторі 2560 px лишає мертвий правий берег. Клас несе і
+  // повну ширину, і всю щільність: за його межами жодне з правил нижче не діє.
+  root.classList.add('ops-console');
+  root.parentElement?.classList.add('ops-shell');
+  // Дві смуги змісту, а не дві колонки сітки: картки цієї консолі мають різну висоту, і рядкова
+  // сітка лишала б під кожною коротшою карткою дірку заввишки в її сусідку. Кожна смуга — власний
+  // потік, який пакується щільно. Ліворуч сигнал, праворуч обслуговування; на вузькому екрані
+  // `display: contents` розпускає обидві в один стовпчик, і жодне правило не дублюється.
+  root.innerHTML = `${opsKpiStrip(data, runtime, deploy)}
+    <div class="ops-grid">
+    <div class="ops-col ops-col--signal">
     ${opsRuntimeSection(runtime)}
+    ${opsCoverageSection(coverage)}
+    ${opsSourceTrustSection(sourceTrust)}
+    </div>
+    <div class="ops-col ops-col--service">
     ${opsDeploySection(deploy)}
-    <section class="ops-section"><header class="ops-section-head"><div><p>Каталог для користувачів</p><h2>Додати Telegram-канал</h2></div><button id="ops-logout">Вийти</button></header>
+    ${opsBackfillSection(backfill)}
+    <section class="ops-section" id="channels-section"><header class="ops-section-head"><div><p>Каталог для користувачів</p><h2>Додати Telegram-канал</h2></div><button id="ops-logout">Вийти</button></header>
       <form id="channel-form" class="channel-form">
         <label>Назва<input required name="title" maxlength="120" placeholder="Повітряні Сили ЗС України"></label>
         <label>Username<input required name="username" maxlength="40" placeholder="@channel_name"></label>
@@ -4100,8 +4324,8 @@ async function renderOps() {
       </form>
       <div class="ops-channel-list">${data.channels.map((channel) => `<article class="${channel.active ? '' : 'is-disabled'}"><div><span>${channel.verified ? '✓ перевірено' : escapeHtml(channel.category)}</span><h3>${escapeHtml(channel.title)}</h3><p>@${escapeHtml(channel.username)}${channel.location_name ? ` · ${escapeHtml(channel.location_name)}` : ''}</p></div><div class="ops-channel-actions"><a href="${escapeHtml(channel.url)}" target="_blank" rel="noreferrer">Відкрити ↗</a><button data-channel-toggle="verified" data-id="${channel.id}" data-value="${channel.verified}">${channel.verified ? 'Зняти перевірку' : 'Перевірити'}</button><button data-channel-toggle="active" data-id="${channel.id}" data-value="${channel.active}">${channel.active ? 'Приховати' : 'Активувати'}</button></div></article>`).join('')}</div>
     </section>
-    ${opsSourceTrustSection(sourceTrust)}
-    ${opsBackfillSection(backfill)}
+    </div>
+    <div class="ops-col ops-col--full">
     <div class="ops-group" id="codex-group">
       <header class="ops-group-head"><p>Модель в аналітиці</p><h2>Codex-аналітика</h2>
         <p>Вхід, вибір моделі, чотири перемикачі, звірка з правилами й журнал усіх звернень — усе, що визначає, коли систему пише машина, і що саме вона написала.</p></header>
@@ -4111,7 +4335,9 @@ async function renderOps() {
       ${opsAiRunsSection(aiRuns, codex, codexSettings?.settings ?? null)}
     </div>
     ${opsVectorSection(vectorOps)}
-    <details class="ops-raw"><summary>Технічний стан і журнали</summary><pre class="ops-json">${escapeHtml(JSON.stringify({ sources: data.sources, outbox: data.outbox, aiRuns: data.aiRuns, database: data.database }, null, 2))}</pre></details>`;
+    <details class="ops-raw"><summary>Технічний стан і журнали</summary><pre class="ops-json">${escapeHtml(JSON.stringify({ sources: data.sources, outbox: data.outbox, aiRuns: data.aiRuns, database: data.database }, null, 2))}</pre></details>
+    </div>
+    </div>`;
   wireRuntimeSection(root, () => renderOps());
   // Картка оновлення перемальовує ЛИШЕ себе і має власний таймер: повний renderOps() кожні три
   // секунди скидав би напівзаповнену форму каналу й напівнабраний пароль сусідніх карток.
@@ -4121,6 +4347,7 @@ async function renderOps() {
   wireShadowSection(root, codexSettings?.settings ?? null);
   wireAiRunsSection(root, codex, codexSettings?.settings ?? null);
   wireSourceTrustSection(root);
+  wireCoverageSection(root);
   root.querySelectorAll('[data-project-vector]').forEach((button) => button.addEventListener('click', async () => {
     const output = $(`#projection-${button.dataset.projectVector}`, root);
     output.textContent = 'Рахуємо…';

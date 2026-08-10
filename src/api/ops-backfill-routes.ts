@@ -1,13 +1,9 @@
-import type { FastifyPluginAsync, FastifyReply, FastifyRequest } from 'fastify';
+import type { FastifyPluginAsync, FastifyRequest } from 'fastify';
 import { backfillLimits, backfillSweepRunning, readBackfillProgress } from '../services/source-backfill.js';
-import { hasValidOpsAuth } from './ops-auth.js';
+import { hasValidOpsAuth, opsUnauthorized } from './ops-auth.js';
 
 function authorised(request: FastifyRequest): boolean {
   return hasValidOpsAuth(request.headers.authorization);
-}
-
-function unauthorized(reply: FastifyReply) {
-  return reply.header('WWW-Authenticate', 'Basic realm="ThreatLens Ops"').code(401).send({ error: 'unauthorized' });
 }
 
 /**
@@ -38,7 +34,7 @@ const NOTICE = 'Офіційні alert-канали дозбираються о�
  */
 const opsBackfillRoutes: FastifyPluginAsync = async (app) => {
   app.get('/ops/api/backfill', async (request, reply) => {
-    if (!authorised(request)) return unauthorized(reply);
+    if (!authorised(request)) return opsUnauthorized(request, reply);
     const limits = backfillLimits();
     const sources = await readBackfillProgress();
     return {

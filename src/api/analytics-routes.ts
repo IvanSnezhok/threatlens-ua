@@ -1,5 +1,5 @@
 import type { FastifyPluginAsync, FastifyReply, FastifyRequest } from 'fastify';
-import { hasValidOpsAuth } from './ops-auth.js';
+import { hasValidOpsAuth, opsUnauthorized } from './ops-auth.js';
 import {
   AnalyticsInputError,
   archiveCoverage,
@@ -75,7 +75,7 @@ type Handler = (window: AnalyticsWindow, query: AnalyticsQuery) => Promise<unkno
 const analyticsRoutes: FastifyPluginAsync = async (app) => {
   app.addHook('onRequest', async (request: FastifyRequest, reply: FastifyReply) => {
     if (hasValidOpsAuth(request.headers.authorization)) return;
-    return reply.header('WWW-Authenticate', 'Basic realm="ThreatLens Ops"').code(401).send({ error: 'unauthorized' });
+    return opsUnauthorized(request, reply);
   });
 
   /**

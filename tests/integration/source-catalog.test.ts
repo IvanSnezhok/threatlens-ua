@@ -64,8 +64,17 @@ const A3_DSNS = ['dsns_telegram', 'DSNS_Kharkiv', 'dsns_kyiv_region'];
  * on an oblast we then believe is covered, or a parser that reads ordinary news as an official alert
  * for an entire oblast at the highest evidence level the system has.
  *
- * `ternopilskaODA` is the instructive one: it *does* publish alerts, as "Увага‼️Повітряна тривога‼️"
- * with no location and no status circle. A body naming no place cannot move a location's state.
+ * `ternopilskaODA` is the instructive one, and the label above is wrong for it: it *does* publish
+ * alerts. Verbatim, ternopilskaODA/26967 and /26968, 07.08.2026, twenty-seven minutes apart —
+ *
+ *   УВАГА‼️Повітряна тривога! Пройдіть негайно в укриття!
+ *   Відбій повітряної тривоги‼️
+ *
+ * — with no location and no status circle in either. A body naming no place cannot move a location's
+ * state, and this parser takes its scope from the text rather than from the source id it was handed,
+ * so what unblocks this row is a per-source default scope in the catalogue, not a wider pattern.
+ * `migrations/029_disabled_channel_reaudit.sql` re-sampled all five of the others on 10.08.2026 and
+ * reproduced the original finding: zero alert posts in 7–18 posts each.
  */
 const A4_UNCONFIRMED_FORMAT = [
   'chernigivskaODA', 'zhytomyrskaODA', 'poltavskaOVA', 'dnipropetrovskaODA',
@@ -299,6 +308,18 @@ describe.skipIf(!integrationDatabaseAvailable)('verified channel catalogue', () 
       // location catalogue holds Ukrainian names only, so a Russian-language message produces no
       // threat type and no locations. An enabled row that contributes nothing is worse than a
       // disabled one: it reports healthy and its silence reads as an absence of threats.
+      //
+      // The 10.08.2026 re-audit found the failure is not only silence, which is why these stay off
+      // rather than being enabled as harmless. Running @krymrealii's sampled posts through the real
+      // classifier produced two threat events out of sixteen and both were false: a news story about
+      // a political prisoner became a `guided_air_bomb` over Джанкой, because «декабре» matched the
+      // KAB pattern `каб[а-яіїєґ]*` as it stood that day — `v6` replaced that pattern with the
+      // abbreviation's enumerated declension and «декабре» no longer matches anything; and a report
+      // that Ukrainian forces control the Kinburn spit
+      // became a `uav` threat over Херсонська область and the town of Лиман, because «лиманом» is a
+      // common noun in Russian and a settlement in the catalogue. @vanek_nikolaev resolved one
+      // location in twenty and mis-scoped it: "мопеды в Одесской области … над Одессой … над
+      // Арцизом" landed on Арциз alone, the only name spelled the same in both languages.
       for (const handle of C_RUSSIAN_LANGUAGE) expect(get(rows, handle).enabled).toBe(false);
       // The same rule, applied to the row migration 011 already registered.
       const vanek = await sql<{ enabled: boolean }>(
@@ -308,7 +329,12 @@ describe.skipIf(!integrationDatabaseAvailable)('verified channel catalogue', () 
     });
 
     it('switches off the unverified operator', async () => {
-      // Seven subscribers, no identified operator, no stated data source.
+      // Seven subscribers, no identified operator, no stated data source. Still seven on 10.08.2026,
+      // and the re-audit added a second reason that does not depend on the operator ever being
+      // identified: all twenty sampled posts are the two-line pair "🚨 м. Київ / Повітряна тривога"
+      // and "🟢 м. Київ / Відбій повітряної тривоги". That is an alert-state mirror, not threat
+      // reporting — the classifier returns `not_an_assertion` on every one — and the state it
+      // mirrors is already carried by `air-alert-ua` and `aerial-alerts-mirror`.
       for (const handle of C_UNVERIFIED_OPERATOR) expect(get(rows, handle).enabled).toBe(false);
     });
 

@@ -1,6 +1,6 @@
-import type { FastifyPluginAsync, FastifyReply, FastifyRequest } from 'fastify';
+import type { FastifyPluginAsync, FastifyRequest } from 'fastify';
 import { z } from 'zod';
-import { hasValidOpsAuth } from './ops-auth.js';
+import { hasValidOpsAuth, opsUnauthorized } from './ops-auth.js';
 import { beginCodexLogin, cancelPendingLogin, codexStatus, disconnectCodex } from '../services/codex-auth.js';
 import { listCodexModels } from '../services/codex-client.js';
 import { readCodexSettings, resolveSettings, saveCodexSettings } from '../services/codex-settings.js';
@@ -8,10 +8,6 @@ import { shadowAgreement } from '../services/shadow-classifier.js';
 
 function authorised(request: FastifyRequest): boolean {
   return hasValidOpsAuth(request.headers.authorization);
-}
-
-function unauthorized(reply: FastifyReply) {
-  return reply.header('WWW-Authenticate', 'Basic realm="ThreatLens Ops"').code(401).send({ error: 'unauthorized' });
 }
 
 /**
@@ -31,7 +27,7 @@ function unauthorized(reply: FastifyReply) {
  */
 const opsCodexRoutes: FastifyPluginAsync = async (app) => {
   app.get('/ops/codex', async (request, reply) => {
-    if (!authorised(request)) return unauthorized(reply);
+    if (!authorised(request)) return opsUnauthorized(request, reply);
     return codexStatus();
   });
 
@@ -41,7 +37,7 @@ const opsCodexRoutes: FastifyPluginAsync = async (app) => {
    * on the operator's machine, and should not pretend it can by redirecting.
    */
   app.post('/ops/codex/login', async (request, reply) => {
-    if (!authorised(request)) return unauthorized(reply);
+    if (!authorised(request)) return opsUnauthorized(request, reply);
     try {
       const started = await beginCodexLogin();
       return { ...started, redirectUri: (await codexStatus()).redirectUri };
@@ -52,13 +48,13 @@ const opsCodexRoutes: FastifyPluginAsync = async (app) => {
   });
 
   app.delete('/ops/codex/login', async (request, reply) => {
-    if (!authorised(request)) return unauthorized(reply);
+    if (!authorised(request)) return opsUnauthorized(request, reply);
     cancelPendingLogin();
     return { cancelled: true };
   });
 
   app.delete('/ops/codex', async (request, reply) => {
-    if (!authorised(request)) return unauthorized(reply);
+    if (!authorised(request)) return opsUnauthorized(request, reply);
     return { disconnected: await disconnectCodex() };
   });
 
@@ -76,7 +72,7 @@ const opsCodexRoutes: FastifyPluginAsync = async (app) => {
    * serve an operator a stale list at the exact moment they came to change something.
    */
   app.get('/ops/codex/settings', async (request, reply) => {
-    if (!authorised(request)) return unauthorized(reply);
+    if (!authorised(request)) return opsUnauthorized(request, reply);
     const [stored, catalogue, status] = await Promise.all([
       readCodexSettings(), listCodexModels(), codexStatus()
     ]);
@@ -115,7 +111,7 @@ const opsCodexRoutes: FastifyPluginAsync = async (app) => {
   });
 
   app.put('/ops/codex/settings', async (request, reply) => {
-    if (!authorised(request)) return unauthorized(reply);
+    if (!authorised(request)) return opsUnauthorized(request, reply);
     const parsed = settingsBody.safeParse(request.body);
     if (!parsed.success) {
       return reply.code(400).send({ error: 'invalid_settings', issues: parsed.error.issues.map((issue) => issue.path.join('.')) });
@@ -143,7 +139,7 @@ const opsCodexRoutes: FastifyPluginAsync = async (app) => {
   });
 
   app.get('/ops/shadow-classifier', async (request, reply) => {
-    if (!authorised(request)) return unauthorized(reply);
+    if (!authorised(request)) return opsUnauthorized(request, reply);
     const parsed = agreementQuery.safeParse(request.query);
     if (!parsed.success) return reply.code(400).send({ error: 'invalid_query' });
     return shadowAgreement(parsed.data.hours, parsed.data.examples);

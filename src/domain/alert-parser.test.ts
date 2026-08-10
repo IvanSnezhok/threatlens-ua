@@ -7,6 +7,12 @@ import { parseAlertChannelMessage, locationKey, type AlertChannelParse } from '.
  * administrations (khersonskaODA, kyivoda, VinnytsiaODA, oda_rv, slv_vca, kherson_miskrada) for the
  * location-first one. Nothing here reaches the network: the channels' wording is the contract under
  * test, so it is pinned as data.
+ *
+ * The last-but-one block pins the other half of that contract: wording from channels that are
+ * registered in `sources` and switched OFF, sampled 06.08–10.08.2026 for
+ * `migrations/029_disabled_channel_reaudit.sql`. Those fixtures assert refusals. A channel is
+ * enabled in the catalogue when its wording appears here as an accepted shape, so a shape that
+ * appears here as a refused one is the written record of why its channel is still silent.
  */
 const OBSERVED_AT = new Date('2026-08-07T11:47:00.000Z');
 
@@ -416,6 +422,99 @@ describe('alert channel parser — shapes it does not know', () => {
 
   it('ignores an empty message', () => {
     expect(parse('   \n  ')).toMatchObject({ kind: 'ignored', reason: 'empty' });
+  });
+});
+
+/**
+ * The catalogue re-audit of 10.08.2026 (`migrations/029_disabled_channel_reaudit.sql`).
+ *
+ * Every message below is verbatim from the public preview of a channel that is registered in
+ * `sources` and switched OFF, sampled 06.08–10.08.2026. None of them may become an alert transition,
+ * and each one is here because it is adjacent to a family the parser deliberately excludes: an
+ * unlocated declaration, an "УВАГА" advisory, an oblast-wide scope with an exclusion clause, or a
+ * prose mention inside a news post. Pinning them is what stops a future change made to admit one of
+ * these channels from admitting it by accident, and what gives whoever builds the missing design a
+ * written-down statement of the shape they have to read.
+ */
+describe('alert channel parser — the shapes that keep channels switched off', () => {
+  it('refuses the unlocated oblast-wide declaration @ternopilskaODA publishes', () => {
+    // ternopilskaODA/26967 and /26968, 07.08.2026, twenty-seven minutes apart: a complete alert and
+    // its all-clear with no location anywhere in either message. The scope is the oblast and it
+    // lives in the identity of the channel, which this parser deliberately does not know — it takes
+    // a source id from the caller and applies every shape to every channel. Reading these would
+    // need a per-source default scope in the catalogue, not a pattern here.
+    expect(parse('УВАГА‼️Повітряна тривога! Пройдіть негайно в укриття!'))
+      .toMatchObject({ kind: 'ignored', reason: 'advisory' });
+    expect(parse('Відбій повітряної тривоги‼️'))
+      .toMatchObject({ kind: 'ignored', reason: 'unrelated' });
+  });
+
+  it('refuses the Zaporizhzhia prose format, exclusion clause and all', () => {
+    // zoda_gov_ua/65746 and /65749, 09.08.2026, republished within two seconds by
+    // ivan_fedorov_zp/45788 and /45791. "крім" carries an exclusion the location model cannot
+    // express, and the readable sibling names «всій Запорізькій області» — a phrase, not a
+    // catalogue row. Migration 014 refused this format; this is the same format four months on.
+    expect(parse('🚨УВАГА🚨\nОголошена повітряна тривога у громадах Запорізької області, '
+      + 'крім міста Запоріжжя!\nБережіть себе і терміново прослідуйте у безпечне місце!'))
+      .toMatchObject({ kind: 'ignored', reason: 'unrelated' });
+    expect(parse('🚨УВАГА🚨\nОголошена повітряна тривога по всій Запорізькій області!\n'
+      + 'Бережіть себе і терміново прослідуйте у безпечне місце!'))
+      .toMatchObject({ kind: 'ignored', reason: 'unrelated' });
+  });
+
+  it('refuses the Zaporizhzhia all-clears, whose scope does not pair with their starts', () => {
+    // zoda_gov_ua/65744 and /65748. Both are unambiguous sentences; neither pairs reliably with the
+    // starts above — 09.08 ran "крім міста Запоріжжя" at 16:34 and closed with "по Запорізькій
+    // області" at 17:19. A parser that read the starts it understood and refused these would leave
+    // alerts running until `ALERT_CHANNEL_MAX_ALERT_SECONDS` swept them.
+    //
+    // Note which bucket they land in: `unrelated`, not `unrecognized`. ✅ is not a status circle and
+    // "по" is not the "в/у" the end pattern anchors on, so nothing in the message reaches the
+    // wording-drift alarm. That is the documented cost of enabling a channel whose format was never
+    // read — its all-clears would be silent, not loud.
+    expect(parse('✅ Відбій повітряної тривоги по Запорізькій області та м. Запоріжжя!'))
+      .toMatchObject({ kind: 'ignored', reason: 'unrelated' });
+    expect(parse('✅ Відбій повітряної тривоги по Запорізькій області!'))
+      .toMatchObject({ kind: 'ignored', reason: 'unrelated' });
+  });
+
+  it('refuses the Zaporizhzhia threat notices published inside a running alert', () => {
+    // ivan_fedorov_zp/45794 and /45793, 09.08.2026. Nine of that channel's eighteen sampled posts
+    // are this family. They sit next to the all-clears above in the same feed, which is why the
+    // "Загроза …" exclusion has to survive any change made to read that channel.
+    expect(parse('‼️УВАГА! Загроза застосування керованих авіаційних бомб (КАБів) '
+      + 'по Запорізькій області та м. Запоріжжя‼️'))
+      .toMatchObject({ kind: 'ignored', reason: 'threat_notice' });
+    expect(parse('‼️УВАГА! Активність ворожої тактичної авіації! '
+      + 'Загроза для Запорізької області та м. Запоріжжя‼️'))
+      .toMatchObject({ kind: 'ignored', reason: 'threat_notice' });
+  });
+
+  it('files an administration news post that mentions the vocabulary as unrelated', () => {
+    // dnipropetrovskaODA/31281 and odeskaODA/18400, 08–09.08.2026. Both are what A2/A4 said the
+    // administration feeds are: reporting, with the alert vocabulary in a subordinate clause. They
+    // must stay out of the wording-drift alarm or the alarm is worthless.
+    expect(parse('Гучні звуки, які чули мешканці Дніпра, - бойова робота наших сил ППО.\n\n'
+      + 'До відбою повітряної тривоги перебувайте у безпечних місцях.'))
+      .toMatchObject({ kind: 'ignored', reason: 'unrelated' });
+    expect(parse('На жаль, до 12 людей збільшилася кількість постраждалих внаслідок нічної атаки '
+      + 'ворога по Одещині. 11 людей госпіталізовані в стані середньої тяжкості. Ще одному '
+      + 'постраждалому допомогу надано амбулаторно.\n\nПрошу мешканців не ігнорувати сигнали '
+      + 'повітряної тривоги та залишатися в укриттях до відбою.'))
+      .toMatchObject({ kind: 'ignored', reason: 'unrelated' });
+  });
+
+  it('refuses the @alarm_kyiv alert-state mirror, which is a monitor row and not an alert channel', () => {
+    // alarm_kyiv/2690 and /2691, 10.08.2026. Twenty of twenty posts are this pair. The row is
+    // `mtproto_monitor`, so this text never reaches this parser today — it is pinned because the
+    // shape is one flag away from being read as an official alert for the capital, and because the
+    // asymmetry below is the whole argument for keeping it a monitor: the 🟢 half reaches the
+    // wording-drift alarm and the 🚨 half does not, so the channel would clear more loudly than it
+    // alerts.
+    expect(parse('🚨 м. Київ\nПовітряна тривога'))
+      .toMatchObject({ kind: 'ignored', reason: 'unrelated' });
+    expect(parse('🟢 м. Київ\nВідбій повітряної тривоги'))
+      .toEqual({ kind: 'unrecognized', headline: 'м. Київ' });
   });
 });
 

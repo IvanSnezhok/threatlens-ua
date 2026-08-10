@@ -1,11 +1,11 @@
-import type { FastifyPluginAsync, FastifyReply, FastifyRequest } from 'fastify';
+import type { FastifyPluginAsync, FastifyRequest } from 'fastify';
 import { z } from 'zod';
 import { config } from '../config.js';
 import { pool } from '../db/pool.js';
 import {
   commitState, readActiveRun, readDeploymentState, readRecentRuns, type DeploymentStateView
 } from '../services/deployment.js';
-import { hasValidOpsAuth } from './ops-auth.js';
+import { hasValidOpsAuth, opsUnauthorized } from './ops-auth.js';
 
 /**
  * Operator-controlled deployment, from the application's side of the wall.
@@ -24,10 +24,6 @@ import { hasValidOpsAuth } from './ops-auth.js';
 
 function authorised(request: FastifyRequest): boolean {
   return hasValidOpsAuth(request.headers.authorization);
-}
-
-function unauthorized(reply: FastifyReply) {
-  return reply.header('WWW-Authenticate', 'Basic realm="ThreatLens Ops"').code(401).send({ error: 'unauthorized' });
 }
 
 /**
@@ -116,7 +112,7 @@ const opsDeployRoutes: FastifyPluginAsync = async (app) => {
    * because the journal it will read on reconnect is in a database the update never restarts.
    */
   app.get('/ops/api/deploy', async (request, reply) => {
-    if (!authorised(request)) return unauthorized(reply);
+    if (!authorised(request)) return opsUnauthorized(request, reply);
     const [app_, state, current, history, runner] = await Promise.all([
       appIdentity(),
       readDeploymentState(),
@@ -157,7 +153,7 @@ const opsDeployRoutes: FastifyPluginAsync = async (app) => {
    * without the answer being "and I have now moved your working tree".
    */
   app.post('/ops/api/deploy/check', async (request, reply) => {
-    if (!authorised(request)) return unauthorized(reply);
+    if (!authorised(request)) return opsUnauthorized(request, reply);
     if (!config.DEPLOY_ENABLED) return reply.code(503).send({ error: 'deploy_disabled' });
     const runner = await callRunner('/check', { method: 'POST', body: {}, timeoutMs: config.DEPLOY_RUNNER_TIMEOUT_MS });
     if (!runner.reachable) return reply.code(502).send({ error: 'runner_unreachable' });
@@ -175,7 +171,7 @@ const opsDeployRoutes: FastifyPluginAsync = async (app) => {
    * a failure an operator cannot read afterwards is the failure mode this feature exists to remove.
    */
   app.post('/ops/api/deploy', async (request, reply) => {
-    if (!authorised(request)) return unauthorized(reply);
+    if (!authorised(request)) return opsUnauthorized(request, reply);
     if (!config.DEPLOY_ENABLED) return reply.code(503).send({ error: 'deploy_disabled' });
     const parsed = deployBody.safeParse(request.body);
     if (!parsed.success) {

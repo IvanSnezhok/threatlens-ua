@@ -77,11 +77,23 @@ Which of those channels is actually read is data, not code. Every row with
 alert periods; twenty-one bodies are registered and the rest are switched off. `enabled` on these
 rows means one specific thing — **the parser has been shown this channel's published wording, as a
 fixture, in `src/domain/alert-parser.test.ts`** — and not "this body is trustworthy", which is what
-`tier` and `official` say. Three registered administrations publish real alerts and are switched off
+`tier` and `official` say. Four registered administrations publish real alerts and are switched off
 anyway because their format cannot be read safely; `migrations/014_multi_channel_alert_routing.sql`
-carries the verbatim samples and the reasoning. `ALERT_CHANNEL_ENABLED` is the deployment-level kill
-switch above all of them, the same shape as `OSINT_MONITOR_ENABLED`, and nothing in the application
-writes `sources.enabled` for this adapter type.
+carries the verbatim samples for three of them (Odesa and the Zaporizhzhia pair) and
+`migrations/029_disabled_channel_reaudit.sql` for the fourth. `ALERT_CHANNEL_ENABLED` is the
+deployment-level kill switch above all of them, the same shape as `OSINT_MONITOR_ENABLED`, and
+nothing in the application writes `sources.enabled` for this adapter type.
+
+The fourth is Ternopil, and it is the case worth knowing because it shows what `enabled` is really
+gating. @ternopilskaODA publishes "УВАГА‼️Повітряна тривога! Пройдіть негайно в укриття!" and, half
+an hour later, "Відбій повітряної тривоги‼️" — a complete, unambiguous air-raid alert and its
+all-clear, with **no location in either message**. The scope is the oblast and it lives in the
+identity of the channel, not in the text, and `parseAlertChannelMessage` is deliberately
+channel-agnostic: it takes a source id from the caller and applies every shape it knows to every
+registered channel. Reading Ternopil needs a per-source default scope in the catalogue and a parser
+that accepts an unlocated declaration only when the caller supplied one — a schema and contract
+change, not a fixture. Until then the row is a registered, documented, deliberately-silent
+capability, which is what every switched-off row in this table is.
 
 The distinction that matters is **designation**, not transport. A tier A source designated to publish
 alerts starts and ends official alerts whether its bytes arrive over HTTPS or MTProto. What has not
@@ -496,6 +508,38 @@ one Codex client, so it is audited in `ai_runs` under `surface = 'retrospective_
 `decision = 'ignored_retrospective_model'`, kept apart from the deterministic word because a replay
 reproduces the first and can never reproduce the second.
 
+### The guided-bomb pattern: a stem is not a word (`v6`)
+
+`каб[а-яіїєґ]*` was three letters and a glob, which matches every Ukrainian word that merely *begins*
+with them. The channel re-audit behind migration 029 hit it from the Russian side — a news story
+about a political prisoner «в декабре 2025 года … из Джанкоя» was read as a guided bomb over Джанкой
+— and recorded that the Ukrainian half was still live: "Кабмін ухвалив постанову про виплати для
+Харківщини" classified as a **significant** `guided_air_bomb` over Харківська область, and 46 monitor
+rows publish routine government news. It was not hypothetical. On 2026-08-09 a Zhytomyr news item
+about a cable factory — «Підприємство виготовляє **кабельні** системи для автомобілів» — was archived
+as `event_created` / `guided_air_bomb` over Житомир, a published threat event whose entire evidence
+was one word.
+
+The replacement is the abbreviation's **enumerated declension** with a letter boundary on both sides
+— `(?<!\p{L})каб(?:а|у|ом|і|и|ів|ам|ами|ах)?(?!\p{L})` — the same generator-not-stemmer choice
+`place-morphology.ts` makes for place names, and for the same reason: a closed suffix list can be
+read against the language and argued about, while a glob can only be tested against the messages
+somebody happened to look at. A stop-list (`кабмін|кабінет|кабел`) was the alternative and was
+rejected — it has to grow with the dictionary, and the next word it does not yet know becomes a
+published threat rather than a missed match. The boundaries make it unnecessary anyway: `(?<!\p{L})`
+refuses «декабре», `(?!\p{L})` refuses «Кабмін», «Кабінет», «кабельний», «кабіна» and «кабачки», and
+a non-letter still ends the token so "КАБ-500" matches on the abbreviation. The long form gains
+«керован* авіабомб*», the compound spelling twelve archived messages use and the rules had never
+read at all.
+
+The `v5 → v6` replay over the production archive moved **2 of 1 671** archived decisions, both
+`guided_air_bomb → unknown`, both hand-reviewed, and made **nothing** newly significant: the Zhytomyr
+cable-factory event and a joke about a urologist's «кабінєт» that was already being ignored for
+naming no place. All 116 messages the archive contains with a real weapon sense — `КАБ`, `КАБи`,
+`КАБів`, `КАБам`, `КАБах`, the lower-case telegraphic `каб`/`каби`/`кабів`/`кабам`, and «керованих
+авіаційних бомб» — kept their class, their locations and their significance unchanged. The gold
+corpus measures identically to `v5` on all three axes.
+
 ### Classification archive
 
 `source_messages` keeps the raw text and one `processing_status` word; everything the classifier
@@ -549,7 +593,13 @@ three in the morning. `v5` measures significance P=100% / R=90.4%, threat-class 
 the messages both sides call significant, and locations P=99.6% / R=93.1%. (`v4` measured
 significance P=98.4% / R=90.4% and locations P=97.2% / R=93.1%; `v3` measured P=97.2% / R=88.8% and
 P=R=89.4%.) What `v5` moved is precision alone, through the two retrospective false positives `v4`
-left — recall is unchanged and must be, because the veto is only allowed to subtract.
+left — recall is unchanged and must be, because the veto is only allowed to subtract. `v6` measures
+the same three numbers to the decimal: the words it stops matching do not occur in this snapshot and
+its two `guided_air_bomb` entries are real weapon forms that keep their class, so the corpus's job
+for that change was to show the narrowing cost nothing rather than to score it. The false positive
+`v6` closed is pinned in `src/domain/classifier.test.ts`, verbatim and with its archive id, because
+the fixture is a labelled sample of one snapshot and a message from outside it has no place in the
+counts the header pins.
 
 The fixture separates two things that used to be one number. `assertsThreat` is the reviewer's
 reading of the text; `significant` additionally requires that the place named exists in the location

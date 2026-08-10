@@ -1821,30 +1821,51 @@ body { overflow-x: hidden; }
 
 /* ---- 13. Операційна консоль ------------------------------------------------------------------- */
 
-.ops-metrics {
+/* Смуга показників. Раніше це були чотири картки з цифрою кеглем 32 — тобто третина першого
+   екрана консолі під чотири числа, з яких жодне не вимагає дії. Тепер це один рядок фішок
+   заввишки 46 px, у якому до тих чотирьох чисел додано два стани, заради яких консоль і
+   відкривають: чи є що розгортати і чи затримано показ.
+
+   Тон з'являється рівно там, де стан вимагає уваги: черга з чергою, затриманий показ, недоступний
+   runner. Синхронізоване розгортання лишається беззвучним — як і скрізь у цій консолі. */
+.ops-kpis {
   display: grid;
-  grid-template-columns: repeat(4, 1fr);
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
   gap: 1px;
-  margin-bottom: 38px;
+  margin-bottom: 16px;
   background: var(--rule-2);
   border: 1px solid var(--rule-2);
 }
-.ops-metrics article { padding: 20px; background: var(--surface); }
-.ops-metrics span {
-  display: block;
+.ops-kpi {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 11px 14px;
+  background: var(--surface);
+}
+.ops-kpi span {
   color: var(--bone-4);
   font: 400 9px/1 var(--mono);
   letter-spacing: .12em;
   text-transform: uppercase;
+  white-space: nowrap;
 }
-.ops-metrics strong {
-  display: block;
-  margin-top: 12px;
+.ops-kpi strong {
   color: var(--bone);
-  font: 400 32px/.9 var(--display);
+  font: 400 17px/1 var(--display);
   font-variant-numeric: tabular-nums;
-  letter-spacing: -.05em;
+  letter-spacing: -.04em;
+  text-align: right;
 }
+/* Довгий стан («Доступне оновлення») не має права розсунути смугу — він переходить на мову
+   підпису, а не на другий рядок. */
+.ops-kpi strong:not(:first-child) { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ops-kpi.is-warn { box-shadow: inset 0 -2px 0 var(--risk); }
+.ops-kpi.is-warn strong { color: var(--risk); font-size: 12px; letter-spacing: .02em; }
+.ops-kpi.is-bad { box-shadow: inset 0 -2px 0 var(--alert); }
+.ops-kpi.is-bad strong { color: #ff9a86; font-size: 12px; letter-spacing: .02em; }
+.ops-kpi.is-off strong { color: var(--bone-3); font-size: 12px; letter-spacing: .02em; }
 
 .ops-section {
   margin-top: 22px;
@@ -2410,6 +2431,260 @@ code {
 .ai-run-detail h3:first-child { margin-top: 0; }
 .ai-run-detail .ops-json { max-height: 420px; }
 
+/* ---- 13б. Консоль: сітка й щільність -----------------------------------------------------------
+
+   Дві скарги, одна причина. Консоль успадкувала верстку статті: колонка, обмежена мірою рядка
+   (1240 px), і заголовок картки кеглем 30 у титульному накресленні. Для тексту, який читають, це
+   правильно. Для приладової панелі, яку СКАНУЮТЬ, це коштує два екрани прокрутки й мертвий правий
+   берег на будь-якому моніторі, ширшому за ноутбук.
+
+   Тому все нижче живе під `.ops-console` і не діє більше ніде: решта сайту лишається статтею.
+   Змінюється ієрархія, а не мова — ті самі токени, ті самі волоскові лінійки, ті самі 1 px
+   проміжки з рамкою, що прозирає крізь них. Заголовок картки з титульного лишається титульним,
+   але приладового кегля: 15 px в один рядок із рубрикою, на власній планці, як підпис модуля в
+   стійці. Це і є економія — не дрібніший шрифт, а заголовок, який займає рядок замість трьох. */
+
+.ops-shell { padding-top: 30px; }
+.ops-shell .content-heading { margin-bottom: 20px; padding-bottom: 14px; }
+.ops-shell .content-heading h1 { max-width: none; font-size: clamp(24px, 2.2vw, 30px); }
+.ops-shell .content-heading > p:last-child { margin-top: 10px; max-width: 90ch; font-size: 13px; }
+/* Міра рядка тут скасована свідомо: у цій колонці не читають, а звіряють числа. */
+.content-shell > div.ops-console { max-width: none; }
+
+/* Дві смуги змісту, а не рядкова сітка. Різниця вирішальна: картки консолі мають дуже різну висоту
+   (сімдесят рядків довіри проти шести фактів розгортання), і в рядковій сітці під кожною коротшою
+   карткою лишалася б дірка заввишки в її сусідку — та сама змарнована вертикаль, лише повернута
+   на дев'яносто градусів. Кожна смуга пакується власним потоком.
+
+   Ліворуч сигнал: режим показу → покриття по областях → довіра до джерел. Праворуч обслуговування:
+   розгортання → дозбір → каталог каналів. Знизу на всю ширину — те, у чому розгортаються сотні
+   рядків: Codex, вектори, сирий стан.
+
+   На вузькому екрані обидві смуги розпускаються `display: contents` — правила спанів не
+   дублюються, а порядок лишається осмисленим: спершу весь сигнал, потім усе обслуговування. */
+.ops-grid { display: grid; grid-template-columns: 1fr; gap: 14px; align-items: start; }
+.ops-grid > *, .ops-col > * { margin-top: 0; min-width: 0; }
+.ops-col { display: contents; }
+
+@media (min-width: 1400px) {
+  .ops-grid { grid-template-columns: 1fr 1fr; }
+  .ops-col { display: grid; gap: 14px; align-content: start; min-width: 0; }
+  .ops-col--full { grid-column: 1 / -1; }
+}
+
+/* Ширший монітор перерозподіляє, а не розтягує: смузі сигналу дістається більше, бо в ній живуть
+   обидві відомості — двадцять сім областей і сімдесят джерел. */
+@media (min-width: 1700px) {
+  .ops-grid { grid-template-columns: 7fr 5fr; }
+}
+
+/* Планка модуля. Рубрика й заголовок в один рядок, дії — праворуч, усе на власному тлі впритул до
+   країв картки. */
+.ops-console .ops-section { margin-top: 0; padding: 0 16px 16px; }
+.ops-console .ops-section-head {
+  align-items: center;
+  gap: 10px 14px;
+  margin: 0 -16px 14px;
+  padding: 10px 16px;
+  background: var(--surface-2);
+  border-bottom: 1px solid var(--rule-2);
+}
+.ops-console .ops-section-head > div {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: 2px 11px;
+  min-width: 0;
+}
+.ops-console .ops-section > header p { margin: 0; }
+.ops-console .ops-section > header h2 {
+  margin: 0;
+  font: 700 15px/1.25 var(--display);
+  letter-spacing: -.025em;
+}
+.ops-console .ops-section-head > button { padding: 7px 11px; }
+.ops-console .ops-channel-actions { flex-wrap: wrap; gap: 6px; }
+.ops-console .ops-channel-actions a,
+.ops-console .ops-channel-actions button,
+.ops-console .ops-channel-actions select { padding: 7px 9px; font-size: 9px; }
+.ops-console .codex-state { padding: 6px 9px; }
+
+/* Внутрішні відступи. Кожне число окремо мале; разом вони і є та сама третина екрана.
+
+   Обидві плитки — фактів і полів — переїжджають із сітки у flex, і це не косметика. У сітці
+   `auto-fit` останній ряд лишає порожні комірки, крізь які просвічує тло контейнера, тобто рівно
+   ту саму рамку-волосок: шість фактів у чотири колонки давали дві «діри» завбільшки з картку.
+   У flex останній ряд розтягується на всю ширину, і порожнього місця не лишається взагалі. */
+.ops-console .codex-facts {
+  display: flex;
+  flex-wrap: wrap;
+  margin-top: 14px;
+}
+.ops-console .codex-facts div { flex: 1 1 158px; padding: 9px 11px; }
+.ops-console .codex-facts dd { margin-top: 5px; font-size: 12px; }
+/* Списки, які ростуть від даних, а не від задуму: п'ятдесят одне джерело дозбору, сімдесят сім
+   каналів каталогу, історія оновлень. Кожен із них колись був завдовжки з екран і робив рівно те,
+   на що скаржилися, — з'їдав вертикаль, не додаючи нічого, що читають цілком. Тепер у кожного
+   власна панель прокрутки: картка має стелю, а список лишається повним.
+
+   Журнал звернень до моделі свідомо не обмежено — його рядки розгортаються на сотні рядків JSON
+   просто в потоці, і стеля перетворила б це на прокрутку всередині прокрутки. */
+.ops-console #runtime-section .ops-channel-list,
+.ops-console #deploy-section .ops-channel-list,
+.ops-console #backfill-section .ops-channel-list,
+.ops-console #channels-section .ops-channel-list,
+.ops-console #vector-section .ops-channel-list {
+  max-height: min(54vh, 540px);
+  overflow: auto;
+  overscroll-behavior: contain;
+}
+.ops-console .ops-channel-list article { gap: 14px; padding: 11px 0; }
+.ops-console .ops-channel-list article:first-child { padding-top: 0; }
+.ops-console .ops-channel-list h3 { margin: 5px 0 3px; font-size: 13.5px; }
+.ops-console .ops-channel-list p { font-size: 10.5px; }
+.ops-console .codex-features { display: flex; flex-wrap: wrap; margin-top: 14px; }
+.ops-console .codex-feature { flex: 1 1 208px; padding: 11px 12px; }
+.ops-console .channel-form { margin: 14px 0 18px; gap: 10px; }
+.ops-console .deploy-stages { margin-top: 12px; }
+.ops-console #runtime-section .codex-model,
+.ops-console #runtime-section .codex-facts,
+.ops-console #runtime-section .ops-channel-list { margin-top: 14px; }
+.ops-console .ops-group { margin-top: 0; padding-left: 16px; }
+.ops-console .ops-group .ops-section:first-of-type { margin-top: 0; }
+.ops-console .ops-group-head h2 { font: 700 17px/1.2 var(--display); letter-spacing: -.03em; }
+.ops-console .ops-group-head > p:last-child { margin-top: 7px; font-size: 12px; }
+.ops-console .ops-raw { margin-top: 0; }
+/* «Нічого ще не сталося» — теж стан, і він не потребує тридцяти чотирьох пікселів повітря
+   згори й знизу, щоб бути прочитаним. */
+.ops-console .empty-state { padding: 16px 0; }
+.ops-console .empty-state strong { font-size: 14px; }
+.ops-console .empty-state p { font-size: 12px; }
+
+/* Група Codex — власна сітка тієї самої дванадцятки: вхід і керування стоять поруч, бо це одне
+   рішення, а два журнали лишаються на всю ширину, бо в них розгортаються сотні рядків. */
+@media (min-width: 1400px) {
+  .ops-console .ops-group {
+    display: grid;
+    grid-template-columns: repeat(12, 1fr);
+    gap: 14px;
+    align-items: start;
+  }
+  .ops-console .ops-group > * { grid-column: span 12; }
+  .ops-console .ops-group > #codex-section { grid-column: span 5; }
+  .ops-console .ops-group > #codex-settings-section { grid-column: span 7; }
+}
+
+/* Чотири поля в ряд там, де для цього справді є ширина: плитка полів рантайму — єдине місце
+   консолі, де вертикаль з'їдалася однією карткою на рішення. Базис, а не кількість колонок:
+   flex сам вирішує, скільки поміститься, і останній ряд усе одно лишається щільним. */
+@media (min-width: 1700px) {
+  .ops-console #runtime-section .codex-feature { flex-basis: 168px; }
+}
+
+/* Застереження, яке вже прочитали. Текст лишається на місці — згортається лише його товща:
+   перший рядок несе саме застереження, решта — його обґрунтування, і воно потрібне один раз. */
+.ops-fold { padding: 11px 14px; margin-top: 14px; }
+.ops-fold > summary {
+  list-style: none;
+  cursor: pointer;
+  display: flex;
+  align-items: baseline;
+  gap: 9px;
+}
+.ops-fold > summary::-webkit-details-marker { display: none; }
+.ops-fold > summary::after {
+  content: '▾';
+  margin-left: auto;
+  color: var(--bone-4);
+  font-size: 9px;
+  transition: transform .16s var(--ease);
+}
+.ops-fold[open] > summary::after { transform: rotate(180deg); }
+.ops-fold > summary strong { margin: 0; font: 600 12px/1.4 var(--body); letter-spacing: 0; }
+.ops-fold > p { margin-top: 9px; font-size: 12px; }
+
+/* ---- Покриття по областях ----------------------------------------------------------------------
+
+   Двадцять сім рядків і рядок «Загальнодержавні». Форма — відомість, як і в довіри до джерел, з
+   тієї ж причини: колонки чисел порівнюють скануванням згори вниз, а не тримаючи попереднє
+   значення в пам'яті. Заголовок кожної числової колонки — кнопка з aria-sort, бо питання «де
+   найгустіше» і питання «де порожньо» — це та сама таблиця, відсортована в різні боки.
+
+   Смуга під числом потоку росте від правого краю, під самим числом, і не має кольору: обсяг
+   трафіку — не небезпека. Колір тут лишається за трьома станами — тривога, загроза й прогалина. */
+
+.coverage-table-wrap {
+  margin-top: 12px;
+  max-height: min(74vh, 780px);
+  border: 1px solid var(--rule-2);
+  overflow: auto;
+  overscroll-behavior: contain;
+}
+.coverage-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-variant-numeric: tabular-nums;
+}
+.coverage-table thead th {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  padding: 0;
+  background: var(--surface-2);
+  border-bottom: 1px solid var(--rule-2);
+  text-align: right;
+}
+.coverage-table thead th.th-name { text-align: left; width: 40%; }
+.coverage-table thead button {
+  width: 100%;
+  padding: 8px 10px;
+  border: 0;
+  background: transparent;
+  color: var(--bone-4);
+  font: 400 9px/1.3 var(--mono);
+  letter-spacing: .1em;
+  text-align: inherit;
+  text-transform: uppercase;
+  cursor: pointer;
+  transition: color .16s var(--ease);
+}
+.coverage-table thead button:hover { color: var(--bone-2); }
+.coverage-table thead button.is-sorted { color: var(--bone); }
+.coverage-table thead button.is-sorted::after { content: ' ▾'; font-size: 8px; }
+.coverage-table thead th[aria-sort="ascending"] button.is-sorted::after { content: ' ▴'; }
+
+.coverage-row > th, .coverage-row > td { padding: 5px 10px; border-bottom: 1px solid var(--rule); }
+.coverage-row:hover > th, .coverage-row:hover > td { background: rgba(233, 231, 224, .035); }
+.coverage-name { font-weight: 400; text-align: left; }
+.coverage-oblast { font-size: 12.5px; letter-spacing: -.01em; }
+.coverage-id {
+  margin-left: 8px;
+  color: var(--bone-4);
+  font: 400 9px/1 var(--mono);
+  letter-spacing: .06em;
+}
+.coverage-table .td-num { text-align: right; font: 400 12px/1.5 var(--mono); }
+.coverage-sources b { color: var(--bone); font-weight: 400; }
+.coverage-off { color: var(--bone-4); }
+/* Смуга щільності живе у фоні клітинки, а не окремим елементом: інакше вона або відсунула б
+   число, або накрила б його. */
+.coverage-flow {
+  color: var(--bone);
+  background-image: linear-gradient(270deg, rgba(233, 231, 224, .13) var(--heat, 0%), transparent var(--heat, 0%));
+}
+.coverage-alerts b { color: var(--alert); font-weight: 500; }
+.coverage-threats b { color: var(--threat); font-weight: 500; }
+.coverage-nil { color: var(--bone-4); }
+/* Область, у яку за все вікно нічого не надійшло. Жовтий, а не червоний: це не інцидент, це
+   прогалина каталогу — стан, який виправляють, а не на який реагують. */
+.coverage-row.is-uncovered > th { box-shadow: inset 2px 0 0 var(--risk); }
+.coverage-row.is-uncovered .coverage-oblast { color: var(--risk); }
+.coverage-row.is-national > th, .coverage-row.is-national > td {
+  background: var(--surface-2);
+  border-top: 1px solid var(--rule-2);
+}
+.coverage-row.is-national .coverage-oblast { color: var(--bone-3); font-style: italic; }
+
 .ops-raw { margin-top: 26px; }
 .ops-raw summary { cursor: pointer; color: var(--bone-4); font: 400 10px/1 var(--mono); letter-spacing: .12em; text-transform: uppercase; }
 .ops-raw summary:hover { color: var(--bone-2); }
@@ -2536,8 +2811,37 @@ code {
   .content-heading { margin-bottom: 32px; padding-bottom: 20px; }
   .metric-grid { grid-template-columns: 1fr; }
   .timeline article { grid-template-columns: 1fr; gap: 8px; }
-  .ops-metrics { grid-template-columns: 1fr 1fr; }
+  .ops-kpis { grid-template-columns: 1fr 1fr; }
+  .ops-console .ops-section { padding: 0 12px 12px; }
+  .ops-console .ops-section-head { margin: 0 -12px 12px; padding: 9px 12px; }
+  .ops-shell { padding-top: 20px; }
   .ops-section { padding: 20px 16px; }
+
+  /* Відомість покриття на телефоні — картки з тими самими підписами, що були в шапці, і з тим
+     самим порядком: сортування працює по DOM і не помічає, що колонки стали рядками. */
+  .coverage-table-wrap { max-height: none; overflow: visible; border: 0; }
+  .coverage-table, .coverage-table tbody, .coverage-table tr, .coverage-table td { display: block; width: auto; }
+  .coverage-table thead { display: none; }
+  .coverage-row {
+    margin-bottom: 6px;
+    border: 1px solid var(--rule-2);
+    background: var(--surface-2);
+  }
+  .coverage-row > th { display: block; border-bottom: 1px solid var(--rule); }
+  .coverage-row > td:last-child { border-bottom: 0; }
+  .coverage-table .td-num {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 12px;
+  }
+  .coverage-table .td-num::before {
+    content: attr(data-label);
+    color: var(--bone-4);
+    font-size: 9px;
+    letter-spacing: .1em;
+    text-transform: uppercase;
+  }
   .channel-form { grid-template-columns: 1fr 1fr; }
   .ops-channel-list article { display: grid; }
   .ops-channel-actions { overflow-x: auto; }

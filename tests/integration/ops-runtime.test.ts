@@ -90,7 +90,7 @@ describe.skipIf(!integrationDatabaseAvailable)('ops runtime settings', () => {
     (await import('../../src/services/analytics-narrative.js')).resetAnalyticsNarrativeMemo();
   });
 
-  it('401s without Basic auth, and says so in the header a browser needs', async () => {
+  it('401s without Basic auth, and names the realm the command line needs', async () => {
     const app = await buildApp();
     try {
       const anonymous = await get(app, {});
@@ -108,6 +108,43 @@ describe.skipIf(!integrationDatabaseAvailable)('ops runtime settings', () => {
       expect(write.statusCode).toBe(401);
       // The refusal must not be a refusal that also changed something.
       expect((await storedSettings()).publication_mode).toBe('live');
+    } finally {
+      await app.close();
+    }
+  });
+
+  /**
+   * The same 401, minus the one header that takes the browser out of the application's hands.
+   *
+   * Chrome acts on `WWW-Authenticate: Basic` even when the 401 answers a `fetch()`: it opens its
+   * own credential dialog and never resolves the promise, so the console's `renderOps()` cannot
+   * reach the branch that draws `<form class="ops-login">`. `opsFetch` in `web/app.js` marks every
+   * `/ops/*` request with `X-Requested-With: XMLHttpRequest` for exactly this, and the guard reads
+   * the mark. Everything else about the refusal — status, body, the credentials it will accept —
+   * is unchanged, which is what keeps the `curl -u` recipes in `docs/OPERATIONS.md` accurate.
+   */
+  it('drops the challenge for the console fetch, and refuses it just as hard', async () => {
+    const app = await buildApp();
+    try {
+      const fromConsole = await get(app, { 'x-requested-with': 'XMLHttpRequest' });
+      expect(fromConsole.statusCode).toBe(401);
+      expect(fromConsole.headers['www-authenticate']).toBeUndefined();
+      expect(fromConsole.json()).toEqual({ error: 'unauthorized' });
+
+      // The write path is guarded by the same helper and must answer the same way.
+      const write = await app.inject({
+        method: 'PUT', url: '/ops/api/runtime',
+        headers: { 'x-requested-with': 'XMLHttpRequest' },
+        payload: { publicationMode: 'delayed_15s' }
+      });
+      expect(write.statusCode).toBe(401);
+      expect(write.headers['www-authenticate']).toBeUndefined();
+      expect((await storedSettings()).publication_mode).toBe('live');
+
+      // And the mark buys nothing beyond the header: credentials are still the only way in.
+      const signedIn = await get(app, { authorization: OPS, 'x-requested-with': 'XMLHttpRequest' });
+      expect(signedIn.statusCode).toBe(200);
+      expect(signedIn.headers['www-authenticate']).toBeUndefined();
     } finally {
       await app.close();
     }

@@ -1,6 +1,6 @@
-import type { FastifyPluginAsync, FastifyReply, FastifyRequest } from 'fastify';
+import type { FastifyPluginAsync, FastifyRequest } from 'fastify';
 import { pool } from '../db/pool.js';
-import { hasValidOpsAuth } from './ops-auth.js';
+import { hasValidOpsAuth, opsUnauthorized } from './ops-auth.js';
 
 const uuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
@@ -12,10 +12,6 @@ const SURFACES = ['narrative', 'digest', 'attacks', 'shadow', 'risk', 'retrospec
 
 function authorised(request: FastifyRequest): boolean {
   return hasValidOpsAuth(request.headers.authorization);
-}
-
-function unauthorized(reply: FastifyReply) {
-  return reply.header('WWW-Authenticate', 'Basic realm="ThreatLens Ops"').code(401).send({ error: 'unauthorized' });
 }
 
 /**
@@ -35,7 +31,7 @@ function unauthorized(reply: FastifyReply) {
  */
 const opsAiRunsRoutes: FastifyPluginAsync = async (app) => {
   app.get<{ Querystring: { limit?: string; status?: string; model?: string; surface?: string } }>('/ops/ai-runs', async (request, reply) => {
-    if (!authorised(request)) return unauthorized(reply);
+    if (!authorised(request)) return opsUnauthorized(request, reply);
 
     const requestedLimit = Number(request.query.limit ?? 50);
     if (!Number.isInteger(requestedLimit) || requestedLimit < 1) return reply.code(400).send({ error: 'invalid_limit' });
@@ -81,7 +77,7 @@ const opsAiRunsRoutes: FastifyPluginAsync = async (app) => {
   });
 
   app.get<{ Params: { id: string } }>('/ops/ai-runs/:id', async (request, reply) => {
-    if (!authorised(request)) return unauthorized(reply);
+    if (!authorised(request)) return opsUnauthorized(request, reply);
     if (!uuidPattern.test(request.params.id)) return reply.code(400).send({ error: 'invalid_id' });
     const result = await pool.query(
       `SELECT id,model,prompt_version,surface,classifier_version,validation_status,fallback_reason,

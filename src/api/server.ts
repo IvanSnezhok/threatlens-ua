@@ -17,13 +17,14 @@ import { registerOutboxMetrics } from '../bot/outbox.js';
 import { resolveRuntimeSettings } from '../services/runtime-settings.js';
 import { registerAlertChannelMetrics } from '../services/ingestion.js';
 import { registerTelegramCollectorMetrics, telegramCollectorStatus } from '../sources/telegram.js';
-import { hasValidOpsAuth, safeEqual } from './ops-auth.js';
+import { hasValidOpsAuth, opsUnauthorized, safeEqual } from './ops-auth.js';
 import analyticsRoutes from './analytics-routes.js';
 import attackAnalyticsRoutes from './attack-analytics-routes.js';
 import occupationRoutes from './occupation-routes.js';
 import opsAiRunsRoutes from './ops-ai-runs-routes.js';
 import opsCodexRoutes from './ops-codex-routes.js';
 import opsBackfillRoutes from './ops-backfill-routes.js';
+import opsCoverageRoutes from './ops-coverage-routes.js';
 import opsDeployRoutes from './ops-deploy-routes.js';
 import opsRuntimeRoutes from './ops-runtime-routes.js';
 import opsSourceTrustRoutes from './ops-source-trust-routes.js';
@@ -249,6 +250,7 @@ export async function buildServer() {
   await app.register(opsRuntimeRoutes);
   await app.register(opsDeployRoutes);
   await app.register(opsBackfillRoutes);
+  await app.register(opsCoverageRoutes);
 
   app.get('/api/v1/config', async () => ({
     mapStyleUrl: config.MAP_STYLE_URL,
@@ -520,9 +522,7 @@ export async function buildServer() {
   });
 
   app.get('/ops/api', async (request, reply) => {
-    if (!hasValidOpsAuth(request.headers.authorization)) {
-      return reply.header('WWW-Authenticate', 'Basic realm="ThreatLens Ops"').code(401).send({ error: 'unauthorized' });
-    }
+    if (!hasValidOpsAuth(request.headers.authorization)) return opsUnauthorized(request, reply);
     const [sources, outbox, ai, database, channels] = await Promise.all([
       pool.query(`SELECT id,name,tier,last_success_at,last_error_at,last_error FROM sources ORDER BY tier,id`),
       pool.query(`SELECT status,priority,count(*)::integer FROM notification_outbox GROUP BY status,priority ORDER BY priority,status`),
@@ -533,7 +533,7 @@ export async function buildServer() {
     return { sources: sources.rows, outbox: outbox.rows, aiRuns: ai.rows, database: database.rows[0], channels };
   });
   app.post('/ops/channels', async (request, reply) => {
-    if (!hasValidOpsAuth(request.headers.authorization)) return reply.code(401).send({ error: 'unauthorized' });
+    if (!hasValidOpsAuth(request.headers.authorization)) return opsUnauthorized(request, reply);
     const parsed = createChannelSchema.safeParse(request.body);
     if (!parsed.success) return reply.code(400).send({ error: 'invalid_channel', issues: parsed.error.flatten().fieldErrors });
     try {
@@ -546,7 +546,7 @@ export async function buildServer() {
     }
   });
   app.patch<{ Params: { id: string } }>('/ops/channels/:id', async (request, reply) => {
-    if (!hasValidOpsAuth(request.headers.authorization)) return reply.code(401).send({ error: 'unauthorized' });
+    if (!hasValidOpsAuth(request.headers.authorization)) return opsUnauthorized(request, reply);
     if (!uuidPattern.test(request.params.id)) return reply.code(400).send({ error: 'invalid_id' });
     const parsed = updateChannelSchema.safeParse(request.body);
     if (!parsed.success) return reply.code(400).send({ error: 'invalid_channel', issues: parsed.error.flatten().fieldErrors });
@@ -560,9 +560,7 @@ export async function buildServer() {
     }
   });
   app.post('/ops/run-assessment', async (request, reply) => {
-    if (!hasValidOpsAuth(request.headers.authorization)) {
-      return reply.header('WWW-Authenticate', 'Basic realm="ThreatLens Ops"').code(401).send({ error: 'unauthorized' });
-    }
+    if (!hasValidOpsAuth(request.headers.authorization)) return opsUnauthorized(request, reply);
     return { published: await runRiskAssessments() };
   });
 

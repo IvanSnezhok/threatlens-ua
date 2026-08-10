@@ -1224,3 +1224,129 @@ describe('classifyMessage on retrospective and narrative messages (v5)', () => {
     });
   });
 });
+
+// ------------------------------------------------------------------------------------------------
+// v6: the guided-bomb pattern
+// ------------------------------------------------------------------------------------------------
+//
+// `каб[а-яіїєґ]*` was a three-letter stem plus a glob, which is to say it matched any Ukrainian word
+// beginning with those letters. The channel re-audit behind migration 029 found it from the Russian
+// side («декабре» → a guided bomb over Джанкой) and recorded that the Ukrainian half — «Кабмін»,
+// «Кабінет» — was still live with 46 monitor rows able to trigger it on routine government news.
+// It was not a hypothetical: osint-zhenyok/6ea8fc00-0bb5-4820-aaa9-946db5c7f96f, a news item about a
+// cable factory in Zhytomyr, archived as `event_created` / `guided_air_bomb` under `v5`.
+//
+// The pair below is the shape of every test here: the weapon forms the production archive actually
+// contains must all still parse, and the ordinary words must raise nothing **with an oblast name in
+// the message**, because a false positive with no place resolves to nothing anyway and would prove
+// the wrong thing. The negative cases carry Харківщина, Одещина, Житомир and Херсонщина for exactly
+// that reason.
+
+describe('classifyMessage on the guided-bomb pattern (v6)', () => {
+  const catalogue = [
+    { id: 'ua-63', name: 'Харківська область', aliases: ['харківщина', 'харківщині'], type: 'oblast', geocoded: true },
+    { id: 'ua-51', name: 'Одеська область', aliases: ['одещина', 'одещині'], type: 'oblast', geocoded: true },
+    { id: 'ua-65', name: 'Херсонська область', aliases: ['херсонщина', 'херсонщині'], type: 'oblast', geocoded: true },
+    { id: 'ua-18', name: 'Житомирська область', aliases: ['житомирщина'], type: 'oblast', geocoded: true },
+    { id: 'ua-14', name: 'Донецька область', aliases: ['донеччина', 'донеччині'], type: 'oblast', geocoded: true },
+    { id: 'ua-city-zaporizhzhia', name: 'Запоріжжя', aliases: ['запоріжжя', 'запоріжжі'], type: 'city', geocoded: true, oblastId: 'ua-23' },
+    { id: 'ua-city-zhytomyr', name: 'Житомир', aliases: ['житомир', 'житомирі'], type: 'city', geocoded: true, oblastId: 'ua-18' }
+  ];
+  const read = (text: string) => classifyMessage(text, catalogue);
+
+  it('reads every weapon form the production archive contains', () => {
+    // The four inflections the archive writes (`каб` ×78, `кабів` ×42, `каби` ×37, `кабам` ×5 over
+    // 3 434 stored messages, case-insensitive), in the sentences the channels wrote them in, plus
+    // the locative plural the alert channel uses for a stand-down. Capitalisation is not the
+    // discriminator and must not become one: the telegraphic 🟠 posts write it in lower case.
+    for (const text of [
+      '🚀 КАБи на Запоріжжі',
+      'Загроза застосування керованих авіаційних бомб (КАБів) на Харківщині',
+      '🟠 10:09 каб напрямок Житомир',
+      '🟠 20:22 Загроза кабів на Донеччині',
+      '🟡 10:23 Відбій по кабам на Донеччині',
+      '🟡 22:02 Відбій по КАБах на Донеччині',
+      'Харківщина: 3 каби буде',
+      'КАБами по Херсонщині'
+    ]) {
+      expect(read(text).threatType, text).toBe('guided_air_bomb');
+    }
+  });
+
+  it('still reads a KAB written with its calibre', () => {
+    // "КАБ-500" ends the token at the hyphen, so a digit suffix costs nothing.
+    const result = read('КАБ-500 по Харківщині');
+    expect(result.threatType).toBe('guided_air_bomb');
+    expect(result.locations.map((location) => location.id)).toEqual(['ua-63']);
+  });
+
+  it('reads the compound spelling the channels use when they do not abbreviate', () => {
+    // Twelve archived messages carry «керованих авіабомб» and ten of them name no КАБ at all, so
+    // this phrase was invisible to the rules before v6.
+    expect(read('🔴🔴 22:36 Загроза керованих авіабомб в м. Запоріжжя!').threatType)
+      .toBe('guided_air_bomb');
+    expect(read('Загроза керованих авіаційних бомб на Харківщині').threatType)
+      .toBe('guided_air_bomb');
+  });
+
+  it('never reads a government word as a guided bomb, with the oblast named', () => {
+    // The two messages the re-audit reproduced against the production catalogue. Under v5 both
+    // classified as a significant `guided_air_bomb` — «Кабмін» over Харківська область and
+    // «Кабінет» over Одеська область — which is the defect migration 029 recorded.
+    for (const text of [
+      'Кабмін ухвалив постанову про виплати для Харківщини',
+      'Кабінет Міністрів затвердив бюджет для Одещини',
+      'Кабмін виділив кошти Херсонщині на відновлення житла'
+    ]) {
+      const result = read(text);
+      expect(result.threatType, text).toBe('unknown');
+      expect(result.intent, text).toBe('none');
+      expect(result.locations, text).toEqual([]);
+      expect(isSignificant(result), text).toBe(false);
+      expect(significanceRejection(result), text).toBe('not_an_assertion');
+    }
+  });
+
+  it('never reads the archived cable-factory report as a guided bomb', () => {
+    // Verbatim, osint-zhenyok/6ea8fc00-0bb5-4820-aaa9-946db5c7f96f, 2026-08-09 11:31:42Z. Archived
+    // under v5 as `event_created` / `guided_air_bomb` over Житомир: a published threat event whose
+    // entire evidence was the word «кабельні». It is pinned verbatim rather than paraphrased
+    // because the wording is the finding.
+    const result = read('🔶 Країна мразей атакувала підприємство Kromberg & Schubert у Житомирі — '
+      + 'виробництво призупинили.\n\nПідприємство виготовляє кабельні системи для автомобілів. '
+      + 'Через атаку його виробничі потужності та інфраструктура зазнали значних пошкоджень, тому '
+      + 'роботу зупинили на невизначений термін.');
+    expect(result.threatType).not.toBe('guided_air_bomb');
+    expect(result.locations.map((location) => location.id)).not.toContain('ua-city-zhytomyr');
+  });
+
+  it('never reads the other ordinary каб-words the archive contains', () => {
+    // «кабінеті» (a driver's cabinet in Дія), «кабінєт» (a joke about a urologist's office) and
+    // «кабачки» (courgettes) are the remaining `каб` words in 3 434 archived messages. Each is given
+    // an oblast so the refusal cannot be an artefact of there being no place to attach.
+    for (const text of [
+      'Документ відображатиметься в застосунку «Дія» та Кабінеті водія — Херсонщина',
+      'Просьба пройти в кабінєт травматоуролога, Одещина',
+      'А кабачки підійдуть замість кукурудзи? Харківщина',
+      'У Житомирі прокладають кабельні мережі'
+    ]) {
+      const result = read(text);
+      expect(result.threatType, text).toBe('unknown');
+      expect(isSignificant(result), text).toBe(false);
+    }
+  });
+
+  it('never reads the Russian month out of the middle of a word', () => {
+    // Migration 029's finding, from the disabled @krymrealii sample: «в декабре 2025 года». The
+    // left-hand `(?<!\p{L})` boundary is what refuses it, and it refuses every other word that
+    // merely contains the three letters at the same time.
+    const result = read('Евгений Швед – автомеханик из Джанкоя, в декабре 2025 года, Харьковщина');
+    expect(result.threatType).not.toBe('guided_air_bomb');
+    expect(isSignificant(result)).toBe(false);
+  });
+
+  it('does not let the compound form absorb an unguided bomb', () => {
+    // «керован» stays required. A ФАБ is a different weapon and this class must not claim it.
+    expect(read('Скидання авіабомб по Харківщині').threatType).not.toBe('guided_air_bomb');
+  });
+});

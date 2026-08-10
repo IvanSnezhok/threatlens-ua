@@ -1,5 +1,5 @@
-import type { FastifyPluginAsync, FastifyReply, FastifyRequest } from 'fastify';
-import { hasValidOpsAuth } from './ops-auth.js';
+import type { FastifyPluginAsync, FastifyRequest } from 'fastify';
+import { hasValidOpsAuth, opsUnauthorized } from './ops-auth.js';
 import {
   LAG_REFERENCE_SECONDS,
   MIN_SAMPLE_SIZE,
@@ -23,10 +23,6 @@ function authorised(request: FastifyRequest): boolean {
   return hasValidOpsAuth(request.headers.authorization);
 }
 
-function unauthorized(reply: FastifyReply) {
-  return reply.header('WWW-Authenticate', 'Basic realm="ThreatLens Ops"').code(401).send({ error: 'unauthorized' });
-}
-
 /**
  * Operator-only view of dynamic source trust.
  *
@@ -41,7 +37,7 @@ function unauthorized(reply: FastifyReply) {
  */
 const opsSourceTrustRoutes: FastifyPluginAsync = async (app) => {
   app.get('/ops/api/source-trust', async (request, reply) => {
-    if (!authorised(request)) return unauthorized(reply);
+    if (!authorised(request)) return opsUnauthorized(request, reply);
     const sources = await listSourceTrust();
     return {
       methodology: {
@@ -66,7 +62,7 @@ const opsSourceTrustRoutes: FastifyPluginAsync = async (app) => {
   app.get<{ Params: { id: string }; Querystring: { limit?: string } }>(
     '/ops/api/source-trust/:id',
     async (request, reply) => {
-      if (!authorised(request)) return unauthorized(reply);
+      if (!authorised(request)) return opsUnauthorized(request, reply);
       if (!SOURCE_ID.test(request.params.id)) return reply.code(400).send({ error: 'invalid_source_id' });
       const limit = request.query.limit == null ? 60 : Number(request.query.limit);
       if (!Number.isFinite(limit) || limit < 1 || limit > 365) return reply.code(400).send({ error: 'invalid_limit' });
@@ -79,7 +75,7 @@ const opsSourceTrustRoutes: FastifyPluginAsync = async (app) => {
    * are indistinguishable in the table, which is the point — an operator's run is a real run.
    */
   app.post('/ops/api/source-trust/recalculate', async (request, reply) => {
-    if (!authorised(request)) return unauthorized(reply);
+    if (!authorised(request)) return opsUnauthorized(request, reply);
     return recalculateSourceTrust();
   });
 };

@@ -1,0 +1,261 @@
+-- Re-audit of every switched-off MTProto row in the catalogue, against freshly sampled wording.
+--
+-- Nineteen rows were off when this file was written: fifteen `mtproto_alert_channel` and four
+-- `mtproto_monitor`. Their reasons were written in migrations 011, 013 and 014 and had not been
+-- re-checked against a live feed since. A reason that is never re-checked decays into a habit: the
+-- channel may have changed its format, the classifier may have grown the vocabulary the row was
+-- waiting for, or the concern may simply have been wrong. This migration re-checks all nineteen and
+-- writes down what was actually observed, so the next person inherits evidence rather than folklore.
+--
+-- ================================================================================================
+-- 0. Method, and what it can and cannot establish
+-- ================================================================================================
+--
+-- On 2026-08-10 the public channel preview at `https://t.me/s/<handle>` was fetched once for each of
+-- the nineteen handles — no MTProto session, no credential, no account of ours touched. Every
+-- message on the returned page was run through the real `parseAlertChannelMessage` for the alert
+-- rows and the real `classifyMessage` (against the production location catalogue, 642 lexemes) for
+-- the monitor rows. All nineteen previews were public and returned messages; none of them restricts
+-- the web preview.
+--
+-- The window that gives is 4–20 posts per channel spanning 06.08–10.08.2026. That is enough to
+-- **falsify** "this channel never publishes alerts" — one alert post does it — and enough to read a
+-- format that is published. It is NOT enough to prove a silent channel is permanently silent, so
+-- every "no alert posts observed" below is stated as what it is: the same finding migration 013
+-- made, reproduced two catalogue generations later, not a stronger one.
+--
+-- The result: **no row flips.** One reason is corrected outright (Ternopil), several are sharpened,
+-- and every one of them now carries a dated verbatim sample instead of a recollection. The
+-- `UPDATE`s below re-assert `enabled=false` idempotently — they change nothing in a database that
+-- has not been hand-edited, and repair one that has.
+--
+-- ================================================================================================
+-- 1. A1 — the three administrations whose format migration 014 refused. Refused again.
+-- ================================================================================================
+--
+-- `gov-zaporizhzhia-oda` (@zoda_gov_ua) and `gov-zaporizhzhia-head` (@ivan_fedorov_zp) publish the
+-- same prose format 014 described, unchanged, and the pair still mirrors itself post for post
+-- (zoda_gov_ua/65746 at 16:34:06 and ivan_fedorov_zp/45788 at 16:34:04 are the same sentence two
+-- seconds apart, which is what their shared `independence_group` already says). Verbatim, 09.08.2026:
+--
+--     🚨УВАГА🚨
+--     Оголошена повітряна тривога у громадах Запорізької області, крім міста Запоріжжя!
+--     Бережіть себе і терміново прослідуйте у безпечне місце!
+--
+--     🚨УВАГА🚨
+--     Оголошена повітряна тривога по всій Запорізькій області!
+--     Бережіть себе і терміново прослідуйте у безпечне місце!
+--
+--     ✅ Відбій повітряної тривоги по Запорізькій області та м. Запоріжжя!
+--     ✅ Відбій повітряної тривоги по Запорізькій області!
+--
+-- 014 settled this on "крім", and that argument is intact. This sample adds the reason the obvious
+-- narrower fix does not work either. Suppose the parser learned only the shapes without "крім" and
+-- refused the rest. The observed sequence on ivan_fedorov_zp for 09.08 was:
+--
+--     16:34 start,  scope "у громадах … крім міста Запоріжжя"   → refused
+--     17:19 end,    scope "по Запорізькій області"              → read, ends nothing
+--     17:43 start,  scope "по всій Запорізькій області"         → read, starts an alert
+--     …and the sampling window closes with no all-clear for it.
+--
+-- A parser that reads the starts it understands and refuses the all-clears it does not is a parser
+-- that leaves alerts running for ever. `ALERT_CHANNEL_MAX_ALERT_SECONDS` would eventually sweep
+-- them, which is a defect backstop and not a design. And the location the readable start actually
+-- names is «всій Запорізькій області» — a phrase, not a catalogue row — so even the subset that
+-- parses resolves to nothing. Reading this channel needs a scope model that can express exclusion
+-- and a word order C ("Оголошена повітряна тривога <прийменник> <місце>"). Both are parser design.
+--
+-- `gov-odesa-oda` (@odeskaODA) — twelve posts, 08.08 08:43 → 09.08 20:59 UTC, **not one of them an
+-- alert post**. The only mention of the vocabulary is prose inside an aftermath report, and the
+-- parser files it correctly as `unrelated`:
+--
+--     Прошу мешканців не ігнорувати сигнали повітряної тривоги та залишатися в укриттях до відбою.
+--
+-- So the fresh window neither confirms nor refutes 014's finding — the unlocated «🟢 Відбій
+-- повітряної тривоги!» all-clear that has no location to act on. That fixture is still pinned in
+-- `alert-parser.test.ts` and the row stays off on 014's reasoning, unamended.
+UPDATE sources SET enabled = false
+ WHERE id IN ('gov-odesa-oda', 'gov-zaporizhzhia-oda', 'gov-zaporizhzhia-head');
+
+-- ================================================================================================
+-- 2. A4 — Ternopil: the premise was wrong, the verdict is not
+-- ================================================================================================
+--
+-- THIS IS THE CORRECTION IN THIS FILE, and it matters more than the rows it does not move.
+--
+-- Migration 013 filed `gov-ternopil-oda` (@ternopilskaODA) under "alert format NOT confirmed", on
+-- the finding that "not one of them published a single post about an alert — the feeds are grants,
+-- road repairs, school openings and condolences". For this channel that sentence is false, and
+-- `tests/integration/source-catalog.test.ts` already said so in prose — without a sample, without a
+-- date, and without stating what would actually unblock the row. This is that statement. Verbatim,
+-- ternopilskaODA/26967 at 2026-08-07 14:47:35 UTC and /26968 at 15:14:23 UTC, twenty-seven minutes
+-- apart, a complete alert and its all-clear:
+--
+--     УВАГА‼️Повітряна тривога! Пройдіть негайно в укриття!
+--
+--     Відбій повітряної тривоги‼️
+--
+-- The channel does declare air-raid alerts. What it does not do is say where, and it prints no
+-- status circle either. There is no location anywhere in either message: the scope is the oblast,
+-- and it lives in the identity of the channel, not in the text. `parseAlertChannelMessage` is
+-- deliberately channel-agnostic — the caller passes a source id and every shape is accepted from
+-- every registered channel — so there is nowhere for the parser to learn "when @ternopilskaODA says
+-- this, it means Тернопільська область".
+--
+-- Making it readable means a per-source default scope in the catalogue and a parser that accepts an
+-- unlocated phrase only when the caller supplied one. That is a schema change, a parser contract
+-- change and a new failure mode (any channel that ever prints a bare "Повітряна тривога!" in prose
+-- would alert its whole oblast), so it is a design decision, not a flag. Note also that the start
+-- here begins with "УВАГА", which the parser files as `advisory` — the exclusion that keeps
+-- "🟠 УВАГА!!! Загроза застосування КАБів" from moving alert state. Admitting Ternopil by weakening
+-- that exclusion would trade one oblast's coverage for every channel's advisory discipline, which is
+-- not a trade this catalogue is allowed to make.
+--
+-- Both messages are pinned as negative fixtures in `src/domain/alert-parser.test.ts`, so the day
+-- somebody builds the per-source scope, the shape it has to read is already written down.
+--
+-- The other five A4 rows were re-sampled and reproduce 013's finding exactly — administrative news,
+-- aftermath reporting, condolences, zero alert posts:
+--
+--   `gov-chernihiv-oda`      @chernigivskaODA     7 posts, 08.08 06:30 → 09.08 17:12 UTC, 0 alert
+--   `gov-zhytomyr-oda`       @zhytomyrskaODA      9 posts, 05.08 10:11 → 09.08 16:29 UTC, 0 alert
+--   `gov-poltava-oda`        @poltavskaOVA       10 posts, 07.08 14:52 → 10.08 04:57 UTC, 0 alert
+--   `gov-dnipropetrovsk-oda` @dnipropetrovskaODA 13 posts, 08.08 07:25 → 10.08 04:30 UTC, 0 alert
+--   `gov-donetsk-oda`        @DonetskaODA        18 posts, 07.08 19:42 → 09.08 19:04 UTC, 0 alert
+--
+-- Two of them mention the vocabulary in passing and are filed `unrelated`, which is the distinction
+-- `IgnoreReason` exists to keep. Dnipropetrovsk, verbatim, dnipropetrovskaODA/31281:
+--
+--     Гучні звуки, які чули мешканці Дніпра, - бойова робота наших сил ППО.
+--
+--     До відбою повітряної тривоги перебувайте у безпечних місцях.
+--
+-- 013's own note on Dnipropetrovsk — that the oblast's alert traffic runs through `dnipro_alerts`
+-- and `sirena_dp`, both enabled and both `current` — still describes what the sample shows.
+UPDATE sources SET enabled = false
+ WHERE id IN ('gov-chernihiv-oda', 'gov-zhytomyr-oda', 'gov-poltava-oda',
+              'gov-dnipropetrovsk-oda', 'gov-donetsk-oda', 'gov-ternopil-oda');
+
+-- ================================================================================================
+-- 3. A2 and A3 — free prose and after-action reporting, unchanged
+-- ================================================================================================
+--
+-- `gov-kharkiv-oda` (@kharkivoda, 10 posts, 09.08 07:13 → 17:32 UTC), `gov-kharkiv-head`
+-- (@synegubov, 9 posts, 09.08 06:27 → 17:31 UTC) and `gov-sumy-oda` (@Sumy_news_ODA, 13 posts,
+-- 08.08 06:14 → 10.08 05:15 UTC): zero alert posts, zero alert-vocabulary headlines. What they
+-- publish is casualty and damage reporting written as prose — Sumy's daily "⚫У Білопільській
+-- громаді внаслідок ударів БпЛА поранення та травми отримали 14 людей…" bulletin is the shape of the
+-- whole feed. 013's A2 reading holds without amendment. The Kharkiv pair also reproduces the
+-- duplication its shared `independence_group` records: both republished the same presidential
+-- briefing within eight minutes on 09.08.
+--
+-- `gov-dsns-ua` (@dsns_telegram, 4 posts), `gov-dsns-kharkiv` (@DSNS_Kharkiv, 4 posts) and
+-- `gov-dsns-kyiv-oblast` (@dsns_kyiv_region, 5 posts): the sample is small because these channels
+-- post slowly, and every post in it is the aftermath reporting 013 described — fires extinguished,
+-- crews deployed, a road accident cleared. Not one carries the alert vocabulary at all. The A3
+-- argument was never about format anyway: an alert path fed by after-action reports would declare
+-- alerts that started in the past and would never clear them, and nothing observed here is an
+-- all-clear.
+UPDATE sources SET enabled = false
+ WHERE id IN ('gov-kharkiv-oda', 'gov-kharkiv-head', 'gov-sumy-oda',
+              'gov-dsns-ua', 'gov-dsns-kharkiv', 'gov-dsns-kyiv-oblast');
+
+-- ================================================================================================
+-- 4. The four monitors: a lower bar, and all four still fail it
+-- ================================================================================================
+--
+-- A monitor row feeds `classifyMessage` and nothing else. It cannot start or end an alert period, so
+-- the question is not "can the alert parser read it" but "does it publish operational threat text
+-- the classifier can turn into a located threat". Each of the four was run message by message
+-- through the real classifier against the production catalogue. The counts below are
+-- (messages yielding a threat type AND at least one resolved Ukrainian location) / (messages).
+--
+-- `osint-kyiv-alarm` (@alarm_kyiv) — **0/20**, and the reason is new. 013 rejected this row for
+-- being an unknown channel with seven subscribers; the count is still seven on 10.08.2026 and the
+-- operator is still unnamed, but that is no longer the strongest objection. The channel is alive and
+-- publishes in Ukrainian, and every one of its twenty posts is the identical two-line pair:
+--
+--     🚨 м. Київ
+--     Повітряна тривога
+--
+--     🟢 м. Київ
+--     Відбій повітряної тривоги
+--
+-- That is an alert-state mirror, not threat reporting. It names no weapon, no direction and no
+-- observation, so the classifier returns `threatType='unknown'` with zero locations and
+-- `significanceRejection='not_an_assertion'` on all twenty — a source that would report healthy and
+-- contribute nothing, which is exactly the failure 011 named. The state it mirrors is already
+-- carried by `air-alert-ua` and `aerial-alerts-mirror`, from bodies that own it. Enabling this row
+-- would add a seven-subscriber anonymous relay of a fact two Tier A sources already hold.
+--
+-- `osint-alert-odessa` (@alertOdessa) — **0/20**, and now disqualified twice over. It is the same
+-- alert-state mirror shape as @alarm_kyiv, in Russian:
+--
+--     ❗️21:28 Одесса и область — воздушная тревога!
+--     ️⚡️ 21:31 Одесса и область — отбой тревоги
+--
+-- Russian-language handling is still not in `src/domain/classifier.ts`, so the language objection
+-- 013 raised stands unchanged; and even with it, the content is state mirroring rather than threat
+-- observation, so this row would not become useful the day Russian patterns land.
+--
+-- `osint-krym-realii` (@krymrealii) — **2/16, and both are false.** This is the strongest evidence in
+-- the file, because it shows the Russian-language gap is not merely a silence. Verbatim,
+-- krymrealii/38339, a news story about a political prisoner:
+--
+--     🇺🇦 Российские силовики инкриминировали крымчанину Евгению Шведу «государственную измену».
+--     … Евгений Швед – автомеханик из Джанкоя. … в декабре 2025 года …
+--
+-- The classifier reads it as `guided_air_bomb` over **Джанкой**. The needle is «декабре»: the KAB
+-- pattern is `каб[а-яіїєґ]*`, the Russian word for December contains it, and «Джанкоя» resolves.
+-- A second post produced the same class from «Кабмина». And krymrealii/38340 — a report that
+-- Ukrainian forces control the Kinburn spit — is read as a `uav` threat over **Херсонська область**
+-- and the town of **Лиман**, four hundred kilometres away, because «лиманом» in "Днепровско-Бугским
+-- лиманом" is a common noun in Russian and a settlement name in the catalogue.
+--
+-- Two published threat events, neither of them a threat. This row stays off, and the finding is
+-- larger than the row: see the note at the end of this section.
+--
+-- `osint-vanek-nikolaev` (@vanek_nikolaev) — **1/20**, and the one that resolves is mis-scoped.
+-- The channel's weapon slang survives partially (`мопед` → uav, `ракета Х-59` → cruise_missile fire
+-- on eleven of twenty posts), so this is not the total silence 011 predicted. It is worse. Verbatim,
+-- vanek_nikolaev/42208:
+--
+--     на сейчас по мопедам в Одесской области:
+--     1 над Одессой
+--     1 управляемый реактивный крутится над Арцизом
+--     2 с моря курсом на/через Тузлы
+--
+-- The classifier resolves **Арциз and nothing else**. «Одесской области», «Одессой» and «Тузлы» are
+-- Russian spellings the Ukrainian catalogue does not carry, so a warning covering an oblast lands on
+-- one town of twelve thousand people. The other ten threat-typed posts resolve no location at all
+-- and are recorded as `ignored`/`no_location`. A source that mis-scopes one warning in twenty and
+-- drops the rest is not partial coverage; it is a wrong footprint on the map with a Tier C
+-- assertion behind it. `independence_group='air-force'` stays as 011 set it, and `kpszsu` — the
+-- channel it reposts — is enabled and `current`, so nothing about the original grouping is stale.
+--
+-- **A finding that outlives these four rows.** «декабре» is Russian, but `каб[а-яіїєґ]*` also matches
+-- the Ukrainian «Кабмін» and «Кабінет». "Кабмін ухвалив постанову про виплати для Харківщини"
+-- classifies today as a significant `guided_air_bomb` threat over Харківська область, and forty-six
+-- monitor rows are enabled. That is a live defect in `src/domain/classifier.ts`, not a reason to
+-- keep these four off, and it is recorded here because this audit is where it was found. Fixing it
+-- is a pattern change and therefore a `CLASSIFIER_VERSION` bump with a gold-corpus replay, which
+-- does not belong in a catalogue migration.
+UPDATE sources SET enabled = false
+ WHERE id IN ('osint-kyiv-alarm', 'osint-alert-odessa', 'osint-krym-realii',
+              'osint-vanek-nikolaev');
+
+-- ================================================================================================
+-- 5. What the collector sees, and what it does not
+-- ================================================================================================
+--
+-- Nothing here changes the resolve pass. Fifty-four MTProto rows were enabled before this file and
+-- fifty-four are enabled after it, so the `DIALOG_SCAN_LIMIT = 500` comment in
+-- `src/sources/telegram.ts` — "an account that carries only the ~54 collected channels costs one
+-- request" — still describes the deployment exactly, and no operator action is required to apply
+-- this migration.
+--
+-- The nineteen rows below remain registered, documented and deliberately silent. `health_status`
+-- stays `unknown` for every one of them, which is the honest answer: `markSourceSuccess` never runs
+-- for a row the collector does not read, and `/api/v1/sources` reports it as unknown rather than
+-- healthy. If a future migration enables any of them, the collector account must be subscribed to
+-- that channel first — `docs/OPERATIONS.md` carries the table of which handles that means.

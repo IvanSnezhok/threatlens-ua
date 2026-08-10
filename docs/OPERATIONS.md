@@ -280,6 +280,105 @@ Reading it:
 - **A step in a series with an unchanged channel** usually means `TRUST_METHODOLOGY_VERSION` moved;
   every row carries the version it was computed under, so compare like with like.
 
+## Enabling a switched-off source
+
+Nineteen MTProto rows are registered and switched off: fifteen `mtproto_alert_channel` and four
+`mtproto_monitor`. They are not a backlog and they are not credentials waiting to arrive. Each one is
+a decision with a written reason — `migrations/011`, `013`, `014`, and the re-audit in
+`migrations/029_disabled_channel_reaudit.sql`, which re-checked all nineteen against freshly sampled
+wording on 10.08.2026 and moved none of them.
+
+```bash
+# What is off, and what its handle is.
+docker compose exec -T postgres psql -U threatlens -d threatlens -c "
+  SELECT id, name, adapter_type, telegram_username, health_status
+  FROM sources WHERE NOT enabled AND adapter_type LIKE 'mtproto%' ORDER BY adapter_type, id"
+```
+
+`health_status='unknown'` on all nineteen is correct and not a fault: `markSourceSuccess` never runs
+for a row the collector does not read, and `/api/v1/sources` reports unknown rather than healthy.
+
+### The bar, per adapter type
+
+- **`mtproto_alert_channel`** — `enabled=true` means exactly one thing: **the parser has been shown
+  this channel's published wording, as a fixture, in `src/domain/alert-parser.test.ts`**. Not "the
+  body is trustworthy" (that is `tier` and `official`), and not "the channel looks active". An
+  official row starts and ends alert periods outright, so a channel whose wording the parser cannot
+  read is an oblast that looks covered and is not.
+- **`mtproto_monitor`** — a lower bar, because a monitor feeds `classifyMessage` and can never touch
+  an alert period: **does it publish operational threat text that resolves to a Ukrainian location**.
+  The test is empirical, not editorial — run its messages through the classifier and count.
+
+### How to re-audit one, without touching the collector account
+
+No MTProto session is needed and none should be used. The public channel preview is plain HTML and
+needs no credential:
+
+```bash
+curl -sS -A 'Mozilla/5.0' "https://t.me/s/<handle>" -o /tmp/<handle>.html   # ~20 recent posts
+```
+
+Extract the message bodies (`div.tgme_widget_message_text.js-message_text`, `<br>` → newline) and run
+each one through the **real** module in a scratch harness — `parseAlertChannelMessage(text, at)` for
+an alert row, `classifyMessage(text, catalogue)` for a monitor row, with the catalogue read from
+`listLocationLexemes()`. Reading the wording by eye is how a channel gets enabled on a format the
+parser does not actually accept.
+
+Then, and only then:
+
+1. **It parses cleanly today** → add its verbatim message to `alert-parser.test.ts` as a positive
+   fixture and flip the flag in a migration whose header names the sample and its date.
+2. **It parses after a new pattern** → only if the pattern cannot admit an excluded family. The
+   exclusions are not negotiable: `повітрян…` must precede `тривог…` in the location-first patterns,
+   `Загроза …` / `Відбій загрози …` / `Відбій по …` never move alert state, and a bare `Відбій`
+   carrying a "still under alert" addendum is a threat stand-down. Widening any of them to admit a
+   channel trades every channel's safety for one oblast's coverage.
+3. **It is unreadable or ambiguous** → leave it off and refresh the reason in a migration with a
+   dated verbatim sample, so the next audit starts from evidence. Pin the shape as a **negative**
+   fixture while you are there; `alert-parser.test.ts` carries a block of them for exactly this.
+
+### Channels the collector account must join before any of these is enabled
+
+The collector receives updates only for dialogs its account is in. `resolveChannelPeers` builds the
+username → peer-id table from one `getDialogs` pass, and a handle that is not in the dialog list is
+reported in `collector.unresolved` and its `sources` row is marked `error` — honestly, and for ever,
+until somebody joins the channel. So enabling any row below is **two** actions, and the join comes
+first.
+
+Whether the account is already subscribed to any of them **cannot be read from the database**:
+`loadAlertChannels()` and `loadMonitoredTelegramChannels()` both filter on `enabled=true`, so a
+switched-off handle never enters a resolve pass and its `health_status='unknown'` records that it was
+never looked for — not that it was looked for and missed. Treat every row below as needing a join
+until a pass says otherwise, and check the flag and the join in that order: flip one row, watch
+`collector.unresolved` after the retry, join what it names.
+
+| Row | Handle | Adapter | Join before enabling |
+| --- | --- | --- | --- |
+| `gov-chernihiv-oda` | [@chernigivskaODA](https://t.me/chernigivskaODA) | alert channel | yes |
+| `gov-dnipropetrovsk-oda` | [@dnipropetrovskaODA](https://t.me/dnipropetrovskaODA) | alert channel | yes |
+| `gov-donetsk-oda` | [@DonetskaODA](https://t.me/DonetskaODA) | alert channel | yes |
+| `gov-dsns-kharkiv` | [@DSNS_Kharkiv](https://t.me/DSNS_Kharkiv) | alert channel | yes |
+| `gov-dsns-kyiv-oblast` | [@dsns_kyiv_region](https://t.me/dsns_kyiv_region) | alert channel | yes |
+| `gov-dsns-ua` | [@dsns_telegram](https://t.me/dsns_telegram) | alert channel | yes |
+| `gov-kharkiv-head` | [@synegubov](https://t.me/synegubov) | alert channel | yes |
+| `gov-kharkiv-oda` | [@kharkivoda](https://t.me/kharkivoda) | alert channel | yes |
+| `gov-odesa-oda` | [@odeskaODA](https://t.me/odeskaODA) | alert channel | yes |
+| `gov-poltava-oda` | [@poltavskaOVA](https://t.me/poltavskaOVA) | alert channel | yes |
+| `gov-sumy-oda` | [@Sumy_news_ODA](https://t.me/Sumy_news_ODA) | alert channel | yes |
+| `gov-ternopil-oda` | [@ternopilskaODA](https://t.me/ternopilskaODA) | alert channel | yes |
+| `gov-zaporizhzhia-head` | [@ivan_fedorov_zp](https://t.me/ivan_fedorov_zp) | alert channel | yes |
+| `gov-zaporizhzhia-oda` | [@zoda_gov_ua](https://t.me/zoda_gov_ua) | alert channel | yes |
+| `gov-zhytomyr-oda` | [@zhytomyrskaODA](https://t.me/zhytomyrskaODA) | alert channel | yes |
+| `osint-alert-odessa` | [@alertOdessa](https://t.me/alertOdessa) | monitor | yes |
+| `osint-krym-realii` | [@krymrealii](https://t.me/krymrealii) | monitor | yes |
+| `osint-kyiv-alarm` | [@alarm_kyiv](https://t.me/alarm_kyiv) | monitor | yes |
+| `osint-vanek-nikolaev` | [@vanek_nikolaev](https://t.me/vanek_nikolaev) | monitor | yes |
+
+Joining costs nothing operationally and does **not** enable anything — the catalogue decides what is
+read. The account currently carries 54 collected channels; `DIALOG_SCAN_LIMIT` is 500 and
+`getDialogs` pages at 100, so joining all nineteen would take the pass to 73 channels and still cost
+one request. Nothing in the resolve pass needs re-tuning at that size.
+
 ## Deployment from /ops
 
 Off unless `DEPLOY_ENABLED=true`. Off is a complete configuration: the «Оновлення з main» block says

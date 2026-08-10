@@ -97,7 +97,7 @@ describe('the one thing the model is allowed to do', () => {
     expect(request.surface).toBe('retrospective_gate');
     expect(request.promptVersion).toBe('retrospective-gate-v1');
     expect(request.json).toBe(true);
-    expect(request.classifierVersion).toBe('v5');
+    expect(request.classifierVersion).toBe('v6');
     // The whole message, not the classifier's 500-character summary: the essays this layer exists
     // for say what they are in their last paragraph as often as in their first.
     expect(request.user).toBe(SUSPECT_TEXT);

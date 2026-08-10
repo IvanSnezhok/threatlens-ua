@@ -89,8 +89,20 @@ import {
  *   present-tense verb of motion — publishes exactly as it did in `v4`. That asymmetry is deliberate
  *   and is the whole safety argument: missing a retrospective false positive costs a reader one
  *   wrong line, suppressing a real warning costs them the warning.
+ * * `v6` — the guided-bomb pattern stops matching ordinary words. `каб[а-яіїєґ]*` was a three-letter
+ *   stem plus a glob, and three letters is not a stem: it matched «Кабмін», «Кабінет», «кабельний»,
+ *   «кабачки» and the Russian «декабре», so "Кабмін ухвалив постанову про виплати для Харківщини"
+ *   classified as a significant `guided_air_bomb` over Харківська область with 46 monitor rows able
+ *   to trigger it on routine government news. It was not hypothetical: a Zhytomyr cable-factory news
+ *   item published a real threat event over Житомир on 2026-08-09, and migration 029's channel
+ *   re-audit hit the Russian half of the same hole («декабре» → a guided bomb over Джанкой). The
+ *   pattern is now the enumerated declension of the abbreviation with a letter boundary on both
+ *   sides — every weapon form the archive contains matches, nothing that merely begins with those
+ *   three letters does. The long form additionally reads «керован* авіабомб*», the compound spelling
+ *   of the same weapon, which the rules had never matched at all and which twelve archived messages
+ *   use.
  */
-export const CLASSIFIER_VERSION = 'v5';
+export const CLASSIFIER_VERSION = 'v6';
 
 export interface LocationLexeme {
   id: string;
@@ -134,7 +146,40 @@ const patterns: Array<[ThreatType, RegExp]> = [
   // two — the structural one does: {@link isSignificant} refuses to raise anything that names no
   // place, so a post office notice classifies as a threat about nowhere and is dropped.
   ['cruise_missile', /(крилат[а-яіїєґ]* ракет[а-яіїєґ]*|іскандер[-– ]?к|калібр[а-яіїєґ]*|он[іи]кс|п[-– ]?800|(?<!\p{L})бандерол[а-яіїєґ]*|швидкісн[а-яіїєґ]*\s+ціл[а-яіїєґ]*)/iu],
-  ['guided_air_bomb', /(каб[а-яіїєґ]*|керован[а-яіїєґ]* авіаційн[а-яіїєґ]* бомб[а-яіїєґ]*)/iu],
+  // The КАБ half is an enumerated declension table rather than a stem plus a glob, and the reason is
+  // the defect it replaces. `каб[а-яіїєґ]*` matched every Ukrainian word that merely *begins* with
+  // those three letters: "Кабмін ухвалив постанову про виплати для Харківщини" classified as a
+  // significant `guided_air_bomb` over Харківська область, and "Підприємство виготовляє кабельні
+  // системи для автомобілів … у Житомирі" was published as a real threat event on 2026-08-09
+  // (osint-zhenyok, source message 6ea8fc00-0bb5-4820-aaa9-946db5c7f96f). Migration 029 found the
+  // same hole from the Russian side — «в декабре 2025 года … Джанкоя» was read as a guided bomb over
+  // Джанкой — and recorded that the Ukrainian «Кабмін»/«Кабінет» case was still live.
+  //
+  // The archive says what the weapon actually looks like. Over 3 434 stored messages the only forms
+  // that carry the weapon sense are `каб` ×78, `кабів` ×42, `каби` ×37 and `кабам` ×5
+  // (case-insensitive; the channels write КАБ, КАБи, КАБів, КАБам in capitals and каб, каби, кабів,
+  // кабам in the telegraphic 🟠 posts), and every one of them is the abbreviation declined as an
+  // ordinary masculine hard-stem noun. The other four `каб` words in the archive — `кабінеті`,
+  // `кабінєт`, `кабельні`, `кабачки` — are not the weapon in any sense.
+  //
+  // So the paradigm is generated and closed, the same choice `place-morphology.ts` makes for place
+  // names and for the same reason: an enumerated suffix list can be read against the language and
+  // argued about, while `[а-яіїєґ]*` can only be tested against the messages somebody happened to
+  // look at. A stop-list (`кабмін|кабінет|кабел`) was the alternative and is rejected — it would
+  // have to grow with the dictionary, and the next word it does not yet know about becomes a
+  // published threat rather than a missed match.
+  //
+  // The two boundaries carry the rest and are what make a stop-list unnecessary: `(?<!\p{L})` keeps
+  // the token out of the middle of a word («декабре», «скабеева»), `(?!\p{L})` keeps it out of
+  // anything longer that starts with it («Кабмін», «Кабінет», «кабельний», «кабіна», «кабачки»).
+  // Non-letters still end the token, so "КАБ-500" and "КАБи-сучки" match on the first component.
+  //
+  // The long form gains «керован* авіабомб*», which is the compound the channels write when they do
+  // not abbreviate: twelve archived messages carry it — "🔴🔴 Загроза керованих авіабомб в
+  // м. Запоріжжя…" is the standard shape — and ten of those name no КАБ anywhere, so the phrase was
+  // invisible to these rules. «керован» stays required: an unguided ФАБ is a different weapon and
+  // this class must not absorb it.
+  ['guided_air_bomb', /((?<!\p{L})каб(?:а|у|ом|і|и|ів|ам|ами|ах)?(?!\p{L})|керован[а-яіїєґ]*\s+(?:авіаційн[а-яіїєґ]*\s+бомб|авіабомб)[а-яіїєґ]*)/iu],
   // "герань" and "мопед" are the two slang names the OSINT feeds use for a Shahed-type drone, and
   // the bare "реакт" is how they abbreviate a jet-powered one in telegraphic posts
   // ("3х реакт йдуть по межі Котельва").

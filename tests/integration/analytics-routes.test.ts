@@ -103,6 +103,39 @@ describe.skipIf(!integrationDatabaseAvailable)('analytics routes', () => {
     }
   });
 
+  /**
+   * This plugin refuses from an `onRequest` hook rather than from inside each handler — the other
+   * shape of the same guard, and the one that would have been missed had the fix been applied
+   * handler by handler. It must suppress `WWW-Authenticate` for the console's own fetch for the
+   * same reason: Chrome honours the challenge on a `fetch()` too, and the analytics tab is drawn
+   * by the same console that the challenge locks out.
+   */
+  it('drops the challenge for the console fetch while still refusing it', async () => {
+    const app = await buildApp();
+    try {
+      const response = await app.inject({
+        method: 'GET', url: '/ops/api/analytics/coverage',
+        headers: { 'x-requested-with': 'XMLHttpRequest' }
+      });
+      expect(response.statusCode).toBe(401);
+      expect(response.headers['www-authenticate']).toBeUndefined();
+      expect(response.json()).toEqual({ error: 'unauthorized' });
+
+      // Bad credentials plus the mark are still bad credentials.
+      const wrong = await app.inject({
+        method: 'GET', url: '/ops/api/analytics/coverage',
+        headers: {
+          authorization: `Basic ${Buffer.from('operator:wrong').toString('base64')}`,
+          'x-requested-with': 'XMLHttpRequest'
+        }
+      });
+      expect(wrong.statusCode).toBe(401);
+      expect(wrong.headers['www-authenticate']).toBeUndefined();
+    } finally {
+      await app.close();
+    }
+  });
+
   it('keeps its auth hook inside its own encapsulation context', async () => {
     // The plugin is registered without fastify-plugin, so the `onRequest` hook that demands operator
     // credentials applies to its routes and nothing else. This is what makes
