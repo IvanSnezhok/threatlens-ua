@@ -31,7 +31,52 @@ const MIGRATION_FILES = [
   '027_aerial_alert_mirror.sql',
   '028_analytics_min_pass_interval.sql',
   '029_disabled_channel_reaudit.sql',
-  '030_app_settings.sql'
+  '030_app_settings.sql',
+  '031_homonym_settlement_gaps.sql'
+];
+
+/**
+ * Every settlement a migration inserts by hand, and the oblast its KATOTTG code says it is in.
+ *
+ * This is the audit the 2026-08-10 incident asked for. A UAV corridor across Dnipropetrovsk oblast
+ * was rendered on Обухівський район, Київська область, and the first suspicion was that one of
+ * migration 024's eighteen rows carried a parent in the wrong oblast — a defect no unit test could
+ * see, because the parent is chosen by a subquery against rows the KATOTTG sync creates. It did not:
+ * all eighteen were correct, and the cause was a missing homonym instead (see migration 031). The
+ * table stays because the *class* of defect is real and silent: a settlement pointed at the wrong
+ * raion looks perfectly healthy in `locations` and only shows up as a polygon 400 km away.
+ *
+ * The expected value is the oblast, not the raion, because both are correct answers depending on
+ * the database: migrations 024 and 031 attach a settlement to its raion when the sync has already
+ * created that row and to its oblast when it has not, which is the case in a freshly migrated test
+ * database. Walking up to the oblast is the assertion that holds either way — and it is exactly the
+ * walk `listLocationLexemes` and the territory climb make.
+ */
+const SEEDED_SETTLEMENT_OBLASTS: ReadonlyArray<readonly [string, string, string]> = [
+  // migration 024
+  ['UA32060110010087428', 'Згурівка', 'ua-32'],
+  ['UA32060070010067563', 'Велика Димерка', 'ua-32'],
+  ['UA32060090010046220', 'Зазим’я', 'ua-32'],
+  ['UA32060090040088774', 'Погреби', 'ua-32'],
+  ['UA32080010010043861', 'Білогородка', 'ua-32'],
+  ['UA32080030010080493', 'Бородянка', 'ua-32'],
+  ['UA32080090020082865', 'Крюківщина', 'ua-32'],
+  ['UA32140070010070369', 'Глеваха', 'ua-32'],
+  ['UA32140170010072394', 'Чабани', 'ua-32'],
+  ['UA74100190010032782', 'Козелець', 'ua-74'],
+  ['UA74080150020098715', 'Дігтярі', 'ua-74'],
+  ['UA74080090010045475', 'Мала Дівиця', 'ua-74'],
+  ['UA12020170010095010', 'Обухівка', 'ua-12'],
+  ['UA12040150020083955', 'Карнаухівка', 'ua-12'],
+  ['UA59080310010046655', 'Юнаківка', 'ua-59'],
+  ['UA59080290010046940', 'Хотінь', 'ua-59'],
+  ['UA18040350030097353', 'Озерне', 'ua-18'],
+  ['UA51040190010067512', 'Сарата', 'ua-51'],
+  // migration 031
+  ['UA12120010020096111', 'Богуслав', 'ua-12'],
+  ['UA63020050010064235', 'Золочів', 'ua-63'],
+  ['UA59080130010087968', 'Миколаївка', 'ua-59'],
+  ['UA59060070010030190', 'Липова Долина', 'ua-59']
 ];
 
 describe.skipIf(!integrationDatabaseAvailable)('migration runner against live PostgreSQL', () => {
@@ -124,6 +169,33 @@ describe.skipIf(!integrationDatabaseAvailable)('migration runner against live Po
       "SELECT id FROM sources WHERE id IN ('ukraine-alarm','alerts-in-ua') ORDER BY id"
     );
     expect(sources.rows.map((row) => row.id)).toEqual(['alerts-in-ua', 'ukraine-alarm']);
+  });
+
+  it('puts every hand-seeded settlement in the oblast its KATOTTG code names', async () => {
+    const rows = await sql<{ official_code: string; name_uk: string; oblast_id: string | null }>(
+      `WITH RECURSIVE ancestry(id, ancestor_id, ancestor_type) AS (
+         SELECT id, id, type FROM locations
+         UNION ALL
+         SELECT ancestry.id, parent.id, parent.type
+           FROM ancestry JOIN locations child ON child.id = ancestry.ancestor_id
+                         JOIN locations parent ON parent.id = child.parent_id
+       )
+       SELECT l.official_code, l.name_uk,
+              (SELECT ancestor_id FROM ancestry
+                WHERE ancestry.id = l.id AND ancestor_type IN ('oblast','special_city') LIMIT 1) AS oblast_id
+         FROM locations l WHERE l.official_code = ANY($1::text[])`,
+      [SEEDED_SETTLEMENT_OBLASTS.map(([code]) => code)]
+    );
+    const byCode = new Map(rows.rows.map((row) => [row.official_code, row]));
+    // Present at all: a row silently absent would make its messages resolve to nothing, which is the
+    // gap migrations 024 and 031 exist to close.
+    expect([...byCode.keys()].sort()).toEqual(SEEDED_SETTLEMENT_OBLASTS.map(([code]) => code).sort());
+    expect(SEEDED_SETTLEMENT_OBLASTS.map(([code]) => `${code} ${byCode.get(code)?.oblast_id}`))
+      .toEqual(SEEDED_SETTLEMENT_OBLASTS.map(([code, , oblast]) => `${code} ${oblast}`));
+    // The name is asserted alongside so a code typed one digit wrong cannot pass by landing on some
+    // other settlement that happens to sit in the same oblast.
+    expect(SEEDED_SETTLEMENT_OBLASTS.map(([code]) => byCode.get(code)?.name_uk))
+      .toEqual(SEEDED_SETTLEMENT_OBLASTS.map(([, name]) => name));
   });
 
   it('registers the occupation snapshot table with its revision uniqueness guarantee', async () => {

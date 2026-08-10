@@ -829,7 +829,20 @@ describe('classifyMessage on Ukrainian place-name morphology (v4)', () => {
     { id: 'city-dihtiari', name: 'Дігтярі', aliases: ['дігтярі'], type: 'city', oblastId: 'ua-74' },
     { id: 'city-khotin', name: 'Хотінь', aliases: ['хотінь'], type: 'city', oblastId: 'ua-59' },
     { id: 'city-yunakivka', name: 'Юнаківка', aliases: ['юнаківка'], type: 'city', oblastId: 'ua-59' },
-    { id: 'city-mena', name: 'Мена', aliases: ['мена'], type: 'city', oblastId: 'ua-74' }
+    { id: 'city-mena', name: 'Мена', aliases: ['мена'], type: 'city', oblastId: 'ua-74' },
+    // The homonym pairs migration 031 completes. Each was a single catalogue row before it, which
+    // is why the message's own oblast could not save it: `pickAmongTied` reads the oblast only to
+    // separate two rows that claim the same span, so one unopposed row won whatever the text said.
+    { id: 'ua-14', name: 'Донецька область', aliases: ['донеччина'], type: 'oblast', geocoded: true },
+    { id: 'ua-46', name: 'Львівська область', aliases: ['львівщина'], type: 'oblast', geocoded: true },
+    { id: 'city-bohuslav-kyiv', name: 'Богуслав', aliases: ['богуслав'], type: 'city', oblastId: 'ua-32' },
+    { id: 'city-bohuslav-dnipro', name: 'Богуслав', aliases: ['богуслав'], type: 'city', oblastId: 'ua-12' },
+    { id: 'city-zolochiv-lviv', name: 'Золочів', aliases: ['золочів'], type: 'city', oblastId: 'ua-46' },
+    { id: 'city-zolochiv-kharkiv', name: 'Золочів', aliases: ['золочів'], type: 'city', oblastId: 'ua-63' },
+    { id: 'city-mykolaivka-donetsk', name: 'Миколаївка', aliases: ['миколаївка'], type: 'city', oblastId: 'ua-14' },
+    { id: 'city-mykolaivka-sumy', name: 'Миколаївка', aliases: ['миколаївка'], type: 'city', oblastId: 'ua-59' },
+    { id: 'city-dolyna', name: 'Долина', aliases: ['долина'], type: 'city', oblastId: 'ua-26' },
+    { id: 'city-lypova-dolyna', name: 'Липова Долина', aliases: ['липова долина'], type: 'city', oblastId: 'ua-59' }
   ];
   const at = (text: string) => classifyMessage(text, catalogue).locations.map((location) => location.id).sort();
 
@@ -926,6 +939,55 @@ describe('classifyMessage on Ukrainian place-name morphology (v4)', () => {
     expect(at('БпЛА у напрямку Зазим’є Велика Димерка')).toEqual(['city-dymerka', 'city-zazymia']);
     expect(at('Погреби - Троя рух БПЛА')).toEqual(['city-pohreby', 'ua-80']);
     expect(at('Жуляни 2 балістики падають!!')).toEqual(['ua-80']);
+  });
+
+  // ----------------------------------------------------------------------------------------------
+  // E. The homonyms migration 031 completes: a catalogue that held one of a pair named the wrong
+  //    oblast even when the message named the right one in its own first line.
+  // ----------------------------------------------------------------------------------------------
+
+  it('E1 reads the Dnipropetrovsk Богуслав out of the message that painted Обухівський район', () => {
+    // Verbatim from the production archive: `source_messages` id
+    // 6b1e7d29-dbb5-4df2-a731-f418f66c62f4, osint-rynda, 2026-08-10T11:50:11Z. With only the Kyiv
+    // Богуслав in the catalogue this resolved `katottg-ua32120010010027554`, the unmapped-ancestor
+    // climb in `territory-state.ts` walked it up to Обухівський район, Київська область, and the
+    // territory panel showed a Kyiv-oblast raion carrying a Dnipropetrovsk UAV corridor for an hour.
+    expect(at('Дніпропетровщина:\nБпЛА курсом на Богуслав\nРеактивний БпЛА курсом на Божедарівку'))
+      .toEqual(['city-bohuslav-dnipro', 'ua-12']);
+    // The Kyiv one is still reachable when the message says so, which is the whole point of adding
+    // the second row rather than replacing the first.
+    expect(at('Київщина: БпЛА курсом на Богуслав')).toEqual(['city-bohuslav-kyiv', 'ua-32']);
+    // And bare, with no oblast anywhere, the pair refuses. Inventing 400 km is worse than silence.
+    expect(at('БпЛА курсом на Богуслав')).toEqual([]);
+  });
+
+  it('E2 keeps a Kharkiv Золочів out of Lviv oblast', () => {
+    // 8ef447a6-28b2-4852-bbcf-65a7d24817bf and 09264f03-ef64-4bab-a907-e2eea613a809, both archived,
+    // both naming Харківщина in the same sentence, both resolving Золочів, Львівська обл. before 031.
+    expect(at('🛵Реактивний БПЛА на Харківщину з БНР попереднім курсом на Золочів'))
+      .toEqual(['city-zolochiv-kharkiv', 'ua-63']);
+    expect(at('Харківщина:\nБпЛА курсом на Золочів')).toEqual(['city-zolochiv-kharkiv', 'ua-63']);
+    expect(at('Львівщина: БпЛА курсом на Золочів')).toEqual(['city-zolochiv-lviv', 'ua-46']);
+  });
+
+  it('E3 keeps a Sumy-border Миколаївка out of Donetsk oblast', () => {
+    // a4d3b0ac-7df8-4ecf-b019-61d39f10fceb and a66137b9-7a22-4734-ada2-b0ad7adf4cc9, Air Force.
+    // Хотінь — the settlement in the first of them, added by 024 — is in the same raion as this one.
+    expect(at('🛵 Сумщина: БпЛА повз Хотінь ➡️ у напрямку Миколаївки/Степанівки.'))
+      .toEqual(['city-khotin', 'city-mykolaivka-sumy', 'ua-59']);
+    expect(at('🛵 Сумщина: реактивний БпЛА ➡️ в напрямку Миколаївки.'))
+      .toEqual(['city-mykolaivka-sumy', 'ua-59']);
+    expect(at('Донеччина: БпЛА курсом на Миколаївку')).toEqual(['city-mykolaivka-donetsk', 'ua-14']);
+  });
+
+  it('E4 lets Липова Долина take the span Долина was reading out of it', () => {
+    // 02ece8e9-78c3-401b-a18e-654bfb199a55, Air Force. The second word alone resolved Долина,
+    // Івано-Франківська обл. — the far west — out of a Sumy border report. This is the longest-name
+    // rule doing its job, not a tie-break: with the two-word row present there is no shorter match.
+    expect(at('🛵 Сумщина: БпЛА ➡️ на півночі від Липової Долини,  курс - змінний.'))
+      .toEqual(['city-lypova-dolyna', 'ua-59']);
+    // The Ivano-Frankivsk town keeps its own name.
+    expect(at('БпЛА курсом на Долину')).toEqual(['city-dolyna']);
   });
 
   // ----------------------------------------------------------------------------------------------
