@@ -114,6 +114,7 @@ describe('metric registration', () => {
     'threatlens_retrospective_gate_outcomes_total',
     'threatlens_ingestion_leg_runs_total',
     'threatlens_ingestion_leg_interval_seconds',
+    'threatlens_ingestion_leg_duration_seconds',
     'threatlens_alert_pokes_total'
   ];
 

@@ -1,4 +1,5 @@
 import { Counter, Gauge, type Registry } from 'prom-client';
+import { notifyAdmin, type AdminNoticeReason } from '../bot/admin-notice.js';
 import { config } from '../config.js';
 import {
   ALERT_CHANNEL_SOURCE_ID, MONITOR_ADAPTER_TYPE, ingestAlertChannelMessages, loadAlertChannels,
@@ -176,15 +177,68 @@ export function telegramCollectorStatus(): TelegramCollectorStatus {
   return { ...collectorStatus, unresolved: [...collectorStatus.unresolved] };
 }
 
+/**
+ * The running collector's logger, so {@link setCollectorStatus} can report a notice that Telegram
+ * refused without every call site having to hand it one.
+ *
+ * Module-scoped for the same reason `collectorStatus` is: production has exactly one collector and
+ * it owns this value for the process.
+ */
+let collectorLog: CollectorLogger | null = null;
+
 /** Test seam. Production has exactly one collector, and it owns this value for the process. */
 export function resetTelegramCollectorStatus(): void {
   collectorStatus = { ...INITIAL_STATUS };
+  collectorLog = null;
   collectorReady.set(0);
 }
 
+/**
+ * The states worth waking an operator for, and the line each of them sends.
+ *
+ * `degraded` and `flood_wait` both mean "some or all of the registry is not being read"; `failed`
+ * means the pass bound nothing at all. `starting`, `ready` and `disabled` are not here: the first
+ * two are the healthy path and the third is a deployment that was never asked to collect (absent
+ * credentials, or a stopped collector) — announcing it would page somebody about a configuration
+ * choice they made.
+ */
+const COLLECTOR_NOTICES: Partial<Record<
+  TelegramCollectorState, { reason: AdminNoticeReason; line: (status: TelegramCollectorStatus) => string }
+>> = {
+  degraded: {
+    reason: 'collector_degraded',
+    line: (status) => `колектор Telegram деградував: привʼязано ${status.resolved} з ${status.channels} `
+      + `каналів, не читаються ${status.unresolved.length} (${status.detail ?? 'без деталей'})`
+  },
+  flood_wait: {
+    reason: 'collector_flood_wait',
+    line: (status) => `колектор Telegram у flood wait${status.floodWaitSeconds != null
+      ? ` (${status.floodWaitSeconds} с)` : ''}: збір зупинено, причина ${status.detail ?? 'невідома'}`
+  },
+  failed: {
+    reason: 'collector_failed',
+    line: (status) => `колектор Telegram не працює: ${status.detail ?? 'невідома причина'}, `
+      + `привʼязано ${status.resolved} з ${status.channels} каналів`
+  }
+};
+
+/**
+ * The one place the collector's state word changes, and therefore the one place a notice belongs.
+ *
+ * The debounce is structural rather than a timer: the notice is emitted only when `state` differs
+ * from the word it held a line earlier. A retry pass that re-enters the SAME state — which is what
+ * `armRetry` produces every `RESOLVE_RETRY_MS` for as long as an upstream stays down — patches the
+ * counts and the flood-wait interval and sends nothing. So does the `gainedNothing` branch, which
+ * carries a fresh `floodWaitUntil` on an unchanged state. One line per transition, never per tick;
+ * `notifyAdmin`'s own per-reason cooldown then bounds a transition that flaps.
+ */
 function setCollectorStatus(patch: Partial<TelegramCollectorStatus>): void {
+  const previous = collectorStatus.state;
   collectorStatus = { ...collectorStatus, ...patch, since: new Date().toISOString() };
   collectorReady.set(collectorStatus.state === 'ready' ? 1 : 0);
+  if (collectorStatus.state === previous) return;
+  const notice = COLLECTOR_NOTICES[collectorStatus.state];
+  if (notice) void notifyAdmin(notice.reason, notice.line(collectorStatus), collectorLog ?? undefined);
 }
 
 // ------------------------------------------------------------------------------------------------
@@ -587,6 +641,7 @@ function defaultSchedule(run: () => void, ms: number): () => void {
 export async function startTelegramCollector(
   log: CollectorLogger, deps: TelegramCollectorDeps = {}
 ): Promise<(() => Promise<void>) | undefined> {
+  collectorLog = log;
   if (!config.TELEGRAM_API_ID || !config.TELEGRAM_API_HASH || !config.TELEGRAM_SESSION) {
     setCollectorStatus({ ...INITIAL_STATUS, detail: 'credentials_absent' });
     return undefined;

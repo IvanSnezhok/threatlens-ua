@@ -1,5 +1,8 @@
+import { Registry } from 'prom-client';
 import { describe, expect, it } from 'vitest';
-import { LEG_BACKOFF_CAP_MS, legDelayMs, startLegScheduler, type SchedulerLeg } from './leg-scheduler.js';
+import {
+  LEG_BACKOFF_CAP_MS, legDelayMs, legSchedulerMetrics, startLegScheduler, type SchedulerLeg
+} from './leg-scheduler.js';
 
 /**
  * The scheduler split, without a clock and without a database.
@@ -280,5 +283,77 @@ describe('stopping', () => {
     await h.settle();
     // The `finally` ran after the stop; the chain must be dead, not merely quiet for one gap.
     expect(h.pending()).toHaveLength(0);
+  });
+});
+
+// ------------------------------------------------------------------------------------------------
+// The term the interval gauge leaves out
+// ------------------------------------------------------------------------------------------------
+
+/**
+ * `threatlens_ingestion_leg_duration_seconds`, and why it is a separate series rather than a
+ * refinement of the gauge beside it.
+ *
+ * The scheduler's interval is a GAP: it is armed when a pass finishes, so the real spacing between
+ * two requests to an upstream is `interval + duration`, and until this histogram existed only the
+ * first term was exported. A leg whose passes take three seconds at a four-second interval is
+ * polling every seven and no metric said so — including the request-budget table in
+ * `docs/OPERATIONS.md`, which is computed as though a pass were instant.
+ *
+ * The virtual clock in this file cannot move `process.hrtime`, so what is asserted here is the
+ * wiring — one observation per pass, per leg, failures included — and not a duration value. The
+ * value is exactly the thing that has no meaning under a fake clock.
+ */
+describe('per-pass duration', () => {
+  /** The observation count of one leg's series, across every bucket. */
+  async function passes(registry: Registry, leg: string): Promise<number> {
+    const metric = registry.getSingleMetric('threatlens_ingestion_leg_duration_seconds') as unknown as {
+      get(): Promise<{ values: Array<{ metricName?: string; labels: Record<string, string>; value: number }> }>;
+    };
+    const { values } = await metric.get();
+    return values.find((entry) =>
+      entry.metricName === 'threatlens_ingestion_leg_duration_seconds_count' && entry.labels.leg === leg)?.value ?? 0;
+  }
+
+  it('is registered beside the counter and the gauge, and registering twice is safe', () => {
+    const registry = new Registry();
+    for (const [name, metric] of legSchedulerMetrics()) {
+      if (!registry.getSingleMetric(name)) registry.registerMetric(metric);
+    }
+    expect(registry.getMetricsAsArray().map((metric) => metric.name)).toEqual([
+      'threatlens_ingestion_leg_runs_total',
+      'threatlens_ingestion_leg_interval_seconds',
+      'threatlens_ingestion_leg_duration_seconds'
+    ]);
+    const duration = registry.getSingleMetric('threatlens_ingestion_leg_duration_seconds');
+    expect(duration).toBeDefined();
+    expect((duration as unknown as { labelNames: string[] }).labelNames).toEqual(['leg']);
+  });
+
+  it('observes one pass per tick per leg, failures included', async () => {
+    const registry = new Registry();
+    for (const [name, metric] of legSchedulerMetrics()) {
+      if (!registry.getSingleMetric(name)) registry.registerMetric(metric);
+    }
+    const before = { fast: await passes(registry, 'duration-fast'), dead: await passes(registry, 'duration-dead') };
+
+    const h = harness();
+    const fast = countingLeg('duration-fast', () => 4000);
+    // A leg that throws must still be measured: a pass that failed after a long timeout is exactly
+    // the case where the gap understates the real spacing by the most.
+    const dead: SchedulerLeg = {
+      name: 'duration-dead', intervalMs: () => 4000,
+      run: async () => { throw new Error('upstream down'); }
+    };
+    const stop = startLegScheduler([fast.leg, dead], silent, { timers: h.timers });
+    await h.settle();
+    await h.advance(12_000);
+    stop();
+
+    // Four healthy passes at a four-second gap; the dead leg backs off to 8 s then 16 s, so it runs
+    // at 0, 8_000 and nothing more inside the window.
+    expect(fast.calls()).toBe(4);
+    expect(await passes(registry, 'duration-fast')).toBe(before.fast + 4);
+    expect(await passes(registry, 'duration-dead')).toBe(before.dead + 2);
   });
 });

@@ -1,4 +1,4 @@
-import { Counter, Gauge } from 'prom-client';
+import { Counter, Gauge, Histogram } from 'prom-client';
 
 /**
  * One self-rescheduling chain per collection leg.
@@ -141,10 +141,38 @@ const legInterval = new Gauge({
   labelNames: ['leg'], registers: []
 });
 
-export function legSchedulerMetrics(): ReadonlyArray<[string, Counter<string> | Gauge<string>]> {
+/**
+ * How long one pass of a leg actually took.
+ *
+ * The gauge above is a GAP and cannot be read as a period — that is the whole «інтервал — це пауза,
+ * а не період» property this module is built on. So `threatlens_ingestion_leg_interval_seconds`
+ * *understates* the real spacing between two requests to an upstream by exactly the length of a
+ * pass, and until this histogram existed that length was unobservable from outside the process:
+ * real spacing = armed gap + pass duration, and only one of the two terms was exported.
+ *
+ * That matters for two questions at once. The request-budget table in `docs/OPERATIONS.md` is
+ * computed from the floors and is therefore a worst case that only holds if a pass is instant —
+ * `histogram_quantile(0.95, …)` here is what says how much headroom the floors actually have. And a
+ * pass whose duration approaches its own interval is a leg that has quietly halved its own polling
+ * rate without ever entering backoff, which no existing series would show.
+ *
+ * Observed for FAILED passes too: a leg that fails after a thirty-second timeout has spaced its
+ * requests thirty seconds further apart than the gauge claims, and that is precisely the case where
+ * the difference is largest. Buckets run from 50 ms (a cached mirror response) to 30 s (an upstream
+ * at its timeout), which spans every pass this scheduler can produce.
+ */
+const legDuration = new Histogram({
+  name: 'threatlens_ingestion_leg_duration_seconds',
+  help: 'Wall-clock seconds one pass of a collection leg took, successful or failed',
+  labelNames: ['leg'],
+  buckets: [0.05, 0.1, 0.25, 0.5, 1, 2, 5, 10, 30], registers: []
+});
+
+export function legSchedulerMetrics(): ReadonlyArray<[string, Counter<string> | Gauge<string> | Histogram<string>]> {
   return [
     ['threatlens_ingestion_leg_runs_total', legRuns],
-    ['threatlens_ingestion_leg_interval_seconds', legInterval]
+    ['threatlens_ingestion_leg_interval_seconds', legInterval],
+    ['threatlens_ingestion_leg_duration_seconds', legDuration]
   ];
 }
 
@@ -192,6 +220,10 @@ export function startLegScheduler(
       // The handle has fired; dropping it here keeps `stop()` from clearing a dead timer and, more
       // importantly, keeps the map from holding a handle that no longer exists while the pass runs.
       handles.delete(leg.name);
+      // Started before the body and stopped in the `finally`, so the observation covers exactly the
+      // window in which no timer is armed for this leg — which is what makes it the missing term of
+      // «real spacing = armed gap + pass duration».
+      const observeDuration = legDuration.startTimer({ leg: leg.name });
       try {
         await leg.run();
         if (failures) {
@@ -207,6 +239,9 @@ export function startLegScheduler(
         // failure count the backoff is computed from.
         log.error({ error, leg: leg.name, failures }, 'collection leg failed');
       } finally {
+        // Observed BEFORE the next pass is armed: the duration is the length of the pass, not the
+        // length of the pass plus whatever `schedule()` costs.
+        observeDuration();
         schedule();
       }
     };

@@ -445,6 +445,38 @@ Migration 024 landed with it: eighteen settlements the channels name and the imp
 aliases of the city, and "запоріжжя" removed from the oblast's aliases so a bare "Запоріжжя" names the
 city exactly as a bare "Київ" already did.
 
+The second tie-break above has a precondition that is easy to miss and cost an hour of wrong map on
+2026-08-10: it runs **only when two catalogue rows contest the same span**. A name held by one row is
+never tied, so nothing reads the oblast the message named in its own first line, and the row wins
+whatever the text says — «Дніпропетровщина: БпЛА курсом на Богуслав» resolved the Kyiv-oblast
+Богуслав, and the unmapped-ancestor climb faithfully painted Обухівський район 400 km away. Migration
+031 repaired that class four times by adding the missing second row; migration 032 added the two
+silent drops 031 had reported and one more the archive proved. The exposure is structural rather than
+incidental — Ukraine has 85 settlements called Калинівка and 97 called Миколаївка — so
+`scripts/homonym-audit.mjs` is the standing control over it: it joins every catalogue name to the
+KATOTTG workbook, counts the same-name settlements sitting in other oblasts, and ranks by whether the
+catalogue holds exactly one bearer of the name. It writes nothing; the report says where to look, and
+`docs/OPERATIONS.md` («Аудит тезок каталогу») has the evidence-first procedure for turning one of its
+rows into a migration. Калинівка is how 032 was found: highest score in the catalogue, and an
+archived «🛵Київщина: БПЛА над Калинівкою» resolving Вінницька область underneath it.
+
+**The distance guard is blocked on coordinates, and is recorded here rather than built.** Every defect
+of this class has the same signature — a resolved settlement hundreds of kilometres from every other
+place the message names — and the natural rule is to refuse such a settlement outright. It cannot be
+written yet. KATOTTG carries no coordinates, so of the 647 rows in `locations` exactly 55 have
+latitude and longitude (the country row, the 25 oblasts, the two special cities, 27 seeded
+capitals) and every
+hand-seeded settlement has none by design, because `geocoded` doubles as the third tie-break's marker
+of a first-order row: giving a село coordinates would make it outrank the city it must not outrank.
+Three prerequisites, in order: a per-settlement coordinate source that is licence-compatible and
+joinable on the KATOTTG code (OpenStreetMap's `katotth` tag reaches admin_level 6, i.e. raions, and
+stops there; a place-node join by name and oblast would reintroduce the very homonym problem it is
+meant to solve); a column that separates "has coordinates" from "is a first-order row", since today
+they are one boolean; and a measured threshold, because a stated cross-oblast vector («БпЛА з
+Брянської обл., рф — на північ Сумщини, курсом на Новгород-Сіверський») is legitimately far from
+everything else in its own message. Until all three exist the catalogue is corrected row by row from
+archive evidence — slower, and incapable of being wrong about geography it never asserts.
+
 ### Retrospection: reading the tense, not just the vocabulary (`v5`)
 
 Everything up to `v4` read a message for the words in it and nothing at all for the *tense* it was

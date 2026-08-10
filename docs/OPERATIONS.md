@@ -180,7 +180,9 @@ Two properties worth stating because they are easy to assume wrong:
   alternative subtracts the elapsed time and therefore fires the next request the instant a slow one
   returns — a burst, at exactly the moment the upstream is already struggling. A gap can never issue
   two requests closer together than the interval, so the floors above are floors on the real request
-  spacing.
+  spacing. `threatlens_ingestion_leg_interval_seconds` therefore *understates* that spacing by the
+  length of a pass; `threatlens_ingestion_leg_duration_seconds{leg}` is the missing term, and real
+  spacing is the sum of the two.
 - **The floors cannot be configured away.** They are compiled constants, not settings. `/ops` can
   slow every leg down to 60 s and cannot speed any of them past its provider's number.
 
@@ -872,6 +874,74 @@ docker compose exec -T postgres psql -U threatlens -d threatlens -c "
 There is deliberately **no manual trigger**. An operator-fired history burst is exactly the request
 shape that earns a Telegram flood wait, and a flood wait stops live collection for every channel on
 the account. The sweep re-checks every `CLASSIFIER_BACKFILL_CHECK_INTERVAL_SECONDS` (300) by itself.
+
+## Аудит тезок каталогу
+
+`scripts/homonym-audit.mjs` scores every settlement name in `locations` by how badly a namesake
+could misplace it. It reads the official KATOTTG workbook through the same `parseKatottgWorkbook` the
+nightly sync uses and the catalogue through `docker exec … psql`, and it writes nothing anywhere.
+
+```bash
+npx tsx scripts/homonym-audit.mjs                       # cached inputs, top 20
+npx tsx scripts/homonym-audit.mjs --refresh             # re-download the workbook, re-read the catalogue
+npx tsx scripts/homonym-audit.mjs --all --json /tmp/a.json
+npx tsx scripts/homonym-audit.mjs --locations dump.json # audit an export, no database needed
+```
+
+**When to run it.** After every migration that adds settlements by hand; after a KATOTTG sync whose
+`reference_dataset_syncs.source_sha256` has moved (the codifier renames and merges settlements, and a
+rename can create a homonym that did not exist); and first thing when an incident report says a threat
+was drawn in the wrong oblast — the name in the report will be somewhere in this table. The report
+prints the workbook's own SHA-256, so it can always be compared against the one the sync imported.
+
+**How to read it.** One row per distinct catalogue name.
+
+| column | meaning |
+| --- | --- |
+| `bearers` | catalogue rows spelling this name |
+| `here` | KATOTTG settlements of the name inside the oblast(s) those rows sit in |
+| `elsewhere` | KATOTTG settlements of the name in **any other** oblast — the misplacement surface |
+| `oblasts` / `spread` | how many other oblasts, and which |
+| `risk` | `elsewhere × (bearers === 1)` |
+
+The multiplier is one or zero because a second bearer does not reduce the risk, it changes the
+failure mode. `resolveSpanCollisions` in `src/domain/classifier.ts` refuses a span two rows claim
+unless `pickAmongTied` can rank them, and the strongest thing it ranks by is the oblast the message
+itself named. **With one row nothing is tied and the tie-break never runs**, so a single row wins its
+span whatever oblast the message just named — which is the Obukhiv incident of 2026-08-10 exactly
+(`migrations/031`). Names with two or more bearers are therefore listed separately and unscored, as
+guarded rather than safe.
+
+A high score on its own is **not** evidence of anything. Most of these names will never be written by
+a monitoring channel, and importing the 29 000 villages the KATOTTG importer deliberately skips would
+make ambiguity the normal case rather than the exception. The report says where to look.
+
+**Adding a row.** The precedents are `migrations/024`, `031` and `032`; a new migration follows them
+step for step, and every step is a refusal to guess:
+
+1. **Archive first.** Grep `source_messages` (read-only) for the name and read the hits. A row is
+   justified by messages that name the place, not by its score. Record the ids verbatim in the
+   migration header — that is what makes the decision reviewable a year later.
+2. **Workbook second.** Read the code out of `kodifikator-07-07.xlsx` with `parseKatottgWorkbook` and
+   confirm the raion **and** the hromada in the same row are the ones the messages mean. Record the
+   nationwide homonym count honestly, however embarrassing it is: 031 added a Миколаївка with 97.
+3. **Guard the name if the count demands it.** Adding one row for a many-bearer name *creates* the
+   very failure it is meant to fix — that is why 032 adds a Kherson Степанівка beside the Sumy one
+   and both Kyiv Калинівка beside the Vinnytsia one. Two rows make the span contested, so the
+   message's own oblast decides and a message naming neither gets silence. Silence is the answer
+   this module already gives to «Городок».
+4. **Prove it against the archive.** Classify every archived message twice — once against the
+   production catalogue export, once against the export plus the new rows — and put the count of
+   changed resolutions in the header. 032 moved 17 of 4 250 and named all of them.
+5. **Pin it in three places.** A verbatim positive fixture and an opposite-oblast refusal control in
+   `src/domain/classifier.test.ts`; the filename in `MIGRATION_FILES` and the row in
+   `SEEDED_SETTLEMENT_OBLASTS` in `tests/integration/migrations.test.ts`, which asserts every
+   hand-seeded settlement sits in the oblast its KATOTTG code names; and the newest-migration
+   literals in `tests/integration/ops-deploy.test.ts`.
+
+Coordinates would make most of this unnecessary — a settlement 400 km from everything else the
+message names could simply be refused — and there are none. See the «Not fixed here» section of
+`migrations/032` for what that guard would need before it could be written.
 
 ## Analytical queries
 

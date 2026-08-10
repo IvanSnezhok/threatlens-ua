@@ -606,8 +606,8 @@ export const APP_SETTINGS: Record<keyof AppConfig, SettingMeta> = {
   },
   TELEGRAM_ADMIN_CHAT_ID: {
     scope: 'db_tunable', group: 'telegram', apply: 'hot', ui: { kind: 'text' },
-    applyNote: 'Наразі не читається жодним модулем: значення зберігається й показується, але поки що '
-      + 'ні на що не впливає.'
+    applyNote: 'Читається на місці, у мить самої події (src/bot/admin-notice.ts): новий chat id діє '
+      + 'з наступного сповіщення, без перезапуску. Порожнє значення вимикає їх повністю.'
   },
   TELEGRAM_API_ID: {
     scope: 'db_secret', group: 'telegram', apply: 'restart', confirm: true, impact: 'collector',

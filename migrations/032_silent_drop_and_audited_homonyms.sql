@@ -1,0 +1,187 @@
+-- ================================================================================================
+-- 032 — the two settlements 031 reported and did not add, and the one the tezka audit found
+-- ================================================================================================
+--
+-- Two classes of defect, both proved from the archive, both closed by rows rather than by rules.
+--
+--   * **Silent drops.** A settlement the monitoring channels name and the catalogue does not hold
+--     resolves to nothing, so a correct report is rendered as its oblast or as nothing at all.
+--     Migration 031 named two of these in its own "not fixed here" section — Божедарівка and
+--     Степанівка — deliberately leaving them for a decision taken on its own evidence. This is that
+--     decision.
+--   * **A wrong-oblast homonym.** The same defect 031 repaired four times: one catalogue row wins a
+--     span unopposed because `pickAmongTied` in `src/domain/classifier.ts` only runs when two rows
+--     contest it, so the oblast the message names in its own first line is never read. This one was
+--     not found by an incident. It was found by `scripts/homonym-audit.mjs`, which ranks every
+--     catalogue name by how many same-name settlements sit in other oblasts: Калинівка is the
+--     highest-scoring name in the whole catalogue (85 settlements of that name in Ukraine, 81 of
+--     them outside Вінницька область, spread over 21 other oblasts), and the archive turned out to
+--     contain the misresolution the score predicted.
+--
+-- Where the codes come from, and what was checked
+-- -----------------------------------------------
+-- Every code below was read out of the official workbook the sync itself downloads (`KATOTTG_URL`,
+-- kodifikator-07-07.xlsx, sha256 5c5317759b2b90208e9b00338bc3db3c5e694272a166acf73f1543b3e18ecbea)
+-- with `parseKatottgWorkbook`, and the raion and hromada in the same row were used to confirm the
+-- settlement is the one the messages mean. That checksum is the same one production recorded when it
+-- last imported the codifier (`reference_dataset_syncs.source_sha256`, version 07.07.2026), so these
+-- codes were read out of exactly the document the running catalogue was built from. The homonym count
+-- across all of Ukraine is recorded for each, in the convention migration 024 set and 031 kept.
+--
+-- The rows
+-- --------
+--
+--   Божедарівка   UA12040010010084655  Кам'янський р-н, Дніпропетровська обл.        (2 homonyms)
+--     Category X, Божедарівська громада. Twelve archived mentions over two days and five independent
+--     feeds, every one of them Dnipropetrovsk:
+--       1e04c4e4-8380-4a2b-ad51-327b3a192bc6  «🛵Дніпропетровщина: реактивний БПЛА кружляє в
+--                                              районі Божедарівки»
+--       6bfea2ed-8b6a-4d3e-8c3e-425c52a5a1ca  «Дніпропетровщина: / Реактивний БпЛА курсом на
+--                                              Божедарівку»
+--       b26f54e1-a42a-46ce-ada2-4cdc5447cb26  «🛵 Реактивний БпЛА на Дніпропетровщині, курсом на
+--                                              Божедарівку.»
+--       60db3357-e412-46fe-9f07-424e13df0ab9  «🛵Дніпропетровщина: реактивний на Божедарівку /
+--                                              Кринички з півдня»
+--       6b1e7d29-dbb5-4df2-a731-f418f66c62f4  the Obukhiv incident message itself, whose second
+--                                              line 031 could repair and whose third it could not
+--     and f201b2f3, 707f08a8, d9db8a07, 0b43bda8, 863d6851, 96b856dd, 6251f414. Nine of the twelve
+--     name Дніпропетровщина in their own text; the remaining three are єРадар/СК running commentary
+--     that names Харків and Опішня in the same breath, and their referent is still this settlement —
+--     Верхівцеве and Кринички, its neighbours in the same raion, are named beside it and are already
+--     in the catalogue.
+--     This is the one row here that carries no ambiguity at all: Ukraine holds exactly two
+--     Божедарівка and the other, UA12040010060018170, is a село in the SAME hromada (Божедарівська,
+--     Кам'янський р-н) — checked in the workbook. A bare, oblast-less «Божедарівку» therefore has no
+--     wrong answer available to it, which is why this row resolves where the other four refuse.
+--
+--   Степанівка    UA59080250010051865  Сумський р-н, Сумська обл.                   (50 homonyms)
+--   Степанівка    UA65100150090070661  Херсонський р-н, Херсонська обл.
+--     Fifty settlements of this name in Ukraine, across twenty-one oblasts. That count is the reason
+--     both rows are here rather than one.
+--
+--     The Sumy row is the one the archive asks for. It is category X, Степанівська громада, and it
+--     sits on the border between Хотінь (added by 024) and Миколаївка (added by 031) — the three
+--     settlements the Air Force names as one corridor:
+--       a4d3b0ac-7df8-4ecf-b019-61d39f10fceb  «🛵 Сумщина: БпЛА повз Хотінь ➡️ у напрямку
+--                                              Миколаївки/Степанівки.»
+--       c35fec1c-0a04-42d0-921e-9d6124ffa2e2  «🛵 Сумщина: БпЛА повз Хотінь ➡️ в напрямку
+--                                              Степанівки.»
+--       3b4c0d69-7a57-48c1-8319-9bd913109a94  «Сумщина: / БпЛА курсом на Степанівку»
+--       10a52c37-dc63-4441-b8d6-b37bc5733d6d  «Сумщина: / Молнія курсом на Степанівку / …»
+--       74e55bb1-17b9-4483-91cf-dee1e625ac15  «Полтавщина: … / Сумщина: 1 на Степанівку, 1 на
+--                                              Алтинівку»
+--     All five name Сумщина in their own text. Every threat mention of the name in the archive is
+--     one of these five.
+--
+--     The Kherson row changes nothing in the archive and exists so that the Sumy row cannot claim a
+--     span that is not its own. Adding a single row for a fifty-bearer name would have *created* a
+--     failure mode the catalogue did not have: with one row, a bare «Степанівка» and a
+--     «Херсонщина: … Степанівка» would both resolve to a settlement 600 km from where the message is
+--     talking about, which is the exact shape of the Obukhiv incident. The second row makes the span
+--     contested, so `pickAmongTied` runs: Сумщина picks Sumy, Херсонщина picks Kherson, a message
+--     naming neither — or both — resolves nothing. It is not an invented row either: it is the only
+--     Степанівка in Херсонська область in the workbook (category C, Херсонська громада), and the
+--     archive names it, in d70115c9-3543-4dff-92bd-079842297142, the Kherson ODA's daily bulletin
+--     listing «…Ольгівка, Красносільське, Янтарне, Степанівка та місто Херсон» among the settlements
+--     shelled that day. That message resolves nothing today and still resolves nothing after this
+--     migration — the retrospective veto refuses the whole bulletin — so the row is a guard and is
+--     described as one, not as a fix.
+--
+--   Калинівка     UA32060130010033581  Броварський р-н, Київська обл.               (85 homonyms)
+--   Калинівка     UA32140090010093169  Фастівський р-н, Київська обл.
+--     The audit's highest-risk name, and the archive agrees with the audit. The catalogue held one
+--     Калинівка — UA05120070010068103, місто, Хмільницький р-н, Вінницька обл., which the KATOTTG
+--     importer reads because it is category M — and it was winning every span unopposed:
+--       02b6756a-b89c-4f0c-acb5-5ba21d313cac  «🛵Київщина: БПЛА над Калинівкою» — єРадар,
+--         2026-08-08T13:35:45Z. The message names Київщина in its first word and the catalogue
+--         answered Вінницька область, 200 km away. Re-run against the production catalogue export
+--         with the current classifier, it still does.
+--       44b77f50-b15b-4c34-bf67-abbf41d84a94  «Далі на Калинівку / … / Від Баришівки так само тим
+--         же маршрутом» — the same feed forty minutes later, tracking a corridor whose other
+--         landmark, Баришівка, is Броварський район. It too resolved the Vinnytsia місто.
+--       4f663040-6fb4-427c-90be-0b224928dee1  «🛵Від Обухова на Калинівку» — Обухів is Київська
+--         область. This one resolves nothing (it carries no threat word), but it is a third
+--         independent use of the name for a Kyiv-oblast place in a single evening.
+--
+--     Both Kyiv-oblast смт are added because the archive does not say which one it means, and
+--     guessing is the failure this file exists to prevent. The two messages point in opposite
+--     directions — Баришівка is twenty kilometres from the Броварський Калинівка, Обухів is twenty
+--     from the Фастівський one — and with no coordinates in the catalogue there is nothing that can
+--     decide between them (see «Not fixed here» below). What the pair does decide is that the answer
+--     stops being Вінниччина: «Київщина: БПЛА над Калинівкою» now resolves Київська область and no
+--     settlement, «Вінниччина: БпЛА курсом на Калинівку» still resolves the Vinnytsia місто because
+--     the message names its oblast, and a bare «Калинівку» refuses. Refusing is what this module
+--     already does with two Городок, and an oblast is a true statement where a settlement 200 km
+--     away is not.
+--
+--     The five *села* also called Калинівка in Київська область are not added. The pair above
+--     already produces the refusal, and a село no message has ever named would be a row with no
+--     evidence behind it.
+--
+-- What was measured
+-- -----------------
+-- Every one of the 4 250 messages in the archive was classified twice with the current classifier:
+-- once against the production catalogue export, once against the same export plus these five rows.
+-- Seventeen resolutions change and no others:
+--
+--   11  Божедарівка gained, all in Dnipropetrovsk messages (the twelfth mention, 6251f414 «По
+--       Божедарівки мінус», resolves nothing before this migration and nothing after it)
+--    4  Степанівка gained, all in Sumy messages
+--    2  Калинівка lost — 02b6756a keeps Київська область and drops the Vinnytsia settlement,
+--       44b77f50 drops it and resolves nothing
+--
+-- Nothing else in the archive moves: not the Kherson bulletin, not the Vinnytsia місто, not the four
+-- rows 031 added, not the eighteen 024 added.
+--
+-- Not fixed here, and deliberately
+-- --------------------------------
+-- **The distance guard is blocked on coordinates.** Every defect this file and 031 repair has the
+-- same shape — a resolved settlement hundreds of kilometres from every other place the message
+-- names — and the obvious rule is to refuse a settlement that is implausibly far from the rest of
+-- the message's geography. That rule cannot be written today: KATOTTG carries no coordinates, so of
+-- the 647 rows in `locations` exactly 55 carry latitude and longitude — the country row, the 25
+-- oblasts, the two special cities and 27 seeded capitals — and every settlement 024, 031 and 032 add
+-- has none —
+-- `geocoded` is the catalogue's own marker of a first-order row and giving one to a село would make
+-- it outrank the city it must not outrank in `pickAmongTied`. The prerequisites, in order: a
+-- coordinate source per settlement that is licence-compatible and joinable on the KATOTTG code
+-- (OpenStreetMap's `katotth` tag reaches admin_level 6, i.e. raions, and does not reach settlements;
+-- a place-node join by name and oblast would reintroduce exactly the homonym problem it is meant to
+-- solve); a column that separates "has coordinates" from "is a first-order row", because today they
+-- are the same boolean; and a measured threshold, since a stated cross-oblast vector («БпЛА з
+-- Брянської обл., рф — на північ Сумщини, курсом на Новгород-Сіверський») is legitimately far from
+-- everything else in its own message. Until all three exist the catalogue is corrected row by row
+-- from archive evidence, which is slower and cannot be wrong about geography it never asserts.
+--
+-- **The audit is not an import list.** `scripts/homonym-audit.mjs` scores 149 catalogue names as
+-- exposed, 945 same-name settlements in total. The top forty were grepped against `source_messages`
+-- by stem, and separately every archived classification was queried for a settlement resolved
+-- outside every oblast its own message named. Both sweeps returned the same short list, and after
+-- the national bulletins (which name cities in a dozen oblasts and are correct reporting, not
+-- defects) and the four cases 031 already fixed are removed, only Калинівка is left. The
+-- report's job is to say where to look, not what to add — see docs/OPERATIONS.md, «Аудит тезок
+-- каталогу», for the procedure and for why a high score on its own is not evidence of anything.
+--
+-- Tier, parent and coordinates follow migrations 024 and 031 exactly: `locations.type` has no
+-- `settlement` value so the leaf tier is `city`; the parent is the raion when the KATOTTG sync has
+-- created it and the oblast when it has not (a fresh test database); and no coordinates are set.
+
+INSERT INTO locations (id, parent_id, type, name_uk, official_code, aliases)
+SELECT 'katottg-' || lower(settlement.code),
+       COALESCE(
+         (SELECT raion.id FROM locations raion WHERE raion.official_code = settlement.raion_code),
+         settlement.oblast_id
+       ),
+       'city', settlement.name_uk, settlement.code, ARRAY[lower(settlement.name_uk)]
+  FROM (VALUES
+    -- Дніпропетровська область
+    ('UA12040010010084655', 'UA12040000000032213', 'ua-12', 'Божедарівка'),
+    -- Сумська область
+    ('UA59080250010051865', 'UA59080000000057897', 'ua-59', 'Степанівка'),
+    -- Херсонська область — the guard that keeps the Sumy row out of Kherson oblast
+    ('UA65100150090070661', 'UA65100000000029736', 'ua-65', 'Степанівка'),
+    -- Київська область — both смт, because the archive does not say which one it means
+    ('UA32060130010033581', 'UA32060000000012455', 'ua-32', 'Калинівка'),
+    ('UA32140090010093169', 'UA32140000000020217', 'ua-32', 'Калинівка')
+  ) AS settlement(code, raion_code, oblast_id, name_uk)
+ON CONFLICT DO NOTHING;

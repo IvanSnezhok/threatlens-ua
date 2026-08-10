@@ -1,4 +1,5 @@
 import { buildServer } from './api/server.js';
+import { notifyAdmin, setAdminNoticeBot } from './bot/admin-notice.js';
 import { createBot } from './bot/bot.js';
 import { startNotificationWorkers } from './bot/outbox.js';
 import { config } from './config.js';
@@ -26,7 +27,7 @@ await migrate();
 // `console` rather than `app.log`: the server, and therefore the pino instance, does not exist yet,
 // and a boot-time degrade that left no line in `docker compose logs` would be discoverable only on
 // /metrics.
-await loadAppSettings({
+const settings = await loadAppSettings({
   warn: (fields, message) => console.warn(message, fields),
   error: (fields, message) => console.error(message, fields)
 });
@@ -47,6 +48,22 @@ const stopOccupation = startOccupationScheduler(app.log);
 // заради третього знака після коми.
 const stopSourceTrust = startSourceTrustScheduler(app.log);
 const bot = createBot();
+// BEFORE the collector starts, because the collector's very first pass can land in `failed` or
+// `flood_wait` and that transition is one of the three this notifier exists for.
+setAdminNoticeBot(bot);
+// The settings degrade is announced HERE and not from the `catch` that increments
+// `threatlens_app_settings_read_failures_total`, for one ordering reason: `loadAppSettings()` runs
+// before `createBot()` — it has to, because the token it would build the bot from may be a stored
+// row — so at the moment of the failure there is no bot to send anything with. `degraded` is the
+// same fact, carried forward the four lines it takes for one to exist. There is exactly one caller
+// of `loadAppSettings`, so nothing else can increment that counter unobserved.
+if (settings.degraded) {
+  void notifyAdmin(
+    'app_settings_read_failed',
+    'app_settings не прочитано на старті: процес працює на .env, збережені налаштування не діють',
+    app.log
+  );
+}
 const stopNotifications = startNotificationWorkers(bot, app.log);
 const stopCollector = await startTelegramCollector(app.log);
 

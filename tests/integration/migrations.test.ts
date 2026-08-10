@@ -32,7 +32,8 @@ const MIGRATION_FILES = [
   '028_analytics_min_pass_interval.sql',
   '029_disabled_channel_reaudit.sql',
   '030_app_settings.sql',
-  '031_homonym_settlement_gaps.sql'
+  '031_homonym_settlement_gaps.sql',
+  '032_silent_drop_and_audited_homonyms.sql'
 ];
 
 /**
@@ -47,7 +48,7 @@ const MIGRATION_FILES = [
  * raion looks perfectly healthy in `locations` and only shows up as a polygon 400 km away.
  *
  * The expected value is the oblast, not the raion, because both are correct answers depending on
- * the database: migrations 024 and 031 attach a settlement to its raion when the sync has already
+ * the database: migrations 024, 031 and 032 attach a settlement to its raion when the sync has already
  * created that row and to its oblast when it has not, which is the case in a freshly migrated test
  * database. Walking up to the oblast is the assertion that holds either way — and it is exactly the
  * walk `listLocationLexemes` and the territory climb make.
@@ -76,7 +77,15 @@ const SEEDED_SETTLEMENT_OBLASTS: ReadonlyArray<readonly [string, string, string]
   ['UA12120010020096111', 'Богуслав', 'ua-12'],
   ['UA63020050010064235', 'Золочів', 'ua-63'],
   ['UA59080130010087968', 'Миколаївка', 'ua-59'],
-  ['UA59060070010030190', 'Липова Долина', 'ua-59']
+  ['UA59060070010030190', 'Липова Долина', 'ua-59'],
+  // migration 032 — two of these are guards rather than referents (the Kherson Степанівка and one of
+  // the two Kyiv Калинівка can never be the answer on their own), and they are audited exactly like
+  // the rest: a guard pointed at the wrong oblast would break the tie-break it exists to arm.
+  ['UA12040010010084655', 'Божедарівка', 'ua-12'],
+  ['UA59080250010051865', 'Степанівка', 'ua-59'],
+  ['UA65100150090070661', 'Степанівка', 'ua-65'],
+  ['UA32060130010033581', 'Калинівка', 'ua-32'],
+  ['UA32140090010093169', 'Калинівка', 'ua-32']
 ];
 
 describe.skipIf(!integrationDatabaseAvailable)('migration runner against live PostgreSQL', () => {

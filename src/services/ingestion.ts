@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto';
 import type { PoolClient } from 'pg';
-import { Counter, Gauge, type Registry } from 'prom-client';
+import { Counter, Gauge, type Histogram, type Registry } from 'prom-client';
 import { config } from '../config.js';
 import { pool } from '../db/pool.js';
 import { parseAlertChannelMessage } from '../domain/alert-parser.js';
@@ -849,7 +849,7 @@ const threatToDeEscalation = new Counter({
  * one.
  */
 export function registerAlertChannelMetrics(registry: Registry): void {
-  const metrics: ReadonlyArray<[string, Counter<string> | Gauge<string>]> = [
+  const metrics: ReadonlyArray<[string, Counter<string> | Gauge<string> | Histogram<string>]> = [
     ['threatlens_aerial_mirror_polls_total', aerialMirrorPolls],
     ['threatlens_aerial_mirror_raw_regions', aerialMirrorRawRegions],
     ['threatlens_alert_channel_messages_total', alertChannelMessages],

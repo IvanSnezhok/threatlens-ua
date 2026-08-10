@@ -28,6 +28,10 @@ import { beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 
 const configState = vi.hoisted(() => ({
   TELEGRAM_API_ID: '1000', TELEGRAM_API_HASH: 'api-hash', TELEGRAM_SESSION: 'session',
+  // Read by `src/bot/admin-notice.ts`, which `setCollectorStatus` now calls on a state flip, and by
+  // the timestamp formatter that notice goes through. Empty by default: every test in this file
+  // other than the «operator notices» block is about the collector, not about who hears from it.
+  TELEGRAM_ADMIN_CHAT_ID: '', APP_TIMEZONE: 'Europe/Kyiv',
   ALERT_CHANNEL_ENABLED: true, ALERT_CHANNEL_USERNAME: 'air_alert_ua',
   // Backfill is a separate concern with its own coverage; leaving it on would only make every test
   // here also assert `getMessages` paging.
@@ -101,6 +105,7 @@ vi.mock('../services/operations.js', () => ({
   }
 }));
 
+import { resetAdminNotices, setAdminNoticeBot } from '../bot/admin-notice.js';
 import {
   floodWaitSeconds, resetTelegramCollectorStatus, resolveChannelPeers, startTelegramCollector,
   telegramCollectorStatus, type ChannelRoute, type TelegramCollectorRuntime
@@ -260,6 +265,8 @@ beforeEach(() => {
   operations.successes = [];
   operations.errors = [];
   operations.timeline = [];
+  configState.TELEGRAM_ADMIN_CHAT_ID = '';
+  resetAdminNotices();
   resetTelegramCollectorStatus();
 });
 
@@ -678,5 +685,103 @@ describe('resolveChannelPeers', () => {
     const second = await resolveChannelPeers(byName.client, routesFor(MONITOR_CHANNELS.slice(0, 5)), silentLog);
     expect(second).toMatchObject({ floodWaitSeconds: 300, floodWaitPhase: 'username', usernameLookups: 1 });
     expect(second.unresolved).toHaveLength(5);
+  });
+});
+
+// ------------------------------------------------------------------------------------------------
+// One line per transition, never per tick
+// ------------------------------------------------------------------------------------------------
+
+/**
+ * The operator notice, seen from the collector's side.
+ *
+ * `setCollectorStatus` is the one place the state word changes, so it is the one place a notice can
+ * be emitted without double-counting; what this block pins is that the emission is keyed on the
+ * CHANGE and not on the call. The retry path is the case that matters: `armRetry` re-enters
+ * `attach()` every `RESOLVE_RETRY_MS` for as long as an upstream stays down, and every one of those
+ * passes calls `setCollectorStatus` again with fresh counts. A notifier keyed on the call rather
+ * than on the transition would send a Telegram message every ten minutes, forever, about a
+ * condition the operator was told about once.
+ *
+ * The cooldown that bounds a genuinely FLAPPING transition is a property of the notifier and is
+ * covered in `src/bot/admin-notice.test.ts`; here the clock is never moved.
+ */
+describe('operator notices', () => {
+  function recorder() {
+    const sent: string[] = [];
+    setAdminNoticeBot({ api: { async sendMessage(_chatId: string, text: string) { sent.push(text); return {}; } } });
+    return sent;
+  }
+
+  it('says nothing at all when the collector reaches ready', async () => {
+    configState.TELEGRAM_ADMIN_CHAT_ID = '4242';
+    const sent = recorder();
+    const fake = fakeClient();
+    const stop = await start(fake);
+    try {
+      expect(telegramCollectorStatus().state).toBe('ready');
+      // `disabled → starting → ready` is the healthy path, and none of those three words is a
+      // reason to wake anybody.
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      expect(sent).toEqual([]);
+    } finally { await stop?.(); }
+    // Neither is the stop, which lands on `disabled`.
+    expect(sent).toEqual([]);
+  });
+
+  it('sends one line when the collector degrades, and nothing on a retry that stays degraded', async () => {
+    configState.TELEGRAM_ADMIN_CHAT_ID = '4242';
+    const sent = recorder();
+    const broken = MONITOR_CHANNELS[10] as string;
+    const fake = fakeClient({
+      dialogs: ALL_CHANNELS.filter((handle) => handle !== broken),
+      onGetPeerId: (username) => (username === broken ? new Error('CHANNEL_PRIVATE') : undefined)
+    });
+    const armed: ArmedTimer[] = [];
+    const stop = await start(fake, armed);
+    try {
+      expect(telegramCollectorStatus()).toMatchObject({ state: 'degraded', resolved: 53 });
+      await vi.waitFor(() => expect(sent).toHaveLength(1));
+      expect(sent[0]).toContain('колектор Telegram деградував');
+      expect(sent[0]).toContain('привʼязано 53 з 54');
+
+      // The retry re-enters the same state with the same counts. One transition, one line.
+      armed[0]?.run();
+      await vi.waitFor(() => expect(fake.calls.dialogScans).toBe(2));
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      expect(sent).toHaveLength(1);
+      expect(telegramCollectorStatus().state).toBe('degraded');
+    } finally { await stop?.(); }
+  });
+
+  it('sends one line when no channel binds at all, naming the flood wait', async () => {
+    configState.TELEGRAM_ADMIN_CHAT_ID = '4242';
+    const sent = recorder();
+    const fake = fakeClient({ dialogs: [], dialogsError: new FloodWaitError({ capture: 900 }) });
+    const armed: ArmedTimer[] = [];
+    const stop = await start(fake, armed);
+    try {
+      expect(telegramCollectorStatus()).toMatchObject({ state: 'flood_wait', resolved: 0 });
+      await vi.waitFor(() => expect(sent).toHaveLength(1));
+      expect(sent[0]).toContain('flood wait (900 с)');
+      expect(sent[0]).toContain('⚠️ ThreatLens');
+    } finally { await stop?.(); }
+  });
+
+  it('stays silent when TELEGRAM_ADMIN_CHAT_ID is empty, degraded or not', async () => {
+    // The default for this file, restated as the property it is: an unset admin chat id is a
+    // deployment that has not asked for these notices, not a deployment that fails to send them.
+    const sent = recorder();
+    const broken = MONITOR_CHANNELS[10] as string;
+    const fake = fakeClient({
+      dialogs: ALL_CHANNELS.filter((handle) => handle !== broken),
+      onGetPeerId: (username) => (username === broken ? new Error('CHANNEL_PRIVATE') : undefined)
+    });
+    const stop = await start(fake, []);
+    try {
+      expect(telegramCollectorStatus().state).toBe('degraded');
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      expect(sent).toEqual([]);
+    } finally { await stop?.(); }
   });
 });

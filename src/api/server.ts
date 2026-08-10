@@ -14,6 +14,7 @@ import { registerAnalyticsSchedulerMetrics } from '../services/analytics-schedul
 import { registerDeploymentMetrics } from '../services/deployment.js';
 import { registerBackfillMetrics } from '../services/source-backfill.js';
 import { registerAppSettingsMetrics } from '../services/app-settings.js';
+import { registerAdminNoticeMetrics } from '../bot/admin-notice.js';
 import { registerOutboxMetrics } from '../bot/outbox.js';
 import { resolveRuntimeSettings } from '../services/runtime-settings.js';
 import { registerAlertChannelMetrics } from '../services/ingestion.js';
@@ -150,6 +151,11 @@ export async function buildServer() {
   // `docs/OPERATIONS.md` names an incident condition — a fanout more than thirty minutes behind the
   // events it is reading — that nobody could observe.
   registerOutboxMetrics(registry);
+  // `threatlens_admin_notices_total`: the operator lines addressed to `TELEGRAM_ADMIN_CHAT_ID`, by
+  // reason and by outcome. The `disabled` series is the answer to «чому мені нічого не приходить»
+  // and the `failed` one is the only trace of a notice Telegram refused — both are invisible
+  // without this line.
+  registerAdminNoticeMetrics(registry);
 
   const app = Fastify({ logger: { level: config.NODE_ENV === 'development' ? 'debug' : 'info' }, trustProxy: true });
   await app.register(rateLimit, { max: 300, timeWindow: '1 minute' });

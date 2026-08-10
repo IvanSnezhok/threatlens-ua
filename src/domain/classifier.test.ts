@@ -842,7 +842,20 @@ describe('classifyMessage on Ukrainian place-name morphology (v4)', () => {
     { id: 'city-mykolaivka-donetsk', name: 'Миколаївка', aliases: ['миколаївка'], type: 'city', oblastId: 'ua-14' },
     { id: 'city-mykolaivka-sumy', name: 'Миколаївка', aliases: ['миколаївка'], type: 'city', oblastId: 'ua-59' },
     { id: 'city-dolyna', name: 'Долина', aliases: ['долина'], type: 'city', oblastId: 'ua-26' },
-    { id: 'city-lypova-dolyna', name: 'Липова Долина', aliases: ['липова долина'], type: 'city', oblastId: 'ua-59' }
+    { id: 'city-lypova-dolyna', name: 'Липова Долина', aliases: ['липова долина'], type: 'city', oblastId: 'ua-59' },
+    // Migration 032. Божедарівка is the one row of the five with no ambiguity to guard against —
+    // its only namesake is a село in the same hromada — so it is a plain settlement row. The other
+    // four come in pairs on purpose: a fifty-bearer and an eighty-five-bearer name held by a single
+    // catalogue row would win every span unopposed, which is the defect, not the fix.
+    { id: 'ua-05', name: 'Вінницька область', aliases: ['вінниччина'], type: 'oblast', geocoded: true },
+    { id: 'ua-65', name: 'Херсонська область', aliases: ['херсонщина'], type: 'oblast', geocoded: true },
+    { id: 'city-bozhedarivka', name: 'Божедарівка', aliases: ['божедарівка'], type: 'city', oblastId: 'ua-12' },
+    { id: 'city-verkhivtseve', name: 'Верхівцеве', aliases: ['верхівцеве'], type: 'city', oblastId: 'ua-12' },
+    { id: 'city-stepanivka-sumy', name: 'Степанівка', aliases: ['степанівка'], type: 'city', oblastId: 'ua-59' },
+    { id: 'city-stepanivka-kherson', name: 'Степанівка', aliases: ['степанівка'], type: 'city', oblastId: 'ua-65' },
+    { id: 'city-kalynivka-vinnytsia', name: 'Калинівка', aliases: ['калинівка'], type: 'city', oblastId: 'ua-05' },
+    { id: 'city-kalynivka-brovary', name: 'Калинівка', aliases: ['калинівка'], type: 'city', oblastId: 'ua-32' },
+    { id: 'city-kalynivka-fastiv', name: 'Калинівка', aliases: ['калинівка'], type: 'city', oblastId: 'ua-32' }
   ];
   const at = (text: string) => classifyMessage(text, catalogue).locations.map((location) => location.id).sort();
 
@@ -952,8 +965,10 @@ describe('classifyMessage on Ukrainian place-name morphology (v4)', () => {
     // Богуслав in the catalogue this resolved `katottg-ua32120010010027554`, the unmapped-ancestor
     // climb in `territory-state.ts` walked it up to Обухівський район, Київська область, and the
     // territory panel showed a Kyiv-oblast raion carrying a Dnipropetrovsk UAV corridor for an hour.
+    // The message's second settlement, Божедарівка, was a silent drop 031 reported and 032 added, so
+    // both lines of the incident message now name the place they were always about (see F1).
     expect(at('Дніпропетровщина:\nБпЛА курсом на Богуслав\nРеактивний БпЛА курсом на Божедарівку'))
-      .toEqual(['city-bohuslav-dnipro', 'ua-12']);
+      .toEqual(['city-bohuslav-dnipro', 'city-bozhedarivka', 'ua-12']);
     // The Kyiv one is still reachable when the message says so, which is the whole point of adding
     // the second row rather than replacing the first.
     expect(at('Київщина: БпЛА курсом на Богуслав')).toEqual(['city-bohuslav-kyiv', 'ua-32']);
@@ -973,8 +988,10 @@ describe('classifyMessage on Ukrainian place-name morphology (v4)', () => {
   it('E3 keeps a Sumy-border Миколаївка out of Donetsk oblast', () => {
     // a4d3b0ac-7df8-4ecf-b019-61d39f10fceb and a66137b9-7a22-4734-ada2-b0ad7adf4cc9, Air Force.
     // Хотінь — the settlement in the first of them, added by 024 — is in the same raion as this one.
+    // Степанівка in the same message is migration 032's row; before it the third name in this
+    // corridor resolved to nothing at all.
     expect(at('🛵 Сумщина: БпЛА повз Хотінь ➡️ у напрямку Миколаївки/Степанівки.'))
-      .toEqual(['city-khotin', 'city-mykolaivka-sumy', 'ua-59']);
+      .toEqual(['city-khotin', 'city-mykolaivka-sumy', 'city-stepanivka-sumy', 'ua-59']);
     expect(at('🛵 Сумщина: реактивний БпЛА ➡️ в напрямку Миколаївки.'))
       .toEqual(['city-mykolaivka-sumy', 'ua-59']);
     expect(at('Донеччина: БпЛА курсом на Миколаївку')).toEqual(['city-mykolaivka-donetsk', 'ua-14']);
@@ -988,6 +1005,77 @@ describe('classifyMessage on Ukrainian place-name morphology (v4)', () => {
       .toEqual(['city-lypova-dolyna', 'ua-59']);
     // The Ivano-Frankivsk town keeps its own name.
     expect(at('БпЛА курсом на Долину')).toEqual(['city-dolyna']);
+  });
+
+  // ----------------------------------------------------------------------------------------------
+  // F. The settlements migration 032 adds: the two silent drops 031 reported but did not add, and
+  //    the wrong-oblast homonym `scripts/homonym-audit.mjs` found before any incident did.
+  // ----------------------------------------------------------------------------------------------
+
+  it('F1 resolves Божедарівка, whose only namesake shares its hromada', () => {
+    // Twelve archived mentions, every one Dnipropetrovsk. Verbatim: 6bfea2ed-8b6a-4d3e-8c3e-
+    // 425c52a5a1ca (osint-rynda), 1e04c4e4-8380-4a2b-ad51-327b3a192bc6 and 60db3357-e412-46fe-9f07-
+    // 424e13df0ab9 (єРадар), b26f54e1-a42a-46ce-ada2-4cdc5447cb26 (Air Force). Before this row every
+    // one of them resolved the oblast and nothing else, so a stated course reached no settlement.
+    expect(at('Дніпропетровщина:\nРеактивний БпЛА курсом на Божедарівку'))
+      .toEqual(['city-bozhedarivka', 'ua-12']);
+    expect(at('🛵Дніпропетровщина: реактивний БПЛА кружляє в районі Божедарівки'))
+      .toEqual(['city-bozhedarivka', 'ua-12']);
+    expect(at('🛵 Реактивний БпЛА на Дніпропетровщині, курсом на Божедарівку.'))
+      .toEqual(['city-bozhedarivka', 'ua-12']);
+    expect(at('🛵Дніпропетровщина: реактивний на Божедарівку / Кринички з півдня'))
+      .toEqual(['city-bozhedarivka', 'ua-12']);
+    // The incident message of migration 031, both of whose settlements now resolve.
+    expect(at('Дніпропетровщина:\nБпЛА курсом на Богуслав\nРеактивний БпЛА курсом на Божедарівку'))
+      .toEqual(['city-bohuslav-dnipro', 'city-bozhedarivka', 'ua-12']);
+    // Unlike every other name in this block, a bare Божедарівка is allowed to resolve: Ukraine holds
+    // two, and the other (UA12040010060018170) is a село in the same hromada, so there is no wrong
+    // oblast for the name to land in. This is the СК running commentary that names Kharkiv and
+    // Опішня in the same breath and never says which oblast the drone is over — 863d6851-690c-43e4-
+    // aa3f-509e878e3a70, verbatim. (Neither Харків nor Опішня is in the trimmed catalogue above, so
+    // this assertion is about the one name it can reach.)
+    expect(at('Харків неподалік 3х дрона\nОпішня той так і літає\nреакт на Божедарівку'))
+      .toEqual(['city-bozhedarivka']);
+  });
+
+  it('F2 gives Степанівка to Sumy, keeps it out of Kherson, and refuses it bare', () => {
+    // The Sumy row is what the archive asks for: five threat mentions, all naming Сумщина, all on
+    // the Хотінь–Миколаївка–Степанівка border corridor. Verbatim, in order: c35fec1c-0a04-42d0-921e-
+    // 9d6124ffa2e2 (Air Force), 3b4c0d69-7a57-48c1-8319-9bd913109a94 and 10a52c37-dc63-4441-b8d6-
+    // b37bc5733d6d (Ринда).
+    expect(at('🛵 Сумщина: БпЛА повз Хотінь ➡️ в напрямку Степанівки.'))
+      .toEqual(['city-khotin', 'city-stepanivka-sumy', 'ua-59']);
+    expect(at('Сумщина:\nБпЛА курсом на Степанівку')).toEqual(['city-stepanivka-sumy', 'ua-59']);
+    // The Cherkasy block of the same message is left in verbatim: the settlement it names is not in
+    // the trimmed catalogue above, and what matters is that a second oblast in the text does not
+    // pull Степанівка out of the one that owns it.
+    expect(at('Сумщина:\nМолнія курсом на Степанівку\n\nЧеркащина:\nБпЛА курсом на Канів'))
+      .toEqual(['city-stepanivka-sumy', 'ua-59']);
+    // The Kherson row earns its place here rather than in the archive: fifty settlements in Ukraine
+    // are called Степанівка, so a single row would have resolved every one of these spans wherever
+    // the message was talking about. With the pair, the message decides.
+    expect(at('Херсонщина: БпЛА курсом на Степанівку')).toEqual(['city-stepanivka-kherson', 'ua-65']);
+    // Bare, and naming both oblasts, are the two shapes that must refuse. Before 032 the first of
+    // them resolved nothing because the name was absent; it must still resolve nothing now that it
+    // is present twice, which is a different reason for the same right answer.
+    expect(at('БпЛА курсом на Степанівку')).toEqual([]);
+    expect(at('Сумщина та Херсонщина: БпЛА курсом на Степанівку')).toEqual(['ua-59', 'ua-65']);
+  });
+
+  it('F3 stops a Kyiv-oblast Калинівка resolving to Vinnytsia, 200 km away', () => {
+    // The highest-risk name in `scripts/homonym-audit.mjs`: 85 settlements called Калинівка, 81 of
+    // them outside Вінницька область, and the catalogue held only the Vinnytsia місто because the
+    // KATOTTG importer reads category M. 02b6756a-b89c-4f0c-acb5-5ba21d313cac, єРадар,
+    // 2026-08-08T13:35:45Z, verbatim — the message names Київщина in its first word.
+    expect(at('🛵Київщина: БПЛА над Калинівкою')).toEqual(['ua-32']);
+    // Two Kyiv-oblast смт carry the name and the archive does not say which one the message means —
+    // Баришівка in the follow-up message is twenty kilometres from the Броварський one, Обухів in
+    // the message after that is twenty from the Фастівський one — so the pair refuses and the oblast
+    // stands alone. An oblast is a true statement; a settlement 200 km away is not.
+    expect(at('БпЛА курсом на Калинівку')).toEqual([]);
+    // Вінниччина still reaches its own Калинівка, which is the whole point of adding rows rather
+    // than removing one.
+    expect(at('Вінниччина: БпЛА курсом на Калинівку')).toEqual(['city-kalynivka-vinnytsia', 'ua-05']);
   });
 
   // ----------------------------------------------------------------------------------------------
