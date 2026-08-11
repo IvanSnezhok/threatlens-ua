@@ -71,10 +71,12 @@ describe.skipIf(!integrationDatabaseAvailable)('subscription fanout', () => {
       expect(event.published).toBe(true);
       expect((await liveThreats(new Date(Date.now() + 1000))).find((row) => row.id === event.id))
         .toMatchObject({ evidenceLevel: 'unverified', title: 'Аналітична загроза: Київська область' });
-      const evidence = await sql<{ evidence_role: string; confidence: number }>(
+      const evidence = await sql<{ evidence_role: string; confidence: string }>(
         `SELECT evidence_role,confidence FROM event_evidence WHERE event_id=$1`, [event.id]
       );
-      expect(evidence.rows[0]).toMatchObject({ evidence_role: 'model:demo', confidence: 0.97 });
+      expect(evidence.rows[0]?.evidence_role).toBe('model:demo');
+      // node-postgres intentionally returns NUMERIC as text to avoid precision loss.
+      expect(Number(evidence.rows[0]?.confidence)).toBe(0.97);
 
       await runFanout();
       expect(await chatsNotifiedFor(event.id)).toEqual([8991]);

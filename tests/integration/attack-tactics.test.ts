@@ -67,6 +67,20 @@ async function seedMessage(
 const HOUR = 3_600_000;
 
 /**
+ * A recent instant whose minute cannot make the 20-minute fixture cross an hour boundary.
+ *
+ * The production detector is correctly sensitive to hour-distribution shifts. The fixture intends
+ * to test weapon mix only, so using wall-clock `new Date()` made it accidentally add a third
+ * time-of-day detection whenever CI started after minute 40.
+ */
+function stableNow(): Date {
+  const now = new Date();
+  now.setUTCMinutes(20, 0, 0);
+  if (now.getTime() > Date.now()) now.setUTCHours(now.getUTCHours() - 1);
+  return now;
+}
+
+/**
  * Fourteen days of three messages each — two cruise, one drone — and then one cluster of twenty in
  * the current day, fifteen of which are drones.
  *
@@ -115,7 +129,7 @@ describe.skipIf(!integrationDatabaseAvailable)('attack tactics', () => {
   });
 
   it('reads a weapon-mix shift out of a real fortnight, with the arithmetic to check it', async () => {
-    const now = new Date();
+    const now = stableNow();
     await seedFortnight(now);
     const { runTacticsPass } = await import('../../src/services/attack-tactics.js');
 
@@ -147,7 +161,7 @@ describe.skipIf(!integrationDatabaseAvailable)('attack tactics', () => {
   }, 60_000);
 
   it('confirms an unchanged picture instead of writing a second row', async () => {
-    const now = new Date();
+    const now = stableNow();
     await seedFortnight(now);
     const { runTacticsPass } = await import('../../src/services/attack-tactics.js');
 
@@ -167,7 +181,7 @@ describe.skipIf(!integrationDatabaseAvailable)('attack tactics', () => {
   }, 60_000);
 
   it('serves the block on the public attacks endpoint, beside the period aggregates', async () => {
-    const now = new Date();
+    const now = stableNow();
     await seedFortnight(now);
     await (await import('../../src/services/attack-tactics.js')).runTacticsPass('manual', { now });
 
@@ -196,7 +210,7 @@ describe.skipIf(!integrationDatabaseAvailable)('attack tactics', () => {
   }, 60_000);
 
   it('does not serve a pass computed inside the publication hold', async () => {
-    const now = new Date();
+    const now = stableNow();
     await seedFortnight(now);
     // Computed five seconds ago: newer than a `now()-15s` cutoff and older than the request.
     await (await import('../../src/services/attack-tactics.js')).runTacticsPass('manual', {
@@ -222,7 +236,7 @@ describe.skipIf(!integrationDatabaseAvailable)('attack tactics', () => {
   }, 60_000);
 
   it('refuses to compare a day too thin to compare', async () => {
-    const now = new Date();
+    const now = stableNow();
     // A fortnight of baseline and only five messages today: every share would have a single-digit
     // denominator, so the pass emits nothing at all rather than a page of confident fractions.
     for (let day = 1; day <= 14; day += 1) {
@@ -245,7 +259,7 @@ describe.skipIf(!integrationDatabaseAvailable)('attack tactics', () => {
   }, 60_000);
 
   it('runs as a leg of the recompute, behind its own five-minute floor', async () => {
-    const now = new Date();
+    const now = stableNow();
     await seedFortnight(now);
     const { recomputeAnalytics } = await import('../../src/services/analytics-scheduler.js');
 

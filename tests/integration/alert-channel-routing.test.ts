@@ -1,4 +1,4 @@
-import { afterEach, beforeAll, describe, expect, it } from 'vitest';
+import { beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import { ensureMigrated, integrationDatabaseAvailable, sql } from '../helpers/db.js';
 
 /**
@@ -36,9 +36,10 @@ async function routes() {
 describe.skipIf(!integrationDatabaseAvailable)('alert channel routing', () => {
   beforeAll(ensureMigrated);
 
-  afterEach(async () => {
+  beforeEach(async () => {
     // The catalogue flags are what these tests manipulate, and `resetDatabase` does not restore
-    // them. Migration 014 is the statement of record for which rows are on.
+    // them. Restore BEFORE the first assertion too: another integration file shares this database
+    // and may have disabled a source before this file begins.
     await sql(`UPDATE sources SET enabled=true WHERE id = ANY($1::text[])`,
       [['air-alert-ua', 'gov-kherson-oda', 'gov-kherson-mva', 'gov-kyiv-oblast-oda',
         'gov-vinnytsia-oda', 'gov-rivne-oda', 'gov-sloviansk-mva']]);
