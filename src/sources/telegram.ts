@@ -66,11 +66,13 @@ export async function resolveChannelRoutes(log: CollectorLogger): Promise<Map<st
 
   const monitored = await loadMonitoredTelegramChannels().catch((error) => {
     log.error({ error }, 'monitored channel registry could not be read; falling back to the Air Force channel');
-    return [] as MonitoredTelegramChannel[];
+    return null;
   });
   const classifier = new Map<string, MonitoredTelegramChannel>();
-  for (const channel of monitored) classifier.set(channel.username, channel);
-  if (![...classifier.values()].some((channel) => channel.sourceId === AIR_FORCE_SOURCE_ID)) {
+  for (const channel of monitored ?? []) classifier.set(channel.username, channel);
+  // Only a failed registry read gets the fallback. A successful empty list is a deliberate Ops
+  // state and must not be silently repopulated with the Air Force row.
+  if (monitored === null) {
     classifier.set(AIR_FORCE_CHANNEL, {
       sourceId: AIR_FORCE_SOURCE_ID, username: AIR_FORCE_CHANNEL, adapterType: 'mtproto'
     });
@@ -175,6 +177,15 @@ let collectorStatus: TelegramCollectorStatus = { ...INITIAL_STATUS };
  */
 export function telegramCollectorStatus(): TelegramCollectorStatus {
   return { ...collectorStatus, unresolved: [...collectorStatus.unresolved] };
+}
+
+let collectorReload: (() => void) | null = null;
+
+/** Ask the connected collector to re-read the source registry after a committed Ops switch. */
+export function requestTelegramCollectorReload(): boolean {
+  if (!collectorReload) return false;
+  collectorReload();
+  return true;
 }
 
 /**
@@ -764,6 +775,15 @@ export async function startTelegramCollector(
       attaching = false;
     }
   };
+  collectorReload = () => {
+    const floodUntil = collectorStatus.floodWaitUntil
+      ? Date.parse(collectorStatus.floodWaitUntil) : Number.NaN;
+    if (Number.isFinite(floodUntil) && floodUntil > Date.now()) {
+      armRetry(floodUntil - Date.now());
+      return;
+    }
+    void attach();
+  };
   const attachPass = async (): Promise<void> => {
     const routes = await resolveChannelRoutes(log);
     const resolution = await resolveChannelPeers(client, routes, log);
@@ -776,7 +796,12 @@ export async function startTelegramCollector(
     // live handlers do not already carry learned nothing — it was cut short by a flood wait or a
     // failed dialog scan — and re-registering on its result would drop the channels that ARE being
     // read in order to re-register a subset of them. The live pair stays; only the retry is re-armed.
+    const desiredRouteKeys = new Set([...routes.values()]
+      .map((route) => `${route.kind}:${route.sourceId}:${route.username}`));
+    const removesLiveRoute = [...routesByPeerId.values()]
+      .some((route) => !desiredRouteKeys.has(`${route.kind}:${route.sourceId}:${route.username}`));
     const gainedNothing = attachedBuilders.length > 0
+      && !removesLiveRoute
       && [...resolution.byPeerId.keys()].every((peerId) => routesByPeerId.has(peerId));
     if (gainedNothing) {
       setCollectorStatus({
@@ -942,6 +967,7 @@ export async function startTelegramCollector(
 
   return async () => {
     stopped = true;
+    collectorReload = null;
     cancelRetry?.();
     cancelRetry = null;
     stopClassifierBackfill?.();

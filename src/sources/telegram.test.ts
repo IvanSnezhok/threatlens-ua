@@ -107,7 +107,7 @@ vi.mock('../services/operations.js', () => ({
 
 import { resetAdminNotices, setAdminNoticeBot } from '../bot/admin-notice.js';
 import {
-  floodWaitSeconds, resetTelegramCollectorStatus, resolveChannelPeers, startTelegramCollector,
+  floodWaitSeconds, requestTelegramCollectorReload, resetTelegramCollectorStatus, resolveChannelPeers, startTelegramCollector,
   telegramCollectorStatus, type ChannelRoute, type TelegramCollectorRuntime
 } from './telegram.js';
 
@@ -501,6 +501,23 @@ describe('flood-wait handling', () => {
       expect(live).toHaveLength(1);
       expect(live[0]?.ms).toBe(1_200_000);
     } finally { await stop?.(); }
+  });
+
+  it('rebinds after an Ops registry change and removes a disabled live route', async () => {
+    const removed = MONITOR_CHANNELS[0] as string;
+    const fake = fakeClient();
+    const stop = await start(fake);
+    try {
+      expect(await deliver(fake, 'new', channelMessage(removed))).toBe(true);
+      useRegistry(ALL_CHANNELS.filter((handle) => handle !== removed));
+      expect(requestTelegramCollectorReload()).toBe(true);
+      await vi.waitFor(() => expect(fake.calls.dialogScans).toBe(2));
+      await vi.waitFor(() => expect(telegramCollectorStatus().resolved).toBe(53));
+      expect(telegramCollectorStatus()).toMatchObject({ state: 'ready', channels: 53, resolved: 53 });
+      expect(await deliver(fake, 'new', channelMessage(removed))).toBe(false);
+      expect(fake.handlers).toHaveLength(2);
+    } finally { await stop?.(); }
+    expect(requestTelegramCollectorReload()).toBe(false);
   });
 
   it('cancels the armed retry when the collector is stopped', async () => {

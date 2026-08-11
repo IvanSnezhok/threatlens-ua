@@ -13,6 +13,9 @@ import {
   threatContentHash,
   type AssessmentPublishedState, type ThreatPublishedState, type ThreatSnapshot
 } from './notification-policy.js';
+import {
+  claimDeliveryBatch, deliveryClass, recordProviderBackoff, registerDeliveryGovernorMetrics
+} from './delivery-governor.js';
 
 /**
  * Notifications this worker refused to queue, by the reason it refused.
@@ -36,6 +39,7 @@ export function registerOutboxMetrics(registry: Registry): void {
   if (!registry.getSingleMetric('threatlens_notifications_suppressed_total')) {
     registry.registerMetric(notificationsSuppressed);
   }
+  registerDeliveryGovernorMetrics(registry);
 }
 
 function html(value: unknown): string {
@@ -573,81 +577,76 @@ async function reclaimStuckSending(): Promise<number> {
 async function deliverBatch(bot: Bot, log: { warn: Function }) {
   const reclaimed = await reclaimStuckSending();
   if (reclaimed) log.warn({ reclaimed }, 'reclaimed notifications stuck in sending');
-  const client = await pool.connect();
-  try {
-    await client.query('BEGIN');
-    const batch = await client.query(
-      `SELECT * FROM notification_outbox WHERE status IN ('pending','retry') AND next_attempt_at<=now()
-       ORDER BY priority,created_at LIMIT 25 FOR UPDATE SKIP LOCKED`
-    );
-    for (const row of batch.rows) {
-      await client.query(`UPDATE notification_outbox SET status='sending',attempts=attempts+1,updated_at=now() WHERE id=$1`, [row.id]);
-    }
-    await client.query('COMMIT');
-    for (const row of batch.rows) {
-      try {
-        const payload = row.payload ?? {};
-        const text = formatMessage(row);
-        const options = {
-          parse_mode: 'HTML' as const,
-          // A de-escalation is worth recording and not worth a sound at night, so the policy can ask
-          // for silence explicitly; everything from priority 3 down was already quiet.
-          disable_notification: payload.silent === true || row.priority >= 3,
-          link_preview_options: { is_disabled: true }
-        };
-        const editMessageId = Number(payload.editMessageId ?? 0) || null;
-        let messageId: number | null = null;
-        if (editMessageId) {
-          // Editing keeps one message per threat in the chat: «ще стоїть, до 04:10» replaces the line
-          // the person already read instead of stacking another push on top of it. The message may be
-          // gone (deleted, or older than Telegram lets us edit), and grammy reports that as an
-          // ordinary API error — falling through to a normal send is the correct answer, not a retry,
-          // because the subscriber has nothing to look at either way.
-          try {
-            await bot.api.editMessageText(String(row.chat_id), editMessageId, text, {
-              parse_mode: options.parse_mode, link_preview_options: options.link_preview_options
-            });
-            messageId = editMessageId;
-          } catch (error: any) {
-            log.warn({ outboxId: row.id, code: String(error?.error?.error_code ?? error?.error_code ?? 'unknown') },
-              'notification edit failed, sending a new message');
-          }
+  const batch = await claimDeliveryBatch();
+  for (let index = 0; index < batch.length; index += 1) {
+    const row = batch[index]!;
+    try {
+      const payload = row.payload ?? {};
+      const text = formatMessage(row);
+      const options = {
+        parse_mode: 'HTML' as const,
+        // A de-escalation is worth recording and not worth a sound at night, so the policy can ask
+        // for silence explicitly; everything from priority 3 down was already quiet.
+        disable_notification: payload.silent === true || row.priority >= 3,
+        link_preview_options: { is_disabled: true }
+      };
+      const editMessageId = Number(payload.editMessageId ?? 0) || null;
+      let messageId: number | null = null;
+      if (editMessageId) {
+        // Editing keeps one message per threat in the chat: «ще стоїть, до 04:10» replaces the line
+        // the person already read instead of stacking another push on top of it. The message may be
+        // gone (deleted, or older than Telegram lets us edit), and grammy reports that as an
+        // ordinary API error — falling through to a normal send is the correct answer, not a retry,
+        // because the subscriber has nothing to look at either way.
+        try {
+          await bot.api.editMessageText(String(row.chat_id), editMessageId, text, {
+            parse_mode: options.parse_mode, link_preview_options: options.link_preview_options
+          });
+          messageId = editMessageId;
+        } catch (error: any) {
+          log.warn({ outboxId: row.id, code: String(error?.error?.error_code ?? error?.error_code ?? 'unknown') },
+            'notification edit failed, sending a new message');
         }
-        if (messageId === null) {
-          const sent = await bot.api.sendMessage(String(row.chat_id), text, options);
-          messageId = sent.message_id;
-        }
-        await pool.query(`UPDATE notification_outbox SET status='sent',sent_at=now(),updated_at=now() WHERE id=$1`, [row.id]);
-        await pool.query(
+      }
+      if (messageId === null) {
+        const sent = await bot.api.sendMessage(String(row.chat_id), text, options);
+        messageId = sent.message_id;
+      }
+      await pool.query(`UPDATE notification_outbox SET status='sent',sent_at=now(),updated_at=now() WHERE id=$1`, [row.id]);
+      await pool.query(
           `INSERT INTO notification_deliveries(outbox_id,telegram_message_id,delivered_status,queued_at,sent_at)
            VALUES ($1,$2,'sent',$3,now())`, [row.id, messageId, row.created_at]
-        );
-        // The message id is what makes the *next* soft update an edit rather than a new push.
-        if (payload.state?.key) {
-          await pool.query(
+      );
+      // The message id is what makes the *next* soft update an edit rather than a new push.
+      if (payload.state?.key) {
+        await pool.query(
             `UPDATE notification_state SET telegram_message_id=$3,delivered_at=now(),updated_at=now()
              WHERE entity_kind=$1 AND entity_key=$2 AND chat_id=$4`,
             [payload.state.kind, payload.state.key, messageId, row.chat_id]
-          );
-        }
-      } catch (error: any) {
-        const code = String(error?.error?.error_code ?? error?.error_code ?? 'unknown');
-        const retryAfter = Number(error?.error?.parameters?.retry_after ?? Math.min(300, 2 ** row.attempts));
-        await pool.query(
+        );
+      }
+    } catch (error: any) {
+      const code = String(error?.error?.error_code ?? error?.error_code ?? 'unknown');
+      const retryAfter = Number(error?.error?.parameters?.retry_after ?? Math.min(300, 2 ** row.attempts));
+      await pool.query(
           `UPDATE notification_outbox SET status=CASE WHEN attempts>=$4 OR $3 IN ('400','403') THEN 'failed' ELSE 'retry' END,
            next_attempt_at=now()+($2||' seconds')::interval,updated_at=now() WHERE id=$1`, [row.id, retryAfter, code, maxAttempts]
-        );
-        await pool.query(
+      );
+      await pool.query(
           `INSERT INTO notification_deliveries(outbox_id,delivered_status,error_code,queued_at)
            VALUES ($1,'failed',$2,$3)`, [row.id, code, row.created_at]
+      );
+      if (code === '403') await pool.query(`UPDATE telegram_users SET enabled=false WHERE chat_id=$1`, [row.chat_id]);
+      if (code === '429') {
+        // retry_after is aggregate for this bot. Put untouched claims back now instead of waiting
+        // for the five-minute crash-reclaim path, persist the pause, and resume by priority later.
+        await recordProviderBackoff(
+          row.id, deliveryClass(row), retryAfter, batch.slice(index + 1).map((item) => String(item.id))
         );
-        if (code === '403') await pool.query(`UPDATE telegram_users SET enabled=false WHERE chat_id=$1`, [row.chat_id]);
+        break;
       }
     }
-  } catch (error) {
-    await client.query('ROLLBACK').catch(() => undefined);
-    throw error;
-  } finally { client.release(); }
+  }
 }
 
 /**

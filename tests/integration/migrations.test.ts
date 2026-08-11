@@ -37,7 +37,9 @@ const MIGRATION_FILES = [
   '033_tactics_and_research_switches.sql',
   '034_attack_tactics.sql',
   '035_attack_research.sql',
-  '036_resource_efficiency.sql'
+  '036_resource_efficiency.sql',
+  '037_ops_source_management.sql',
+  '038_telegram_delivery_governor.sql'
 ];
 
 /**

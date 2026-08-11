@@ -486,6 +486,7 @@ async function persistOfficialAlertSnapshot(sourceId: string, body: unknown): Pr
 
 export async function syncOfficialAlerts(log?: { warn: Function }): Promise<void> {
   if (!config.UKRAINE_ALARM_API_TOKEN) return;
+  if (!await sourceCollectionEnabled('ukraine-alarm')) return;
   try {
     const response = await fetch(config.UKRAINE_ALARM_API_URL, {
       headers: { Authorization: config.UKRAINE_ALARM_API_TOKEN, Accept: 'application/json' },
@@ -504,8 +505,8 @@ export async function syncOfficialAlerts(log?: { warn: Function }): Promise<void
 
 export async function syncAlertsInUa(log?: { warn: Function }): Promise<void> {
   if (!config.ALERTS_IN_UA_TOKEN) return;
+  if (!await sourceCollectionEnabled('alerts-in-ua')) return;
   try {
-    await pool.query(`UPDATE sources SET enabled=true WHERE id='alerts-in-ua'`);
     const response = await fetch(config.ALERTS_IN_UA_URL, {
       headers: { Authorization: `Bearer ${config.ALERTS_IN_UA_TOKEN}`, Accept: 'application/json' },
       signal: AbortSignal.timeout(12_000)
@@ -563,6 +564,7 @@ export async function syncAlertsInUa(log?: { warn: Function }): Promise<void> {
  */
 export async function syncAerialMirror(log?: { warn: Function }): Promise<void> {
   if (!config.AERIAL_MIRROR_ENABLED) return;
+  if (!await sourceCollectionEnabled(AERIAL_MIRROR_SOURCE_ID)) return;
   try {
     const snapshot = await collectAerialMirrorSnapshot(new Date(), log);
     const persisted = await persistOfficialAlertSnapshot(
@@ -575,6 +577,14 @@ export async function syncAerialMirror(log?: { warn: Function }): Promise<void> 
     countChannelError(AERIAL_MIRROR_SOURCE_ID, 'collect');
     throw error;
   }
+}
+
+/** The database switch is checked immediately before a polled adapter touches its provider. */
+async function sourceCollectionEnabled(sourceId: string): Promise<boolean> {
+  const result = await pool.query<{ enabled: boolean }>(
+    `SELECT enabled FROM sources WHERE id=$1`, [sourceId]
+  );
+  return result.rows[0]?.enabled === true;
 }
 
 /** One GET against the mirror, with the identification header and the non-2xx rule. */
@@ -1202,12 +1212,9 @@ export interface MonitoredTelegramChannel {
  *    fallback username. A monitoring row can therefore never be routed to the alert reconciler,
  *    and cannot shadow an official channel by claiming its name — which matters far more now that
  *    twenty-one handles carry alert authority instead of one.
- *  * **Disabled monitors.** `enabled=false` really stops collection here. It does not for the two
- *    HTTP official adapters — `syncOfficialAlerts` gates on a token and `syncAlertsInUa` sets the
- *    flag to true itself, so for those rows the column reports configuration rather than
- *    controlling it. That known defect is not carried into this path. The Air Force row is left on
- *    its existing behaviour on purpose: it is an official source that must keep working exactly as
- *    it does now, so it is not gated on a flag nothing currently sets.
+ *  * **Disabled rows.** `enabled=false` stops every classifier route, including the Air Force row.
+ *    A registry read failure still gets the one-channel fallback in `resolveChannelRoutes`; a
+ *    successful empty result is obeyed.
  */
 export async function loadMonitoredTelegramChannels(): Promise<MonitoredTelegramChannel[]> {
   if (!config.OSINT_MONITOR_ENABLED) {
@@ -1215,6 +1222,7 @@ export async function loadMonitoredTelegramChannels(): Promise<MonitoredTelegram
     const airForce = await pool.query<{ id: string; telegram_username: string; adapter_type: string }>(
       `SELECT id,lower(telegram_username) AS telegram_username,adapter_type FROM sources
        WHERE telegram_username IS NOT NULL AND adapter_type='mtproto'
+         AND enabled=true
          AND lower(telegram_username) NOT IN (${ALERT_CHANNEL_HANDLES_SQL})
        ORDER BY id`,
       [ALERT_CHANNEL_ADAPTER_TYPE]
@@ -1225,10 +1233,10 @@ export async function loadMonitoredTelegramChannels(): Promise<MonitoredTelegram
     `SELECT id,lower(telegram_username) AS telegram_username,adapter_type FROM sources
      WHERE telegram_username IS NOT NULL
        AND adapter_type = ANY($2::text[])
-       AND (adapter_type <> $3 OR enabled = true)
+       AND enabled = true
        AND lower(telegram_username) NOT IN (${ALERT_CHANNEL_HANDLES_SQL})
      ORDER BY id`,
-    [ALERT_CHANNEL_ADAPTER_TYPE, [...CLASSIFIER_ADAPTER_TYPES], MONITOR_ADAPTER_TYPE]
+    [ALERT_CHANNEL_ADAPTER_TYPE, [...CLASSIFIER_ADAPTER_TYPES]]
   );
   return toMonitoredChannels(result.rows);
 }

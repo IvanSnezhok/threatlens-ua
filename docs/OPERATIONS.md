@@ -6,6 +6,16 @@
 - `/health/ready`: database is reachable, **every migration shipped in this image** is applied, and the MTProto collector is not blocked. The migration check is a set comparison against the image's own `migrations/` directory, not one hard-coded filename: a 503 answers `{"reason":"migrations_pending","required":[…],"applied":[…]}` so the diff is readable. A ready response carries `commit` (the image's `APP_COMMIT`) and `migration` (the newest shipped file) — the deployment runner requires both a 200 and a matching `commit` before it records an update as successful, which is what stops a `compose up` that silently kept the old container from being reported as a success. The response carries a `collector` object in both directions; `503 {"reason":"collector_flood_wait"}` and `collector_failed` are the two states that mean no Telegram channel is being read at all. `disabled` (no MTProto credentials) and `degraded` (handlers live, some handles unbound) stay ready.
 - `/api/v1/sources/health`: configured, current, stale, error and unconfigured source states. MTProto rows additionally carry `collector` — the live handler state, which the database cannot hold.
 - `/ops/api`: Basic-auth protected worker, AI, source and database state.
+- `/ops/api/sources`: the operational source ledger and its guarded enable/disable endpoint.
+
+The source ledger is the canonical place to answer four different questions without conflating
+them: whether an adapter is fresh, what it last failed on, which official alert states it currently
+holds, and which upstream names or classified messages fell through the location catalogue. A
+source switch always records a reason in `source_enabled_audit`. Official rows additionally require
+the source id to be typed and the authority acknowledgement checked. Disabling a source that holds
+alerts requires a separate acknowledgement and **does not update `alert_source_states`**; the holds
+remain until a valid all-clear, reconciliation, or the existing adapter-specific safety backstop.
+Ops also refuses to disable the final enabled official alert source.
 - `/ops`: operator console. Credentials are held only in the active tab's memory; it can add, verify, activate and hide recommended Telegram channels.
 - `/metrics`: open in development; in production requires `METRICS_TOKEN` Bearer auth or ops Basic auth.
 
@@ -1369,7 +1379,18 @@ Production backups must additionally be encrypted and copied to independent obje
   A `degraded` collector never silently downgrades an alert channel: an unbound Tier A handle is a
   source that stops holding its alerts, which the aggregate treats as one fewer official source.
 - **Telegram 403:** the user is disabled automatically; queued messages stop.
-- **Telegram 429:** delivery uses the provider `retry_after` value.
+- **Telegram 429:** delivery persists the provider `retry_after` as a bot-wide pause in
+  `telegram_delivery_governor`. Untouched rows from the claimed batch return to `retry` immediately
+  (their attempt count is not spent), and recovery selects official alerts and threat escalations
+  before analytics, soft edits, or ordinary updates. Do not restart to clear the pause: it survives
+  restart deliberately.
+- **Telegram mass-delivery governor:** the shared token bucket defaults to 25 deliveries/s with a
+  burst of 25 (`TELEGRAM_DELIVERY_RATE_PER_SECOND`, `TELEGRAM_DELIVERY_BURST`). `/ops` shows the
+  classed backlog, oldest age, provider pause and recent defer/coalesce/recovery decisions. Alert
+  starts/ends, official threat messages and evidence escalations are protected and never coalesced.
+  Only queued soft validity edits and same-key analytical assessments may supersede an older queued
+  row; a retained assessment is rewritten as a self-contained message so it never refers to an
+  update the chat did not receive.
 - **AI invalid/timeout:** failure is recorded and deterministic fallback is used.
 - **Unknown provider location:** an unmapped provider location is a catalogue gap, not a source outage. Locations that did resolve are persisted normally, the source stays `current`, and the unmapped names are counted and logged (`unresolvedLocationReports()`) instead of being guessed at. The source is only marked `error` when the response contained alerts and **none** of them could be mapped — the snapshot is then refused whole rather than applied partially.
 - **Reclaimed notifications:** a row left in `sending` for more than 300 seconds is returned to `retry` on the next delivery pass, or marked `failed` once it has used all 8 attempts. The pass logs `reclaimed notifications stuck in sending` with a count; a non-zero count on every pass means delivery is crashing mid-batch.
@@ -1571,6 +1592,12 @@ Production backups must additionally be encrypted and copied to independent obje
   than thirty minutes behind the events it is reading: check `worker_state` for
   `notification-fanout`, the outbox backlog in `/ops/api`, and whether delivery is failing rather
   than the events being stale.
+- **Telegram delivery backlog:** watch `threatlens_telegram_delivery_backlog{class}` together with
+  `threatlens_telegram_delivery_oldest_seconds{class}`. A growing `protected` series is an incident;
+  check `threatlens_telegram_delivery_blocked_seconds` and
+  `threatlens_telegram_delivery_governor_decisions_total{decision,class}` to distinguish a provider
+  pause from local budget pressure. A growing `analytics`/`soft` backlog while `protected` drains is
+  the intended priority order during mass fan-out.
 - **A source stuck in `failed` in `source_backfill_state`.** One source failing never stops live
   collection, never stops the other sources' catch-up, and never marks the source unhealthy —
   `last_error` and `consecutive_failures` are the whole signal. The exponential guard backs the retry

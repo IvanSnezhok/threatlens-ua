@@ -2959,6 +2959,89 @@ code {
 .ops-console .empty-state strong { font-size: 14px; }
 .ops-console .empty-state p { font-size: 12px; }
 
+/* Source ledger — an operator's instrument panel, not another card grid. The horizontal rule is the
+   unit: identity, freshness, findings and the switch remain aligned while detail unfolds beneath. */
+.source-ledger-summary { display: flex; flex-wrap: wrap; border: 1px solid var(--rule-2); }
+.source-ledger-summary span { flex: 1 1 130px; padding: 10px 12px; color: var(--bone-3); font: 500 9px/1.25 var(--mono); letter-spacing: .06em; text-transform: uppercase; border-right: 1px solid var(--rule-2); }
+.source-ledger-summary span:last-child { border-right: 0; }
+.source-ledger-summary b { margin-right: 5px; color: var(--bone); font-size: 14px; }
+.source-ledger-summary .is-bad b { color: #ff9a86; }
+.source-ledger-summary .is-alert b { color: var(--alert); }
+.source-ledger-summary .is-warn b { color: var(--risk); }
+.source-ledger-tools { display: grid; grid-template-columns: minmax(180px, 1fr) 170px; gap: 8px; margin: 10px 0; }
+.source-ledger-tools label { position: relative; }
+.source-ledger-tools label > span { position: absolute; z-index: 1; top: 7px; left: 10px; color: var(--bone-4); font: 500 7px/1 var(--mono); letter-spacing: .12em; text-transform: uppercase; pointer-events: none; }
+.source-ledger-tools input, .source-ledger-tools select { width: 100%; height: 46px; padding: 18px 10px 5px; }
+.source-ledger-list { max-height: min(72vh, 820px); overflow: auto; overscroll-behavior: contain; border-top: 1px solid var(--rule-2); }
+.source-ledger-row { border-bottom: 1px solid var(--rule-2); }
+.source-ledger-row[hidden] { display: none; }
+.source-ledger-row.is-disabled { opacity: .58; }
+.source-ledger-main { display: grid; grid-template-columns: 86px minmax(210px, 1fr) 118px 180px 92px; gap: 12px; align-items: center; min-height: 72px; padding: 10px 0; }
+.source-ledger-status { display: inline-flex; align-items: center; gap: 6px; color: var(--bone-3); font: 500 8px/1 var(--mono); letter-spacing: .08em; text-transform: uppercase; }
+.source-ledger-status i { width: 7px; height: 7px; border-radius: 50%; background: var(--bone-4); box-shadow: 0 0 0 3px color-mix(in srgb, var(--bone-4) 16%, transparent); }
+.source-ledger-status.is-ok i { background: var(--safe); box-shadow: 0 0 0 3px color-mix(in srgb, var(--safe) 18%, transparent); }
+.source-ledger-status.is-warn i { background: var(--risk); box-shadow: 0 0 0 3px color-mix(in srgb, var(--risk) 18%, transparent); }
+.source-ledger-status.is-bad i { background: var(--alert); box-shadow: 0 0 0 3px color-mix(in srgb, var(--alert) 18%, transparent); }
+.source-ledger-identity { min-width: 0; }
+.source-ledger-identity h3 { overflow: hidden; margin: 0; color: var(--bone); font: 650 13px/1.25 var(--display); text-overflow: ellipsis; white-space: nowrap; }
+.source-ledger-identity p { overflow: hidden; margin: 4px 0 6px; color: var(--bone-4); font: 400 8px/1.2 var(--mono); text-overflow: ellipsis; white-space: nowrap; }
+.source-ledger-tags { display: flex; flex-wrap: wrap; gap: 4px; }
+.source-ledger-tags span { padding: 3px 5px; color: var(--bone-3); font: 500 7px/1 var(--mono); letter-spacing: .05em; text-transform: uppercase; border: 1px solid var(--rule-2); }
+.source-ledger-tags .is-official { color: #ffb3a4; border-color: color-mix(in srgb, var(--alert) 36%, var(--rule-2)); }
+.source-ledger-freshness { display: grid; gap: 3px; }
+.source-ledger-freshness span, .source-ledger-freshness small { color: var(--bone-4); font: 500 7px/1.2 var(--mono); letter-spacing: .08em; text-transform: uppercase; }
+.source-ledger-freshness b { color: var(--bone-2); font: 500 11px/1.2 var(--mono); }
+.source-ledger-signals { display: grid; grid-template-columns: repeat(3, 1fr); gap: 4px; }
+.source-ledger-signals span { display: grid; gap: 3px; padding: 7px 5px; color: var(--bone-4); font: 500 7px/1 var(--mono); text-align: center; text-transform: uppercase; background: var(--surface-2); }
+.source-ledger-signals b { color: var(--bone-3); font-size: 11px; }
+.source-ledger-signals .is-alert b { color: var(--alert); }
+.source-ledger-signals .is-warn b { color: var(--risk); }
+.source-ledger-signals .is-bad b { color: #ff9a86; }
+.source-switch { display: grid; justify-items: center; gap: 5px; padding: 6px; color: var(--bone-4); font: 500 7px/1 var(--mono); letter-spacing: .06em; text-transform: uppercase; border: 0; background: transparent; cursor: pointer; }
+.source-switch i { position: relative; width: 34px; height: 17px; border: 1px solid var(--rule); border-radius: 20px; background: var(--surface-2); }
+.source-switch i::after { content: ''; position: absolute; top: 3px; left: 3px; width: 9px; height: 9px; border-radius: 50%; background: var(--bone-4); transition: transform .18s var(--ease), background .18s var(--ease); }
+.source-switch.is-on { color: var(--safe); }
+.source-switch.is-on i { border-color: color-mix(in srgb, var(--safe) 52%, var(--rule)); }
+.source-switch.is-on i::after { background: var(--safe); transform: translateX(17px); }
+.source-ledger-detail { padding: 0 0 10px 98px; }
+.source-ledger-detail summary { width: max-content; color: var(--bone-4); font: 500 8px/1 var(--mono); letter-spacing: .06em; text-transform: uppercase; cursor: pointer; }
+.source-ledger-detail dl { display: grid; grid-template-columns: repeat(4, 1fr); margin: 10px 0 0; border: 1px solid var(--rule-2); }
+.source-ledger-detail dl div { padding: 8px; border-right: 1px solid var(--rule-2); }
+.source-ledger-detail dt { color: var(--bone-4); font: 500 7px/1 var(--mono); text-transform: uppercase; }
+.source-ledger-detail dd { margin: 5px 0 0; color: var(--bone-2); font: 400 9px/1.4 var(--mono); }
+.source-ledger-failure, .source-ledger-holds, .source-ledger-gaps { margin-top: 8px; padding: 10px 12px; border-left: 2px solid var(--rule); background: var(--surface-2); }
+.source-ledger-failure { border-color: var(--alert); }
+.source-ledger-holds { border-color: var(--alert); }
+.source-ledger-gaps { border-color: var(--risk); }
+.source-ledger-detail p, .source-ledger-detail li { color: var(--bone-3); font-size: 10px; line-height: 1.5; }
+.source-ledger-detail ul { margin: 7px 0 0; padding-left: 17px; }
+.source-ledger-holds li span { display: block; color: var(--bone-4); font: 400 9px/1.4 var(--mono); }
+.source-ledger-audit { color: var(--bone-4) !important; font-family: var(--mono); }
+.source-change-dialog { width: min(520px, calc(100vw - 28px)); padding: 0; color: var(--bone); border: 1px solid var(--rule); background: var(--surface); box-shadow: 0 24px 80px #000b; }
+.source-change-dialog::backdrop { background: #060809d9; backdrop-filter: blur(5px); }
+.source-change-dialog form { position: relative; display: grid; gap: 13px; padding: 26px; }
+.source-dialog-kicker { color: var(--alert); font: 600 8px/1 var(--mono); letter-spacing: .16em; text-transform: uppercase; }
+.source-change-dialog h3 { margin: 0; font: 700 23px/1.1 var(--display); }
+.source-change-dialog p { margin: 0 0 4px; color: var(--bone-3); font-size: 12px; line-height: 1.55; }
+.source-change-dialog textarea { width: 100%; min-height: 92px; resize: vertical; }
+.source-change-dialog .check-field { display: flex; align-items: flex-start; gap: 9px; color: var(--bone-2); font-size: 11px; line-height: 1.45; }
+.source-change-dialog .check-field input { flex: 0 0 auto; width: 15px; height: 15px; margin-top: 1px; accent-color: var(--alert); }
+.source-change-dialog output { min-height: 16px; color: #ff9a86; font-size: 11px; }
+.source-dialog-close { position: absolute; top: 12px; right: 14px; color: var(--bone-3); font-size: 22px; border: 0; background: transparent; cursor: pointer; }
+.source-dialog-actions { display: flex; justify-content: flex-end; gap: 7px; }
+.source-dialog-actions button { padding: 9px 12px; font: 600 9px/1 var(--mono); text-transform: uppercase; border: 1px solid var(--rule); background: transparent; color: var(--bone-2); cursor: pointer; }
+.source-dialog-actions button:last-child { border-color: var(--alert); background: var(--alert); color: var(--ink); }
+.source-dialog-actions button:disabled { opacity: .45; cursor: wait; }
+
+@media (max-width: 760px) {
+  .source-ledger-tools { grid-template-columns: 1fr; }
+  .source-ledger-main { grid-template-columns: 72px minmax(0, 1fr) 76px; gap: 8px; }
+  .source-ledger-freshness { display: none; }
+  .source-ledger-signals { grid-column: 2 / -1; }
+  .source-ledger-detail { padding-left: 80px; }
+  .source-ledger-detail dl { grid-template-columns: 1fr 1fr; }
+}
+
 /* Група Codex — власна сітка тієї самої дванадцятки: вхід і керування стоять поруч, бо це одне
    рішення, а два журнали лишаються на всю ширину, бо в них розгортаються сотні рядків. */
 @media (min-width: 1400px) {

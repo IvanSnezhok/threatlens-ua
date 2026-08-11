@@ -17,6 +17,8 @@ export const envSchema = z.object({
   TELEGRAM_BOT_USERNAME: z.string().default(''),
   TELEGRAM_MODE: z.enum(['polling', 'disabled']).default('polling'),
   TELEGRAM_ADMIN_CHAT_ID: z.string().default(''),
+  TELEGRAM_DELIVERY_RATE_PER_SECOND: z.coerce.number().int().min(1).max(30).default(25),
+  TELEGRAM_DELIVERY_BURST: z.coerce.number().int().min(1).max(30).default(25),
   TELEGRAM_API_ID: z.string().default(''),
   TELEGRAM_API_HASH: z.string().default(''),
   TELEGRAM_SESSION: z.string().default(''),
@@ -627,6 +629,18 @@ export const APP_SETTINGS: Record<keyof AppConfig, SettingMeta> = {
     scope: 'db_tunable', group: 'telegram', apply: 'hot', ui: { kind: 'text' },
     applyNote: 'Читається на місці, у мить самої події (src/bot/admin-notice.ts): новий chat id діє '
       + 'з наступного сповіщення, без перезапуску. Порожнє значення вимикає їх повністю.'
+  },
+  TELEGRAM_DELIVERY_RATE_PER_SECOND: {
+    scope: 'db_tunable', group: 'telegram', apply: 'hot', impact: 'alerts',
+    ui: { kind: 'number', min: 1, max: 30, unit: 'повід./с' },
+    applyNote: 'Спільний для всіх процесів бюджет зберігається в PostgreSQL; нова межа діє з '
+      + 'наступного циклу доставки без перезапуску.'
+  },
+  TELEGRAM_DELIVERY_BURST: {
+    scope: 'db_tunable', group: 'telegram', apply: 'hot', impact: 'alerts',
+    ui: { kind: 'number', min: 1, max: 30, unit: 'повідомлень' },
+    applyNote: 'Максимальний короткий сплеск спільного кошика. Офіційні та ескалаційні '
+      + 'сповіщення завжди вибираються першими, але теж дотримуються межі Telegram.'
   },
   TELEGRAM_API_ID: {
     scope: 'db_secret', group: 'telegram', apply: 'restart', confirm: true, impact: 'collector',

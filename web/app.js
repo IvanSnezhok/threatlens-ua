@@ -5085,6 +5085,166 @@ function wireCoverageSection(root) {
   $('[data-coverage-refresh]', section)?.addEventListener('click', () => void rerender());
 }
 
+// ------------------------------------------------------------------------------------------------
+// Реєстр джерел: живий стан, прогалини й захищений рубильник
+// ------------------------------------------------------------------------------------------------
+
+const OPS_SOURCE_STATUS = {
+  current: ['актуальне', 'ok'], stale: ['застаріло', 'warn'], error: ['помилка', 'bad'],
+  unknown: ['очікує', 'off'], unconfigured: ['не налаштовано', 'off'], disabled: ['вимкнено', 'off']
+};
+
+function sourceMoment(value) {
+  return value ? `${timeAgo(value)} · ${new Date(value).toLocaleString('uk-UA')}` : 'ще не було';
+}
+
+function sourceKind(source) {
+  if (source.adapterType === 'mtproto_alert_channel') return 'Telegram · стан тривоги';
+  if (source.adapterType === 'mtproto_monitor') return 'Telegram · моніторинг';
+  if (source.adapterType === 'mtproto') return 'Telegram · класифікатор';
+  return 'API · стан тривоги';
+}
+
+function opsSourceRow(source) {
+  const [status, tone] = OPS_SOURCE_STATUS[source.status] ?? [source.status, 'off'];
+  const gaps = Number(source.catalogueGaps?.providerCount ?? 0)
+    + Number(source.catalogueGaps?.ignoredMessages24h ?? 0);
+  const holding = Number(source.holdingCount ?? 0);
+  const latest = source.lastMessageReceivedAt ?? source.lastSuccessAt;
+  const search = `${source.name} ${source.id} ${source.telegramUsername ?? ''}`.toLowerCase();
+  const detail = [
+    `<div><dt>Останній успіх</dt><dd>${escapeHtml(sourceMoment(source.lastSuccessAt))}</dd></div>`,
+    `<div><dt>Останнє повідомлення</dt><dd>${escapeHtml(sourceMoment(source.lastMessageReceivedAt))}</dd></div>`,
+    `<div><dt>Очікувана давність</dt><dd>${escapeHtml(String(source.staleAfterSeconds))} с</dd></div>`,
+    `<div><dt>Група незалежності</dt><dd>${escapeHtml(source.independenceGroup)}</dd></div>`
+  ].join('');
+  const holds = (source.holding ?? []).map((item) =>
+    `<li><b>${escapeHtml(item.locationName)}</b><span>${escapeHtml(item.alertType)} · від ${escapeHtml(sourceMoment(item.startedAt))}${item.missingSince ? ` · відсутнє у зрізі від ${escapeHtml(sourceMoment(item.missingSince))}` : ''}</span></li>`).join('');
+  const providerSamples = (source.catalogueGaps?.providerSamples ?? [])
+    .map((sample) => `<li>${escapeHtml(sample)}</li>`).join('');
+  return `<article class="source-ledger-row${source.enabled ? '' : ' is-disabled'}" data-source-row
+      data-name="${escapeHtml(search)}" data-status="${escapeHtml(source.status)}"
+      data-enabled="${source.enabled}" data-official="${source.official}" data-holding="${holding > 0}"
+      data-gaps="${gaps > 0}">
+    <div class="source-ledger-main">
+      <span class="source-ledger-status is-${tone}"><i></i>${escapeHtml(status)}</span>
+      <div class="source-ledger-identity">
+        <h3>${escapeHtml(source.name)}</h3>
+        <p>${escapeHtml(source.id)}${source.telegramUsername ? ` · @${escapeHtml(source.telegramUsername)}` : ''}</p>
+        <div class="source-ledger-tags"><span>Tier ${escapeHtml(source.tier)}</span>${source.official ? '<span class="is-official">офіційне</span>' : ''}<span>${escapeHtml(sourceKind(source))}</span></div>
+      </div>
+      <div class="source-ledger-freshness"><span>Свіжість</span><b>${escapeHtml(latest ? timeAgo(latest) : 'немає даних')}</b><small>межа ${escapeHtml(String(source.staleAfterSeconds))} с</small></div>
+      <div class="source-ledger-signals">
+        <span class="${holding ? 'is-alert' : ''}"><b>${holding}</b> тримає</span>
+        <span class="${gaps ? 'is-warn' : ''}"><b>${gaps}</b> прогалин</span>
+        <span class="${source.lastError ? 'is-bad' : ''}"><b>${source.lastError ? '1' : '0'}</b> збій</span>
+      </div>
+      <button type="button" class="source-switch${source.enabled ? ' is-on' : ''}" data-source-switch="${escapeHtml(source.id)}" aria-label="${source.enabled ? 'Вимкнути' : 'Увімкнути'} ${escapeHtml(source.name)}"><i></i><span>${source.enabled ? 'увімкнено' : 'вимкнено'}</span></button>
+    </div>
+    <details class="source-ledger-detail"><summary>Деталі та журнал</summary>
+      <dl>${detail}</dl>
+      ${source.lastError ? `<div class="source-ledger-failure"><b>Останній збій · ${escapeHtml(sourceMoment(source.lastErrorAt))}</b><p>${escapeHtml(source.lastError)}</p></div>` : ''}
+      ${holding ? `<div class="source-ledger-holds"><b>Стан тривоги, який джерело зараз тримає</b><ul>${holds}</ul></div>` : ''}
+      ${gaps ? `<div class="source-ledger-gaps"><b>Прогалини каталогу</b><p>${escapeHtml(String(source.catalogueGaps?.ignoredMessages24h ?? 0))} повідомлень із відомою загрозою, але без локації за 24 год · ${escapeHtml(String(source.catalogueGaps?.providerCount ?? 0))} назв провайдера не зіставлено.</p>${providerSamples ? `<ul>${providerSamples}</ul>` : ''}</div>` : ''}
+      ${source.lastChange ? `<p class="source-ledger-audit">Остання зміна: ${escapeHtml(sourceMoment(source.lastChange.changedAt))} · ${escapeHtml(source.lastChange.changedBy)} · ${escapeHtml(source.lastChange.reason)}</p>` : ''}
+    </details>
+  </article>`;
+}
+
+function opsSourcesSection(data) {
+  if (!data) return '<section class="ops-section" id="sources-section"><header class="ops-section-head"><div><p>Збір</p><h2>Джерела</h2></div></header><p class="legend-note">Реєстр джерел недоступний.</p></section>';
+  const totals = data.totals ?? {};
+  return `<section class="ops-section source-ledger" id="sources-section">
+    <header class="ops-section-head"><div><p>Збір · ${escapeHtml(String(totals.sources ?? 0))} джерел</p><h2>Стан і керування джерелами</h2></div><button type="button" data-source-refresh>Оновити</button></header>
+    <div class="source-ledger-summary">
+      <span><b>${escapeHtml(String(totals.enabled ?? 0))}</b> увімкнено</span>
+      <span class="${totals.failing ? 'is-bad' : ''}"><b>${escapeHtml(String(totals.failing ?? 0))}</b> зі збоями</span>
+      <span class="${totals.holding ? 'is-alert' : ''}"><b>${escapeHtml(String(totals.holding ?? 0))}</b> тримають тривоги</span>
+      <span class="${totals.withGaps ? 'is-warn' : ''}"><b>${escapeHtml(String(totals.withGaps ?? 0))}</b> мають прогалини</span>
+    </div>
+    <div class="source-ledger-tools"><label><span>Пошук</span><input type="search" data-source-search placeholder="Назва, id або @username"></label><label><span>Стан</span><select data-source-filter><option value="all">Усі</option><option value="failing">Зі збоями</option><option value="holding">Тримають тривогу</option><option value="gaps">З прогалинами</option><option value="disabled">Вимкнені</option><option value="official">Офіційні</option></select></label></div>
+    <details class="safety-note ops-fold"><summary><strong>Вимкнення не є відбоєм</strong></summary><p>${escapeHtml(data.notice ?? '')}</p></details>
+    <div class="source-ledger-list" data-source-list>${(data.sources ?? []).map(opsSourceRow).join('')}</div>
+    <dialog class="source-change-dialog" data-source-dialog><form method="dialog" data-source-form>
+      <button type="button" class="source-dialog-close" data-source-cancel aria-label="Закрити">×</button>
+      <span class="source-dialog-kicker">Зміна контуру збору</span><h3 data-source-dialog-title></h3><p data-source-dialog-copy></p>
+      <label>Причина зміни<textarea required minlength="8" maxlength="500" name="reason" placeholder="Що перевірено і чому змінюємо стан"></textarea></label>
+      <label class="source-confirm-field" data-source-confirm-field>Введіть id джерела для підтвердження<input name="confirmation" autocomplete="off"></label>
+      <label class="check-field" data-source-official-ack><input type="checkbox" name="officialAck"> Розумію, що це джерело має офіційну alert-владу.</label>
+      <label class="check-field" data-source-holds-ack><input type="checkbox" name="holdsAck"> Розумію, що вже підняті тривоги залишаться активними.</label>
+      <output data-source-change-status></output><div class="source-dialog-actions"><button type="button" data-source-cancel>Скасувати</button><button type="submit" data-source-submit>Застосувати</button></div>
+    </form></dialog>
+  </section>`;
+}
+
+function wireSourcesSection(root, data) {
+  const section = $('#sources-section', root);
+  if (!section || !data) return;
+  const rows = () => [...section.querySelectorAll('[data-source-row]')];
+  const apply = () => {
+    const query = String($('[data-source-search]', section)?.value ?? '').trim().toLowerCase();
+    const filter = $('[data-source-filter]', section)?.value ?? 'all';
+    rows().forEach((row) => {
+      const matchFilter = filter === 'all'
+        || (filter === 'failing' && ['error', 'stale'].includes(row.dataset.status))
+        || (filter === 'holding' && row.dataset.holding === 'true')
+        || (filter === 'gaps' && row.dataset.gaps === 'true')
+        || (filter === 'disabled' && row.dataset.enabled === 'false')
+        || (filter === 'official' && row.dataset.official === 'true');
+      row.hidden = !matchFilter || !row.dataset.name.includes(query);
+    });
+  };
+  $('[data-source-search]', section)?.addEventListener('input', apply);
+  $('[data-source-filter]', section)?.addEventListener('change', apply);
+  $('[data-source-refresh]', section)?.addEventListener('click', () => void renderOps());
+
+  const dialog = $('[data-source-dialog]', section);
+  const form = $('[data-source-form]', section);
+  let selected = null;
+  section.querySelectorAll('[data-source-switch]').forEach((button) => button.addEventListener('click', () => {
+    selected = (data.sources ?? []).find((source) => source.id === button.dataset.sourceSwitch) ?? null;
+    if (!selected) return;
+    const enabling = !selected.enabled;
+    $('[data-source-dialog-title]', dialog).textContent = `${enabling ? 'Увімкнути' : 'Вимкнути'} «${selected.name}»`;
+    $('[data-source-dialog-copy]', dialog).textContent = selected.holdingCount
+      ? `Джерело тримає ${selected.holdingCount} стан(и) тривоги. Вимкнення не завершить їх і не створить відбій.`
+      : `Зміна набуде чинності для наступного циклу збору${selected.adapterType.startsWith('mtproto') ? ' після безпечної перебудови MTProto-підписки' : ''}.`;
+    $('[data-source-confirm-field]', dialog).hidden = !selected.official;
+    $('[data-source-official-ack]', dialog).hidden = !selected.official;
+    $('[data-source-holds-ack]', dialog).hidden = enabling || !selected.holdingCount;
+    form.reset();
+    $('[data-source-change-status]', dialog).textContent = '';
+    dialog.showModal();
+  }));
+  section.querySelectorAll('[data-source-cancel]').forEach((button) => button.addEventListener('click', () => dialog.close()));
+  form?.addEventListener('submit', async (event) => {
+    event.preventDefault();
+    if (!selected) return;
+    const values = new FormData(form);
+    const submit = $('[data-source-submit]', form);
+    const status = $('[data-source-change-status]', form);
+    submit.disabled = true; status.textContent = 'Застосовуємо…';
+    const result = await opsFetch(`/ops/api/sources/${encodeURIComponent(selected.id)}`, {
+      method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({
+        enabled: !selected.enabled, expectedEnabled: selected.enabled, reason: values.get('reason'),
+        confirmation: values.get('confirmation') || undefined,
+        acknowledgeOfficialAuthority: form.elements.officialAck.checked,
+        acknowledgeHeldAlerts: form.elements.holdsAck.checked
+      })
+    }).catch(() => null);
+    const payload = await result?.json().catch(() => null);
+    if (result?.ok) { dialog.close(); return void renderOps(); }
+    const errors = {
+      official_confirmation_required: `Потрібно ввести «${selected.id}» і підтвердити офіційну владу джерела.`,
+      held_alerts_acknowledgement_required: 'Підтвердьте, що активні тривоги залишаться на місці.',
+      last_official_alert_source: 'Останнє увімкнене офіційне alert-джерело не можна вимкнути з Ops.',
+      source_state_changed: 'Стан уже змінився в іншій вкладці. Оновіть реєстр.'
+    };
+    status.textContent = errors[payload?.error] ?? 'Не вдалося змінити джерело.';
+    submit.disabled = false;
+  });
+}
+
 // Смуга показників. Шість фішок в один рядок замість чотирьох карток заввишки в сто пікселів:
 // консоль починається з відповіді на «чи все живе», а не з чотирьох цифр кеглем 32.
 function opsKpiChip(label, value, tone = '', hint = '') {
@@ -5094,7 +5254,8 @@ function opsKpiChip(label, value, tone = '', hint = '') {
 }
 
 function opsKpiStrip(data, runtime, deploy) {
-  const queued = data.outbox.reduce((sum, item) => sum + Number(item.count), 0);
+  const queued = (data.telegramDelivery?.backlog ?? [])
+    .reduce((sum, item) => sum + Number(item.count), 0);
   const mode = runtime?.settings?.publicationMode;
   const delaySeconds = runtime?.effective?.delaySeconds ?? 0;
   const pill = deploy ? deployPill(deploy) : { label: 'невідомо', tone: 'off' };
@@ -5123,6 +5284,32 @@ function opsKpiStrip(data, runtime, deploy) {
   </div>`;
 }
 
+function opsTelegramDeliverySection(data) {
+  const governor = data.telegramDelivery;
+  if (!governor) return '';
+  const blocked = Number(governor.blocked_seconds ?? 0);
+  const backlog = governor.backlog ?? [];
+  const labels = { protected: 'Захищені', standard: 'Звичайні', soft: 'Мʼякі оновлення', analytics: 'Аналітика' };
+  return `<section class="ops-section" id="telegram-delivery-section">
+    <header class="ops-section-head"><div><p>Масова розсилка</p><h2>Ліміт Telegram</h2></div>
+      <span class="ops-state ${blocked ? 'is-warn' : 'is-ok'}">${blocked ? `пауза ${blocked} с` : 'працює'}</span></header>
+    <dl class="ops-facts">
+      <div><dt>Спільний темп</dt><dd>${escapeHtml(String(governor.ratePerSecond))}/с</dd></div>
+      <div><dt>Короткий сплеск</dt><dd>${escapeHtml(String(governor.burst))}</dd></div>
+      <div><dt>Доступно токенів</dt><dd>${escapeHtml(Number(governor.tokens ?? 0).toFixed(1))}</dd></div>
+    </dl>
+    <div class="ops-channel-list">${backlog.length ? backlog.map((item) => `<article><div>
+      <span>${escapeHtml(labels[item.notification_class] ?? item.notification_class)}</span>
+      <h3>${escapeHtml(String(item.count))} у черзі</h3>
+      <p>${escapeHtml(item.status)} · найстаріше ${escapeHtml(String(item.oldest_seconds ?? 0))} с</p>
+    </div></article>`).join('') : '<p class="legend-note">Черга порожня.</p>'}</div>
+    ${(governor.decisions ?? []).length ? `<div class="ops-channel-list">${governor.decisions.slice(0, 8).map((item) => `<article><div>
+      <span>${escapeHtml(item.decision)}</span><h3>${escapeHtml(labels[item.notification_class] ?? item.notification_class)}</h3>
+      <p>${escapeHtml(item.reason)} · ${escapeHtml(new Date(item.created_at).toLocaleString('uk-UA'))}</p>
+    </div></article>`).join('')}</div>` : ''}
+  </section>`;
+}
+
 /**
  * Форма входу оператора, спільна для обох маршрутів консолі.
  *
@@ -5145,7 +5332,7 @@ function opsLoginForm(root, probe, retry) {
 async function renderOps() {
   clearInterval(codexPollTimer);
   clearInterval(deployPollTimer);
-  const root = contentShell('Закритий контур', 'Операційна консоль', 'Стан системи та керування каталогом рекомендованих Telegram-каналів.');
+  const root = contentShell('Закритий контур', 'Операційна консоль', 'Живий стан джерел, захищене керування збором і сервісні контури.');
   const response = await opsFetch('/ops/api');
   if (response.status === 401) {
     opsLoginForm(root, '/ops/api', () => void renderOps());
@@ -5158,7 +5345,7 @@ async function renderOps() {
   // Стан входу приходить у складі налаштувань, а не окремим запитом: перемикач «увімкнено» поруч
   // із мертвою сесією — найзаплутаніший стан цієї функції, і показати їх із двох різних моментів
   // означало б зробити його ще заплутанішим.
-  const [vectorOps, research, codexSettings, aiRuns, shadow, sourceTrust, runtime, deploy, backfill, coverage] = await Promise.all([
+  const [vectorOps, research, codexSettings, aiRuns, shadow, sourceTrust, runtime, deploy, backfill, coverage, opsSources] = await Promise.all([
     opsFetch('/ops/vectors').then((result) => result.ok ? result.json() : null).catch(() => null),
     // Тільки перелік і ліміти. Жодного меморандуму тут не рахується: він зʼявляється лише після
     // натискання, і саме тому відкриття консолі нічого не витрачає.
@@ -5170,7 +5357,8 @@ async function renderOps() {
     opsFetch('/ops/api/runtime').then((result) => result.ok ? result.json() : null).catch(() => null),
     opsFetch('/ops/api/deploy').then((result) => result.ok ? result.json() : null).catch(() => null),
     opsFetch('/ops/api/backfill').then((result) => result.ok ? result.json() : null).catch(() => null),
-    opsFetch(`/ops/api/coverage?windowDays=${coverageWindowDays}`).then((result) => result.ok ? result.json() : null).catch(() => null)
+    opsFetch(`/ops/api/coverage?windowDays=${coverageWindowDays}`).then((result) => result.ok ? result.json() : null).catch(() => null),
+    opsFetch('/ops/api/sources').then((result) => result.ok ? result.json() : null).catch(() => null)
   ]);
   lastDeployData = deploy;
   const codex = codexSettings?.status ?? null;
@@ -5195,10 +5383,12 @@ async function renderOps() {
     <div class="ops-grid">
     <div class="ops-col ops-col--signal">
     ${opsRuntimeSection(runtime)}
+    ${opsSourcesSection(opsSources)}
     ${opsCoverageSection(coverage)}
     ${opsSourceTrustSection(sourceTrust)}
     </div>
     <div class="ops-col ops-col--service">
+    ${opsTelegramDeliverySection(data)}
     ${opsDeploySection(deploy)}
     ${opsBackfillSection(backfill)}
     <section class="ops-section" id="channels-section"><header class="ops-section-head"><div><p>Каталог для користувачів</p><h2>Додати Telegram-канал</h2></div><button id="ops-logout">Вийти</button></header>
@@ -5238,6 +5428,7 @@ async function renderOps() {
   wireShadowSection(root, codexSettings?.settings ?? null);
   wireAiRunsSection(root, codex, codexSettings?.settings ?? null);
   wireSourceTrustSection(root);
+  wireSourcesSection(root, opsSources);
   wireCoverageSection(root);
   wireResearchSection(root, () => renderOps());
   root.querySelectorAll('[data-project-vector]').forEach((button) => button.addEventListener('click', async () => {

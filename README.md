@@ -307,6 +307,7 @@ Useful endpoints:
 - `/ops/api` and `/ops/run-assessment` — Basic-auth protected operations API.
 - `/ops/api/runtime` — Basic-auth protected publication mode and recompute cadence: the stored settings, the bounds they are checked against, what the hold is doing right now (cutoff, cutoff version, held events, seconds behind), the audit trail of who changed which field, and the sentence stating what the delay does not touch. `PUT` accepts any subset of the fields; a cross-field violation is a 400 with the offending field named, never a 500.
 - `/ops/api/source-trust` — Basic-auth protected dynamic source trust: every source's current score with the full methodology (weights, window, thresholds) in the payload, per-source history, and a recalculate-now POST.
+- `/ops/api/sources` — Basic-auth protected source ledger: freshness, latest failure, current alert holds, provider/classifier catalogue gaps and guarded enable/disable controls. Changes require a reason, official rows require typed confirmation, active holds require a separate acknowledgement, and the last official alert source cannot be switched off here.
 - `/ops/vectors` and `/ops/threats/:id/vector-projection` — Basic-auth protected extrapolation of a reported chain, with an explicit uncertainty cone. Stored in its own tables, marked `data_nature = 'calculated'` by constraint, and unreachable from any module that builds a public response.
 - `/ops` — operator login and channel catalog management; channel mutations remain Basic-auth protected.
 
@@ -477,12 +478,12 @@ state. And the nightly trust run reads the same archive to score every source's 
 | **Routing for 21 official oblast channels** | Registered in the database, inert. Alert routing reads one channel from configuration rather than the catalogue, and the parser does not yet handle their word order (`🔴 <район> - повітряна тривога!` versus `🔴 13:47 Повітряна тривога в <район>`). |
 | **Analytics endpoints** | Archive schema and queries exist, and the public attack-analytics page now reads them (`/api/v1/analytics/attacks`, day/week/month, waves and trends). Remaining: operator-facing slices beyond the coverage view. |
 | **Threat vectors** | Chains of *reported* movement, public. Extrapolation computed but exposed only under `/ops`, stored separately so it cannot leak into a public response. |
+| **Operator panel: source management** | All alert and Telegram sources are shown with freshness, failures, catalogue gaps and held alert state. Audited switches apply to polled adapters immediately and safely rebind MTProto; disabling never clears an alert hold. |
 
 ### Next
 
 | | Why it matters |
 |---|---|
-| **Operator panel: source management** | 58 sources exist, 24 deliberately disabled, and the panel cannot show or toggle any of them — it manages the user-facing recommendation list instead. It also has no view of catalogue gaps, stuck alerts, withdrawals, or which source is holding an alert open. |
 | **Conditional forward warning** | The nightly digest is unconditional and fixed at 23:20. A warning issued *because* a threat is building — for the coming evening or day — does not exist yet. |
 | **Model-based classification** | Classification is still deterministic rules (v2). But the two prerequisites now exist: the archive is a replayable labelled corpus (`npm run classifier:replay`), and shadow mode records a model's verdict beside every rules verdict with an agreement flag. What remains is accumulating enough disagreement data and a deliberate decision to promote — the model still cannot touch an event, an alert or the map. |
 | **Russian-language sources** | Three registered channels stay disabled because the classifier and the location catalogue are Ukrainian-only. |
@@ -491,7 +492,6 @@ state. And the nightly trust run reads the same archive to score every source's 
 ### Known limits
 
 - Single application replica. Schedulers share database cursors; horizontal scaling needs advisory-lock leadership first.
-- `sources.enabled` does not gate the two polled API adapters — they check only for a token.
 - Alerts at hromada level resolve to the parent raion; the catalogue has no hromada tier.
 - Abbreviated administrative forms (`р-н`, `обл.`) resolve to the namesake city rather than the district.
 - The map's live region names at most eight territories and follows the **icon** tier, which is the

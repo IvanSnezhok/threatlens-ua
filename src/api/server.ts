@@ -18,6 +18,7 @@ import { registerAppSettingsMetrics } from '../services/app-settings.js';
 import { registerAdminNoticeMetrics } from '../bot/admin-notice.js';
 import { registerAttackResearchMetrics } from '../services/attack-research.js';
 import { registerOutboxMetrics } from '../bot/outbox.js';
+import { telegramDeliveryGovernorStatus } from '../bot/delivery-governor.js';
 import { resolveRuntimeSettings } from '../services/runtime-settings.js';
 import { registerAlertChannelMetrics } from '../services/ingestion.js';
 import { registerTelegramCollectorMetrics, telegramCollectorStatus } from '../sources/telegram.js';
@@ -34,6 +35,7 @@ import opsDeployRoutes from './ops-deploy-routes.js';
 import opsRuntimeRoutes from './ops-runtime-routes.js';
 import opsSettingsRoutes from './ops-settings-routes.js';
 import opsSourceTrustRoutes from './ops-source-trust-routes.js';
+import opsSourcesRoutes from './ops-sources-routes.js';
 import opsVectorRoutes from './ops-vector-routes.js';
 import vectorRoutes from './vector-routes.js';
 import { runRiskAssessments } from '../services/risk.js';
@@ -59,16 +61,18 @@ const locationIdPattern = /^[a-z0-9-]{1,64}$/i;
  * credentials, each polled API needs its own token, and the demo source follows its flag.
  */
 function sourceIsConfigured(row: { id: string; adapter_type: string | null; enabled: boolean }): boolean {
+  if (!row.enabled) return false;
   const mtproto = Boolean(config.TELEGRAM_API_ID && config.TELEGRAM_API_HASH && config.TELEGRAM_SESSION);
   switch (row.adapter_type) {
     case 'mtproto':
     case 'mtproto_alert_channel':
     case 'mtproto_monitor':
-      return mtproto && row.enabled;
+      return mtproto;
     case 'ukraine_alarm': return Boolean(config.UKRAINE_ALARM_API_TOKEN);
     case 'alerts_in_ua': return Boolean(config.ALERTS_IN_UA_TOKEN);
     case 'demo': return config.DEMO_SOURCE_ENABLED;
-    default: return row.enabled;
+    case 'aerial_alerts_mirror': return config.AERIAL_MIRROR_ENABLED;
+    default: return true;
   }
 }
 
@@ -264,7 +268,7 @@ async function sourceHealth() {
   return rows.map((row) => {
     const configured = sourceIsConfigured(row);
     return {
-      ...row, configured, status: configured ? row.health_status : 'unconfigured',
+      ...row, configured, status: !row.enabled ? 'disabled' : configured ? row.health_status : 'unconfigured',
       // ADDITIVE, and null for every non-MTProto row: `status` keeps its existing vocabulary
       // (`current`/`stale`/`error`/`unknown`/`unconfigured`) because the web console maps those by
       // name. What this adds is the in-process fact the database cannot hold — whether the live
@@ -419,6 +423,7 @@ export async function buildServer(options: BuildServerOptions = {}) {
   await app.register(opsCodexRoutes);
   await app.register(opsAiRunsRoutes);
   await app.register(opsSourceTrustRoutes);
+  await app.register(opsSourcesRoutes);
   await app.register(opsRuntimeRoutes);
   await app.register(opsSettingsRoutes);
   await app.register(opsDeployRoutes);
@@ -770,14 +775,18 @@ export async function buildServer(options: BuildServerOptions = {}) {
 
   app.get('/ops/api', async (request, reply) => {
     if (!hasValidOpsAuth(request.headers.authorization)) return opsUnauthorized(request, reply);
-    const [sources, outbox, ai, database, channels] = await Promise.all([
+    const [sources, outbox, ai, database, channels, telegramDelivery] = await Promise.all([
       pool.query(`SELECT id,name,tier,last_success_at,last_error_at,last_error FROM sources ORDER BY tier,id`),
       pool.query(`SELECT status,priority,count(*)::integer FROM notification_outbox GROUP BY status,priority ORDER BY priority,status`),
       pool.query(`SELECT id,model,status,error,duration_ms,created_at FROM ai_runs ORDER BY created_at DESC LIMIT 20`),
       pool.query(`SELECT pg_size_pretty(pg_database_size(current_database())) size,now() database_time`),
-      listRecommendedChannels(null, true)
+      listRecommendedChannels(null, true),
+      telegramDeliveryGovernorStatus()
     ]);
-    return { sources: sources.rows, outbox: outbox.rows, aiRuns: ai.rows, database: database.rows[0], channels };
+    return {
+      sources: sources.rows, outbox: outbox.rows, aiRuns: ai.rows,
+      database: database.rows[0], channels, telegramDelivery
+    };
   });
   app.post('/ops/channels', async (request, reply) => {
     if (!hasValidOpsAuth(request.headers.authorization)) return opsUnauthorized(request, reply);

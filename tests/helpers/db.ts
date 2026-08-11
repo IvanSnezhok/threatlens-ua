@@ -46,7 +46,7 @@ export async function count(table: string, where = 'true', params: unknown[] = [
 
 /** Tables holding per-test state. Reference data seeded by the migrations is preserved. */
 const VOLATILE_TABLES = [
-  'notification_deliveries', 'notification_outbox', 'notification_state', 'nightly_digest_runs',
+  'source_enabled_audit', 'telegram_delivery_decisions', 'notification_deliveries', 'notification_outbox', 'notification_state', 'nightly_digest_runs',
   'risk_assessment_signals', 'risk_assessments', 'risk_signals',
   'event_updates', 'event_evidence', 'threat_event_locations', 'threat_events',
   'alert_source_states', 'alert_periods',
@@ -142,6 +142,8 @@ export async function resetDatabase(): Promise<void> {
   await sql(`UPDATE codex_settings SET model=NULL, narrative_enabled=false, digest_enabled=false,
              attacks_enabled=false, shadow_enabled=false, retrospective_gate_enabled=false,
              tactics_enabled=false, attack_research_enabled=false, updated_at=now()
+             WHERE singleton`);
+  await sql(`UPDATE telegram_delivery_governor SET tokens=25,last_refill_at=now(),blocked_until=NULL,updated_at=now()
              WHERE singleton`);
 }
 

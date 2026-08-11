@@ -82,7 +82,9 @@ anyway because their format cannot be read safely; `migrations/014_multi_channel
 carries the verbatim samples for three of them (Odesa and the Zaporizhzhia pair) and
 `migrations/029_disabled_channel_reaudit.sql` for the fourth. `ALERT_CHANNEL_ENABLED` is the
 deployment-level kill switch above all of them, the same shape as `OSINT_MONITOR_ENABLED`, and
-nothing in the application writes `sources.enabled` for this adapter type.
+only the authenticated `/ops/api/sources/:id` safety workflow writes `sources.enabled`: it requires
+a reason, typed source id and authority acknowledgement, records the decision, preserves any alert
+holds, and refuses to switch off the final enabled official alert source.
 
 The fourth is Ternopil, and it is the case worth knowing because it shows what `enabled` is really
 gating. @ternopilskaODA publishes "УВАГА‼️Повітряна тривога! Пройдіть негайно в укриття!" and, half

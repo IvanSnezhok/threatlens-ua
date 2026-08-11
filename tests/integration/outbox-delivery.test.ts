@@ -1,8 +1,13 @@
 import { beforeAll, beforeEach, describe, expect, it } from 'vitest';
+import { Registry } from 'prom-client';
 import {
   OBLAST, ensureMigrated, fakeBot, integrationDatabaseAvailable,
   resetDatabase, runDelivery, seedThreatEvent, seedUser, sql
 } from '../helpers/db.js';
+import { config } from '../../src/config.js';
+import {
+  claimDeliveryBatch, deliveryClass, registerDeliveryGovernorMetrics, telegramDeliveryGovernorStatus
+} from '../../src/bot/delivery-governor.js';
 
 /**
  * Covers `reclaimStuckSending` and the delivery state machine in `src/bot/outbox.ts`.
@@ -240,5 +245,147 @@ describe.skipIf(!integrationDatabaseAvailable)('outbox delivery and stuck-messag
     // Silent notifications are reserved for priority >= 3.
     expect(stub.calls[0]!.options.disable_notification).toBe(false);
     expect(stub.calls[1]!.options.disable_notification).toBe(true);
+  });
+
+  describe('aggregate delivery governor', () => {
+    it('classifies and claims official and escalation rows before discretionary traffic', async () => {
+      await seedUser(8201);
+      const eventId = await seedThreatEvent({ locationIds: [OBLAST] });
+      const analytics = await seedOutbox({
+        chatId: 8201, eventId, status: 'pending', attempts: 0, priority: 1,
+        payload: { locationName: 'Київ', state: { kind: 'assessment', key: 'a' } }
+      });
+      await sql(`UPDATE notification_outbox SET notification_type='assessment_update' WHERE id=$1`, [analytics]);
+      const escalation = await seedOutbox({
+        chatId: 8201, eventId, status: 'pending', attempts: 0, priority: 4,
+        payload: { locationName: 'Київ', evidenceLevel: 'confirmed', updateKind: 'escalation' }
+      });
+      const official = await seedOutbox({
+        chatId: 8201, eventId, status: 'pending', attempts: 0, priority: 3,
+        payload: { locationName: 'Київ', evidenceLevel: 'official', updateKind: 'initial' }
+      });
+
+      const claimed = await claimDeliveryBatch();
+
+      expect(claimed.map((row) => row.id)).toEqual([official, escalation, analytics]);
+      expect(claimed.map(deliveryClass)).toEqual(['protected', 'protected', 'analytics']);
+    });
+
+    it('coalesces only replaceable rows and makes a retained assessment self-contained', async () => {
+      await seedUser(8202);
+      const eventId = await seedThreatEvent({ locationIds: [OBLAST] });
+      const firstSoft = await seedOutbox({
+        chatId: 8202, eventId, status: 'pending', attempts: 0, priority: 4,
+        payload: { updateKind: 'soft', validUntil: '2026-08-11T01:00:00Z', state: { kind: 'threat', key: eventId } }
+      });
+      await sql(`UPDATE notification_outbox SET created_at=now()-interval '2 minutes' WHERE id=$1`, [firstSoft]);
+      const latestSoft = await seedOutbox({
+        chatId: 8202, eventId, status: 'pending', attempts: 0, priority: 4,
+        payload: { updateKind: 'soft', validUntil: '2026-08-11T02:00:00Z', state: { kind: 'threat', key: eventId } }
+      });
+      const firstAssessment = await seedOutbox({
+        chatId: 8202, eventId, status: 'pending', attempts: 0, priority: 4,
+        payload: { level: 'elevated', updateKind: 'initial', state: { kind: 'assessment', key: 'ua-32:uav' } }
+      });
+      await sql(
+        `UPDATE notification_outbox SET notification_type='assessment_update',created_at=now()-interval '2 minutes'
+         WHERE id=$1`, [firstAssessment]
+      );
+      const latestAssessment = await seedOutbox({
+        chatId: 8202, eventId, status: 'pending', attempts: 0, priority: 4,
+        payload: { level: 'high', updateKind: 'escalation', previousLevel: 'elevated', previousScore: 3,
+          state: { kind: 'assessment', key: 'ua-32:uav' } }
+      });
+      await sql(`UPDATE notification_outbox SET notification_type='assessment_update' WHERE id=$1`, [latestAssessment]);
+
+      const claimed = await claimDeliveryBatch();
+
+      expect(claimed.map((row) => row.id)).toContain(latestSoft);
+      expect(claimed.map((row) => row.id)).toContain(latestAssessment);
+      expect(claimed.map((row) => row.id)).not.toContain(firstSoft);
+      expect(claimed.map((row) => row.id)).not.toContain(firstAssessment);
+      const old = await sql<{ status: string; coalesced_into: string }>(
+        `SELECT status,coalesced_into FROM notification_outbox WHERE id=$1`, [firstSoft]
+      );
+      expect(old.rows[0]).toEqual({ status: 'coalesced', coalesced_into: latestSoft });
+      const decision = await sql<{ decision: string; notification_class: string }>(
+        `SELECT decision,notification_class FROM telegram_delivery_decisions WHERE outbox_id=$1`, [firstSoft]
+      );
+      expect(decision.rows[0]).toEqual({ decision: 'coalesced', notification_class: 'soft' });
+      const retained = claimed.find((row) => row.id === latestAssessment)!;
+      expect(retained.payload).toMatchObject({ updateKind: 'initial', previousLevel: null, previousScore: null });
+    });
+
+    it('enforces one aggregate token across consecutive claimers', async () => {
+      const previousRate = config.TELEGRAM_DELIVERY_RATE_PER_SECOND;
+      const previousBurst = config.TELEGRAM_DELIVERY_BURST;
+      config.TELEGRAM_DELIVERY_RATE_PER_SECOND = 1;
+      config.TELEGRAM_DELIVERY_BURST = 1;
+      try {
+        await seedUser(8203);
+        const eventId = await seedThreatEvent({ locationIds: [OBLAST] });
+        await seedOutbox({ chatId: 8203, eventId, status: 'pending', attempts: 0 });
+        await seedOutbox({ chatId: 8203, eventId, status: 'pending', attempts: 0 });
+
+        expect(await claimDeliveryBatch()).toHaveLength(1);
+        expect(await claimDeliveryBatch()).toHaveLength(0);
+      } finally {
+        config.TELEGRAM_DELIVERY_RATE_PER_SECOND = previousRate;
+        config.TELEGRAM_DELIVERY_BURST = previousBurst;
+      }
+    });
+
+    it('exposes classed backlog and governor state to Ops and Prometheus', async () => {
+      await seedUser(8205);
+      const eventId = await seedThreatEvent({ locationIds: [OBLAST] });
+      await seedOutbox({
+        chatId: 8205, eventId, status: 'pending', attempts: 0,
+        payload: { evidenceLevel: 'official', updateKind: 'initial' }
+      });
+
+      const status = await telegramDeliveryGovernorStatus() as any;
+      expect(status).toMatchObject({ ratePerSecond: 25, burst: 25 });
+      expect(status.backlog).toContainEqual(expect.objectContaining({
+        notification_class: 'protected', status: 'pending', count: 1
+      }));
+
+      const registry = new Registry();
+      registerDeliveryGovernorMetrics(registry);
+      registerDeliveryGovernorMetrics(registry);
+      const metrics = await registry.metrics();
+      expect(metrics).toContain('threatlens_telegram_delivery_backlog{class="protected"} 1');
+      expect(metrics).toContain('threatlens_telegram_delivery_oldest_seconds{class="protected"}');
+      expect(metrics).toContain('threatlens_telegram_delivery_blocked_seconds 0');
+    });
+
+    it('persists a 429 pause, releases untouched claims, then recovers with protected work first', async () => {
+      await seedUser(8204);
+      const eventId = await seedThreatEvent({ locationIds: [OBLAST] });
+      const first = await seedOutbox({ chatId: 8204, eventId, status: 'pending', attempts: 0, priority: 3 });
+      const untouched = await seedOutbox({ chatId: 8204, eventId, status: 'pending', attempts: 0, priority: 4 });
+      const limited = fakeBot(() => { throw telegramError(429, 1); });
+      await runDelivery(limited, async () => (await statusOf(first)).status === 'retry', 'the aggregate pause to be stored');
+
+      expect(await statusOf(untouched)).toEqual({ status: 'retry', attempts: 0 });
+      const blocked = await sql<{ blocked: boolean }>(
+        `SELECT blocked_until>now() AS blocked FROM telegram_delivery_governor WHERE singleton`
+      );
+      expect(blocked.rows[0]!.blocked).toBe(true);
+
+      const protectedRow = await seedOutbox({
+        chatId: 8204, eventId, status: 'pending', attempts: 0, priority: 4,
+        payload: { locationName: 'Київ', evidenceLevel: 'confirmed', updateKind: 'escalation' }
+      });
+      await new Promise((resolve) => setTimeout(resolve, 1_100));
+      const recovered = fakeBot();
+      await runDelivery(recovered, async () => (await statusOf(protectedRow)).status === 'sent',
+        'protected delivery after retry-after recovery');
+
+      const sentOrder = await sql<{ id: string }>(
+        `SELECT id FROM notification_outbox WHERE sent_at IS NOT NULL ORDER BY sent_at,priority`
+      );
+      expect(sentOrder.rows[0]!.id).toBe(protectedRow);
+      expect((await sql(`SELECT 1 FROM telegram_delivery_decisions WHERE decision='recovered'`)).rowCount).toBe(1);
+    });
   });
 });
