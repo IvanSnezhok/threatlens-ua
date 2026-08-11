@@ -36,4 +36,7 @@ ENV APP_COMMIT=${APP_COMMIT}
 ENV APP_BUILT_AT=${APP_BUILT_AT}
 USER node
 EXPOSE 3000
-CMD ["node", "dist/index.js"]
+# Стеля старого простору V8 нижча за ліміт памʼяті контейнера (2 ГіБ у compose.yaml) на запас під
+# зовнішню памʼять, буфери сокетів і сам рантайм: V8, що впирається у власну межу, робить агресивний
+# GC і живе; процес, що впирається в cgroup-ліміт, отримує OOM-kill без жодного шансу прибратися.
+CMD ["node", "--max-old-space-size=1536", "dist/index.js"]

@@ -379,9 +379,21 @@ export async function buildServer() {
     };
   });
 
-  app.get('/api/v1/locations', async () => (await pool.query(
-    `SELECT id,parent_id,type,name_uk,latitude,longitude FROM locations ORDER BY type,name_uk`
-  )).rows);
+  // Каталог для фронтенду: десятки тисяч рядків після KATOTTG-імпорту, і цей маршрут викликається
+  // на кожне завантаження сторінки, а глобальний onSend ставить no-store — жоден шар це не кешує.
+  // Таблицю пише лише добова синхронізація, тож 15 хвилин застарілості невидимі, а кешується вже
+  // СЕРІАЛІЗОВАНИЙ рядок: без цього кожен запит платив і за ~30k обʼєктів рядків, і за багато-
+  // мегабайтний JSON.stringify, і high-water mark старого простору V8 ріс із кожним збігом запитів.
+  let locationsCache: { body: string; loadedAt: number } | null = null;
+  app.get('/api/v1/locations', async (request, reply) => {
+    if (!locationsCache || Date.now() - locationsCache.loadedAt >= 15 * 60_000) {
+      const result = await pool.query(
+        `SELECT id,parent_id,type,name_uk,latitude,longitude FROM locations ORDER BY type,name_uk`
+      );
+      locationsCache = { body: JSON.stringify(result.rows), loadedAt: Date.now() };
+    }
+    return reply.type('application/json; charset=utf-8').send(locationsCache.body);
+  });
   app.get<{ Params: { id: string }; Querystring: { limit?: string } }>('/api/v1/locations/:id/timeline', async (request, reply) => {
     if (!locationIdPattern.test(request.params.id)) return reply.code(400).send({ error: 'invalid_location_id' });
     const requestedLimit = Number(request.query.limit ?? 100);
@@ -479,8 +491,24 @@ export async function buildServer() {
     return { month, alerts: alerts.rows, threats: threats.rows };
   });
 
+  // Межі повільного споживача для /api/v1/stream. Захоплена (hijacked) SSE-відповідь не має
+  // власного таймауту: heartbeat раз на 15 с тримає зʼєднання живим на рівні застосунку навіть коли
+  // TCP-вікно клієнта закрите, тож кожен кадр для завислого клієнта осідає в writable-буфері сокета
+  // — у heap — без стелі. Межа нижче і є стелею: клієнт, що відстав на пів мегабайта, не читає, і
+  // розрив сокета йому нічого не коштує — EventSource перепідключиться з Last-Event-ID, а backfill
+  // дошле до 500 пропущених подій.
+  const SSE_MAX_BUFFERED_BYTES = 512 * 1024;
+  // Ліміт одночасних стрімів: rate limiter рахує запити за хвилину, а не відкриті стріми, тож без
+  // цього один клієнт міг би тримати тисячі захоплених відповідей — кожну зі своїм слухачем хаба,
+  // інтервалом і буфером запису. 500 × 512 КіБ обмежує найгірший випадок завислих стрімів 256 МіБ.
+  const SSE_MAX_STREAMS = 500;
+  let openSseStreams = 0;
   app.get<{ Querystring: { since?: string } }>('/api/v1/stream', async (request, reply) => {
+    if (openSseStreams >= SSE_MAX_STREAMS) {
+      return reply.code(503).header('Retry-After', '30').send({ error: 'stream_capacity' });
+    }
     reply.hijack();
+    openSseStreams += 1;
     sseConnections.inc();
     reply.raw.writeHead(200, {
       'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache, no-transform',
@@ -493,7 +521,13 @@ export async function buildServer() {
     // `slice.cutoffVersion`, so this cannot leak past the cutoff.
     const lastEventId = Math.max(0, Number(request.headers['last-event-id'] ?? request.query.since ?? 0) || 0);
     let closed = false;
-    const writeFrame = (frame: string) => { if (!closed) reply.raw.write(frame); };
+    const writeFrame = (frame: string) => {
+      if (closed) return;
+      reply.raw.write(frame);
+      // `write()` повертає false задовго до реальної небезпеки; рветься зʼєднання лише коли сокет
+      // накопичив більше за межу. destroy() підніме 'close', і прибирання нижче зробить решту.
+      if ((reply.raw.socket?.writableLength ?? 0) > SSE_MAX_BUFFERED_BYTES) request.raw.destroy();
+    };
     // ============================================================================================
     // THE SUBSCRIPTION IS THE FIRST THING THAT HAPPENS AFTER HIJACK. Every await below it is
     // protected by relay.buffer.
@@ -515,7 +549,16 @@ export async function buildServer() {
     const send = (event: SystemEvent) => relay.buffer(event);
     const heartbeat = setInterval(() => writeFrame(`: heartbeat ${Date.now()}\n\n`), 15_000);
     eventHub.on('event', send);
-    request.raw.on('close', () => { closed = true; clearInterval(heartbeat); eventHub.off('event', send); sseConnections.dec(); });
+    const cleanup = () => {
+      if (closed) return;
+      closed = true; clearInterval(heartbeat); eventHub.off('event', send);
+      openSseStreams -= 1; sseConnections.dec();
+    };
+    request.raw.on('close', cleanup);
+    // Асинхронні onRequest-хуки (rate limit) відпрацьовують ДО тіла обробника: сокет міг померти ще
+    // там, і тоді його 'close' уже відлунав — слухач вище не спрацює ніколи, а heartbeat-інтервал і
+    // слухач хаба текли б до кінця життя процесу.
+    if (request.raw.destroyed) cleanup();
     // ONE slice for this connection: the `connected` frame, the backfill bound and the mode label on
     // every backfilled envelope all come from it. Taking three separate readings would let a client
     // be told it is caught up to a version the backfill then refused to send.

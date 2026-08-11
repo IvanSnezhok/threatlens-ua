@@ -626,7 +626,10 @@ async function connectDefaultRuntime(): Promise<TelegramCollectorRuntime> {
   ]);
   const client = new TelegramClient(
     new StringSession(config.TELEGRAM_SESSION), Number(config.TELEGRAM_API_ID), config.TELEGRAM_API_HASH,
-    { connectionRetries: 5 }
+    // entityCache без цього лишається на бібліотечних типових { max: 4096, ttl: 0 }: ttl нуль означає
+    // «ніколи не застаріває», і кеш тримає до 8192 записів (users + chats) довічно. Колектор читає
+    // ~54 фіксовані канали — пів тисячі записів з годинним життям покривають їх усі з запасом.
+    { connectionRetries: 5, entityCache: { max: 512, ttl: 3_600_000 } }
   );
   await client.connect();
   return { client, NewMessage: NewMessage as never, EditedMessage: EditedMessage as never };
@@ -747,8 +750,21 @@ export async function startTelegramCollector(
    * the issue: `markSourceSuccess` before the handlers can deliver is what made a dead collector
    * report fresh `last_success_at` for as long as the process ran.
    */
+  let attaching = false;
   const attach = async (): Promise<void> => {
     if (stopped) return;
+    // Один прохід за раз: retry-таймер запускає `void attach()`, і якби другий прохід стартував,
+    // поки перший ще чекає на resolveChannelPeers, пізніше присвоєння `heartbeat =` осиротило б
+    // попередній інтервал — незупинний setInterval із власним замиканням і DB-записами назавжди.
+    if (attaching) return;
+    attaching = true;
+    try {
+      await attachPass();
+    } finally {
+      attaching = false;
+    }
+  };
+  const attachPass = async (): Promise<void> => {
     const routes = await resolveChannelRoutes(log);
     const resolution = await resolveChannelPeers(client, routes, log);
     if (stopped) return;

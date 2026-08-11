@@ -2,6 +2,7 @@ import { createHash } from 'node:crypto';
 import { strFromU8, unzipSync } from 'fflate';
 import { config } from '../config.js';
 import { pool } from '../db/pool.js';
+import { invalidateLocationLexemeCache } from '../repositories/events.js';
 
 export interface KatottgEntry {
   code: string;
@@ -235,6 +236,9 @@ export async function importKatottgEntries(
       [config.KATOTTG_URL, config.KATOTTG_VERSION, checksum, summary.raions + summary.cities]
     );
     await client.query('COMMIT');
+    // ПІСЛЯ COMMIT: класифікатор працює з кешованим каталогом (`cachedLocationLexemes`), і скинути
+    // кеш до фіксації означало б перечитати ще старі рядки й пришити їх на наступні шість годин.
+    invalidateLocationLexemeCache();
     return summary;
   } catch (error) {
     await client.query('ROLLBACK');

@@ -126,6 +126,38 @@ export async function listLocationLexemes() {
   }));
 }
 
+export type LocationLexemeRow = Awaited<ReturnType<typeof listLocationLexemes>>[number];
+
+/**
+ * The SAME array instance for every caller until the catalogue changes — identity is the contract,
+ * not an optimisation. `indexFor` in `src/domain/classifier.ts` memoises its 300k-entry token index
+ * in a `WeakMap` keyed on the catalogue *array*, so a path that re-queries per message (as ingestion
+ * did) misses that memo 100% of the time and pays the recursive-CTE walk over tens of thousands of
+ * KATOTTG rows plus a full re-index — ~40–75 MB of old-space garbage per ingested message, which is
+ * what inflated the container to gigabytes during message bursts.
+ *
+ * Invalidation is event-driven: `invalidateLocationLexemeCache()` is called after every successful
+ * KATOTTG import — the only writer of `locations`. The TTL below is a backstop for a writer this
+ * module does not know about (a manual psql edit), not the primary mechanism.
+ */
+const LEXEME_CACHE_TTL_MS = 6 * 60 * 60_000;
+let lexemeCache: { rows: LocationLexemeRow[]; loadedAt: number } | null = null;
+let lexemeCacheLoading: Promise<LocationLexemeRow[]> | null = null;
+
+export async function cachedLocationLexemes(): Promise<LocationLexemeRow[]> {
+  if (lexemeCache && Date.now() - lexemeCache.loadedAt < LEXEME_CACHE_TTL_MS) return lexemeCache.rows;
+  // One in-flight load shared by every concurrent message: a burst of N messages on a cold cache
+  // must not become N recursive-CTE queries racing each other on the pool.
+  lexemeCacheLoading ??= listLocationLexemes()
+    .then((rows) => { lexemeCache = { rows, loadedAt: Date.now() }; return rows; })
+    .finally(() => { lexemeCacheLoading = null; });
+  return lexemeCacheLoading;
+}
+
+export function invalidateLocationLexemeCache() {
+  lexemeCache = null;
+}
+
 async function appendSystemEvent(client: PoolClient, eventType: string, payload: unknown) {
   const result = await client.query<{ version: string }>(
     `INSERT INTO system_event_log(event_type,payload) VALUES ($1,$2) RETURNING version`,

@@ -33,6 +33,13 @@ services:
         APP_BUILT_AT: "${APP_BUILT_AT:-}"
     restart: unless-stopped
     env_file: .env
+    # Жорстка стеля пари до `--max-old-space-size=1536` у Dockerfile: heap впирається у власну межу
+    # першим і виживає через GC, а cgroup-ліміт лишається останнім рубежем — OOM-kill із перезапуском
+    # через `restart: unless-stopped` замість контейнера на 5–10 ГіБ, що душить хост.
+    deploy:
+      resources:
+        limits:
+          memory: 2g
     expose:
       - "3000"
     ports:

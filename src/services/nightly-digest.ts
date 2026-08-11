@@ -123,6 +123,10 @@ export async function enqueueNightlyDigests(now = new Date()): Promise<number> {
   const [targetHour, targetMinute] = config.NIGHTLY_DIGEST_TIME.split(':').map(Number);
   if (current.minutes < targetHour! * 60 + targetMinute!) return 0;
 
+  // NOT EXISTS нижче — не оптимізація читабельності, а межа памʼяті: планувальник будить цю функцію
+  // щопівхвилини аж до опівночі, і без фільтра кожен тик після першого успішного прогону
+  // матеріалізував би повний добуток підписки × чинні оцінки (аж до 10⁵–10⁶ рядків із JSONB
+  // `explanation` у кожному) лише для того, щоб цикл нижче їх пропустив.
   const assessments = await pool.query<DigestAssessment>(
     `SELECT DISTINCT s.chat_id::text,a.id,a.location_id,l.name_uk AS location_name,a.threat_type,
             a.risk_score,a.risk_level,a.indicative_percent,a.assessment_confidence,a.explanation,
@@ -134,7 +138,10 @@ export async function enqueueNightlyDigests(now = new Date()): Promise<number> {
        AND a.superseded_by IS NULL AND a.expires_at>now()
        AND (s.threat_type='*' OR s.threat_type=a.threat_type)
      WHERE s.enabled=true AND s.notify_analytics=true
-     ORDER BY s.chat_id::text,a.risk_score DESC,a.generated_at DESC`
+       AND NOT EXISTS (SELECT 1 FROM nightly_digest_runs r
+                        WHERE r.digest_date=$1 AND r.chat_id=s.chat_id)
+     ORDER BY s.chat_id::text,a.risk_score DESC,a.generated_at DESC`,
+    [current.date]
   );
   const grouped = new Map<string, DigestAssessment[]>();
   for (const assessment of assessments.rows) {

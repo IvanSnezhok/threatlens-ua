@@ -6,7 +6,7 @@ import { pool } from '../db/pool.js';
 import { parseAlertChannelMessage } from '../domain/alert-parser.js';
 import { classifyMessage, CLASSIFIER_VERSION, isDeEscalation, significanceRejection } from '../domain/classifier.js';
 import {
-  applyDeEscalation, ingestThreat, listLocationLexemes, recordClassification,
+  applyDeEscalation, cachedLocationLexemes, ingestThreat, recordClassification,
   type ClassificationLogEntry
 } from '../repositories/events.js';
 import {
@@ -1387,7 +1387,10 @@ export async function processMessage(message: NormalizedMessage, options: Proces
 }
 
 async function classifyAndIngest(message: NormalizedMessage, options: ProcessMessageOptions = {}) {
-  const locations = await listLocationLexemes();
+  // Кешований і той САМИЙ масив на кожне повідомлення: `indexFor` у класифікаторі мемоїзує індекс
+  // за ідентичністю масиву, тож свіжий масив на кожен виклик означав повну переіндексацію каталогу
+  // (~300k записів) на кожне повідомлення — саме це роздувало контейнер до гігабайтів під час атак.
+  const locations = await cachedLocationLexemes();
   const classified = classifyMessage(message.text, locations);
   const count = (outcome: string) => {
     if (options.monitor) monitorMessages.inc({ source: message.sourceId, outcome });
