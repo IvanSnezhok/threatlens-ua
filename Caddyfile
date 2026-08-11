@@ -1,6 +1,5 @@
 {$SITE_ADDRESS:http://localhost} {
   encode zstd gzip
-  reverse_proxy app:3000
   header {
     Strict-Transport-Security "max-age=31536000; includeSubDomains"
     X-Content-Type-Options "nosniff"
@@ -8,5 +7,55 @@
     X-Frame-Options "SAMEORIGIN"
     Permissions-Policy "geolocation=(), microphone=(), camera=()"
     Content-Security-Policy "default-src 'self'; script-src 'self' https://telegram.org; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob: https:; connect-src 'self' https:; worker-src blob:; child-src blob:; font-src 'self' data:; frame-ancestors 'self'"
+  }
+
+  # Everything Caddy can answer without waking the application.
+  #
+  # `/data/*` (three GeoJSON layers, ~2 MiB) and `/assets/fonts/*` (nine `.woff2`) are the only
+  # public assets that are CHECKED INTO GIT. That is the entire reason this block can exist and the
+  # reason it stops where it does: the bind mount below is the deployment checkout, so a tracked file
+  # is byte-identical to the one inside the `app` image, while `assets/app.js` and `assets/app.css`
+  # are esbuild output that lives only in the image and must keep going through the proxy.
+  #
+  # Measured before this block, per cold request for the 1 MiB raion layer: 9.4 ms of CPU in `app`
+  # and 13.5 ms in Caddy — the second number being gzip that `encode` redoes for every single
+  # response, because it has no cache. Precompressed siblings turn both into a `stat` plus a
+  # `sendfile`, and they are also the only way to ship Brotli at all: Caddy can *serve* `.br` but
+  # cannot *produce* it, and Brotli is 171 KiB against gzip's 300 KiB on that layer.
+  # `scripts/precompress-static.mjs` writes the siblings; a unit test proves they still inflate to
+  # their source.
+  root * /srv/public
+
+  @static path /data/* /assets/fonts/*
+  handle @static {
+    @present file
+    handle @present {
+      # Neither tree is content-hashed, so neither may claim `immutable` — a corrected boundary has
+      # to reach clients that already have the old one. A day of freshness on geometry that has
+      # changed twice in the project's life, and `stale-while-revalidate` so the refresh happens
+      # behind the user rather than in front of them.
+      @geojson path /data/*
+      header @geojson Cache-Control "public, max-age=86400, stale-while-revalidate=604800"
+      # Font files are keyed one per family per unicode subset and only ever change with a redesign;
+      # a stale one is a cosmetic difference for at most a month.
+      @font path /assets/fonts/*
+      header @font Cache-Control "public, max-age=2592000"
+      file_server {
+        precompressed br gzip
+      }
+    }
+    # Fail-safe, and the reason this optimisation cannot take the site down: no bind mount, a
+    # checkout that predates a new asset, a typo in a path — and the request goes exactly where it
+    # went before this block was written. Degrading to the old behaviour is the worst case.
+    handle {
+      reverse_proxy app:3000
+    }
+  }
+
+  # `index.html` and the application bundle: unhashed filenames, so they stay revalidatable on the
+  # `Cache-Control: public, max-age=0` that `@fastify/static` sets, and a deployment is visible on
+  # the next request rather than whenever a cache decides.
+  handle {
+    reverse_proxy app:3000
   }
 }

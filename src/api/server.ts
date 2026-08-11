@@ -1,6 +1,7 @@
+import { createHash } from 'node:crypto';
 import { readdirSync } from 'node:fs';
 import { resolve } from 'node:path';
-import Fastify from 'fastify';
+import Fastify, { type FastifyReply, type FastifyRequest } from 'fastify';
 import rateLimit from '@fastify/rate-limit';
 import fastifyStatic from '@fastify/static';
 import { Registry, collectDefaultMetrics, Counter, Gauge, Histogram } from 'prom-client';
@@ -74,6 +75,148 @@ function sourceIsConfigured(row: { id: string; adapter_type: string | null; enab
 /** Adapter types the MTProto collector, and only the MTProto collector, is responsible for. */
 const MTPROTO_ADAPTERS = new Set(['mtproto', 'mtproto_alert_channel', 'mtproto_monitor']);
 
+// ------------------------------------------------------------------------------------------------
+// HTTP caching for the public read routes declared in this file
+// ------------------------------------------------------------------------------------------------
+
+/**
+ * Per-reply override for the server-wide `Cache-Control: no-store`.
+ *
+ * `occupation-routes.ts` and `attack-analytics-routes.ts` solve the same problem with a child `onSend`
+ * hook, because they are encapsulated plugins and a child hook runs after the inherited one. The two
+ * routes below are declared directly on the root instance, where that trick is unavailable — a root
+ * hook has nothing to run after. So the root hook itself reads the override, and every route that
+ * does not set it keeps `no-store`, byte for byte as before.
+ */
+const CACHE_CONTROL = Symbol('cacheControl');
+
+function setCacheControl(reply: FastifyReply, value: string): void {
+  (reply as unknown as Record<symbol, string>)[CACHE_CONTROL] = value;
+}
+
+/** RFC 9110 §8.8.3.2 weak comparison — the only comparison `If-None-Match` is defined to use. */
+function etagMatches(header: string, etag: string): boolean {
+  if (header.trim() === '*') return true;
+  const normalize = (value: string) => value.trim().replace(/^W\//, '');
+  const wanted = normalize(etag);
+  return header.split(',').some((candidate) => normalize(candidate) === wanted);
+}
+
+function ifNoneMatch(request: FastifyRequest, etag: string): boolean {
+  const header = request.headers['if-none-match'];
+  const value = Array.isArray(header) ? header[0] : header;
+  return Boolean(value) && etagMatches(value, etag);
+}
+
+/**
+ * A body already committed to bytes, with everything a conditional GET needs.
+ *
+ * The SERIALISED body is what is held, never the row objects: both routes below answer with
+ * megabytes, and caching the rows would still pay `JSON.stringify` per request and would still let
+ * the old-space high-water mark grow with every coinciding request.
+ *
+ * A `Buffer`, not a string, and that is the difference between the memo bounding memory and merely
+ * bounding CPU. `socket.write(string)` ENCODES, so a cached string is copied to fresh bytes once per
+ * reader; `socket.write(buffer)` queues the buffer by reference, so every reader of a burst shares
+ * the one allocation. Measured with `scripts/memory-benchmark.ts` against a 31 000-row catalogue
+ * (3.84 MiB body): 100 coinciding readers took the old-space high-water mark to 815 MiB as strings
+ * — past `--max-old-space-size=640` and fatal — against 39 MiB as a buffer. The route was safe for
+ * many concurrent readers in statements long before it was safe in bytes.
+ */
+interface CachedBody {
+  body: Buffer;
+  /** Strong validator: the bytes are hashed, so equality really is byte equality. */
+  etag: string;
+  expiresAt: number;
+  cacheControl: string;
+}
+
+function strongEtag(body: Buffer): string {
+  return `"${createHash('sha1').update(body).digest('base64url')}"`;
+}
+
+/**
+ * A memo that is also a single flight.
+ *
+ * The single flight is the half that matters for «безпечно для багатьох одночасних читачів»: without
+ * it, N readers arriving inside one computation each run the whole computation, so a refresh burst
+ * multiplies the pool load by N exactly when the pool is least able to absorb it. With it, at most
+ * one computation is ever in the air and the N−1 late arrivals await the same promise — which is
+ * sound here because both bodies are pure functions of database state read at a single instant, and
+ * the publication cutoff is monotonic (`GREATEST(now() - delay, mode_changed_at)`), so a shared
+ * answer is always an EARLIER valid slice, never a later one. Serving something slightly older can
+ * never publish held material; only serving something newer could, and nothing here can.
+ *
+ * A rejected load is not cached and does not stick: the flight is cleared in `finally`, so the next
+ * request retries rather than inheriting a failure for the length of the TTL.
+ */
+function cachedBody(load: () => Promise<CachedBody>): () => Promise<CachedBody> {
+  let cached: CachedBody | null = null;
+  let inFlight: Promise<CachedBody> | null = null;
+  return () => {
+    if (cached && Date.now() < cached.expiresAt) return Promise.resolve(cached);
+    if (inFlight) return inFlight;
+    const flight = load().then((view) => { cached = view; return view; });
+    inFlight = flight;
+    // `catch` before `finally` so this bookkeeping chain can never surface as an unhandled rejection;
+    // the rejection itself still reaches every caller through `flight`.
+    void flight.catch(() => undefined).finally(() => { if (inFlight === flight) inFlight = null; });
+    return flight;
+  };
+}
+
+/** 304 when the client already holds these bytes, the bytes themselves otherwise. */
+function sendCached(request: FastifyRequest, reply: FastifyReply, view: CachedBody) {
+  setCacheControl(reply, view.cacheControl);
+  reply.header('ETag', view.etag);
+  reply.header('Vary', 'Accept-Encoding');
+  if (ifNoneMatch(request, view.etag)) return reply.code(304).send();
+  return reply.type('application/json; charset=utf-8').send(view.body);
+}
+
+/**
+ * One serialisation per live event, not one per connection.
+ *
+ * `EventHub` emits ONE envelope object to every listener, so with 500 streams open the old code ran
+ * `JSON.stringify` 500 times over the same object for the same bytes — per event, at up to one tick
+ * a second. Keyed on the envelope identity, so the entry dies with the event and a reconnect
+ * backfill (whose envelopes are built per connection) simply misses and pays what it always paid.
+ */
+const liveFrames = new WeakMap<SystemEvent, string>();
+
+function sseFrame(event: SystemEvent): string {
+  let frame = liveFrames.get(event);
+  if (frame === undefined) {
+    frame = `id: ${event.version}\nevent: ${event.eventType}\ndata: ${JSON.stringify(event)}\n\n`;
+    liveFrames.set(event, frame);
+  }
+  return frame;
+}
+
+/**
+ * Ceiling on the snapshot memo, enforced here rather than trusted to callers.
+ *
+ * One second is the cadence of `EventHub`'s own poll, so a memo of at most that length cannot make a
+ * reader see anything staler than the feed that tells them to refetch in the first place.
+ */
+const SNAPSHOT_MEMO_CEILING_MS = 1000;
+
+export interface BuildServerOptions {
+  /**
+   * How long `/api/v1/snapshot` may serve an already-computed body, clamped to
+   * {@link SNAPSHOT_MEMO_CEILING_MS}.
+   *
+   * Zero under `NODE_ENV=test` by default, and that is not timidity. The integration harness seeds
+   * `alert_periods`, `threat_events` and `risk_assessments` with direct INSERTs that append nothing
+   * to `system_event_log`, so NO key derivable from the publication slice changes between one test's
+   * data and the next's — a time-based memo would hand the following test the previous test's
+   * territories whenever the two land inside the same second. The single flight is unaffected and
+   * stays on everywhere; only the across-request TTL is stood down, and
+   * `tests/integration/snapshot-cache.test.ts` passes an explicit value to exercise it.
+   */
+  snapshotMemoMs?: number;
+}
+
 /**
  * Every migration THIS IMAGE ships, read once at module load.
  *
@@ -131,7 +274,11 @@ async function sourceHealth() {
   });
 }
 
-export async function buildServer() {
+export async function buildServer(options: BuildServerOptions = {}) {
+  const snapshotMemoMs = Math.min(
+    SNAPSHOT_MEMO_CEILING_MS,
+    Math.max(0, options.snapshotMemoMs ?? (config.NODE_ENV === 'test' ? 0 : SNAPSHOT_MEMO_CEILING_MS))
+  );
   // The publication gauges and the recompute counters are constructed DETACHED in their own service
   // modules — importing a service must never mutate a shared registry — and attached here, where the
   // one Registry lives. Both registrars are idempotent (`registry.getSingleMetric` guards every
@@ -178,7 +325,11 @@ export async function buildServer() {
     reply.header('X-Content-Type-Options', 'nosniff');
     reply.header('Referrer-Policy', 'strict-origin-when-cross-origin');
     reply.header('Permissions-Policy', 'geolocation=(), microphone=(), camera=()');
-    if (reply.getHeader('content-type')?.toString().includes('application/json')) reply.header('Cache-Control', 'no-store');
+    // The override is honoured whatever the content type is, because a 304 carries none — and a 304
+    // that inherited `no-store` would tell the client to throw away the very bytes it just revalidated.
+    const override = (reply as unknown as Record<symbol, string | undefined>)[CACHE_CONTROL];
+    if (override) reply.header('Cache-Control', override);
+    else if (reply.getHeader('content-type')?.toString().includes('application/json')) reply.header('Cache-Control', 'no-store');
     return payload;
   });
 
@@ -328,28 +479,42 @@ export async function buildServer() {
   });
 
   /**
-   * One slice per request, taken before anything it describes.
+   * One slice per computation, taken before anything it describes.
    *
-   * `version` and `generatedAt` now come from the same statement as the three row queries below
-   * them. That also repairs a pre-existing defect: `systemVersion()` used to be evaluated BEFORE the
-   * rows, so the snapshot already advertised a version older than its own data.
+   * `version` and `generatedAt` come from the same statement as the row queries below them. That
+   * also repairs a pre-existing defect: `systemVersion()` used to be evaluated BEFORE the rows, so
+   * the snapshot already advertised a version older than its own data.
    *
-   * The three row queries stay sequential, matching what was here before. Under `NODE_ENV=test` the
-   * application pool is capped at two connections, and the correctness of the slice does not depend
-   * on the fan-out — `Promise.all` is available if a profile ever justifies it.
+   * **The four reads are now concurrent.** They were sequential, with a note that `Promise.all` was
+   * available if a profile ever justified it; the profile is the endpoint itself, which runs on every
+   * page load and paid four serial round trips for four independent statements. None of them holds a
+   * pool client across an await — `pool.query()` checks one out and returns it — so with the pool
+   * capped at two under `NODE_ENV=test` the surplus queries queue and no query can be waiting on a
+   * connection another query of the same batch is holding. The fan-out is also FIXED rather than
+   * per-reader, because the single flight in {@link cachedBody} means at most one batch is ever in
+   * the air however many readers are waiting.
    *
-   * `Cache-Control: no-store` stays on this response (the server-wide `onSend` provides it and this
-   * route installs no child hook): caching a held payload for 120 s would make the hold unbounded.
+   * `territoryAncestry` stays sequential after them: it climbs exactly the ids those rows reference.
+   *
+   * **Publication semantics are untouched.** Every read is still bounded by `slice.cutoffAt`, and the
+   * memo can only ever hand back an EARLIER slice — see {@link cachedBody}. `Cache-Control` is
+   * `no-store` while the hold is on, so a held body is never written down anywhere; in `live` mode it
+   * is `no-cache`, which permits storage but REQUIRES revalidation before every reuse. That is what
+   * makes the `ETag` worth emitting, and it is still not a licence to serve an unrevalidated body: a
+   * mode flip is caught by the very next conditional request, unlike a `max-age` that cannot be
+   * withdrawn once issued.
    */
-  app.get('/api/v1/snapshot', async () => {
+  const snapshotView = cachedBody(async () => {
     const slice = await publicationSlice();
-    const health = await sourceHealth();
+    const [health, alerts, threats, assessments] = await Promise.all([
+      sourceHealth(),
+      activeAlerts(slice.cutoffAt),
+      liveThreats(slice.cutoffAt),
+      currentAssessments(slice.cutoffAt)
+    ]);
     const officialConfigured = health.filter((source) => source.official && source.configured);
     const systemStatus = officialConfigured.some((source) => source.status === 'current') ? 'current'
       : officialConfigured.length ? 'degraded' : config.DEMO_SOURCE_ENABLED ? 'demo' : 'unconfigured';
-    const alerts = await activeAlerts(slice.cutoffAt);
-    const threats = await liveThreats(slice.cutoffAt);
-    const assessments = await currentAssessments(slice.cutoffAt);
     // ONE clock for the whole payload. `sliceMeta` and the territory fold both bucket by freshness,
     // and two `new Date()` calls a few milliseconds apart could land either side of a bucket edge —
     // which would make two consecutive snapshots of identical rows differ in their icon order.
@@ -362,7 +527,7 @@ export async function buildServer() {
       ...threats.flatMap((threat) => threat.locations.map((location) => location.id)),
       ...assessments.map((assessment) => assessment.location_id as string)
     ])].filter(Boolean);
-    return {
+    const body = Buffer.from(JSON.stringify({
       version: slice.cutoffVersion,
       generatedAt: slice.cutoffAt.toISOString(),
       systemStatus,
@@ -376,24 +541,41 @@ export async function buildServer() {
         nodes: await territoryAncestry(referencedLocationIds),
         alerts, threats, assessments
       })
+    }));
+    return {
+      body,
+      etag: strongEtag(body),
+      expiresAt: Date.now() + snapshotMemoMs,
+      cacheControl: slice.mode === 'delayed_15s' ? 'no-store' : 'no-cache'
     };
   });
+  app.get('/api/v1/snapshot', async (request, reply) => sendCached(request, reply, await snapshotView()));
 
   // Каталог для фронтенду: десятки тисяч рядків після KATOTTG-імпорту, і цей маршрут викликається
-  // на кожне завантаження сторінки, а глобальний onSend ставить no-store — жоден шар це не кешує.
-  // Таблицю пише лише добова синхронізація, тож 15 хвилин застарілості невидимі, а кешується вже
-  // СЕРІАЛІЗОВАНИЙ рядок: без цього кожен запит платив і за ~30k обʼєктів рядків, і за багато-
-  // мегабайтний JSON.stringify, і high-water mark старого простору V8 ріс із кожним збігом запитів.
-  let locationsCache: { body: string; loadedAt: number } | null = null;
-  app.get('/api/v1/locations', async (request, reply) => {
-    if (!locationsCache || Date.now() - locationsCache.loadedAt >= 15 * 60_000) {
-      const result = await pool.query(
-        `SELECT id,parent_id,type,name_uk,latitude,longitude FROM locations ORDER BY type,name_uk`
-      );
-      locationsCache = { body: JSON.stringify(result.rows), loadedAt: Date.now() };
-    }
-    return reply.type('application/json; charset=utf-8').send(locationsCache.body);
+  // на кожне завантаження сторінки. Таблицю пише лише добова синхронізація, тож 15 хвилин
+  // застарілості невидимі, а кешується вже СЕРІАЛІЗОВАНИЙ рядок: без цього кожен запит платив і за
+  // ~30k обʼєктів рядків, і за багатомегабайтний JSON.stringify, і high-water mark старого простору
+  // V8 ріс із кожним збігом запитів.
+  //
+  // Тепер це кешується і ПО HTTP — і тільки тут, бо це єдиний публічний маршрут у цьому файлі без
+  // жодної семантики публікації: довідник не залежить від `cutoffAt`, не буває «притриманим» і
+  // однаковий для всіх читачів. Глобальний onSend ставив `no-store`, тож кожне завантаження сторінки
+  // тягло весь каталог мережею заново; `max-age=900` збігається з внутрішнім TTL, а ETag робить
+  // ревалідацію після нього 304-кою замість повторної передачі мегабайтів.
+  const LOCATIONS_TTL_MS = 15 * 60_000;
+  const locationsView = cachedBody(async () => {
+    const result = await pool.query(
+      `SELECT id,parent_id,type,name_uk,latitude,longitude FROM locations ORDER BY type,name_uk`
+    );
+    const body = Buffer.from(JSON.stringify(result.rows));
+    return {
+      body,
+      etag: strongEtag(body),
+      expiresAt: Date.now() + LOCATIONS_TTL_MS,
+      cacheControl: 'public, max-age=900, stale-while-revalidate=3600'
+    };
   });
+  app.get('/api/v1/locations', async (request, reply) => sendCached(request, reply, await locationsView()));
   app.get<{ Params: { id: string }; Querystring: { limit?: string } }>('/api/v1/locations/:id/timeline', async (request, reply) => {
     if (!locationIdPattern.test(request.params.id)) return reply.code(400).send({ error: 'invalid_location_id' });
     const requestedLimit = Number(request.query.limit ?? 100);
@@ -543,9 +725,9 @@ export async function buildServer() {
     // The `close` handler is registered here for the same reason: a client that disconnects during
     // the await would otherwise leak a hub listener.
     // ============================================================================================
-    const relay = createEventRelay(lastEventId, (event) => {
-      writeFrame(`id: ${event.version}\nevent: ${event.eventType}\ndata: ${JSON.stringify(event)}\n\n`);
-    });
+    // `sseFrame`, not an inline template: the hub hands the SAME envelope object to every open
+    // stream, so the bytes are built once per event instead of once per event per connection.
+    const relay = createEventRelay(lastEventId, (event) => { writeFrame(sseFrame(event)); });
     const send = (event: SystemEvent) => relay.buffer(event);
     const heartbeat = setInterval(() => writeFrame(`: heartbeat ${Date.now()}\n\n`), 15_000);
     eventHub.on('event', send);

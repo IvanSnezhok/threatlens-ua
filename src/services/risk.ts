@@ -359,6 +359,24 @@ export function resetRiskRunGuard(): void {
   riskRunInFlight = false;
 }
 
+/**
+ * The published assessment a group already has, as PostgreSQL sees it.
+ *
+ * `live` and `within_own_horizon` are computed in the query rather than in TypeScript because both
+ * compare a stored timestamp against `now()`, and the row was stamped by the database's clock.
+ */
+interface PublishedAssessmentRow {
+  id: string;
+  risk_score: string;
+  risk_level: string;
+  model_version: string;
+  methodology_version: string;
+  /** `expires_at` has not passed: the reader is still being shown this row. */
+  live: boolean;
+  /** `generated_at` is inside the six hours the row itself claims to cover. */
+  within_own_horizon: boolean;
+}
+
 async function runRiskAssessmentsPass(allowModel: boolean): Promise<number> {
   const modelVersion = config.AI_MODEL || 'rule-fallback-v2';
   await pool.query(
@@ -392,18 +410,60 @@ async function runRiskAssessmentsPass(allowModel: boolean): Promise<number> {
     try {
       const raw = await callModel(location, group.threat_type, signals, allowModel);
       const assessment = clampAssessment(raw, signals, group.location_id, group.threat_type);
-      const previous = await pool.query(
-        `SELECT * FROM risk_assessments WHERE location_id=$1 AND threat_type=$2 AND published=true
+      // Only the columns the decision below reads, and the two predicates PostgreSQL is the only
+      // honest judge of: `now()` here is the same clock that stamps `generated_at` and `expires_at`,
+      // and comparing those against a Node `Date` would make the outcome depend on container skew.
+      const previous = await pool.query<PublishedAssessmentRow>(
+        `SELECT id,risk_score,risk_level,model_version,methodology_version,
+                expires_at > now() AS live,
+                generated_at > now() - interval '6 hours' AS within_own_horizon
+         FROM risk_assessments WHERE location_id=$1 AND threat_type=$2 AND published=true
          AND superseded_by IS NULL ORDER BY generated_at DESC LIMIT 1`, [group.location_id, group.threat_type]
       );
       const previousRow = previous.rows[0];
       const nextLevel = riskLevel(assessment.score);
-      const material = !previousRow || previousRow.risk_level !== nextLevel
+      const material = !previousRow || !previousRow.live || !previousRow.within_own_horizon
+        || previousRow.risk_level !== nextLevel
         || previousRow.methodology_version !== 'v2'
         || previousRow.model_version !== modelVersion
         || Math.abs(Number(previousRow.risk_score) - assessment.score) >= 0.5;
       if (previousRow && Math.abs(Number(previousRow.risk_score) - assessment.score) > 3
         && !signals.some((signal) => signal.source_tier === 'A')) continue;
+
+      // Нічого не змінилося — і саме тому нема чого писати.
+      //
+      // A pass that re-scores the same signals to the same level used to INSERT the whole assessment
+      // again with `published=false`, plus one `risk_assessment_signals` row per signal. Nothing ever
+      // read those rows: every consumer filters `published=true`. With the event-driven recompute
+      // running up to once a minute over every oblast under a nationwide wave, that is thousands of
+      // rows an hour in two tables that have no retention policy at all.
+      //
+      // Dropping the write alone would have introduced a gap instead: the published row expires six
+      // hours after it was generated, and while the situation stays flat nothing would replace it, so
+      // the map would lose the assessment at the six-hour mark and get it back only at the next pass.
+      // So the row that is still saying the right thing is extended instead of duplicated.
+      //
+      // Extension is bounded on both ends. `live` is required, so an assessment that already expired
+      // is republished rather than resurrected — the reader must never see a horizon revived hours
+      // after it lapsed. `within_own_horizon` is required, so a row may only be extended during the
+      // six hours it originally claimed: past that the pass states the assessment afresh, with a new
+      // `generated_at` and current wording, and the old one is superseded normally.
+      //
+      // It is safe for the publication cutoff. `generated_at` is untouched, so nothing becomes
+      // visible earlier than it already was; the score, the level and the explanation are untouched,
+      // so no new claim is made. Only the end of an already-published, still-valid horizon moves,
+      // which is why no `assessment.updated` event is written either — there is nothing to notify.
+      if (!material) {
+        await pool.query(
+          `UPDATE risk_assessments
+              SET expires_at=now()+interval '6 hours', horizon_end=now()+interval '6 hours',
+                  extended_at=now()
+            WHERE id=$1 AND published=true AND superseded_by IS NULL
+              AND expires_at > now() AND generated_at > now() - interval '6 hours'`,
+          [previousRow!.id]
+        );
+        continue;
+      }
 
       const client = await pool.connect();
       try {
@@ -411,29 +471,36 @@ async function runRiskAssessmentsPass(allowModel: boolean): Promise<number> {
         const result = await client.query<{ id: string }>(
           `INSERT INTO risk_assessments(location_id,threat_type,horizon_start,horizon_end,risk_score,risk_level,
             assessment_confidence,model_version,methodology_version,indicative_percent,explanation,expires_at,published)
-           VALUES ($1,$2,now(),now()+interval '6 hours',$3,$4,$5,$6,'v2',$7,$8,now()+interval '6 hours',$9) RETURNING id`,
+           VALUES ($1,$2,now(),now()+interval '6 hours',$3,$4,$5,$6,'v2',$7,$8,now()+interval '6 hours',true) RETURNING id`,
           [group.location_id, group.threat_type, assessment.score.toFixed(1), nextLevel, assessment.confidence,
             modelVersion, Math.round(assessment.score * 10), JSON.stringify({
               summary: assessment.summary,
               raisingFactors: assessment.raisingFactors,
               limitingFactors: assessment.limitingFactors,
               caveat: 'Індикативний відсоток — це позначка на шкалі індексу, а не статистична ймовірність удару. Низький рівень не означає безпеку: офіційна тривога може бути оголошена без жодного попереднього сигналу.'
-            }), material]
+            })]
         );
         const assessmentId = result.rows[0]!.id;
-        for (const signal of signals) {
+        // One statement, not one per signal. A nationwide wave gives a group tens of signals and the
+        // pass walks every group, so the loop this replaces was hundreds of round trips holding an
+        // open transaction on a pool of twelve — the connection is held for the length of the slowest
+        // one, and the ingestion tick and every snapshot read wait behind it. `unnest` of three
+        // parallel arrays keeps the row set and the parameter types explicit; the casts are required
+        // because an empty or all-`null` array reaches PostgreSQL untyped.
+        if (signals.length) {
           await client.query(
             `INSERT INTO risk_assessment_signals(assessment_id,signal_id,contribution,explanation)
-             VALUES ($1,$2,$3,$4)`,
-            [assessmentId, signal.id, signal.effective_contribution, signal.signal_type]
+             SELECT $1,s.id,s.contribution,s.explanation
+             FROM unnest($2::uuid[],$3::numeric[],$4::text[]) AS s(id,contribution,explanation)`,
+            [assessmentId, signals.map((signal) => signal.id),
+              signals.map((signal) => signal.effective_contribution),
+              signals.map((signal) => signal.signal_type)]
           );
         }
-        if (material) {
-          if (previousRow) await client.query(`UPDATE risk_assessments SET superseded_by=$2 WHERE id=$1`, [previousRow.id, assessmentId]);
-          await client.query(`INSERT INTO system_event_log(event_type,payload) VALUES ('assessment.updated',$1)`,
-            [JSON.stringify({ assessmentId, locationId: group.location_id })]);
-          published += 1;
-        }
+        if (previousRow) await client.query(`UPDATE risk_assessments SET superseded_by=$2 WHERE id=$1`, [previousRow.id, assessmentId]);
+        await client.query(`INSERT INTO system_event_log(event_type,payload) VALUES ('assessment.updated',$1)`,
+          [JSON.stringify({ assessmentId, locationId: group.location_id })]);
+        published += 1;
         await client.query('COMMIT');
       } catch (error) {
         await client.query('ROLLBACK');

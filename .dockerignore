@@ -5,3 +5,7 @@ dist
 coverage
 backups
 data/postgres
+# Caddy serves these from the checkout, never from the image (Caddyfile, compose.yaml). Inside the
+# image they would be ~970 KiB that `@fastify/static` exposes and nothing ever asks for.
+public/data/*.br
+public/data/*.gz

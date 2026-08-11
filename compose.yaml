@@ -14,8 +14,21 @@ services:
     environment:
       PUBLIC_HOST: ${PUBLIC_HOST:-localhost}
       SITE_ADDRESS: ${SITE_ADDRESS:-http://localhost}
+    # Обмежена й реклеймна: 58 МіБ у спокої, а решта — сторінковий кеш двох мегабайтів GeoJSON,
+    # який ядро віддає під тиском раніше, ніж дійде до OOM. Стеля тут — це межа для процесу, що
+    # тепер тримає файли, а не лише проксі.
+    deploy:
+      resources:
+        limits:
+          memory: 256m
     volumes:
       - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      # Тільки те, що є в git, і тільки на читання. Caddy віддає ці дві теки сам (див. Caddyfile):
+      # у чекауті вони побайтово ті самі, що всередині образу `app`, бо їх версіонує той самий
+      # коміт — на відміну від `public/assets/app.js`, який збирає esbuild усередині образу і якого
+      # в чекауті просто немає. Тому межа монтування проходить рівно тут, а не по `./public`.
+      - ./public/data:/srv/public/data:ro
+      - ./public/assets/fonts:/srv/public/assets/fonts:ro
       - caddy-data:/data
       - caddy-config:/config
     depends_on:
@@ -33,13 +46,19 @@ services:
         APP_BUILT_AT: "${APP_BUILT_AT:-}"
     restart: unless-stopped
     env_file: .env
-    # Жорстка стеля пари до `--max-old-space-size=1536` у Dockerfile: heap впирається у власну межу
+    # Жорстка стеля пари до `--max-old-space-size=640` у Dockerfile: heap впирається у власну межу
     # першим і виживає через GC, а cgroup-ліміт лишається останнім рубежем — OOM-kill із перезапуском
     # через `restart: unless-stopped` замість контейнера на 5–10 ГіБ, що душить хост.
+    #
+    # 1 ГіБ, а не 2, і ось арифметика. Виміряно в спокої: 91 МіБ RSS. Найбільший ОБМЕЖЕНИЙ сплеск —
+    # повільні SSE-споживачі: `SSE_MAX_STREAMS` (500) × `SSE_MAX_BUFFERED_BYTES` (512 КіБ) = 250 МіБ,
+    # і це буфери сокетів, тобто зовнішня памʼять, якої стеля heap не бачить. Звідси розрив: 1024 −
+    # 640 = 384 МіБ під зовнішню памʼять, з запасом над цими 250. Необмеженого шляху до решти вже
+    # немає — каталог локацій індексується раз на процес, а не на повідомлення (коміт 867ef6d).
     deploy:
       resources:
         limits:
-          memory: 2g
+          memory: 1g
     expose:
       - "3000"
     ports:

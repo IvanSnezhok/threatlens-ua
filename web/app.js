@@ -264,6 +264,17 @@ let coverageWindowDays = 7;
 let lastReceived = null;
 let refreshTimer = null;
 let backendStatus = 'current';
+// Стан транспорту. Живе на рівні модуля, бо його читає смуга свіжості: без нього «ЗВʼЯЗОК
+// ПЕРЕРВАНО» жило рівно до наступного тику годинника — updateFreshness() перемальовує обидва рядки
+// щосекунди й мовчки повертав напис «ДАНІ АКТУАЛЬНІ» посеред обірваного звʼязку.
+let stream = null;             // активний EventSource або null
+let streamRetryTimer = null;   // запланований повтор підключення
+let streamAttempt = 0;         // поспіль невдалих підключень; нуль — потік живий
+let streamLive = false;        // рукостискання відбулося, кадри йдуть
+let pollTimer = null;          // наступне опитування знімка (ланцюжок, не інтервал)
+let suspendTimer = null;       // відстрочка засинання прихованої вкладки
+let streamSuspended = false;   // вкладка прихована досить довго, щоб віддати зʼєднання
+let connectionLost = false;    // останній запит знімка не вдався
 // Маршрут, вміст якого зараз лежить у #app. Потрібен рівно одному місцю — консолі, яка не
 // перемальовується від оновлення знімка: без нього прямий вхід на /ops лишив би #app порожнім,
 // бо перший рендер після boot() приходить саме зі знімка.
@@ -668,14 +679,15 @@ function updateFreshness() {
   const backendProblem = backendStatus === 'degraded' || backendStatus === 'unconfigured';
   // «held» стоїть НИЖЧЕ за «delayed» і «stale»: свідома затримка оператора — це не несправність,
   // але справжня несправність поверх неї має лишатися видимою.
-  strip.dataset.state = age > 180 || backendProblem ? 'stale'
+  strip.dataset.state = connectionLost || age > 180 || backendProblem ? 'stale'
     : age > 60 ? 'delayed'
       : held ? 'held' : 'current';
-  $('#system-state').textContent = age > 180 ? 'ДАНІ ЗАСТАРІЛИ'
-    : backendStatus === 'degraded' ? 'ОФІЦІЙНІ ДЖЕРЕЛА НЕДОСТУПНІ'
-      : backendStatus === 'unconfigured' ? 'ДЖЕРЕЛА НЕ НАЛАШТОВАНІ'
-        : age > 60 ? 'МОЖЛИВА ЗАТРИМКА'
-          : held ? `ЗАТРИМКА ${publication?.delaySeconds ?? 15} С` : 'ДАНІ АКТУАЛЬНІ';
+  $('#system-state').textContent = connectionLost ? 'ЗВʼЯЗОК ПЕРЕРВАНО'
+    : age > 180 ? 'ДАНІ ЗАСТАРІЛИ'
+      : backendStatus === 'degraded' ? 'ОФІЦІЙНІ ДЖЕРЕЛА НЕДОСТУПНІ'
+        : backendStatus === 'unconfigured' ? 'ДЖЕРЕЛА НЕ НАЛАШТОВАНІ'
+          : age > 60 ? 'МОЖЛИВА ЗАТРИМКА'
+            : held ? `ЗАТРИМКА ${publication?.delaySeconds ?? 15} С` : 'ДАНІ АКТУАЛЬНІ';
   // Три показники, яких вимагає дорожня карта: режим (у #system-state), фактична свіжість
   // («оновлено N с тому») і ЧАС ОСТАННЬОЇ ОПУБЛІКОВАНОЇ ПОДІЇ. Третій без цього рядка не мав би
   // жодного споживача взагалі: він рахувався у зрізі й показувався тільки в /ops.
@@ -689,16 +701,31 @@ function updateFreshness() {
     : publication.lastPublishedEventAt
       ? ` · остання подія о ${shortTime(publication.lastPublishedEventAt)}`
       : ' · подій ще не було';
-  $('#last-update').textContent = held
-    ? `оновлено ${Math.round(age)} с тому · зріз о ${shortTime(publication.cutoffAt)}${eventAt}`
-    : `оновлено ${Math.round(age)} с тому${eventAt}`;
+  // Про транспорт кажемо рівно тоді, коли він уже підвів: `streamAttempt` більший за нуль означає
+  // щонайменше один зірваний потік. Перші двісті мілісекунд завантаження сторінки — теж «потоку ще
+  // немає», але писати про це читачеві нема чого. Рядок нічого не приховує: вік знімка лишається
+  // на місці, а смуга й далі рахує 60/180 с від нього — це саме додаткова правда, а не заміна.
+  const transport = !streamLive && streamAttempt > 0
+    ? ` · без потоку, оновлення кожні ${Math.round(SNAPSHOT_POLL_FALLBACK_MS / 1000)} с`
+    : '';
+  // Обірваний звʼязок не ховає лічильника віку: «останній відомий стан» без «оновлено N с тому»
+  // лишав би читача без єдиного числа, яким він міряє, наскільки цьому екрану ще можна вірити.
+  $('#last-update').textContent = connectionLost
+    ? `показано останній відомий стан · оновлено ${Math.round(age)} с тому${eventAt}`
+    : held
+      ? `оновлено ${Math.round(age)} с тому · зріз о ${shortTime(publication.cutoffAt)}${eventAt}${transport}`
+      : `оновлено ${Math.round(age)} с тому${eventAt}${transport}`;
 }
 
 async function loadSnapshot() {
-  const response = await fetch('/api/v1/snapshot', { cache: 'no-store' });
+  // `no-cache` still revalidates on every read, but lets the browser send the snapshot ETag and
+  // receive a bodyless 304 in live mode. Delayed publication remains `no-store` because the server
+  // sets that stronger response policy while the hold is active.
+  const response = await fetch('/api/v1/snapshot', { cache: 'no-cache' });
   if (!response.ok) throw new Error('snapshot unavailable');
   snapshot = await response.json();
   backendStatus = snapshot.systemStatus;
+  connectionLost = false;
   lastReceived = new Date();
   renderCurrentRoute({ fromSnapshot: true });
   updateFreshness();
@@ -706,31 +733,182 @@ async function loadSnapshot() {
   void loadVectors();
 }
 
+// ------------------------------------------------------------------------------------------------
+// Транспорт: потік подій, повтори з розкидом і опитування знімка
+// ------------------------------------------------------------------------------------------------
+//
+// Вкладок може бути скільки завгодно, а сервер тримає щонайбільше 500 одночасних стрімів
+// (SSE_MAX_STREAMS у src/api/server.ts) і відповідає 503 на 501-й. Рідна поведінка EventSource на
+// обидва випадки — неправильна: на не-200 він закривається НАЗАВЖДИ (вкладка лишається з мертвим
+// потоком до перезавантаження сторінки), а на розриві живого зʼєднання повторює рівно через
+// `retry: 3000` і без будь-якого розкиду — тобто після рестарту сервера всі клієнти повертаються
+// синхронним фронтом кожні три секунди й самі ж і кладуть щойно піднятий процес.
+//
+// Тому повтором керує цей файл: рідний повтор глушиться close(), а розклад дає експонента з
+// розкидом. Розрізнити 503 і розрив із боку клієнта неможливо — status відповіді EventSource не
+// віддає — і не треба: відповідь на обидва однакова, бо однакова й причина, з якої кадрів немає.
+
+const STREAM_RETRY_BASE_MS = 2000;
+const STREAM_RETRY_CEILING_MS = 60000;
+// Половинний розкид, а не повний: [ceiling/2, ceiling] і розводить фронт клієнтів, і не дозволяє
+// першій же невдачі повернутися за 30 мс — рівно в той сервер, який щойно відмовив.
+function streamRetryDelay(attempt, random = Math.random) {
+  const ceiling = Math.min(STREAM_RETRY_CEILING_MS, STREAM_RETRY_BASE_MS * 2 ** Math.max(0, attempt - 1));
+  return Math.round(ceiling / 2 + random() * (ceiling / 2));
+}
+
+// Опитування знімка — не «резерв на випадок потоку», а самостійна нога свіжості: у затриманому
+// режимі на спокійній системі кадрів не буває взагалі. Поки потік живий, вистачає хвилини; коли
+// потоку немає, хвилина — це до хвилини невидимої тривоги, тож крок падає до двадцяти секунд.
+// Розкид ±15 % — з тієї самої причини, що й у повторі: інакше всі вкладки, підняті одним
+// рестартом, стукають у /api/v1/snapshot одним фронтом і тримають його довіку.
+const SNAPSHOT_POLL_LIVE_MS = 60000;
+const SNAPSHOT_POLL_FALLBACK_MS = 20000;
+function snapshotPollDelay(live, random = Math.random) {
+  const base = live ? SNAPSHOT_POLL_LIVE_MS : SNAPSHOT_POLL_FALLBACK_MS;
+  return Math.round(base * (0.85 + random() * 0.3));
+}
+
+// Кадр потоку сам собою нічого не малює — він лише каже «перечитай знімок». Одна подія приходить
+// усім одночасно, тож фіксовані 250 мс означали, що кожна відкрита вкладка стукає в знімок у ту
+// саму мілісекунду: чим гучніша подія, тим точніший збіг. Розкид розводить цей фронт.
+//
+// Офіційна тривога має власне, коротше вікно. Розводити треба й її — але секунда з чвертю на
+// alert.started — це секунда з чвертю затримки саме того сигналу, який мусить випереджати все інше.
+const REFRESH_DEBOUNCE_MS = 250;
+const REFRESH_SPREAD_MS = 1200;
+const REFRESH_SPREAD_ALERT_MS = 350;
+function refreshDelay(eventName, random = Math.random) {
+  const spread = String(eventName ?? '').startsWith('alert.') ? REFRESH_SPREAD_ALERT_MS : REFRESH_SPREAD_MS;
+  return REFRESH_DEBOUNCE_MS + Math.round(random() * spread);
+}
+
 function connectStream() {
+  // Одна вкладка — один EventSource. Без цього рядка повернення на видиму вкладку посеред уже
+  // запланованого повтору лишало б два відкриті стріми: обидва зі своїм слухачем хаба на сервері,
+  // обидва в межі 500, і жоден із них не зайвий з погляду сервера.
+  closeStream();
+  clearTimeout(streamRetryTimer); streamRetryTimer = null;
   // Точка відновлення: без неї кожна подія, закомічена між зрізом знімка й рукостисканням потоку,
   // лишалася б невидимою для цієї вкладки, доки не прийде якась наступна. Сервер трактує ?since=
   // рівно як Last-Event-ID, а верхньою межею добору лишається зріз публікації — тож повз затримку
-  // це не пропускає нічого.
+  // це не пропускає нічого. Після кожного повтору `since` бере версію свіжого знімка, який тим
+  // часом дотягнуло опитування, тож дірки між ногами транспорту не буває.
   const source = new EventSource(`/api/v1/stream?since=${snapshot?.version ?? 0}`);
-  source.addEventListener('connected', () => { lastReceived = new Date(); updateFreshness(); });
-  const schedule = () => {
+  stream = source;
+  source.addEventListener('connected', () => {
+    streamAttempt = 0; streamLive = true;
     lastReceived = new Date();
-    clearTimeout(refreshTimer);
-    refreshTimer = setTimeout(() => loadSnapshot().catch(markOffline), 250);
-  };
+    schedulePoll();      // потік ожив — крок опитування повертається до хвилини
+    updateFreshness();
+  });
   // 'threat.withdrawn' and 'threat.expired' end a threat. Without them the map keeps drawing it
   // until some unrelated event happens to arrive, which is the one direction that must not lag.
   // 'publication.changed' і 'analytics.updated' — нові імена: іменовані події EventSource НЕ
   // падають у загальний обробник message, тож без цього рядка клієнт мовчки б їх ігнорував.
-  ['alert.started','alert.ended','threat.created','threat.updated','threat.corrected','threat.withdrawn','threat.expired','assessment.updated','source.stale','source.recovered','publication.changed','analytics.updated'].forEach((name) => source.addEventListener(name, schedule));
-  source.onerror = markOffline;
+  ['alert.started','alert.ended','threat.created','threat.updated','threat.corrected','threat.withdrawn','threat.expired','assessment.updated','source.stale','source.recovered','publication.changed','analytics.updated'].forEach((name) => source.addEventListener(name, () => scheduleRefresh(name)));
+  source.onerror = () => {
+    // Обробник живе довше за свій стрім: close() не скасовує вже поставленої в чергу події. Без
+    // цієї перевірки помилка мертвого зʼєднання рахувала б спробу свіжому й псувала б йому розклад.
+    if (stream !== source) return;
+    retryStream();
+  };
+}
+
+function scheduleRefresh(eventName) {
+  // Кадр — це доказ, що конвеєр публікації живий, навіть поки знімок ще їде. Свіжість рахуємо від
+  // нього, як і раніше.
+  lastReceived = new Date();
+  clearTimeout(refreshTimer);
+  refreshTimer = setTimeout(() => {
+    refreshTimer = null;
+    void loadSnapshot().catch(markOffline);
+  }, refreshDelay(eventName));
+}
+
+function closeStream() {
+  if (!stream) return;
+  // onerror знімається ПЕРЕД close(): інакше закриття, яке ми зробили самі, повернулося б у
+  // retryStream() і підняло б лічильник спроб на рівному місці.
+  stream.onerror = null;
+  stream.close();
+  stream = null;
+  streamLive = false;
+}
+
+function retryStream() {
+  closeStream();
+  streamAttempt += 1;
+  clearTimeout(streamRetryTimer);
+  streamRetryTimer = setTimeout(() => { streamRetryTimer = null; connectStream(); }, streamRetryDelay(streamAttempt));
+  // Поки потоку немає, свіжість тримає опитування — і саме тому воно тут же стає частішим.
+  schedulePoll();
+  updateFreshness();
+}
+
+// Ланцюжок таймаутів, а не setInterval: інтервал не чекає завершення запиту, тож клієнт, у якого
+// знімок під навантаженням іде вісім секунд, тримав би кілька паралельних відповідей — і тим
+// сильніше, чим гірше серверу. Ланцюжок дає рівно один запит у польоті й дозволяє змінювати крок.
+function schedulePoll(delay = snapshotPollDelay(streamLive)) {
+  clearTimeout(pollTimer);
+  if (streamSuspended) { pollTimer = null; return; }
+  pollTimer = setTimeout(() => {
+    pollTimer = null;
+    void loadSnapshot().catch(markOffline).finally(() => schedulePoll());
+  }, delay);
 }
 
 function markOffline() {
+  connectionLost = true;
   $('#system-strip').dataset.state = 'stale';
   $('#system-state').textContent = 'ЗВʼЯЗОК ПЕРЕРВАНО';
-  $('#last-update').textContent = 'показано останній відомий стан';
+  // Поки першого знімка не було, віку не існує й updateFreshness() виходить одразу — цей рядок
+  // лишається єдиним, що побачить читач. Далі його щосекунди перемальовує сама updateFreshness,
+  // уже разом із лічильником віку.
+  if (!lastReceived) $('#last-update').textContent = 'показано останній відомий стан';
+  else updateFreshness();
 }
+
+// Прихована вкладка не читається ніким, але коштує серверу рівно стільки ж: слухач хаба, інтервал
+// heartbeat і буфер запису на кожен відкритий стрім. Сповіщення йдуть ботом, а не сторінкою, тож
+// віддати зʼєднання на час, поки на вкладку не дивляться, безпечно — жодного сигналу це не гасить.
+const HIDDEN_GRACE_MS = 60000;
+
+function suspendStreaming() {
+  // Кіоск (/tv) не присипляємо: екран на стіні може повідомити hidden від власного засинання, а
+  // повернення до картинки має бути миттєвим, без вікна на перепідключення.
+  if (document.body.classList.contains('tv-mode') || streamSuspended) return;
+  clearTimeout(suspendTimer);
+  // Хвилина відстрочки: перехід на сусідню вкладку на десять секунд не має коштувати зʼєднання —
+  // рвати й піднімати стрім частіше, ніж він живе, для сервера дорожче, ніж просто його тримати.
+  suspendTimer = setTimeout(() => {
+    suspendTimer = null;
+    if (!document.hidden) return;
+    streamSuspended = true;
+    closeStream();
+    clearTimeout(pollTimer); pollTimer = null;
+    clearTimeout(refreshTimer); refreshTimer = null;
+    clearTimeout(streamRetryTimer); streamRetryTimer = null;
+  }, HIDDEN_GRACE_MS);
+}
+
+function resumeStreaming() {
+  clearTimeout(suspendTimer); suspendTimer = null;
+  // Свіжість перемальовується ДО того, як приїде знімок: повернення на вкладку через десять хвилин
+  // мусить показати «ДАНІ ЗАСТАРІЛИ» одразу, а не після відповіді сервера. Фонові вкладки душать
+  // секундний таймер, тож без цього рядка перший кадр після повернення показував би вік, застиглий
+  // на момент засинання.
+  updateFreshness();
+  if (!streamSuspended) return;
+  streamSuspended = false;
+  streamAttempt = 0;
+  connectStream();
+  void loadSnapshot().catch(markOffline).finally(() => schedulePoll());
+}
+
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden) suspendStreaming(); else resumeStreaming();
+});
 
 function activePage() {
   const path = location.pathname.replace(/\/$/, '') || '/';
@@ -6108,7 +6286,14 @@ async function boot() {
   await loadSnapshot(); connectStream();
   // Пасок на випадок тиші: у затриманому режимі «фактична свіжість» і смуга «ЗАТРИМКА 15 С» не
   // мають права застигнути в очікуванні кадру потоку, якого на спокійній системі просто не буде.
-  setInterval(() => void loadSnapshot().catch(markOffline), 60000);
-  setInterval(() => void loadOccupation(), 900000);
+  schedulePoll();
+  // Довідковий шар не має причин оновлюватися у вкладці, яку віддали разом зі стрімом: лінія
+  // фронту не змінюється за хвилину, а запит із прихованої вкладки коштує серверу як будь-який.
+  setInterval(() => { if (!streamSuspended) void loadOccupation(); }, 900000);
+  // Вкладку могли відкрити фоном — посиланням у сусідній вкладці або відновленням сесії. Тоді
+  // visibilitychange не спрацює жодного разу, і стрім висів би на сервері, поки на нього ніхто
+  // не подивиться. Відстрочка та сама, тож вкладка, яку відкрили «на потім» і показали за пів
+  // хвилини, нічого не втрачає.
+  if (document.hidden) suspendStreaming();
 }
 boot().catch(markOffline);

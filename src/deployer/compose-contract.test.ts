@@ -1,4 +1,5 @@
-import { readFileSync, readdirSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
+import { existsSync, readFileSync, readdirSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { DEPLOY_MANUAL_SERVICES, DEPLOY_REF, DEPLOY_RESTART_SERVICES } from './runner.js';
@@ -20,6 +21,22 @@ const ROOT = resolve(import.meta.dirname, '../..');
 
 function read(relative: string): string {
   return readFileSync(resolve(ROOT, relative), 'utf8');
+}
+
+/**
+ * Whether a path reaches the deployment checkout — which is the only question that matters for
+ * anything Caddy now reads from disk. `git ls-files` would answer it for a file that is already
+ * committed and answer it wrongly for one staged in the same change as the config that serves it,
+ * so the test is "on disk and not ignored" instead. `git check-ignore` exits 0 when it IS ignored.
+ */
+function shipsInCheckout(relative: string): boolean {
+  if (!existsSync(resolve(ROOT, relative))) return false;
+  try {
+    execFileSync('git', ['check-ignore', '-q', '--', relative], { cwd: ROOT, stdio: 'ignore' });
+    return false;
+  } catch {
+    return true;
+  }
 }
 
 const COMPOSE = read('compose.yaml');
@@ -121,13 +138,114 @@ describe('compose topology', () => {
 });
 
 describe('the public edge', () => {
+  const CADDYFILE = read('Caddyfile');
+  /** Directives only. The comments in that file discuss the policies they explain, by name. */
+  const DIRECTIVES = CADDYFILE.split('\n').filter((line) => !line.trimStart().startsWith('#')).join('\n');
+  /** Caddy's `precompressed` takes encoding names; these are the siblings it then looks for. */
+  const SIBLING_EXTENSION: Record<string, string> = { br: 'br', gzip: 'gz', zstd: 'zst' };
+
   it('proxies exactly one upstream, and it is the application', () => {
-    const caddyfile = read('Caddyfile');
-    const proxies = [...caddyfile.matchAll(/reverse_proxy\s+(\S+)/g)].map((match) => match[1]);
-    // The runner is on the same bridge network as Caddy. One upstream is what keeps it unreachable
-    // from the internet no matter what an attacker knows about the topology.
-    expect(proxies).toEqual(['app:3000']);
-    expect(caddyfile).not.toContain('deployer');
+    const proxies = [...CADDYFILE.matchAll(/reverse_proxy\s+(\S+)/g)].map((match) => match[1]);
+    // The runner is on the same bridge network as Caddy. ONE upstream is what keeps it unreachable
+    // from the internet no matter what an attacker knows about the topology. A set, not a list:
+    // `reverse_proxy app:3000` is now written twice — once as the fail-safe for a static path Caddy
+    // cannot find on disk, once for everything else — and both name the same single upstream.
+    expect(new Set(proxies)).toEqual(new Set(['app:3000']));
+    expect(CADDYFILE).not.toContain('deployer');
+  });
+
+  it('serves from disk only the asset trees that are checked into git', () => {
+    // The premise of the whole edge-static block. Caddy reads the deployment CHECKOUT; `app` reads
+    // the IMAGE. The two agree only for files git versions, so a path served from disk that is not
+    // tracked would be served stale, or 404, depending on the day.
+    const served = [...CADDYFILE.matchAll(/@static path (.+)/g)].flatMap((match) => match[1]!.trim().split(/\s+/));
+    expect(served).toEqual(['/data/*', '/assets/fonts/*']);
+    for (const prefix of ['public/data', 'public/assets/fonts']) {
+      const tracked = execFileSync('git', ['ls-files', prefix], { cwd: ROOT, encoding: 'utf8' }).trim();
+      expect(tracked, `${prefix} is served from disk but nothing in it is tracked`).not.toBe('');
+    }
+    // esbuild output, `.gitignore`d, present only inside the image: it must keep going through the
+    // proxy or a fresh checkout would serve a bundle that does not exist.
+    expect(CADDYFILE).not.toContain('/assets/app.');
+  });
+
+  it('mounts those trees into Caddy read-only, at the root the Caddyfile expects', () => {
+    const caddy = SERVICES.get('caddy')!;
+    const root = /root \* (\S+)/.exec(CADDYFILE)?.[1];
+    expect(root).toBe('/srv/public');
+    for (const tree of ['data', 'assets/fonts']) {
+      expect(caddy, `public/${tree} is not mounted into Caddy`).toContain(`./public/${tree}:${root}/${tree}:ro`);
+    }
+    // `:ro` is the point. Caddy terminates the public internet; the checkout it reads is the same
+    // one the deployment runner does `git fetch` into.
+    for (const mount of caddy.matchAll(/^\s+- \.\/public\/\S+$/gm)) {
+      expect(mount[0], 'a public mount is writable').toMatch(/:ro$/);
+    }
+  });
+
+  it('never lets an unhashed asset claim immutability', () => {
+    // None of these filenames carry a content hash, so every cache policy here has to have an end.
+    // `immutable` on `/data/*` would mean a corrected boundary never reaching a browser that has the
+    // old one — and `max-age=0` from `@fastify/static` is what keeps `index.html` and the bundle
+    // honest, which is exactly why they are not in the block above.
+    expect(DIRECTIVES).not.toContain('immutable');
+    const policies = [...DIRECTIVES.matchAll(/Cache-Control "([^"]+)"/g)].map((match) => match[1]!);
+    expect(policies.length).toBeGreaterThan(0);
+    for (const policy of policies) {
+      const maxAge = /max-age=(\d+)/.exec(policy)?.[1];
+      expect(maxAge, `no max-age in "${policy}"`).toBeDefined();
+      // A month. Long enough to be worth doing, short enough that a wrong asset self-corrects
+      // without anyone having to think about cache busting.
+      expect(Number(maxAge), `"${policy}" outlives a deployment cycle`).toBeLessThanOrEqual(2_592_000);
+    }
+  });
+
+  it('asks for precompressed siblings that the repository actually carries', () => {
+    const encodings = /precompressed ([a-z ]+)/.exec(DIRECTIVES)?.[1]!.trim().split(/\s+/);
+    expect(encodings).toEqual(['br', 'gzip']);
+    // Caddy has no Brotli compressor; `encode zstd gzip` is what it can produce on the fly, and the
+    // `.br` files are what it can only serve. Both halves have to stay declared.
+    expect(DIRECTIVES).toMatch(/^\s+encode zstd gzip$/m);
+    for (const encoding of encodings!) {
+      const extension = SIBLING_EXTENSION[encoding];
+      expect(extension, `\`precompressed ${encoding}\` names an encoding Caddy has no extension for`).toBeDefined();
+      for (const file of readdirSync(resolve(ROOT, 'public/data')).filter((name) => name.endsWith('.geojson'))) {
+        expect(
+          shipsInCheckout(`public/data/${file}.${extension}`),
+          `public/data/${file}.${extension} does not reach the checkout — run \`npm run build:static\``
+        ).toBe(true);
+      }
+    }
+  });
+});
+
+describe('the memory ceiling', () => {
+  it('keeps the V8 heap cap below the cgroup limit, with room for external memory', () => {
+    // The pairing this project has been bitten by: a process that hits its cgroup limit is OOM-killed
+    // with no chance to collect, while a heap that hits its OWN limit collects hard and survives. So
+    // the heap cap must stay strictly under the container limit, and the gap must cover the memory
+    // V8 does not count — socket buffers above all.
+    const heapMib = Number(/--max-old-space-size=(\d+)/.exec(read('Dockerfile'))?.[1]);
+    expect(heapMib).toBeGreaterThan(0);
+    const limit = /memory:\s*(\d+)([gm])/.exec(SERVICES.get('app')!);
+    const limitMib = Number(limit![1]) * (limit![2] === 'g' ? 1024 : 1);
+    expect(heapMib).toBeLessThan(limitMib);
+
+    // The largest BOUNDED consumer of external memory is the slow-SSE-consumer worst case, and it is
+    // bounded by two constants. Read them rather than restate them: raising either one without
+    // raising this ceiling is the change that would make the container OOM under a crowd. Searched
+    // across `src/api` rather than pinned to one file, because which module owns the stream
+    // transport is not the thing this test is about.
+    const api = readdirSync(resolve(ROOT, 'src/api'))
+      .filter((file) => file.endsWith('.ts') && !file.endsWith('.test.ts'))
+      .map((file) => read(`src/api/${file}`)).join('\n');
+    const streams = Number(/SSE_MAX_STREAMS = (\d+)/.exec(api)?.[1]);
+    const buffered = Number(/SSE_MAX_BUFFERED_BYTES = (\d+) \* 1024/.exec(api)?.[1]);
+    expect(streams, 'SSE_MAX_STREAMS is not declared anywhere in src/api — the SSE worst case is now unbounded, or this test lost track of it').toBeGreaterThan(0);
+    expect(buffered, 'SSE_MAX_BUFFERED_BYTES is not declared anywhere in src/api — see above').toBeGreaterThan(0);
+    const sseMib = (streams * buffered) / 1024;
+    expect(limitMib - heapMib, `${limitMib - heapMib} MiB of headroom against ${sseMib} MiB of SSE buffers`)
+      .toBeGreaterThan(sseMib);
   });
 });
 
