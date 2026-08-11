@@ -93,6 +93,18 @@ describe('a successful completion', () => {
     expect(JSON.parse(body).response_format).toBeUndefined();
   });
 
+  it('uses the Chat Completions vision content shape when images are present', async () => {
+    let body = '';
+    await codexChat({ ...request, images: [{ dataUrl: 'data:image/jpeg;base64,AA==' }] }, {
+      credentials, settings, audit,
+      fetchImpl: async (_input, init) => { body = String(init?.body); return completion('{}'); }
+    });
+    expect(JSON.parse(body).messages[1].content).toEqual([
+      { type: 'text', text: '{"facts":1}' },
+      { type: 'image_url', image_url: { url: 'data:image/jpeg;base64,AA==', detail: 'auto' } }
+    ]);
+  });
+
   it('writes the caller-supplied digest to the audit log instead of the raw prompt', async () => {
     await codexChat({ ...request, auditInput: { totals: { events: 3 } } }, {
       credentials, settings, audit, fetchImpl: async () => completion('{}')

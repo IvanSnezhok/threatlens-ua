@@ -471,6 +471,12 @@ export interface ClassificationLogEntry {
   eventId?: string | null;
   createdEvent?: boolean;
   withdrawal?: WithdrawalOutcome | null;
+  /** Advisory-only media; never consumed by `recordClassification` or the live event transaction. */
+  media?: NormalizedMessage['media'];
+  /** Original envelope used only by optional post-classification analytical promotion. */
+  message?: NormalizedMessage;
+  /** Backfill provenance keeps an old promoted event archive-only. */
+  historical?: boolean;
 }
 
 /**
@@ -568,6 +574,8 @@ export interface IngestThreatOptions {
    * demoting it would be a behaviour change nobody asked for.
    */
   historical?: boolean;
+  /** Model provenance. Forces `unverified` evidence and disables every retraction branch. */
+  modelPromotion?: { model: string; confidence: number };
 }
 
 export async function ingestThreat(
@@ -616,7 +624,8 @@ export async function ingestThreat(
     const inserted = await client.query<{ id: string }>(
       `INSERT INTO source_messages(source_id,external_id,published_at,edited_at,raw_text,raw_payload,content_hash,processing_status,supersedes_message_id)
        VALUES ($1,$2,$3,$4,$5,$6,$7,'classified',$8)
-       ON CONFLICT (source_id,external_id,content_hash) DO UPDATE SET received_at=now()
+       ON CONFLICT (source_id,external_id,content_hash) DO UPDATE SET
+         received_at=now(), processing_status='classified'
        RETURNING id`,
       [message.sourceId, message.externalId, message.publishedAt, message.editedAt ?? null, message.text, JSON.stringify(message.rawPayload), hash,
         previousMessage.rows[0]?.id ?? null]
@@ -637,7 +646,8 @@ export async function ingestThreat(
       `SELECT tier,official,independence_group FROM sources WHERE id=$1`, [message.sourceId]
     );
     const sourceRow = source.rows[0] ?? { tier: 'C', official: false, independence_group: message.sourceId };
-    const evidenceLevel: EvidenceLevel = sourceRow.official ? 'official' : sourceRow.tier === 'B' ? 'monitoring' : 'unverified';
+    const evidenceLevel: EvidenceLevel = options.modelPromotion ? 'unverified'
+      : sourceRow.official ? 'official' : sourceRow.tier === 'B' ? 'monitoring' : 'unverified';
     const eventLocations = classified.nationalScope
       ? [{ id: 'ua', name: 'Україна', relationType: 'mentioned' as const }]
       : classified.locations;
@@ -685,6 +695,17 @@ export async function ingestThreat(
       [classified.threatType, locationIds]
     ) : { rows: [], rowCount: 0 } as never;
 
+    // Analytical promotion is a gap-filler, never a way to rewrite or widen an event that already
+    // exists. In particular, one overlapping model destination must not attach its other guessed
+    // destinations to an official event and trigger an `evidence_raised`/geography notification.
+    if (options.modelPromotion && existing.rowCount && existing.rows[0]) {
+      await client.query('COMMIT');
+      return {
+        id: existing.rows[0].id, version: await systemVersion(), created: false,
+        sourceMessageId, withdrawal: NO_WITHDRAWAL, published: false
+      };
+    }
+
     let eventId: string;
     let created = false;
     if (existing.rowCount && existing.rows[0]) {
@@ -705,14 +726,17 @@ export async function ingestThreat(
       // expression against the old tuple, so the guard and the assignment beside it cannot disagree.
       await client.query(
         `UPDATE threat_events SET
-           summary=CASE WHEN $3::timestamptz >= last_observed_at THEN $2 ELSE summary END,
+           summary=CASE WHEN $6::boolean THEN summary
+             WHEN $3::timestamptz >= last_observed_at THEN $2 ELSE summary END,
            last_observed_at=GREATEST(last_observed_at,$3::timestamptz),updated_at=now(),
            evidence_level=$4,status=CASE WHEN $4='official' THEN 'active' ELSE status END,
-           direction_text=CASE WHEN $3::timestamptz >= last_observed_at
+           direction_text=CASE WHEN $6::boolean THEN COALESCE(direction_text,$5)
+             WHEN $3::timestamptz >= last_observed_at
              THEN COALESCE($5,direction_text) ELSE direction_text END,
            valid_until=GREATEST(valid_until,$3::timestamptz + interval '30 minutes')
          WHERE id=$1`,
-        [eventId, classified.summary, message.publishedAt, nextEvidence, classified.directionText ?? null]
+        [eventId, classified.summary, message.publishedAt, nextEvidence,
+          classified.directionText ?? null, Boolean(options.modelPromotion)]
       );
       if (existing.rows[0].evidence_level !== nextEvidence) {
         await client.query(
@@ -775,7 +799,8 @@ export async function ingestThreat(
     // two-hour half-life and gates on `expires_at > now()` alone, so a three-hour-old signal still
     // contributes about a third of its weight — a backfill would quietly raise the analytic index of
     // every oblast in the replayed window hours after the reports it is built from stopped applying.
-    const baseContribution = sourceRow.official ? 2.5 : sourceRow.tier === 'B' ? 1.5 : 0.6;
+    const baseContribution = options.modelPromotion ? 0.3
+      : sourceRow.official ? 2.5 : sourceRow.tier === 'B' ? 1.5 : 0.6;
     for (const target of outsideWindow ? [] : signalTargets) {
       for (const signalThreatType of classified.signalThreatTypes) {
         await client.query(
@@ -783,14 +808,17 @@ export async function ingestThreat(
             independence_group,reliability,freshness,geographic_relevance,contribution,observed_at,expires_at)
            VALUES ($1,$2,$3,$4,$5,$6,$7,1,$8,$9,$10::timestamptz,$10::timestamptz + interval '6 hours')`,
           [classified.indicators[0] ?? target.relationType, sourceMessageId, target.id, signalThreatType, sourceRow.tier,
-            sourceRow.independence_group, sourceRow.official ? 1 : sourceRow.tier === 'B' ? 0.75 : 0.4,
+            sourceRow.independence_group, options.modelPromotion ? options.modelPromotion.confidence * 0.5
+              : sourceRow.official ? 1 : sourceRow.tier === 'B' ? 0.75 : 0.4,
             target.relevance, baseContribution * target.relevance, message.publishedAt]
         );
       }
     }
     await client.query(
       `INSERT INTO event_evidence(event_id,source_message_id,evidence_role,confidence) VALUES ($1,$2,$3,$4)
-       ON CONFLICT DO NOTHING`, [eventId, sourceMessageId, sourceRow.independence_group, evidenceLevel === 'official' ? 1 : 0.55]
+       ON CONFLICT DO NOTHING`, [eventId, sourceMessageId,
+        options.modelPromotion ? `model:${sourceRow.independence_group}` : sourceRow.independence_group,
+        options.modelPromotion?.confidence ?? (evidenceLevel === 'official' ? 1 : 0.55)]
     );
     // Corroboration is a statement about the present tense — "two independent groups are reporting
     // this" — and a message from outside its own validity window is not reporting anything now. It
@@ -802,7 +830,7 @@ export async function ingestThreat(
          FROM event_evidence ee
          JOIN source_messages sm ON sm.id=ee.source_message_id
          JOIN sources s ON s.id=sm.source_id
-         WHERE ee.event_id=$1 AND s.tier IN ('A','B')`,
+         WHERE ee.event_id=$1 AND s.tier IN ('A','B') AND ee.evidence_role NOT LIKE 'model:%'`,
         [eventId]
       );
       if ((corroboration.rows[0]?.independent_sources ?? 0) >= 2) {
@@ -856,7 +884,7 @@ export async function ingestThreat(
     // asserted and retracted by the same message — and withdrawal is the dangerous direction to
     // resolve that tie in.
     let withdrawal = NO_WITHDRAWAL;
-    if (classified.retraction && classified.intent === 'redirect') {
+    if (!options.modelPromotion && classified.retraction && classified.intent === 'redirect') {
       const approaching = new Set(classified.locations
         .filter((location) => location.relationType === 'reported_direction')
         .map((location) => location.id));

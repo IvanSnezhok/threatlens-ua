@@ -100,8 +100,11 @@ const opsCodexRoutes: FastifyPluginAsync = async (app) => {
       // route: an operator switching model use on and off wants one form, and a switch reachable
       // only by a different path is a switch nobody finds when the quota runs out.
       shadow: z.boolean(),
-      // The retrospective gate (migration 025), off by default and the only switch on this form that
-      // grants a model any authority over the pipeline: with it on, a model may convert a threat the
+      // Grants the model narrowly bounded publication authority: only high-confidence assertions
+      // missed by the deterministic classifier, always as `unverified`, to both public event
+      // surfaces and the normal Telegram outbox. It can never withdraw an event or alter alerts.
+      analytical_threats: z.boolean(),
+      // The retrospective gate (migration 025), off by default. With it on, a model may convert a threat the
       // rules would have published into an archive-only row, and may do nothing else. It belongs on
       // the same form for the same reason as `shadow` — the operator turning model use off in a
       // hurry must find every switch in one place — and its blast radius is documented beside it in

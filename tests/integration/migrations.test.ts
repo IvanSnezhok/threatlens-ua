@@ -39,7 +39,9 @@ const MIGRATION_FILES = [
   '035_attack_research.sql',
   '036_resource_efficiency.sql',
   '037_ops_source_management.sql',
-  '038_telegram_delivery_governor.sql'
+  '038_telegram_delivery_governor.sql',
+  '039_contextual_multimodal_shadow.sql',
+  '040_model_analytical_threats.sql'
 ];
 
 /**
@@ -221,11 +223,23 @@ describe.skipIf(!integrationDatabaseAvailable)('migration runner against live Po
     // if that happened, so the assertion is about the values, not merely about the columns existing.
     const row = await sql<Record<string, boolean>>(
       `SELECT narrative_enabled,digest_enabled,attacks_enabled,shadow_enabled,
-              retrospective_gate_enabled,tactics_enabled,attack_research_enabled
+              analytical_threats_enabled,retrospective_gate_enabled,tactics_enabled,attack_research_enabled
          FROM codex_settings WHERE singleton`
     );
     expect(row.rowCount).toBe(1);
-    expect(Object.values(row.rows[0]!)).toEqual([false, false, false, false, false, false, false]);
+    expect(Object.values(row.rows[0]!)).toEqual([false, false, false, false, false, false, false, false]);
+  });
+
+  it('keeps contextual/media evidence and analytical event provenance on the shadow table', async () => {
+    const columns = await sql<{ column_name: string }>(
+      `SELECT column_name FROM information_schema.columns
+        WHERE table_schema='public' AND table_name='shadow_classifications'
+          AND column_name = ANY($1::text[]) ORDER BY column_name`,
+      [['analytical_event_id', 'context_message_ids', 'media_kinds', 'model_analysis']]
+    );
+    expect(columns.rows.map((row) => row.column_name)).toEqual([
+      'analytical_event_id', 'context_message_ids', 'media_kinds', 'model_analysis'
+    ]);
   });
 
   it('registers the occupation snapshot table with its revision uniqueness guarantee', async () => {

@@ -522,8 +522,8 @@ all four hand-reviewed retrospectives, and made none newly significant.
 
 **The grey-band gate.** With the `retrospective_gate` switch on in `/ops` (migration 025, off by
 default), a message the rules mark `suspect` gets one narrow question put to a model before the event
-is ingested: is this current, or retrospective? This is the only place in the system where a model's
-answer changes what the pipeline does, and the authority is bounded in one direction only. It is
+is ingested: is this current, or retrospective? This is the model's suppression authority, bounded
+in one direction only. It is
 reached from exactly one call site and only for a `suspect` classification, which the rules set only
 on a message that was about to become an event; the result type admits `archive` from a single branch
 reached only when the model affirms «retrospective» with confidence ≥ 0.7; and every other path —
@@ -543,6 +543,21 @@ one Codex client, so it is audited in `ai_runs` under `surface = 'retrospective_
 `prompt_version = 'retrospective-gate-v1'`. A suppression it produces archives as
 `decision = 'ignored_retrospective_model'`, kept apart from the deterministic word because a replay
 reproduces the first and can never reproduce the second.
+
+**Analytical promotion.** A separate `analytical_threats` switch (migration 040, off by default)
+allows the asynchronous contextual/multimodal classifier to create a public analytical threat after
+the rules refused the message as unrecognised or without a usable assertion/location. The verdict
+must be significant, confidence must meet `ANALYTICAL_THREAT_MIN_CONFIDENCE` (default 0.9), state
+must be `asserted` or `redirected`, threat class must be known, and every destination name is passed
+back through `classifyMessage()` over the production catalogue. Any ambiguous or unknown location
+rejects the whole promotion. Redirects become destination assertions and carry no retraction.
+
+The promoted event uses `ingestThreat()` with forced `evidence_level='unverified'`, a
+`model:<independence_group>` evidence role and reduced risk contribution. Model evidence is excluded
+from two-independent-source confirmation. The ordinary `system_event_log` seam publishes the same
+fact to API/map and Telegram fan-out; subscription evidence thresholds still apply. Official alert
+tables are unreachable from this path. `shadow_classifications.analytical_event_id` links the public
+event back to the exact model verdict and `ai_runs` request.
 
 ### The guided-bomb pattern: a stem is not a word (`v6`)
 
@@ -726,7 +741,7 @@ holds the only copy of the transport decision — the streamed Responses API aga
 overrule the URL — and the only copy of the audit write: every call, including the pre-flight
 refusals that never left the process, lands in `ai_runs` with its prompt, output, duration and
 failure reason. The token goes into one `Authorization` header and nowhere else. Which surfaces may
-call at all — narrative, nightly digest, vector extrapolation, shadow classification — is stored in
+call at all — including narrative, digest, shadow collection and analytical promotion — is stored in
 `codex_settings` and switched from `/ops`; every surface is complete without a model, so a dead session degrades to the
 deterministic text rather than to an error, and model-written prose is always labelled.
 
@@ -962,9 +977,10 @@ reaches a public page directly rather than through Telegram — the commentary u
 rejected wholesale if it invents a digit, a class, an oblast or a forecast, and replaced by the
 deterministic sentences whenever it is. `attack_research` is the opposite extreme: an operator-only
 memo, never scheduled, produced only on an explicit request. Both default to false. Neither can
-create, widen or restore a threat, an alert, a risk signal or a geography — the same warranty every
-switch carries except `retrospective_gate`, which remains the only one with authority over the
-pipeline.
+create, widen or restore a threat, an alert, a risk signal or a geography — except for the two
+deliberately bounded pipeline switches: `retrospective_gate` may only suppress a grey-band
+publication, while `analytical_threats` may only create a labelled unverified assertion from a
+deterministic miss.
 
 ## Event flow
 

@@ -8,7 +8,7 @@ Evidence-first situational awareness for Ukraine: a Telegram bot, responsive sta
 
 - Three official (tier A) alert sources, per-source state reconciliation, and normalized alert periods: the Ukraine Alarm and Alerts.in.ua APIs, plus the official alert channel [@air_alert_ua](https://t.me/air_alert_ua), which needs no API token and works out of the box with the Telegram collector credentials.
 - Two reconciliation models behind one aggregate: snapshot polling for the APIs, and an event-driven path for the channel, which announces raion-level alerts and all-clears one at a time and must never be read as "everything unmentioned is clear".
-- Threat event classifier for UAVs, ballistic and cruise missiles, KABs, aviation, MLRS, artillery, and mortars — v2 vocabulary reading the words the channels actually use (ground-attack S-300/S-400, sea-area launches, naval drones, reconnaissance UAVs, repeat approaches, MiG-31K landings demoted to ambient), with a replayable archived corpus (`npm run classifier:replay`) and an optional model-written shadow second opinion that can never touch an event, an alert or the map.
+- Threat event classifier for UAVs, ballistic and cruise missiles, KABs, aviation, MLRS, artillery, and mortars — with a replayable archived corpus (`npm run classifier:replay`), contextual multimodal model review, and an off-by-default analytical promotion path. Promotion can create only a labelled `unverified` event with catalogue-verified geography; it cannot touch official alerts or withdraw a threat.
 - Evidence levels: `unverified`, `monitoring`, `confirmed`, and `official`.
 - Corroboration by independent source groups; reposts do not count as independent confirmation.
 - Six-hour per-location risk assessment with time decay, source-tier guardrails, validated AI output, and deterministic fallback.
@@ -39,8 +39,8 @@ Evidence-first situational awareness for Ukraine: a Telegram bot, responsive sta
 - Operator-managed catalog of recommended Telegram channels, exposed on the site and through the bot.
 - Codex analytics on a ChatGPT plan, managed entirely from the operations console: an OAuth (PKCE)
   sign-in button instead of a token pasted into `.env` (session stored in PostgreSQL, refreshed
-  automatically, loopback-only callback), a model picker and four per-surface switches — narrative,
-  nightly digest, vector extrapolation, shadow classification — stored in `codex_settings`. The client speaks the streamed
+  automatically, loopback-only callback), a model picker and eight per-surface switches, including
+  separate shadow collection and analytical-threat publication — stored in `codex_settings`. The client speaks the streamed
   Responses API against `chatgpt.com/backend-api/codex` (or `chat/completions` against a compatible
   proxy), audits every call in `ai_runs`, and every surface keeps its deterministic fallback: a
   refused or expired model never breaks the flow, and model-written text is always labelled as such.
@@ -466,8 +466,14 @@ The archive is also what the classifier is tested against and what source trust 
 `npm run classifier:replay` classifies the stored corpus with today's rules and reports what moved —
 by class, by location, and by whether a message raises anything at all, split by direction. The
 shadow classifier, when its `/ops` switch is on, writes a model's second opinion beside each archived
-decision with an `agrees` flag; its product is a reading list of disagreements, never a change to
-state. And the nightly trust run reads the same archive to score every source's last thirty days.
+decision with an `agrees` flag. It receives a bounded same-channel window (8 posts / 30 minutes by
+default), can inspect up to two bounded images, and can use an audio transcript to resolve what is
+moving from where to where and whether the source explicitly withdrew it. Normally its product is a
+reading list of disagreements. With the separate off-by-default `analytical_threats` switch, only a
+high-confidence assertion missed by the rules and resolved through the location catalogue may also
+become a labelled `unverified` event; model withdrawals and official alerts remain structurally
+unreachable. The nightly trust run reads the deterministic archive to score every source's last
+thirty days.
 
 ## Roadmap
 

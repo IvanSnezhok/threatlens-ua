@@ -7,6 +7,7 @@ import {
   type AlertChannelMessage, type AlertTelegramChannel, type MonitoredTelegramChannel
 } from '../services/ingestion.js';
 import { markSourceError, markSourceSuccess } from '../services/operations.js';
+import type { MessageMediaAttachment } from '../types.js';
 import {
   startClassifierBackfill, type BackfillPort, type BackfillRawMessage
 } from '../services/source-backfill.js';
@@ -630,6 +631,26 @@ export interface TelegramCollectorDeps {
   heartbeatMs?: number;
 }
 
+/** Downloads at most one supported attachment, with declared and actual byte caps. */
+export async function telegramAdvisoryMedia(message: any): Promise<MessageMediaAttachment[]> {
+  const document = message?.document;
+  const kind: MessageMediaAttachment['kind'] | null = message?.photo ? 'image'
+    : (message?.voice || message?.audio) ? 'audio' : null;
+  if (!kind || typeof message?.downloadMedia !== 'function') return [];
+  const maxBytes = kind === 'image' ? config.SHADOW_IMAGE_MAX_BYTES : config.SHADOW_AUDIO_MAX_BYTES;
+  if (maxBytes <= 0) return [];
+  const declared = Number(document?.size ?? 0);
+  if (declared > maxBytes) return [];
+  const downloaded = await message.downloadMedia({}).catch(() => undefined);
+  if (!Buffer.isBuffer(downloaded) || downloaded.byteLength === 0 || downloaded.byteLength > maxBytes) return [];
+  const mimeType = kind === 'image' ? 'image/jpeg'
+    : typeof document?.mimeType === 'string' ? document.mimeType : 'audio/ogg';
+  return [{
+    kind, mimeType, bytes: downloaded,
+    fileName: typeof document?.fileName === 'string' ? document.fileName : undefined
+  }];
+}
+
 async function connectDefaultRuntime(): Promise<TelegramCollectorRuntime> {
   const [{ TelegramClient }, { StringSession }, { NewMessage }, { EditedMessage }] = await Promise.all([
     import('teleproto'), import('teleproto/sessions/index.js'), import('teleproto/events/index.js'),
@@ -692,7 +713,7 @@ export async function startTelegramCollector(
 
   const processEvent = async (event: any) => {
     const message = event?.message;
-    if (!message?.message) return;
+    if (!message || (!message.message && !message.photo && !message.voice && !message.audio)) return;
     let route: ChannelRoute | undefined;
     try {
       // The peer id off the event, NOT `message.getChat()`. `getChat` walks
@@ -715,6 +736,7 @@ export async function startTelegramCollector(
       // alert route returns here and can never fall through to the classifier; a classifier route
       // never reaches the alert reconciler, because it is a different branch entirely.
       if (route.kind === 'alert') {
+        if (!message.message) return;
         await ingestAlertChannelMessages(route.sourceId, [{
           externalId: String(message.id),
           publishedAt,
@@ -724,13 +746,18 @@ export async function startTelegramCollector(
         }], log as { warn: Function });
         return;
       }
+      const media = await telegramAdvisoryMedia(message);
       await processMessage({
         sourceId: route.sourceId,
         externalId: String(message.id),
         publishedAt,
         editedAt,
-        text: message.message,
-        rawPayload: { channel: route.username, peerId: String(peerId), id: message.id }
+        text: message.message ?? '',
+        rawPayload: {
+          channel: route.username, peerId: String(peerId), id: message.id,
+          media: media.map((item) => ({ kind: item.kind, mimeType: item.mimeType, bytes: item.bytes.byteLength }))
+        },
+        media
       }, { monitor: route.adapterType === MONITOR_ADAPTER_TYPE });
     } catch (error) {
       // Only the source the message actually belongs to is marked in error. Attributing a failure

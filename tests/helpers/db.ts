@@ -140,7 +140,8 @@ export async function resetDatabase(): Promise<void> {
   // seeded-or-absent by migration 018 rather than truncated, because «no row» already means «all
   // switches off» and truncating would be resetting a row that is not supposed to exist.
   await sql(`UPDATE codex_settings SET model=NULL, narrative_enabled=false, digest_enabled=false,
-             attacks_enabled=false, shadow_enabled=false, retrospective_gate_enabled=false,
+             attacks_enabled=false, shadow_enabled=false, analytical_threats_enabled=false,
+             retrospective_gate_enabled=false,
              tactics_enabled=false, attack_research_enabled=false, updated_at=now()
              WHERE singleton`);
   await sql(`UPDATE telegram_delivery_governor SET tokens=25,last_refill_at=now(),blocked_until=NULL,updated_at=now()

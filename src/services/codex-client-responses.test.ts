@@ -77,6 +77,18 @@ describe('the request the ChatGPT backend accepts', () => {
     expect(result).toMatchObject({ ok: true, content: '{"ok":true}' });
   });
 
+  it('adds bounded image inputs using the Responses vision shape', async () => {
+    let body = '';
+    await codexChat({ ...request, images: [{ dataUrl: 'data:image/png;base64,AA==', detail: 'high' }] }, {
+      credentials, settings, audit,
+      fetchImpl: async (_input, init) => { body = String(init?.body); return sse([completedEvent('{}')]); }
+    });
+    expect(JSON.parse(body).input[0].content).toEqual([
+      { type: 'input_text', text: '{"facts":1}' },
+      { type: 'input_image', image_url: 'data:image/png;base64,AA==', detail: 'high' }
+    ]);
+  });
+
   it('speaks as the client whose id it borrowed', async () => {
     let init: RequestInit | undefined;
     await codexChat(request, {

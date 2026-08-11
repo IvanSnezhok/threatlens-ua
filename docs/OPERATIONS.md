@@ -594,10 +594,10 @@ off.
 ## Codex analytics (operator only)
 
 The whole lifecycle lives in one `/ops` group — «Codex-аналітика»: session status, the sign-in
-button, the model dropdown, the seven surface switches and the `ai_runs` audit viewer. Nothing about
+button, the model dropdown, the eight surface switches and the `ai_runs` audit viewer. Nothing about
 it requires editing `.env` or restarting, except `CODEX_BASE_URL` itself.
 
-The seven, in the order the console shows them and in ascending order of how much authority they
+The eight, in the order the console shows them and in ascending order of how much authority they
 grant:
 
 | switch | what it buys | where the text lands |
@@ -606,6 +606,7 @@ grant:
 | `digest` | prose in the nightly digest | Telegram |
 | `attacks` | **«Формулювання екстраполяції вектора»** | operator only |
 | `shadow` | nothing anybody reads — a comparison table | `/ops` |
+| `analytical_threats` | a catalogue-verified `unverified` event | map/API + opted-in Telegram |
 | `retrospective_gate` | a verdict, not text | the pipeline |
 | `tactics` | commentary under the public tactical block | public attacks page |
 | `attack_research` | the oblast research memo | operator only |
@@ -619,9 +620,12 @@ paragraph they are the only person who can see. The public tactical block has it
 SQL and published either way. `migrations/033_tactics_and_research_switches.sql` carries the same
 sentence as a column comment for anybody who arrives through `psql`.
 
-`retrospective_gate` remains the only switch in the list with authority over the pipeline: every
-other one buys *text*, and turning it off removes a paragraph while the numbers underneath stay the
-same.
+`analytical_threats` and `retrospective_gate` are the two switches with pipeline authority, in
+opposite and bounded directions. The first may turn a deterministic miss into a separately labelled
+`unverified` assertion; the second may turn a grey-band would-publish into archive-only. Analytical
+promotion never counts toward two-source confirmation, never reaches official alert state, and never
+carries a model withdrawal. Telegram delivery still respects the subscription evidence threshold,
+so only «усі згадки» receives an `unverified` analytical event.
 
 ```bash
 # Session: is there one, whose is it, when does it die. Never returns a token.
@@ -656,6 +660,15 @@ Reading it:
   precisely because the moment to turn it off — an exhausted quota mid-attack — is the worst moment
   to edit a file and restart. Its runs audit under `shadow-classifier-v1`; `/ops` shows the agreement
   rate and the newest disagreements, and the follow-up is a pattern and a test, never a state change.
+- **Context is bounded and source-local.** The model sees at most `SHADOW_CONTEXT_MESSAGES` preceding
+  posts from the same `source_id`, no older than `SHADOW_CONTEXT_MINUTES`. Their ids are stored with
+  the verdict. They are never concatenated into the deterministic classifier input, so an old threat
+  cannot be replayed as a new live assertion.
+- **Telegram media is advisory-only.** Photos and voice/audio notes are downloaded only within the
+  configured byte ceilings; raw bytes are not persisted. Images use the selected Codex model's vision
+  input. Telegram OGG voice notes are converted to WebM by `ffmpeg`, then transcribed through
+  `${AI_BASE_URL}/audio/transcriptions` with `AI_API_KEY` and `AI_TRANSCRIPTION_MODEL`. A media-only
+  model disagreement appears in `/ops`; it does not create or withdraw a live threat.
 
 ## Source trust (operator only)
 

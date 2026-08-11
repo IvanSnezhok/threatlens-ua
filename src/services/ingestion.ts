@@ -1332,15 +1332,18 @@ async function archiveClassification(entry: ClassificationLogEntry): Promise<voi
   // is awaited on purpose — the two are independent, neither waits for the other, and the model call
   // is fire-and-forget in both directions.
   //
-  // The text handed over is `classified.summary`: the same message, whitespace-collapsed and capped
-  // at 500 characters. That is what the classifier itself read as far as any human review is
-  // concerned, and taking it from here avoids threading the raw message through four call sites for
-  // a feature that must never be load-bearing.
+  // The original text and envelope are passed because an image/audio-only post can have no useful
+  // deterministic summary, and because an analytical promotion must preserve its source identity.
   scheduleShadowClassification({
     sourceMessageId: entry.sourceMessageId,
+    sourceId: entry.sourceId,
     publishedAt: entry.publishedAt,
-    text: entry.classified.summary,
-    classified: entry.classified
+    text: entry.message?.text ?? entry.classified.summary,
+    classified: entry.classified,
+    media: entry.media,
+    message: entry.message,
+    allowAnalyticalPromotion: entry.decision === 'ignored' || entry.decision === 'unrecognized',
+    historical: entry.historical
   });
   classificationDecisions.inc({ version: CLASSIFIER_VERSION, decision: entry.decision });
   try {
@@ -1426,7 +1429,8 @@ async function classifyAndIngest(message: NormalizedMessage, options: ProcessMes
     }
     await archiveClassification({
       sourceId: message.sourceId, sourceMessageId: outcome.sourceMessageId,
-      publishedAt: message.publishedAt, classified, decision: 'de_escalation',
+      publishedAt: message.publishedAt, classified, decision: 'de_escalation', media: message.media,
+      message, historical: options.historical,
       withdrawal: outcome.withdrawal
     });
     return { deEscalation: true as const, classified, withdrawal: outcome.withdrawal };
@@ -1438,6 +1442,8 @@ async function classifyAndIngest(message: NormalizedMessage, options: ProcessMes
     classificationRejections.inc({ source: message.sourceId, reason: rejection });
     await archiveClassification({
       sourceId: message.sourceId, sourceMessageId, publishedAt: message.publishedAt, classified,
+      media: message.media,
+      message, historical: options.historical,
       // "Recognised nothing", "recognised something that is nowhere" and "recognised a report about
       // last night" are three different findings: the first says the vocabulary has drifted or the
       // message was never about a threat, the second says the place is missing from the catalogue,
@@ -1459,7 +1465,8 @@ async function classifyAndIngest(message: NormalizedMessage, options: ProcessMes
     count('coalesced');
     await archiveClassification({
       sourceId: message.sourceId, sourceMessageId, publishedAt: message.publishedAt, classified,
-      decision: 'coalesced', ignoredReason: 'restated_within_coalesce_window'
+      decision: 'coalesced', ignoredReason: 'restated_within_coalesce_window', media: message.media,
+      message, historical: options.historical
     });
     return { coalesced: true as const };
   }
@@ -1491,7 +1498,8 @@ async function classifyAndIngest(message: NormalizedMessage, options: ProcessMes
       classificationRejections.inc({ source: message.sourceId, reason: 'retrospective_model' });
       await archiveClassification({
         sourceId: message.sourceId, sourceMessageId, publishedAt: message.publishedAt, classified,
-        decision: 'ignored_retrospective_model', ignoredReason: 'retrospective_model'
+        decision: 'ignored_retrospective_model', ignoredReason: 'retrospective_model', media: message.media,
+        message, historical: options.historical
       });
       return { ignored: true as const };
     }
@@ -1506,7 +1514,8 @@ async function classifyAndIngest(message: NormalizedMessage, options: ProcessMes
   }
   await archiveClassification({
     sourceId: message.sourceId, sourceMessageId: result.sourceMessageId,
-    publishedAt: message.publishedAt, classified,
+    publishedAt: message.publishedAt, classified, media: message.media,
+    message, historical: options.historical,
     // `redirect` keeps its own decision because it is the only message class that asserts and
     // withdraws at once; `createdEvent` still records whether the event it asserted was new.
     decision: classified.intent === 'redirect' ? 'redirect' : result.created ? 'event_created' : 'event_merged',

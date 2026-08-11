@@ -2,8 +2,9 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { classifyMessage } from '../domain/classifier.js';
 import type { ClassifiedMessage } from '../types.js';
 import {
-  deterministicVerdict, disagreementFields, normalizePlace, resetShadowMetrics, resetShadowRateLimit,
-  scheduleShadowClassification, shadowClassifierMetrics, shadowClassify, shadowSkipCounts,
+  buildAnalyticalClassification, deterministicVerdict, disagreementFields, normalizePlace,
+  resetShadowMetrics, resetShadowRateLimit, scheduleShadowClassification, shadowClassifierMetrics,
+  shadowClassify, shadowSkipCounts,
   withinRateLimit, type ShadowVerdict
 } from './shadow-classifier.js';
 
@@ -130,6 +131,32 @@ describe('deterministicVerdict', () => {
   });
 });
 
+describe('buildAnalyticalClassification', () => {
+  it('turns a verified destination into a labelled unverified-event payload', () => {
+    const classified = buildAnalyticalClassification(verdict({
+      confidence: 0.96,
+      threatState: 'redirected',
+      locations: ['Черкаси'],
+      destinationLocations: ['Київ'],
+      directionText: 'у напрямку Києва'
+    }), locations, 'Картка: БпЛА прямує на Київ');
+    expect(classified).toMatchObject({
+      intent: 'threat', threatType: 'uav', title: 'Аналітична загроза: Київ',
+      locations: [{ id: 'ua-80', relationType: 'reported_direction' }]
+    });
+    expect(classified?.retraction).toBeUndefined();
+  });
+
+  it.each([
+    verdict({ confidence: 0.89 }),
+    verdict({ confidence: 0.99, threatState: 'withdrawn' }),
+    verdict({ confidence: 0.99, locations: ['Атлантида'], threatState: 'asserted' }),
+    verdict({ confidence: 0.99, significant: false, threatState: 'asserted' })
+  ])('rejects a verdict outside the publication contract', (modelVerdict) => {
+    expect(buildAnalyticalClassification(modelVerdict, locations, 'джерело')).toBeNull();
+  });
+});
+
 describe('withinRateLimit', () => {
   it('allows exactly the budget and refuses the next call', () => {
     const now = 1_000_000;
@@ -165,10 +192,88 @@ describe('shadowClassify', () => {
     });
   });
 
+  it('shows bounded same-channel history as context, not as the current assertion', async () => {
+    const chat = chatReturning(verdict({
+      originLocations: ['Черкаси'], destinationLocations: ['Київ'],
+      directionText: 'з Черкас у напрямку Києва', threatState: 'redirected'
+    }));
+    await shadowClassify(input('далі на Київ'), {
+      chat: chat as never,
+      loadContext: async () => [{
+        id: '00000000-0000-4000-8000-000000000099',
+        publishedAt: new Date('2026-03-01T19:58:00Z'), text: 'БпЛА над Черкасами'
+      }]
+    });
+    const prompt = JSON.parse(chat.mock.calls[0]![0].user);
+    expect(prompt.currentMessage).toBe('далі на Київ');
+    expect(prompt.previousMessages).toEqual([{
+      at: '2026-03-01T19:58:00.000Z', text: 'БпЛА над Черкасами'
+    }]);
+    const insert = query.mock.calls.find(([sql]) => String(sql).includes('INSERT INTO shadow_classifications'))!;
+    expect(JSON.parse((insert[1] as unknown[])[14] as string)).toMatchObject({
+      threatState: 'redirected', originLocations: ['Черкаси'], destinationLocations: ['Київ']
+    });
+  });
+
+  it('transcribes audio and sends images only to the advisory model', async () => {
+    const chat = chatReturning(verdict());
+    await shadowClassify({
+      ...input(''),
+      media: [
+        { kind: 'audio', mimeType: 'audio/ogg', bytes: new Uint8Array([1, 2]) },
+        { kind: 'image', mimeType: 'image/png', bytes: new Uint8Array([3, 4]) }
+      ]
+    }, {
+      chat: chat as never, loadContext: async () => [],
+      transcribe: async () => ({ ok: true, text: 'БпЛА курсом на Київ' })
+    });
+    const request = chat.mock.calls[0]![0];
+    expect(JSON.parse(request.user).audioTranscripts).toEqual(['БпЛА курсом на Київ']);
+    expect(request.images).toHaveLength(1);
+    expect(request.images[0].dataUrl).toMatch(/^data:image\/png;base64,/u);
+  });
+
+  it('does not ask the classifier to guess when a media-only transcription failed', async () => {
+    const chat = chatReturning(verdict());
+    const outcome = await shadowClassify({
+      ...input(''), media: [{ kind: 'audio', mimeType: 'audio/ogg', bytes: new Uint8Array([1]) }]
+    }, {
+      chat: chat as never, loadContext: async () => [],
+      transcribe: async () => ({ ok: false, reason: 'endpoint_error' })
+    });
+    expect(outcome).toEqual({ status: 'skipped', reason: 'model_failed' });
+    expect(chat).not.toHaveBeenCalled();
+  });
+
   it('records a disagreement and the axis it is on', async () => {
     const chat = chatReturning(verdict({ threatType: 'ballistic_missile' }));
     const outcome = await shadowClassify(input('Ударні БпЛА у напрямку Києва'), { chat: chat as never });
     expect(outcome).toMatchObject({ status: 'recorded', agrees: false, fields: ['threat_type'] });
+  });
+
+  it('records and returns the analytical event created by the bounded promotion', async () => {
+    const promote = vi.fn(async () => '00000000-0000-4000-8000-000000000777');
+    const base = input('Картка загроз');
+    const outcome = await shadowClassify({
+      ...base,
+      allowAnalyticalPromotion: true,
+      message: {
+        sourceId: 'monitor', externalId: '42', publishedAt: base.publishedAt,
+        text: 'Картка загроз', rawPayload: {}
+      }
+    }, { chat: chatReturning(verdict({ confidence: 0.96 })) as never, promote });
+    expect(promote).toHaveBeenCalledOnce();
+    expect(outcome.promotedEventId).toBe('00000000-0000-4000-8000-000000000777');
+    expect(query.mock.calls.some(([sql]) => String(sql).includes('analytical_event_id'))).toBe(true);
+  });
+
+  it('collects shadow comparisons without publication when that separate switch is off', async () => {
+    vi.mocked(codexFeatureEnabled).mockImplementation(async (feature) => feature === 'shadow');
+    const promote = vi.fn(async () => 'should-not-run');
+    await shadowClassify({ ...input('Картка загроз'), allowAnalyticalPromotion: true }, {
+      chat: chatReturning(verdict({ confidence: 0.96 })) as never, promote
+    });
+    expect(promote).not.toHaveBeenCalled();
   });
 
   it('writes the comparison with agrees and both verdicts', async () => {

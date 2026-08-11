@@ -261,6 +261,14 @@ export const envSchema = z.object({
   // rather than queued. The switch that turns the feature on at all is `shadow` in `codex_settings`,
   // not an environment variable — see `src/services/codex-settings.ts`.
   SHADOW_CLASSIFIER_MAX_PER_MINUTE: z.coerce.number().int().min(0).max(120).default(6),
+  SHADOW_CONTEXT_MESSAGES: z.coerce.number().int().min(0).max(20).default(8),
+  SHADOW_CONTEXT_MINUTES: z.coerce.number().int().min(1).max(120).default(30),
+  SHADOW_IMAGE_MAX_BYTES: z.coerce.number().int().min(0).max(20_000_000).default(8_000_000),
+  SHADOW_AUDIO_MAX_BYTES: z.coerce.number().int().min(0).max(25_000_000).default(25_000_000),
+  AI_TRANSCRIPTION_MODEL: z.string().default('gpt-transcribe'),
+  // Below this confidence a model verdict remains comparison material only. Publication is also
+  // independently gated by `codex_settings.analytical_threats_enabled` and forced to `unverified`.
+  ANALYTICAL_THREAT_MIN_CONFIDENCE: z.coerce.number().min(0.5).max(1).default(0.9),
 
   // ---- Retrospective gate (model confirmation for the grey band) --------------------------------
   // The only model call in this codebase that sits *inside* the ingestion path, and the only one
@@ -832,6 +840,25 @@ export const APP_SETTINGS: Record<keyof AppConfig, SettingMeta> = {
   },
   SHADOW_CLASSIFIER_MAX_PER_MINUTE: {
     scope: 'db_tunable', group: 'analytics', apply: 'hot', ui: { kind: 'number', min: 0, max: 120 }
+  },
+  SHADOW_CONTEXT_MESSAGES: {
+    scope: 'db_tunable', group: 'analytics', apply: 'hot', ui: { kind: 'number', min: 0, max: 20 }
+  },
+  SHADOW_CONTEXT_MINUTES: {
+    scope: 'db_tunable', group: 'analytics', apply: 'hot', ui: { kind: 'number', min: 1, max: 120, unit: 'хв' }
+  },
+  SHADOW_IMAGE_MAX_BYTES: {
+    scope: 'db_tunable', group: 'analytics', apply: 'hot', ui: { kind: 'number', min: 0, max: 20000000, unit: 'байт' }
+  },
+  SHADOW_AUDIO_MAX_BYTES: {
+    scope: 'db_tunable', group: 'analytics', apply: 'hot', ui: { kind: 'number', min: 0, max: 25000000, unit: 'байт' }
+  },
+  AI_TRANSCRIPTION_MODEL: {
+    scope: 'db_tunable', group: 'analytics', apply: 'hot', ui: { kind: 'text' }
+  },
+  ANALYTICAL_THREAT_MIN_CONFIDENCE: {
+    scope: 'db_tunable', group: 'analytics', apply: 'hot',
+    ui: { kind: 'number', min: 0.5, max: 1 }
   },
   RETROSPECTIVE_GATE_TIMEOUT_MS: {
     scope: 'db_tunable', group: 'analytics', apply: 'hot',

@@ -46,7 +46,8 @@ const configState = vi.hoisted(() => ({
   CLASSIFIER_BACKFILL_MAX_AGE_SECONDS: 21_600, CLASSIFIER_BACKFILL_MAX_MESSAGES: 300,
   CLASSIFIER_BACKFILL_MAX_PAGES: 5, CLASSIFIER_BACKFILL_PAGE_SIZE: 100,
   CLASSIFIER_BACKFILL_MAX_SOURCES_PER_SWEEP: 10, CLASSIFIER_BACKFILL_SOURCE_DELAY_MS: 0,
-  CLASSIFIER_BACKFILL_MIN_RERUN_SECONDS: 3600, CLASSIFIER_BACKFILL_CHECK_INTERVAL_SECONDS: 0
+  CLASSIFIER_BACKFILL_MIN_RERUN_SECONDS: 3600, CLASSIFIER_BACKFILL_CHECK_INTERVAL_SECONDS: 0,
+  SHADOW_IMAGE_MAX_BYTES: 8_000_000, SHADOW_AUDIO_MAX_BYTES: 25_000_000
 }));
 
 const registry = vi.hoisted(() => ({
@@ -108,8 +109,25 @@ vi.mock('../services/operations.js', () => ({
 import { resetAdminNotices, setAdminNoticeBot } from '../bot/admin-notice.js';
 import {
   floodWaitSeconds, requestTelegramCollectorReload, resetTelegramCollectorStatus, resolveChannelPeers, startTelegramCollector,
-  telegramCollectorStatus, type ChannelRoute, type TelegramCollectorRuntime
+  telegramAdvisoryMedia, telegramCollectorStatus, type ChannelRoute, type TelegramCollectorRuntime
 } from './telegram.js';
+
+describe('advisory Telegram media', () => {
+  it('downloads a voice note within the configured cap', async () => {
+    const bytes = Buffer.from([1, 2, 3]);
+    await expect(telegramAdvisoryMedia({
+      voice: {}, document: { size: 3, mimeType: 'audio/ogg' }, downloadMedia: async () => bytes
+    })).resolves.toEqual([{ kind: 'audio', mimeType: 'audio/ogg', bytes, fileName: undefined }]);
+  });
+
+  it('rejects an attachment by declared size before downloading it', async () => {
+    const downloadMedia = vi.fn(async () => Buffer.from([1]));
+    expect(await telegramAdvisoryMedia({
+      audio: {}, document: { size: 30_000_000, mimeType: 'audio/mpeg' }, downloadMedia
+    })).toEqual([]);
+    expect(downloadMedia).not.toHaveBeenCalled();
+  });
+});
 
 // ------------------------------------------------------------------------------------------------
 // Fixtures
@@ -643,6 +661,26 @@ describe('message delivery', () => {
       expect(ingested.alerts[0]?.messages[0]).toMatchObject({
         externalId: '4242', text: '🔴 Повітряна тривога в Броварському районі'
       });
+    } finally { await stop?.(); }
+  });
+
+  it('keeps a captionless threat card on the advisory classifier path', async () => {
+    const fake = fakeClient();
+    const stop = await start(fake);
+    try {
+      const monitor = MONITOR_CHANNELS[4] as string;
+      const bytes = Buffer.from([0xff, 0xd8, 0xff]);
+      expect(await deliver(fake, 'new', channelMessage(monitor, {
+        message: '', photo: {}, downloadMedia: async () => bytes
+      }))).toBe(true);
+      expect(ingested.classifier).toHaveLength(1);
+      expect((ingested.classifier[0]?.message as any).media).toEqual([
+        { kind: 'image', mimeType: 'image/jpeg', bytes, fileName: undefined }
+      ]);
+      expect((ingested.classifier[0]?.message as any).rawPayload.media).toEqual([
+        { kind: 'image', mimeType: 'image/jpeg', bytes: 3 }
+      ]);
+      expect(ingested.alerts).toEqual([]);
     } finally { await stop?.(); }
   });
 

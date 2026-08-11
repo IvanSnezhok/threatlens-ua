@@ -13,6 +13,21 @@ export type RelationType = 'explicit_threat' | 'mentioned' | 'reported_direction
 export const PUBLICATION_MODES = ['live', 'delayed_15s'] as const;
 export type PublicationMode = (typeof PUBLICATION_MODES)[number];
 
+/**
+ * Bounded Telegram media carried to the model classification pipeline.
+ *
+ * The deterministic classifier intentionally reads `text` only. Media-derived text or labels are
+ * model evidence and may be reviewed in `/ops`. With the separate analytical-threat switch on, a
+ * high-confidence assertion with verified geography may create an `unverified` event; media can
+ * never create/cancel an official alert or withdraw a threat.
+ */
+export interface MessageMediaAttachment {
+  kind: 'image' | 'audio';
+  mimeType: string;
+  bytes: Uint8Array;
+  fileName?: string;
+}
+
 export interface NormalizedMessage {
   sourceId: string;
   externalId: string;
@@ -20,6 +35,7 @@ export interface NormalizedMessage {
   editedAt?: Date;
   text: string;
   rawPayload: Record<string, unknown>;
+  media?: MessageMediaAttachment[];
 }
 
 /**

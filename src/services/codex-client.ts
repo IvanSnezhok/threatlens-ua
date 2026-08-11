@@ -72,6 +72,12 @@ export interface CodexChatFailure {
 
 export type CodexChatResult = CodexChatSuccess | CodexChatFailure;
 
+export interface CodexImageInput {
+  /** A bounded data URL produced from Telegram media. Remote URLs are intentionally not accepted. */
+  dataUrl: string;
+  detail?: 'low' | 'high' | 'auto';
+}
+
 export interface CodexChatRequest {
   /** Goes into `ai_runs.prompt_version`; it is what tells three callers apart in the audit log. */
   promptVersion: string;
@@ -90,6 +96,8 @@ export interface CodexChatRequest {
   classifierVersion?: string;
   system: string;
   user: string;
+  /** Optional advisory image inputs. Callers remain responsible for size/type limits. */
+  images?: CodexImageInput[];
   /** Ask for a JSON object back. Callers that parse the reply should always set this. */
   json?: boolean;
   model?: string;
@@ -312,7 +320,14 @@ export async function codexChat(request: CodexChatRequest, deps: CodexClientDeps
         body: JSON.stringify({
           model,
           instructions: request.json ? `${request.system}\n\n${JSON_ONLY_NOTE}` : request.system,
-          input: [{ type: 'message', role: 'user', content: [{ type: 'input_text', text: request.user }] }],
+          input: [{
+            type: 'message', role: 'user', content: [
+              { type: 'input_text', text: request.user },
+              ...(request.images ?? []).map((item) => ({
+                type: 'input_image', image_url: item.dataUrl, detail: item.detail ?? 'auto'
+              }))
+            ]
+          }],
           tools: [],
           tool_choice: 'auto',
           parallel_tool_calls: false,
@@ -332,7 +347,17 @@ export async function codexChat(request: CodexChatRequest, deps: CodexClientDeps
           ...(request.json ? { response_format: { type: 'json_object' } } : {}),
           messages: [
             { role: 'system', content: request.system },
-            { role: 'user', content: request.user }
+            {
+              role: 'user',
+              content: request.images?.length
+                ? [
+                    { type: 'text', text: request.user },
+                    ...request.images.map((item) => ({
+                      type: 'image_url', image_url: { url: item.dataUrl, detail: item.detail ?? 'auto' }
+                    }))
+                  ]
+                : request.user
+            }
           ]
         }),
         signal: AbortSignal.timeout(request.timeoutMs ?? config.AI_TIMEOUT_MS)

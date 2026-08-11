@@ -4007,10 +4007,14 @@ const codexFeatureLabels = {
   // Четвертий перемикач стоїть окремо за суттю, а не лише за порядком: перші три додають текст до
   // того, на що людина вже дивиться, а цей витрачає виклик на КОЖНЕ прийняте повідомлення й не
   // зʼявляється ніде, крім таблиці звірки нижче. Підпис мусить сказати обидві речі: що це тіньовий
-  // режим і що на бойовий шлях він не впливає ніколи.
+  // режим; окремий сусідній перемикач явно пояснює вузьке право на публікацію.
   shadow: {
     title: 'Тіньова класифікація',
-    note: 'Модель читає ті самі повідомлення після того, як правила вже ухвалили рішення, і її вердикт лягає поруч для звірки. На оповіщення, події й карту це не впливає ніколи. Єдиний перемикач, який витрачає виклик на кожне повідомлення, — тому він і найдорожчий.'
+    note: 'Модель читає ті самі повідомлення після рішення правил, а вердикт лягає поруч для звірки. Сам цей перемикач нічого не публікує. Виклик витрачається на кожне повідомлення, тому режим найдорожчий.'
+  },
+  analytical_threats: {
+    title: 'Аналітичні загрози',
+    note: 'Дозволяє високовпевненому вердикту моделі, який правила відхилили, створити окрему неперевірену подію. Вона зʼявиться в API/на мапі та в Telegram для підписок «усі згадки». Географію повторно перевіряє каталог; модель не може оголосити офіційну тривогу чи відбій.'
   },
   // Пʼятий перемикач — єдиний, чий вердикт може щось змінити на бойовому шляху, і зміна ця строго
   // одностороння: «опублікувати» → «лише архів» для повідомлень, які правила вже позначили як
@@ -4125,7 +4129,15 @@ function shadowVerdictLine(label, verdict) {
   const places = verdict.locations?.length ? verdict.locations.join(', ') : 'без локацій';
   const significance = verdict.significant ? 'значуще' : 'проігноровано';
   const confidence = verdict.confidence == null ? '' : ` · впевненість ${verdict.confidence.toFixed(2)}`;
-  return `<p><strong>${escapeHtml(label)}:</strong> ${escapeHtml(verdict.threatType)} · ${escapeHtml(places)} · ${significance}${confidence}</p>`;
+  const states = { asserted: 'загроза наявна', redirected: 'змінила напрямок', withdrawn: 'загрозу знято', uncertain: 'стан невідомий' };
+  const movement = verdict.directionText
+    || (verdict.originLocations?.length || verdict.destinationLocations?.length
+      ? `${verdict.originLocations?.join(', ') || 'невідомо'} → ${verdict.destinationLocations?.join(', ') || 'невідомо'}`
+      : '');
+  const context = verdict.threatState
+    ? ` · ${states[verdict.threatState] || verdict.threatState}${movement ? ` · ${escapeHtml(movement)}` : ''}`
+    : '';
+  return `<p><strong>${escapeHtml(label)}:</strong> ${escapeHtml(verdict.threatType)} · ${escapeHtml(places)} · ${significance}${confidence}${context}</p>`;
 }
 
 // Порожньо буває з двох різних причин, і назвати треба саме ту, що трапилася: вимкнений перемикач —
@@ -4154,6 +4166,7 @@ function opsShadowSection(data, settings) {
         <div><dt>Розбіжностей</dt><dd>${data.disagreed}</dd></div>
         <div><dt>Вікно</dt><dd>${data.windowHours} год</dd></div>
       </dl>
+      <p class="legend-note">Опубліковано аналітичних подій: ${Number(data.promoted || 0)}.</p>
       ${data.byField?.length ? `<p class="legend-note">За осями: ${data.byField.map((row) => `${escapeHtml(shadowFieldName(row.field))} — ${row.count}`).join(', ')}.</p>` : ''}
       <div class="ops-channel-list">${data.recentDisagreements.map((row) => `<article>
         <div>
@@ -4162,6 +4175,8 @@ function opsShadowSection(data, settings) {
           <p>${escapeHtml(row.text)}</p>
           ${shadowVerdictLine('Правила', row.deterministic)}
           ${shadowVerdictLine('Модель', row.model)}
+          ${row.analyticalEventId ? '<p class="legend-note"><strong>Опубліковано як неперевірену аналітичну подію.</strong></p>' : ''}
+          ${(row.contextMessageIds?.length || row.mediaKinds?.length) ? `<p class="legend-note">Контекст: ${row.contextMessageIds?.length || 0} попередніх · медіа: ${escapeHtml(row.mediaKinds?.join(', ') || 'немає')}</p>` : ''}
         </div>
       </article>`).join('')}</div>`;
   return `<section class="ops-section" id="shadow-section">
@@ -4169,7 +4184,7 @@ function opsShadowSection(data, settings) {
       <div><p>Звірка класифікатора</p><h2>Тіньова класифікація</h2></div>
       <button data-shadow-refresh>Оновити</button>
     </header>
-    <p class="legend-note">Модель читає ті самі повідомлення після того, як рішення вже ухвалено правилами. На карту, оповіщення й бота це не впливає ніколи. Розбіжність — не помилка моделі й не помилка правил, а привід прочитати повідомлення.</p>
+    <p class="legend-note">Модель читає повідомлення після рішення правил. Зазвичай вердикт є лише звіркою; якщо оператор окремо ввімкнув «Аналітичні загрози», допустимий високовпевнений вердикт може створити позначену неперевірену подію для мапи/API та Telegram. Офіційні тривоги й відбої лишаються недосяжними.</p>
     ${body}
   </section>`;
 }

@@ -2,22 +2,26 @@ import { Counter } from 'prom-client';
 import { z } from 'zod';
 import { config } from '../config.js';
 import { pool } from '../db/pool.js';
-import { CLASSIFIER_VERSION, significanceRejection } from '../domain/classifier.js';
-import { THREAT_TYPES, type ClassifiedMessage } from '../types.js';
+import {
+  CLASSIFIER_VERSION, classifyMessage, significanceRejection, type LocationLexeme
+} from '../domain/classifier.js';
+import { cachedLocationLexemes, ingestThreat } from '../repositories/events.js';
+import { THREAT_TYPES, type ClassifiedMessage, type NormalizedMessage, type ThreatType } from '../types.js';
 import { codexChat, type CodexFailureReason } from './codex-client.js';
 import { codexFeatureEnabled } from './codex-settings.js';
+import { imageDataUrl, transcribeAudio } from './media-enrichment.js';
 
 /**
  * A model's second opinion on a message the rules have already judged.
  *
  * ## The contract with the live pipeline
  *
- * This module cannot change what anybody sees. It runs *after* the deterministic classification has
- * been made and archived, outside the ingestion transaction, on a promise nobody waits for. Its only
- * product is a row in `shadow_classifications`. There is no branch anywhere in this file that could
- * alter a threat event, an alert, a risk signal or a notification, and there is no return value a
- * caller could act on — {@link scheduleShadowClassification} returns void by design, so that no
- * future edit can quietly start consuming the model's answer.
+ * By default this module only records a second opinion. A separate, off-by-default Ops switch may
+ * promote a narrowly bounded verdict to an `unverified` analytical threat: only when deterministic
+ * rules rejected the current message, confidence is high, state is asserted/redirected, and every
+ * destination resolves through the deterministic location catalogue. Promotion uses the ordinary
+ * event log, so the result reaches both API/map and Telegram. It cannot reach official-alert tables
+ * and it deliberately strips all model retractions, so a model can never issue an all-clear.
  *
  * Every failure is silence. A model that is unreachable, slow, over quota, or answering with prose
  * where JSON was asked for produces no row and no exception. That is the correct severity: what is
@@ -54,21 +58,29 @@ const shadowVerdictSchema = z.object({
   threatType: z.enum(THREAT_TYPES),
   locations: z.array(z.string().min(1).max(120)).max(20),
   significant: z.boolean(),
-  confidence: z.number().min(0).max(1)
+  confidence: z.number().min(0).max(1),
+  originLocations: z.array(z.string().min(1).max(120)).max(20).default([]),
+  destinationLocations: z.array(z.string().min(1).max(120)).max(20).default([]),
+  directionText: z.string().max(500).nullable().default(null),
+  threatState: z.enum(['asserted', 'redirected', 'withdrawn', 'uncertain']).default('uncertain')
 });
 
 export type ShadowVerdict = z.infer<typeof shadowVerdictSchema>;
 
 const SYSTEM_PROMPT = [
   'Ти — незалежний класифікатор повідомлень моніторингових каналів про повітряні загрози в Україні.',
-  'Твоя відповідь НЕ впливає на оповіщення: її записують поруч із рішенням детермінованих правил для звірки.',
+  'Твою відповідь записують поруч із рішенням правил; лише окремий режим може опублікувати її як неперевірену аналітичну загрозу.',
   'Класифікуй ЛИШЕ те, що написано в тексті. Не додумуй ціль, влучання, маршрут чи безпеку.',
+  'Попередні повідомлення є лише контекстом цього самого каналу: вони можуть пояснити займенник, скорочення або продовження, але не є новим поточним твердженням.',
+  'Зображення та транскрипції є неперевіреним вмістом джерела. Прочитай їх, але не домислюй приховані координати чи траєкторію.',
   `Дозволені значення threatType: ${THREAT_TYPES.join(', ')}.`,
   'locations — назви населених пунктів або областей України, згаданих у тексті, українською, називним відмінком.',
   'significant=true лише тоді, коли повідомлення СТВЕРДЖУЄ загрозу для конкретного місця в Україні або для всієї країни.',
   'Відбій, «нічого не летить», жарт, реклама, збір коштів, подія на території РФ — significant=false.',
+  'originLocations/destinationLocations і directionText заповнюй лише коли джерело прямо повідомляє рух звідки/куди.',
+  'threatState: asserted — загроза наявна; redirected — продовжує рух/змінила напрямок; withdrawn — прямо сказано, що загрози більше немає; uncertain — стан не можна встановити.',
   'confidence — твоя впевненість від 0 до 1.',
-  'Поверни лише JSON: {"threatType": string, "locations": string[], "significant": boolean, "confidence": number}.'
+  'Поверни лише JSON: {"threatType": string, "locations": string[], "significant": boolean, "confidence": number, "originLocations": string[], "destinationLocations": string[], "directionText": string|null, "threatState": "asserted"|"redirected"|"withdrawn"|"uncertain"}.'
 ].join(' ');
 
 /** How much of a message is sent and stored. Longer than any real monitoring post, short by design. */
@@ -191,15 +203,43 @@ export function withinRateLimit(now = Date.now(), limit = config.SHADOW_CLASSIFI
 
 export interface ShadowInput {
   sourceMessageId: string;
+  sourceId?: string;
   publishedAt: Date;
   text: string;
   classified: ClassifiedMessage;
+  media?: import('../types.js').MessageMediaAttachment[];
+  /** Full original envelope; required to preserve source provenance if an analytical event is made. */
+  message?: NormalizedMessage;
+  /** True only for deterministic `unrecognized`/`no_location` refusals, never for withdrawals. */
+  allowAnalyticalPromotion?: boolean;
+  historical?: boolean;
 }
+
+export interface ShadowContextMessage { id: string; publishedAt: Date; text: string }
 
 export interface ShadowOptions {
   /** Injected in tests. Defaults to the shared {@link codexChat}. */
   chat?: typeof codexChat;
   now?: () => number;
+  loadContext?: (input: ShadowInput) => Promise<ShadowContextMessage[]>;
+  transcribe?: typeof transcribeAudio;
+  /** Test seam for the post-recording promotion. */
+  promote?: (input: ShadowInput, verdict: ShadowVerdict, model: string) => Promise<string | null>;
+}
+
+export async function loadShadowContext(input: ShadowInput): Promise<ShadowContextMessage[]> {
+  if (!input.sourceId || config.SHADOW_CONTEXT_MESSAGES === 0) return [];
+  const result = await pool.query<{ id: string; published_at: Date; raw_text: string }>(
+    `SELECT id,published_at,raw_text FROM source_messages
+      WHERE source_id=$1 AND id<>$2 AND published_at<=$3
+        AND published_at >= $3 - ($4 || ' minutes')::interval
+      ORDER BY published_at DESC LIMIT $5`,
+    [input.sourceId, input.sourceMessageId, input.publishedAt, String(config.SHADOW_CONTEXT_MINUTES),
+      config.SHADOW_CONTEXT_MESSAGES]
+  );
+  return result.rows.reverse().map((row) => ({
+    id: row.id, publishedAt: new Date(row.published_at), text: row.raw_text.slice(0, 1000)
+  }));
 }
 
 export interface ShadowOutcome {
@@ -208,6 +248,92 @@ export interface ShadowOutcome {
   reason?: 'disabled' | 'rate_limited' | 'empty_text' | 'no_provider' | 'model_failed' | 'write_failed';
   agrees?: boolean;
   fields?: DisagreementField[];
+  promotedEventId?: string;
+}
+
+const THREAT_LABELS: Record<Exclude<ThreatType, 'unknown'>, string> = {
+  uav: 'ударних БпЛА',
+  ballistic_missile: 'балістичних ракет',
+  cruise_missile: 'крилатих ракет',
+  guided_air_bomb: 'керованих авіабомб',
+  aviation: 'бойової авіації',
+  mlrs: 'реактивних систем залпового вогню',
+  artillery: 'артилерії',
+  mortar: 'мінометного обстрілу',
+  combined: 'комбінованої повітряної атаки'
+};
+
+/**
+ * Turns a model verdict into the deliberately smaller event contract.
+ *
+ * Model-written ids are impossible: every name is fed back through the production classifier over
+ * the production catalogue, and a name that does not resolve to exactly one location rejects the
+ * whole promotion. Redirects assert only the destination and carry no retraction object.
+ */
+export function buildAnalyticalClassification(
+  verdict: ShadowVerdict, lexemes: LocationLexeme[], sourceText: string
+): ClassifiedMessage | null {
+  if (!verdict.significant || verdict.threatType === 'unknown') return null;
+  if (verdict.threatState !== 'asserted' && verdict.threatState !== 'redirected') return null;
+  if (verdict.confidence < config.ANALYTICAL_THREAT_MIN_CONFIDENCE) return null;
+  const names = verdict.threatState === 'redirected' && verdict.destinationLocations.length
+    ? verdict.destinationLocations : verdict.locations;
+  if (!names.length) return null;
+
+  const resolved = new Map<string, { id: string; name: string }>();
+  const label = THREAT_LABELS[verdict.threatType];
+  for (const name of names) {
+    const check = classifyMessage(`Загроза ${label} для ${name}.`, lexemes);
+    if (significanceRejection(check) !== null || check.nationalScope || check.locations.length !== 1) {
+      return null;
+    }
+    const location = check.locations[0]!;
+    resolved.set(location.id, { id: location.id, name: location.name });
+  }
+  const locations = [...resolved.values()];
+  if (!locations.length) return null;
+  const placeNames = locations.map((location) => location.name).join(', ');
+  const excerpt = sourceText.replace(/\s+/gu, ' ').trim().slice(0, 300);
+  return {
+    intent: 'threat',
+    threatType: verdict.threatType,
+    signalThreatTypes: [verdict.threatType],
+    locations: locations.map((location) => ({
+      ...location,
+      relationType: verdict.threatState === 'redirected' ? 'reported_direction' : 'explicit_threat'
+    })),
+    nationalScope: false,
+    indicators: ['model_analytical_threat'],
+    directionText: verdict.directionText ?? undefined,
+    title: `Аналітична загроза: ${placeNames}`,
+    summary: `Неперевірена оцінка моделі щодо ${label} для ${placeNames}.${excerpt ? ` Джерело: ${excerpt}` : ''}`
+  };
+}
+
+async function promoteAnalyticalThreat(
+  input: ShadowInput, verdict: ShadowVerdict, model: string
+): Promise<string | null> {
+  if (!input.allowAnalyticalPromotion || !input.message) return null;
+  if (deterministicVerdict(input.classified).significant) return null;
+  const classified = buildAnalyticalClassification(
+    verdict, await cachedLocationLexemes(), input.message.text
+  );
+  if (!classified) return null;
+  const message: NormalizedMessage = {
+    ...input.message,
+    rawPayload: {
+      ...input.message.rawPayload,
+      analyticalThreat: {
+        model, confidence: verdict.confidence, threatState: verdict.threatState,
+        shadowClassifierVersion: CLASSIFIER_VERSION
+      }
+    }
+  };
+  const event = await ingestThreat(message, classified, {
+    historical: input.historical,
+    modelPromotion: { model, confidence: verdict.confidence }
+  });
+  return event.created && event.published ? event.id : null;
 }
 
 /**
@@ -299,14 +425,37 @@ function countOutcome(outcome: ShadowOutcome): ShadowOutcome {
  */
 export async function shadowClassify(input: ShadowInput, options: ShadowOptions = {}): Promise<ShadowOutcome> {
   shadowAttempts.inc();
-  if (!(await codexFeatureEnabled('shadow'))) return countOutcome({ status: 'skipped', reason: 'disabled' });
+  const [shadowEnabled, analyticalEnabled] = await Promise.all([
+    codexFeatureEnabled('shadow'), codexFeatureEnabled('analytical_threats')
+  ]);
+  if (!shadowEnabled && !analyticalEnabled) {
+    return countOutcome({ status: 'skipped', reason: 'disabled' });
+  }
   const text = input.text.trim();
-  if (!text) return countOutcome({ status: 'skipped', reason: 'empty_text' });
+  if (!text && !input.media?.length) return countOutcome({ status: 'skipped', reason: 'empty_text' });
   const now = options.now ?? Date.now;
   if (!withinRateLimit(now())) return countOutcome({ status: 'skipped', reason: 'rate_limited' });
 
   const chat = options.chat ?? codexChat;
-  const prompt = text.slice(0, TEXT_LIMIT);
+  const context = await (options.loadContext ?? loadShadowContext)(input).catch(() => []);
+  const transcribe = options.transcribe ?? transcribeAudio;
+  const transcripts: string[] = [];
+  for (const media of input.media ?? []) {
+    if (media.kind !== 'audio') continue;
+    const result = await transcribe(media).catch(() => ({ ok: false as const }));
+    if (result.ok && result.text) transcripts.push(result.text);
+  }
+  const images = (input.media ?? [])
+    .map(imageDataUrl).filter((dataUrl): dataUrl is string => Boolean(dataUrl))
+    .slice(0, 2).map((dataUrl) => ({ dataUrl, detail: 'high' as const }));
+  if (!text && !transcripts.length && !images.length) {
+    return countOutcome({ status: 'skipped', reason: 'model_failed' });
+  }
+  const prompt = JSON.stringify({
+    previousMessages: context.map((item) => ({ at: item.publishedAt.toISOString(), text: item.text })),
+    currentMessage: text.slice(0, TEXT_LIMIT),
+    audioTranscripts: transcripts
+  });
   const deterministic = deterministicVerdict(input.classified);
 
   const result = await chat({
@@ -315,11 +464,15 @@ export async function shadowClassify(input: ShadowInput, options: ShadowOptions 
     classifierVersion: CLASSIFIER_VERSION,
     system: SYSTEM_PROMPT,
     user: prompt,
+    images,
     json: true,
     // The audit row carries the digest rather than the rendered prompt: the system prompt is a
     // constant that would be repeated on every row, and what is actually worth reading back is the
     // message together with the verdict it was being compared against.
-    auditInput: { text: prompt, deterministic, classifierVersion: CLASSIFIER_VERSION }
+    auditInput: {
+      text: text.slice(0, TEXT_LIMIT), deterministic, classifierVersion: CLASSIFIER_VERSION,
+      contextMessageIds: context.map((item) => item.id), mediaKinds: (input.media ?? []).map((item) => item.kind)
+    }
   }).catch(() => null);
 
   if (!result) return countOutcome({ status: 'skipped', reason: 'model_failed' });
@@ -346,27 +499,43 @@ export async function shadowClassify(input: ShadowInput, options: ShadowOptions 
          source_message_id, classifier_version, published_at,
          deterministic_threat_type, deterministic_locations, deterministic_significant,
          model, model_threat_type, model_locations, model_significant, model_confidence,
-         agrees, disagreement_fields, message_text)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
+         agrees, disagreement_fields, message_text, model_analysis, context_message_ids, media_kinds)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)
        ON CONFLICT (source_message_id, classifier_version) DO NOTHING`,
       [
         input.sourceMessageId, CLASSIFIER_VERSION, input.publishedAt,
         deterministic.threatType, deterministic.locationNames, deterministic.significant,
         result.model, verdict.threatType, verdict.locations, verdict.significant, verdict.confidence,
-        agrees, fields, prompt
+        agrees, fields, text.slice(0, TEXT_LIMIT), JSON.stringify(verdict),
+        context.map((item) => item.id), (input.media ?? []).map((item) => item.kind)
       ]
     );
   } catch {
     return countOutcome({ status: 'skipped', reason: 'write_failed', agrees, fields });
   }
-  return countOutcome({ status: 'recorded', agrees, fields });
+  let promotedEventId: string | null = null;
+  if (analyticalEnabled && input.allowAnalyticalPromotion) {
+    promotedEventId = await (options.promote ?? promoteAnalyticalThreat)(input, verdict, result.model)
+      .catch(() => null);
+    if (promotedEventId) {
+      await pool.query(
+        `UPDATE shadow_classifications SET analytical_event_id=$3
+          WHERE source_message_id=$1 AND classifier_version=$2`,
+        [input.sourceMessageId, CLASSIFIER_VERSION, promotedEventId]
+      ).catch(() => undefined);
+    }
+  }
+  return countOutcome({
+    status: 'recorded', agrees, fields, ...(promotedEventId ? { promotedEventId } : {})
+  });
 }
 
 /**
  * Fire-and-forget entry point for the ingestion path.
  *
- * The promise is dropped on purpose and the return type is void: nothing upstream may wait on a
- * model, and nothing upstream may read what it said. `shadowClassify` already swallows every
+ * The promise is dropped on purpose and the return type is void: ingestion never waits on a model.
+ * When analytical publication is enabled, `shadowClassify` itself performs the bounded promotion
+ * after recording the verdict; nothing upstream branches on the answer. It already swallows every
  * failure; the `catch` here is the belt to that braces, so a bug in the swallowing cannot become an
  * unhandled rejection that takes the process down during an attack.
  *
@@ -416,6 +585,7 @@ export interface ShadowAgreementReport {
   total: number;
   agreed: number;
   disagreed: number;
+  promoted: number;
   /** Null rather than zero when nothing was compared: "0% agreement" and "no data" are opposites. */
   agreementPercent: number | null;
   byField: Array<{ field: string; count: number }>;
@@ -424,14 +594,22 @@ export interface ShadowAgreementReport {
     publishedAt: string;
     text: string;
     deterministic: { threatType: string; locations: string[]; significant: boolean };
-    model: { threatType: string; locations: string[]; significant: boolean; confidence: number | null };
+    model: {
+      threatType: string; locations: string[]; significant: boolean; confidence: number | null;
+      originLocations: string[]; destinationLocations: string[]; directionText: string | null;
+      threatState: 'asserted' | 'redirected' | 'withdrawn' | 'uncertain';
+    };
+    contextMessageIds: string[];
+    mediaKinds: string[];
     fields: string[];
+    analyticalEventId: string | null;
   }>;
 }
 
 export async function shadowAgreement(windowHours = 24, examples = 10): Promise<ShadowAgreementReport> {
-  const totals = await pool.query<{ total: number; agreed: number }>(
-    `SELECT count(*)::int AS total, count(*) FILTER (WHERE agrees)::int AS agreed
+  const totals = await pool.query<{ total: number; agreed: number; promoted: number }>(
+    `SELECT count(*)::int AS total, count(*) FILTER (WHERE agrees)::int AS agreed,
+            count(*) FILTER (WHERE analytical_event_id IS NOT NULL)::int AS promoted
        FROM shadow_classifications
       WHERE published_at > now() - ($1 || ' hours')::interval`,
     [String(windowHours)]
@@ -446,7 +624,8 @@ export async function shadowAgreement(windowHours = 24, examples = 10): Promise<
   const recent = await pool.query(
     `SELECT id, published_at, message_text,
             deterministic_threat_type, deterministic_locations, deterministic_significant,
-            model_threat_type, model_locations, model_significant, model_confidence, disagreement_fields
+            model_threat_type, model_locations, model_significant, model_confidence, disagreement_fields,
+            model_analysis, context_message_ids, media_kinds, analytical_event_id
        FROM shadow_classifications
       WHERE agrees = false AND published_at > now() - ($1 || ' hours')::interval
       ORDER BY published_at DESC LIMIT $2`,
@@ -460,24 +639,36 @@ export async function shadowAgreement(windowHours = 24, examples = 10): Promise<
     total,
     agreed,
     disagreed: total - agreed,
+    promoted: totals.rows[0]?.promoted ?? 0,
     agreementPercent: total ? Math.round((agreed / total) * 1000) / 10 : null,
     byField: fields.rows,
-    recentDisagreements: recent.rows.map((row) => ({
-      id: row.id,
-      publishedAt: new Date(row.published_at).toISOString(),
-      text: row.message_text,
-      deterministic: {
-        threatType: row.deterministic_threat_type,
-        locations: row.deterministic_locations ?? [],
-        significant: row.deterministic_significant
-      },
-      model: {
-        threatType: row.model_threat_type,
-        locations: row.model_locations ?? [],
-        significant: row.model_significant,
-        confidence: row.model_confidence == null ? null : Number(row.model_confidence)
-      },
-      fields: row.disagreement_fields ?? []
-    }))
+    recentDisagreements: recent.rows.map((row) => {
+      const parsed = shadowVerdictSchema.safeParse(row.model_analysis);
+      const analysis = parsed.success ? parsed.data : null;
+      return ({
+        id: row.id,
+        publishedAt: new Date(row.published_at).toISOString(),
+        text: row.message_text,
+        deterministic: {
+          threatType: row.deterministic_threat_type,
+          locations: row.deterministic_locations ?? [],
+          significant: row.deterministic_significant
+        },
+        model: {
+          threatType: row.model_threat_type,
+          locations: row.model_locations ?? [],
+          significant: row.model_significant,
+          confidence: row.model_confidence == null ? null : Number(row.model_confidence),
+          originLocations: analysis?.originLocations ?? [],
+          destinationLocations: analysis?.destinationLocations ?? [],
+          directionText: analysis?.directionText ?? null,
+          threatState: analysis?.threatState ?? 'uncertain'
+        },
+        contextMessageIds: row.context_message_ids ?? [],
+        mediaKinds: row.media_kinds ?? [],
+        fields: row.disagreement_fields ?? [],
+        analyticalEventId: row.analytical_event_id ?? null
+      });
+    })
   };
 }

@@ -47,6 +47,40 @@ describe.skipIf(!integrationDatabaseAvailable)('subscription fanout', () => {
   beforeAll(ensureMigrated);
   beforeEach(resetDatabase);
 
+  describe('model analytical threats', () => {
+    it('publishes one unverified event to API/map and only the opted-in Telegram audience', async () => {
+      await seedUser(8991);
+      await seedSubscription({ chatId: 8991, locationId: OBLAST, minimumEvidenceLevel: 'unverified' });
+      await seedUser(8992);
+      await seedSubscription({ chatId: 8992, locationId: OBLAST, minimumEvidenceLevel: 'monitoring' });
+      const { ingestThreat, liveThreats } = await import('../../src/repositories/events.js');
+      const publishedAt = new Date();
+      const event = await ingestThreat({
+        sourceId: 'demo', externalId: 'analytical-card-1', publishedAt,
+        text: 'Картка загроз: БпЛА на Київщину',
+        rawPayload: { analyticalThreat: { model: 'test-model', confidence: 0.97 } }
+      }, {
+        intent: 'threat', threatType: 'uav', signalThreatTypes: ['uav'],
+        locations: [{ id: OBLAST, relationType: 'reported_direction', name: 'Київська область' }],
+        nationalScope: false, indicators: ['model_analytical_threat'],
+        directionText: 'у напрямку Київщини',
+        title: 'Аналітична загроза: Київська область',
+        summary: 'Неперевірена оцінка моделі щодо БпЛА для Київської області.'
+      }, { modelPromotion: { model: 'test-model', confidence: 0.97 } });
+
+      expect(event.published).toBe(true);
+      expect((await liveThreats(new Date(Date.now() + 1000))).find((row) => row.id === event.id))
+        .toMatchObject({ evidenceLevel: 'unverified', title: 'Аналітична загроза: Київська область' });
+      const evidence = await sql<{ evidence_role: string; confidence: number }>(
+        `SELECT evidence_role,confidence FROM event_evidence WHERE event_id=$1`, [event.id]
+      );
+      expect(evidence.rows[0]).toMatchObject({ evidence_role: 'model:demo', confidence: 0.97 });
+
+      await runFanout();
+      expect(await chatsNotifiedFor(event.id)).toEqual([8991]);
+    });
+  });
+
   describe('bidirectional location hierarchy', () => {
     it('delivers a city-level threat to a subscriber of the parent oblast', async () => {
       await seedUser(9001);
