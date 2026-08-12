@@ -3747,3 +3747,114 @@ body.tv-mode .map-footnote button { font-size: 12px; }
     animation: none !important;
   }
 }
+
+/* ------------------------------------------------------------------------------------------------
+   Вигрузка хронології — позначення рядків і панель над ними
+   ------------------------------------------------------------------------------------------------
+
+   Панель стоїть МІЖ фільтрами і списком, а не над фільтрами й не під списком. Порядок повторює
+   порядок дій: спершу звузити зріз, потім позначити в ньому потрібне, і аж тоді вигрузити. Панель
+   під списком змусила б гортати сотню рядків назад по кнопку, а над фільтрами — читалася б як
+   вигрузка всього, чим вона не є.
+
+   Кольору тут немає навмисно. Решта інтерфейсу домовилася, що колір означає небезпеку; вигрузка
+   не несе жодної, і підсвічена кнопка сперечалася б із мітками доказовості в тому ж полі зору. */
+
+.export-bar {
+  max-width: 1000px;
+  display: flex;
+  align-items: end;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin: -14px 0 22px;
+  padding: 13px 15px;
+  border: 1px solid var(--rule);
+  background: var(--surface);
+}
+.export-bar label {
+  display: grid;
+  gap: 7px;
+  color: var(--bone-4);
+  font: 400 9px/1 var(--mono);
+  letter-spacing: .13em;
+  text-transform: uppercase;
+}
+.export-bar select {
+  min-width: 190px;
+  height: 34px;
+  padding: 0 11px;
+  border: 1px solid var(--rule-2);
+  background: var(--ink-deep);
+  color: var(--bone);
+  font: 400 12px/1 var(--body);
+  color-scheme: dark;
+}
+.export-bar button {
+  min-height: 34px;
+  padding: 0 15px;
+  border: 1px solid var(--rule-3);
+  background: transparent;
+  color: var(--bone-2);
+  font: 600 10px/1 var(--mono);
+  letter-spacing: .12em;
+  text-transform: uppercase;
+  cursor: pointer;
+  transition: color .16s var(--ease), border-color .16s var(--ease);
+}
+.export-bar button:hover:not(:disabled) { border-color: var(--bone); color: var(--bone); }
+/* Вимкнена кнопка мусить читатися як вимкнена, а не як зламана: курсор і прозорість кажуть це
+   раніше, ніж людина встигне натиснути й не зрозуміти, чому нічого не сталося. */
+.export-bar button:disabled { opacity: .4; cursor: not-allowed; }
+/* Чекбокс «позначити всі» — єдина мітка в панелі, яка стоїть у рядок, а не колонкою над полем. */
+.export-bar .pick-all {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 34px;
+  text-transform: none;
+  letter-spacing: .04em;
+  font: 400 12px/1 var(--body);
+  color: var(--bone-2);
+  cursor: pointer;
+}
+.export-bar [data-export-count] {
+  min-height: 34px;
+  display: flex;
+  align-items: center;
+  color: var(--bone-4);
+  font: 400 11px/1 var(--mono);
+  font-variant-numeric: tabular-nums;
+}
+/* Підтвердження займає власний рядок на всю ширину, щоб поява тексту не совала кнопки вбік. */
+.export-bar .export-note {
+  flex-basis: 100%;
+  margin: 2px 0 0;
+  min-height: 15px;
+  color: var(--bone-4);
+  font: 400 11.5px/1.4 var(--body);
+}
+
+/* Колонка чекбоксів додається до наявної сітки хронології першою, а час і текст лишаються там, де
+   були: рядок не має переїжджати через те, що в нього додали спосіб його позначити. */
+.timeline article {
+  grid-template-columns: 26px 170px 1fr;
+  gap: 0 20px;
+}
+.timeline .pick {
+  display: flex;
+  align-items: start;
+  padding-top: 1px;
+  cursor: pointer;
+}
+.timeline .pick input { width: 15px; height: 15px; accent-color: var(--bone-2); cursor: pointer; }
+
+/* Той самий поріг, що й у решти вузьких правил вище (980px), а не власний: два різні breakpoint для
+   однієї сітки дали б смугу ширин, у якій колонка чекбокса вже є, а колонки часу вже немає. */
+@media (max-width: 980px) {
+  /* Вузький екран згортає запис в один стовпець. Чекбокс лишається В ОДНОМУ рядку з часом —
+     власний рядок під галочку коштував би більше висоти, ніж сам запис, — а текст іде під ними на
+     всю ширину, інакше він висів би зсунутим на ширину галочки. */
+  .timeline article { grid-template-columns: 26px 1fr; gap: 8px 12px; }
+  .timeline article > div { grid-column: 1 / -1; }
+  .export-bar select { min-width: 100%; }
+}

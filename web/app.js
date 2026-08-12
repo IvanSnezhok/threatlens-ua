@@ -1,6 +1,9 @@
 import maplibregl from 'maplibre-gl';
 import 'maplibre-gl/dist/maplibre-gl.css';
 import './styles.css';
+import {
+  HISTORY_EXPORT_FORMATS, buildHistoryExport, historyExportFilename, historyExportMime
+} from './history-export.js';
 
 const $ = (selector, root = document) => root.querySelector(selector);
 const threatNames = {
@@ -2837,20 +2840,111 @@ function contentShell(kicker, title, deck) {
 
 async function renderHistory() {
   const root = contentShell('Журнал подій', 'Хронологія', 'Нормалізовані повідомлення з часом, доказовістю та історією змін.');
-  root.innerHTML = `<form class="filter-bar"><label>Територія<select name="location"><option value="">Усі</option>${locations.filter((item) => item.type !== 'country').map((item) => `<option value="${escapeHtml(item.id)}">${escapeHtml(item.name_uk)}</option>`).join('')}</select></label><label>Тип<select name="threatType"><option value="">Усі</option>${Object.entries(threatNames).map(([value,label]) => `<option value="${value}">${escapeHtml(label)}</option>`).join('')}</select></label><label>Доказовість<select name="evidence"><option value="">Усі</option>${Object.entries(evidenceNames).map(([value,label]) => `<option value="${value}">${escapeHtml(label)}</option>`).join('')}</select></label><label>Від<input type="date" name="from"></label><button>Застосувати</button></form><div class="timeline" id="history-results"><p>Завантаження…</p></div>`;
+  root.innerHTML = `<form class="filter-bar"><label>Територія<select name="location"><option value="">Усі</option>${locations.filter((item) => item.type !== 'country').map((item) => `<option value="${escapeHtml(item.id)}">${escapeHtml(item.name_uk)}</option>`).join('')}</select></label><label>Тип<select name="threatType"><option value="">Усі</option>${Object.entries(threatNames).map(([value,label]) => `<option value="${value}">${escapeHtml(label)}</option>`).join('')}</select></label><label>Доказовість<select name="evidence"><option value="">Усі</option>${Object.entries(evidenceNames).map(([value,label]) => `<option value="${value}">${escapeHtml(label)}</option>`).join('')}</select></label><label>Від<input type="date" name="from"></label><button>Застосувати</button></form><div class="export-bar"><label class="pick-all"><input type="checkbox" data-select-all>Позначити всі</label><span data-export-count>Нічого не позначено</span><label>Формат<select name="format">${HISTORY_EXPORT_FORMATS.map((entry) => `<option value="${entry.id}">${escapeHtml(entry.label)}</option>`).join('')}</select></label><button type="button" data-export-save disabled>Зберегти файл</button><button type="button" data-export-copy disabled>Копіювати</button><p class="export-note" data-export-note role="status"></p></div><div class="timeline" id="history-results"><p>Завантаження…</p></div>`;
   const requestedLocation = new URLSearchParams(location.search).get('location');
   if (requestedLocation && locations.some((item) => item.id === requestedLocation)) $('.filter-bar [name="location"]', root).value = requestedLocation;
+  // Записи останнього завантаження і те, що з них позначено. Вибір живе в `Set` за ідентифікатором,
+  // а не прапорцем усередині запису: `loaded` перезаписується цілком на кожному «Застосувати», і
+  // прапорець усередині зник би разом із ним, тоді як окремий набір можна свідомо очистити — що
+  // нижче й робиться, бо позначене за старим фільтром не має тихо поїхати у вигрузку за новим.
+  let loaded = [];
+  const selected = new Set();
+
+  const exportNames = { threat: threatNames, evidence: evidenceNames, status: statusNames, origin: originNames };
+
+  /**
+   * Вмикає панель вигрузки рівно тоді, коли є що вигружати, і показує число.
+   *
+   * Лічильник — не прикраса. Вигрузка мовчки віддає файл, і без цього рядка людина дізнається, що
+   * взяла не ті сімнадцять записів, уже відкривши документ.
+   */
+  const syncSelection = () => {
+    const bar = $('.export-bar', root); if (!bar) return;
+    const count = selected.size;
+    $('[data-export-count]', bar).textContent = count ? `Позначено: ${count}` : 'Нічого не позначено';
+    bar.querySelectorAll('button').forEach((button) => { button.disabled = count === 0; });
+    const all = $('[data-select-all]', root);
+    if (all) { all.checked = count > 0 && count === loaded.length; all.indeterminate = count > 0 && count < loaded.length; }
+  };
+
+  /** Позначені записи в порядку показу, а не в порядку клацання: файл має читатись як хронологія. */
+  const chosen = () => loaded.filter((item) => selected.has(item.id));
+
   const load = async () => {
     const form = $('.filter-bar', root); const params = new URLSearchParams({ limit: '100' });
     new FormData(form).forEach((value, key) => { if (value) params.set(key, key === 'from' ? `${value}T00:00:00.000Z` : String(value)); });
     const response = await fetch(`/api/v1/history?${params}`); const data = await response.json();
+    loaded = Array.isArray(data.items) ? data.items : [];
+    selected.clear();
     // Архів — це те місце, де читач перевіряє, ЩО саме було заявлено й ким. Підпис походження стоїть
     // окремою міткою поруч із доказовістю, а не всередині неї: фільтр «Доказовість» вище лишається
     // фільтром доказовості, і додати до нього «оцінку моделі» ще одним варіантом означало б сказати,
     // що це наступний щабель тієї самої шкали.
-    $('#history-results', root).innerHTML = data.items?.map((item) => `<article data-event="${item.id}"><time>${new Date(item.started_at).toLocaleString('uk-UA')}</time><div><span class="evidence ${item.evidence_level}">${evidenceNames[item.evidence_level]}</span>${isModelOrigin(item.origin) ? `<span class="evidence origin-model">${escapeHtml(originNames.model)}</span>` : ''}<h2>${escapeHtml(item.title)}</h2><p>${escapeHtml(item.summary)}</p><button class="text-button" data-detail="${item.id}">Джерела й зміни →</button></div></article>`).join('') || '<p>За цими фільтрами подій немає.</p>';
+    //
+    // Чекбокс стоїть ПЕРЕД часом і поза блоком тексту: він належить рядку цілком, а не заголовку, і
+    // будь-яке інше місце зробило б його частиною однієї з міток.
+    $('#history-results', root).innerHTML = loaded.map((item) => `<article data-event="${item.id}"><label class="pick"><input type="checkbox" data-pick="${escapeHtml(item.id)}"><span class="visually-hidden">Позначити для вигрузки</span></label><time>${new Date(item.started_at).toLocaleString('uk-UA')}</time><div><span class="evidence ${item.evidence_level}">${evidenceNames[item.evidence_level]}</span>${isModelOrigin(item.origin) ? `<span class="evidence origin-model">${escapeHtml(originNames.model)}</span>` : ''}<h2>${escapeHtml(item.title)}</h2><p>${escapeHtml(item.summary)}</p><button class="text-button" data-detail="${item.id}">Джерела й зміни →</button></div></article>`).join('') || '<p>За цими фільтрами подій немає.</p>';
     document.querySelectorAll('[data-detail]').forEach((button) => button.addEventListener('click', () => void showThreatDetails(button.dataset.detail)));
+    $('#history-results', root).querySelectorAll('[data-pick]').forEach((box) => box.addEventListener('change', () => {
+      if (box.checked) selected.add(box.dataset.pick); else selected.delete(box.dataset.pick);
+      syncSelection();
+    }));
+    syncSelection();
   };
+
+  $('[data-select-all]', root).addEventListener('change', (event) => {
+    const on = event.target.checked;
+    selected.clear();
+    if (on) loaded.forEach((item) => selected.add(item.id));
+    $('#history-results', root).querySelectorAll('[data-pick]').forEach((box) => { box.checked = on; });
+    syncSelection();
+  });
+
+  /**
+   * Дві кнопки — один і той самий рядок, і це навмисно.
+   *
+   * Файл і буфер відрізняються лише тим, куди рядок потрапляє, тож жодна різниця у вмісті між ними
+   * не була б виправдана: людина, яка скопіювала фрагмент, а потім зберегла його ж, має отримати
+   * те саме, інакше вона не зможе довіряти жодному з двох.
+   */
+  const payload = () => buildHistoryExport(chosen(), $('.export-bar [name="format"]', root).value, exportNames);
+
+  const say = (message) => { const note = $('[data-export-note]', root); if (note) note.textContent = message; };
+
+  /** «1 запис», «2 записи», «5 записів» — через ту саму `pluralUk`, що узгоджує числівники всюди. */
+  const records = (count) => `${count} ${pluralUk(count, 'запис', 'записи', 'записів')}`;
+
+  $('[data-export-save]', root).addEventListener('click', () => {
+    const format = $('.export-bar [name="format"]', root).value;
+    const blob = new Blob([payload()], { type: historyExportMime(format) });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url; link.download = historyExportFilename(format);
+    document.body.appendChild(link); link.click(); link.remove();
+    // Звільняти URL одразу після click() не можна в усіх браузерах: завантаження ще не почалося, і
+    // відкликаний обʼєкт лишає порожній файл. Наступний кадр — найраніший безпечний момент.
+    requestAnimationFrame(() => URL.revokeObjectURL(url));
+    say(`Збережено ${records(selected.size)} у файл.`);
+  });
+
+  $('[data-export-copy]', root).addEventListener('click', async () => {
+    const text = payload();
+    try {
+      // `navigator.clipboard` існує лише в захищеному контексті. Резерв через приховане поле —
+      // не забаганка: розгортання за HTTP цілком імовірне у внутрішній мережі, і мовчазна
+      // відмова кнопки там була б єдиним, що людина побачить.
+      if (navigator.clipboard?.writeText) await navigator.clipboard.writeText(text);
+      else {
+        const area = document.createElement('textarea');
+        area.value = text; area.setAttribute('readonly', ''); area.style.position = 'fixed'; area.style.opacity = '0';
+        document.body.appendChild(area); area.select(); document.execCommand('copy'); area.remove();
+      }
+      say(`Скопійовано ${records(selected.size)} у буфер обміну.`);
+    } catch {
+      say('Не вдалося скопіювати. Збережіть файл або дозвольте доступ до буфера обміну.');
+    }
+  });
+
   $('.filter-bar', root).addEventListener('submit', (event) => { event.preventDefault(); void load(); });
   await load();
 }
