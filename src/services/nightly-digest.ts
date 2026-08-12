@@ -17,6 +17,13 @@ interface DigestAssessment {
   explanation: Record<string, unknown>;
   generated_at: Date;
   horizon_end: Date;
+  /**
+   * Скільки з врахованих сигналів цієї оцінки підняла модель, а не правила. Заповнює
+   * {@link modelSignalCounts} після основного запиту; поле необовʼязкове саме тому, що воно
+   * дописується згодом, і відсутнє значення означає «жодного», а не «невідомо» — оцінка без
+   * жодного модельного сигналу не потрапляє у відповідь того запиту взагалі.
+   */
+  model_signals?: number;
 }
 
 function kyivParts(now: Date): { date: string; minutes: number; time: string } {
@@ -34,13 +41,27 @@ function kyivParts(now: Date): { date: string; minutes: number; time: string } {
 // ------------------------------------------------------------------------------------------------
 //
 // Що читає людина о 23:20 — це список оцінок, який згенерував детермінований рушій ризику. Модель
-// не бере участі в жодному числі з цього списку; вона лише може додати один підсумковий рядок
+// не пише жодного числа з цього списку; вона лише може додати один підсумковий рядок
 // під переліком, який стисло каже, на що дивитися першим. Вимкнена — дайджест точно такий, яким був завжди.
+//
+// Чого цей коментар не казав, доки міг: модель не пише числа, але з увімкненим
+// `analytical_threats_enabled` (migration 040) вона може ПІДНЯТИ сигнал, з якого це число зібрано —
+// внесок 0.3 у `risk_signals` (src/repositories/events.ts). Для читача це різні речі: «індекс
+// порахували з того, що повідомили джерела» і «частину індексу порахували з того, що припустила
+// модель». Тому нижче рахується, скільки саме сигналів модельні, і це число їде в payload разом із
+// готовим реченням про нього — див. {@link modelSignalCounts} і {@link modelSignalDisclosure}.
 
 export interface DigestFacts {
   time: string;
-  locations: Array<{ locationName: string; threatType: string; level: string; indicativePercent: number | null; score: string }>;
+  locations: Array<{
+    locationName: string; threatType: string; level: string; indicativePercent: number | null;
+    score: string;
+    /** Скільки сигналів під цією оцінкою дала модель. 0 — коли жодного. */
+    modelSignals: number;
+  }>;
   omitted: number;
+  /** Скільки модельних сигналів у всьому переліку. 0 — коли жодного. */
+  modelSignals: number;
 }
 
 /** Рівно ті факти, які потрапляють у повідомлення. Модель не бачить нічого понад це. */
@@ -52,10 +73,71 @@ export function digestFacts(rows: DigestAssessment[], omitted: number, time: str
       threatType: row.threat_type,
       level: row.risk_level,
       indicativePercent: row.indicative_percent,
-      score: row.risk_score
+      score: row.risk_score,
+      modelSignals: row.model_signals ?? 0
     })),
-    omitted
+    omitted,
+    modelSignals: rows.reduce((sum, row) => sum + (row.model_signals ?? 0), 0)
   };
+}
+
+/**
+ * Скільки з врахованих сигналів кожної оцінки підняла модель.
+ *
+ * Ознака модельного походження береться з `shadow_classifications.analytical_event_id`
+ * (migrations/040_model_analytical_threats.sql:13-18), а не з `threat_events.origin`
+ * (migrations/041_threat_event_origin.sql), і це не байдужий вибір. `origin` описує АВТОРСТВО ПОДІЇ
+ * і навмисно не скидається, коли в модельну подію пізніше вливається повідомлення людини
+ * (src/repositories/events.ts, гілка UPDATE). Через `origin` кожен такий людський сигнал
+ * порахувався б як модельний — і дайджест сказав би читачеві, що припущенням є те, що насправді
+ * повідомило джерело. Тут же питання інше: не «хто створив подію», а «хто підняв ЦЕЙ сигнал», а на
+ * нього відповідає лише рядок тіньової класифікації того самого повідомлення: `analytical_event_id`
+ * непорожній рівно тоді, коли вердикт моделі пройшов усі охоронці й став подією.
+ *
+ * Окремим запитом, а не скалярним підзапитом у переліку оцінок вище: той перелік — добуток підписок
+ * на оцінки, і одна оцінка по Києву повторюється в ньому стільки разів, скільки людей підписано на
+ * Київ. Підзапит рахував би те саме число тисячі разів; тут ідентифікатори спершу згорнуто в
+ * множину, і рахунок робиться один раз на оцінку.
+ *
+ * Обидві сторони запиту йдуть по індексах, які вже є: `ANY($1::uuid[])` — по первинному ключу
+ * `risk_assessment_signals(assessment_id,signal_id)` (migrations/001_init.sql:156-162), EXISTS — по
+ * `shadow_classifications (source_message_id, classifier_version)`
+ * (migrations/020_shadow_classifications.sql:58). Жодного нового індексу це не потребує; EXISTS
+ * замість JOIN — щоб дві версії класифікатора над одним повідомленням не подвоїли лічильник.
+ */
+export async function modelSignalCounts(assessmentIds: string[]): Promise<Map<string, number>> {
+  if (!assessmentIds.length) return new Map();
+  const counts = await pool.query<{ assessment_id: string; model_signals: number }>(
+    `SELECT ras.assessment_id::text AS assessment_id, count(*)::int AS model_signals
+       FROM risk_assessment_signals ras
+       JOIN risk_signals rs ON rs.id=ras.signal_id
+      WHERE ras.assessment_id = ANY($1::uuid[])
+        AND EXISTS (SELECT 1 FROM shadow_classifications sc
+                     WHERE sc.source_message_id=rs.source_message_id
+                       AND sc.analytical_event_id IS NOT NULL)
+      GROUP BY 1`,
+    [assessmentIds]
+  );
+  return new Map(counts.rows.map((row) => [row.assessment_id, row.model_signals]));
+}
+
+/**
+ * Речення про модельний внесок — або нічого.
+ *
+ * Порогу тут немає навмисно: один модельний сигнал у переліку так само означає, що частину індексу
+ * зібрано з припущення, як і десять. А от порожня згадка («модельних сигналів: 0») знецінює саме те
+ * попередження, заради якого рядок існує, тому нуль дає `null`, і повідомлення лишається таким,
+ * яким було завжди.
+ *
+ * Окремого перемикача цей рядок не має, і не має свідомо. Модельні сигнали взагалі існують лише
+ * тоді, коли оператор увімкнув `analytical_threats_enabled` (migration 040, DEFAULT false), — тобто
+ * за замовчуванням рахунок дорівнює нулю й ніхто нічого нового не бачить. Вимикач, який ховає
+ * попередження, але лишає самі модельні сигнали в індексі, був би гіршим за його відсутність:
+ * попередження, яке можна вимкнути окремо від того, про що воно попереджає, — це не попередження.
+ */
+export function modelSignalDisclosure(modelSignals: number): string | null {
+  if (modelSignals <= 0) return null;
+  return `Частину сигналів (${modelSignals}) дала модель — вони не підтверджені джерелом.`;
 }
 
 const DIGEST_SYSTEM_PROMPT = [
@@ -143,8 +225,13 @@ export async function enqueueNightlyDigests(now = new Date()): Promise<number> {
      ORDER BY s.chat_id::text,a.risk_score DESC,a.generated_at DESC`,
     [current.date]
   );
+  // Одне звернення до бази на всі оцінки цього прогону — і лише тоді, коли є про що питати. Порожній
+  // перелік тут — звичайний стан кожного тику після першого успішного прогону за ніч (усіх підписників
+  // уже відсіяв NOT EXISTS вище), тож зайвого запиту в цьому циклі не зʼявляється.
+  const modelSignals = await modelSignalCounts([...new Set(assessments.rows.map((row) => row.id))]);
   const grouped = new Map<string, DigestAssessment[]>();
   for (const assessment of assessments.rows) {
+    assessment.model_signals = modelSignals.get(assessment.id) ?? 0;
     const rows = grouped.get(assessment.chat_id) ?? [];
     rows.push(assessment); grouped.set(assessment.chat_id, rows);
   }
@@ -193,13 +280,24 @@ export async function enqueueNightlyDigests(now = new Date()): Promise<number> {
             locationName: row.location_name, threatType: row.threat_type, score: row.risk_score,
             level: row.risk_level, indicativePercent: row.indicative_percent,
             confidence: row.assessment_confidence, explanation: row.explanation,
-            horizonEnd: row.horizon_end
+            horizonEnd: row.horizon_end,
+            // Порядково, а не лише підсумком: попередження про модельний внесок стосується не всього
+            // переліку однаково, і форматувальник має мати чим позначити саме ту оцінку, у якій цей
+            // внесок є. Нуль тут — звичайний стан рядка, а не відсутність даних.
+            modelSignals: row.model_signals ?? 0
           })),
           omitted: facts.omitted,
           // Позначка їде разом із текстом, а не виводиться з його наявності: повідомлення форматує
           // інший модуль, і він не має здогадуватися, звідки взявся рядок.
           aiSummary: summary.text,
-          aiGenerated: summary.aiGenerated
+          aiGenerated: summary.aiGenerated,
+          // Атрибуція модельного внеску — і числом, і вже готовим реченням. Число тут тому, що воно
+          // потрапило в оцінки й має бути видимим у payload для розбору інциденту заднім числом;
+          // речення — тому, що формулювання попередження належить тому, хто знає, що саме модель
+          // зробила, а не форматувальнику повідомлень. `null` означає «модельних сигналів не було»,
+          // і саме на цьому `null` форматувальник має мовчати: порожня згадка знецінює попередження.
+          modelSignals: facts.modelSignals,
+          modelDisclosure: modelSignalDisclosure(facts.modelSignals)
         })]
       );
       await client.query(

@@ -230,6 +230,73 @@ export function riskLevelChangedLine(previous: unknown, next: unknown, direction
   return `${movement}: ${levelLabel(previous)} → ${levelLabel(next)}`;
 }
 
+// ------------------------------------------------------------------------------------------------
+// The public channel (model analysis)
+// ------------------------------------------------------------------------------------------------
+
+/**
+ * Wording for the one thing the project's own Telegram channel publishes: an unverified estimate a
+ * model produced from a message the deterministic rules refused (`threat_events.origin='model'`,
+ * migration 041, promoted by `promoteAnalyticalThreat` in `src/services/shadow-classifier.ts`).
+ *
+ * ## Why this is a different voice and not a re-used one
+ *
+ * Every other message in this file is addressed to somebody who ASKED for it: a subscriber picked a
+ * territory, a threat type and an evidence threshold, and the wording can assume that context. A
+ * channel post is read by whoever happens to see it — forwarded, screenshotted, quoted without the
+ * line above it. So the disclaimer is not a footnote here, it is the first line: whatever survives
+ * the forward has to carry «це не тривога» with it.
+ *
+ * ## Why the format has to LOOK different from an alert, not merely say so
+ *
+ * `CONTEXT.md` puts official signals above analysis, and the way a reader applies that ordering at
+ * 03:00 is by shape, not by reading. An official alert opens with 🔴 and a bold «Повітряна тривога —
+ * <місце>»; a threat warning opens with ⚠️. Neither marker may appear here, and the heading is
+ * deliberately NOT «<місце> — <загроза>»: a post that shares its silhouette with an alert is a post
+ * that gets read as one, and the disclaimer underneath does not undo that.
+ *
+ * ## What is deliberately absent
+ *
+ * The model's own confidence, although the promotion path has it (`ANALYTICAL_THREAT_MIN_CONFIDENCE`
+ * gates on it and `analytical_outcomes` records it). A self-reported 0.93 printed next to a place
+ * name reads as «93% що прилетить», which is not what it means and not something this system can
+ * claim; the same argument `indicativePercent` carries the word «індикативний» for. It stays in
+ * `/ops`, where the audience knows what it is measuring.
+ *
+ * Like everything else in this module the output is plain text; escaping belongs to the caller —
+ * here `formatMessage` in `src/bot/outbox.ts`, which is also where the HTML layout lives.
+ */
+export const MODEL_CHANNEL_DISCLAIMER =
+  'Оцінка моделі. Не підтверджено джерелом. Не є офіційною тривогою.';
+
+/** «Аналітична оцінка · ударні БпЛА» — the class of threat, never the place, on the heading line. */
+export function modelAnalysisHeading(threatType: unknown): string {
+  return `Аналітична оцінка · ${threatLabel(threatType)}`;
+}
+
+/**
+ * What the reader should do, which is nothing.
+ *
+ * The subscriber-facing threat message says «перейдіть до укриття», because it is built from a
+ * source a human wrote. This one must not: acting on a model guess is the behaviour that makes the
+ * next real warning ignorable, and naming the official signal as the trigger is the only way to say
+ * so without also implying that the estimate is worthless.
+ */
+export const MODEL_CHANNEL_ACTION =
+  'Дій за цією оцінкою вживати не потрібно. Підстава для укриття — офіційне сповіщення про '
+  + 'тривогу та сирена.';
+
+/**
+ * What the channel is, stated in the channel itself.
+ *
+ * A reader who finds a channel that posts about air threats will assume it warns them; a channel
+ * that only ever carries model estimates and never an official alert or an all-clear has to say so
+ * in every post, because the post that is forwarded is the only one somebody sees.
+ */
+export const MODEL_CHANNEL_STANDING =
+  'Публікується автоматично, без перевірки людиною. Офіційні тривоги й відбої в цей канал не '
+  + 'потрапляють.';
+
 // A leading run of emoji, bullets and dashes is how monitoring channels open almost every post. The
 // bot already prints its own status emoji, so keeping theirs produces "⚠️ Київ … ⚠️Загроза".
 // Written as an alternation rather than one character class on purpose: an emoji is a sequence

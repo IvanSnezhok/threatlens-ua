@@ -1,9 +1,10 @@
 import { createHash } from 'node:crypto';
 import type { PoolClient } from 'pg';
+import { config } from '../config.js';
 import { CLASSIFIER_VERSION } from '../domain/classifier.js';
 import type { TerritoryNode } from '../domain/territory-state.js';
 import { pool } from '../db/pool.js';
-import type { ClassifiedMessage, EvidenceLevel, LiveEvent, NormalizedMessage } from '../types.js';
+import type { ClassifiedMessage, EvidenceLevel, LiveEvent, NormalizedMessage, ThreatOrigin } from '../types.js';
 
 /**
  * ================================================================================================
@@ -648,6 +649,18 @@ export async function ingestThreat(
     const sourceRow = source.rows[0] ?? { tier: 'C', official: false, independence_group: message.sourceId };
     const evidenceLevel: EvidenceLevel = options.modelPromotion ? 'unverified'
       : sourceRow.official ? 'official' : sourceRow.tier === 'B' ? 'monitoring' : 'unverified';
+    // Authorship, on its own axis. `evidenceLevel` above sends a Tier C human channel and a model
+    // promotion to the same word — `unverified` — because corroboration really is absent in both
+    // cases; that is correct and stays. What was missing is that a reader could not tell the two
+    // apart afterwards: the only marks of model authorship were `classified.indicators` (consumed
+    // in this transaction, never stored) and `raw_payload -> 'analyticalThreat'` (a join and a JSON
+    // path away from every public read). Now it is a column, written from the same option that
+    // already decides evidence, contribution and evidence_role below, so the four cannot disagree.
+    //
+    // Derived here rather than by the caller for the same reason `evidenceLevel` is: `ingestThreat`
+    // is the only writer of `threat_events`, and a promotion that forgot to pass the origin would
+    // publish a model claim labelled as rule output — the exact confusion this column exists to end.
+    const origin: ThreatOrigin = options.modelPromotion ? 'model' : 'deterministic';
     const eventLocations = classified.nationalScope
       ? [{ id: 'ua', name: 'Україна', relationType: 'mentioned' as const }]
       : classified.locations;
@@ -724,6 +737,16 @@ export async function ingestThreat(
       //
       // `$3 >= last_observed_at` reads the row's PRE-UPDATE value: PostgreSQL evaluates every SET
       // expression against the old tuple, so the guard and the assignment beside it cannot disagree.
+      //
+      // `origin` is deliberately absent from this statement, and it is absent in both directions.
+      // A promotion never reaches here at all — the guard above returns the moment a matching event
+      // already exists — so this branch cannot write `model` onto a rule-authored event. The other
+      // direction is the interesting one: a human message merging into an event the model created
+      // does NOT reset `origin` to `deterministic`. Authorship is a fact about how the row came to
+      // exist and it does not stop being true when a channel later reports the same thing; what
+      // that report changes is corroboration, and corroboration is `evidence_level`, which this
+      // statement does raise. Clearing the flag here would erase the disclosure at the exact moment
+      // the event grows — the reader would watch a model guess quietly become an ordinary report.
       await client.query(
         `UPDATE threat_events SET
            summary=CASE WHEN $6::boolean THEN summary
@@ -759,13 +782,13 @@ export async function ingestThreat(
       // still in the archive an operator and a reader can page through — which is the whole point of
       // replaying the window at all.
       const result = await client.query<{ id: string }>(
-        `INSERT INTO threat_events(threat_type,status,evidence_level,title,summary,started_at,last_observed_at,direction_text,valid_until,ended_at)
-         VALUES ($1,$2,$3,$4,$5,$6::timestamptz,$6::timestamptz,$7,$6::timestamptz + interval '30 minutes',
+        `INSERT INTO threat_events(threat_type,status,evidence_level,origin,title,summary,started_at,last_observed_at,direction_text,valid_until,ended_at)
+         VALUES ($1,$2,$3,$9,$4,$5,$6::timestamptz,$6::timestamptz,$7,$6::timestamptz + interval '30 minutes',
            CASE WHEN $8 THEN $6::timestamptz + interval '30 minutes' ELSE NULL END) RETURNING id`,
         [classified.threatType,
           outsideWindow ? 'expired' : evidenceLevel === 'official' ? 'active' : 'observed', evidenceLevel,
           classified.title, classified.summary, message.publishedAt, classified.directionText ?? null,
-          outsideWindow]
+          outsideWindow, origin]
       );
       eventId = result.rows[0]!.id;
     }
@@ -974,6 +997,13 @@ export async function liveThreats(cutoff: Date): Promise<LiveEvent[]> {
     threatType: row.threat_type,
     status: row.status,
     evidenceLevel: row.evidence_level,
+    // `e.*` above already carries the column; it is mapped explicitly because everything else on
+    // this object is, and because a reader of `LiveEvent` must not have to know that a model event
+    // is the `unverified` one whose indicators happened to say so. COALESCE guards the one window
+    // in which the column can be missing: a server binary that has this mapper but is talking to a
+    // database where migration 041 has not run yet. `deterministic` is the safe answer there — it
+    // under-claims nothing, it only omits a disclosure the database cannot yet make.
+    origin: row.origin ?? 'deterministic',
     title: row.title,
     summary: row.summary,
     startedAt: row.started_at.toISOString(),
@@ -1268,4 +1298,256 @@ export async function locationTimeline(locationId: string, cutoff: Date, limit =
 export async function systemVersion(): Promise<number> {
   const result = await pool.query<{ version: string }>('SELECT COALESCE(max(version),0) version FROM system_event_log');
   return Number(result.rows[0]?.version ?? 0);
+}
+
+// ------------------------------------------------------------------------------------------------
+// Taking a model event back
+// ------------------------------------------------------------------------------------------------
+
+/**
+ * ================================================================================================
+ * Why an early exit for analytical events exists at all, and why it is a SEPARATE function
+ * ================================================================================================
+ *
+ * The retraction path above — {@link applyRetraction} and every branch that calls it — is gated on
+ * `!options.modelPromotion` (see the transit branch in {@link ingestThreat}). That gate is not a
+ * limitation to be worked around: a model allowed to withdraw is a model that can take a *human*
+ * source's live warning off a public map, and `CONTEXT.md` §Межі безпеки puts that outside what
+ * analysis may ever do. It stays exactly as it is, and nothing below relaxes it.
+ *
+ * What the gate leaves behind is the opposite problem. A wrong MODEL event has exactly one exit —
+ * {@link THREAT_VALIDITY_MS} elapsing and `expireThreatEvents` retiring it — so an operator watching
+ * an obviously false analytical pin (a news retrospective read as a live threat, a homonym resolved
+ * into the wrong oblast) has no button for up to half an hour, on a surface people read to decide
+ * whether to move to a shelter.
+ *
+ * This function is that button, and it is deliberately not a parameter on the existing path:
+ *
+ *  - **The guard is a WHERE clause, not a caller's discipline.** `origin='model'` appears in the
+ *    UPDATE itself, so handing this function the id of a deterministic event updates zero rows. Had
+ *    the capability been added as `applyRetraction(..., { operator: true })`, the same guarantee
+ *    would depend on every future edit of a 60-line function preserving one condition.
+ *  - **It cannot widen.** There is no source scope, no location list and no threat-type list to get
+ *    wrong: the unit of work is one event id, and the blast radius is one row plus its audit.
+ *  - **It never reads or writes `threat_assertions`.** The assertion attached to a promoted event is
+ *    a *human channel's* claim about a place — the model only classified it — and an operator
+ *    removing the model's reading of a post does not make the post unsaid. Leaving the assertions
+ *    alone is safe precisely because the event cannot come back: the merge lookup in
+ *    {@link ingestThreat} matches only `status IN ('observed','confirmed','active')`, so a later
+ *    message about the same place and class opens a NEW event with its own authorship rather than
+ *    reviving this one.
+ *  - **`alert_source_states`, `alert_periods`, `risk_signals` and `notification_outbox` are not
+ *    reached from here, and no call path leads from this function to `reconcileAggregateAlert`.**
+ *    The risk signals in particular are left running on their own six-hour expiry: the message was
+ *    still published, and decaying its contribution would be this path editing the analytic index of
+ *    an oblast, which is a second surface and a second mandate.
+ *
+ * **`withdrawn`, not `expired` or `corrected`.** All three are in the CHECK on `threat_events.status`
+ * (migrations/001_init.sql:78) and only one of them is true. `expired` means the validity window ran
+ * out and is written by `expireThreatEvents` when `valid_until <= now()`; this path fires *before*
+ * that deadline by construction, so writing `expired` would state that a window elapsed while
+ * `valid_until` on the same row says it has not. `corrected` means a newer message replaced this
+ * event and carries a replacement id nobody has here. `withdrawn` means the claim was taken back,
+ * which is exactly what happened — and it is already the word `web/app.js` renders as «відкликано»
+ * and the one `liveThreats` keeps visible while `ended_at > cutoff`, so the delayed map loses the pin
+ * in the same frame that explains it instead of before it.
+ */
+export type AnalyticalWithdrawalMode = 'operator' | 'auto_unconfirmed';
+
+export interface AnalyticalWithdrawalRequest {
+  /** Free prose for the audit row. Bounded 8..500 by the CHECK in migration 042. */
+  reason: string;
+  /** Ops account, or the literal `'system'` for {@link withdrawUnconfirmedAnalyticalEvents}. */
+  withdrawnBy: string;
+  mode?: AnalyticalWithdrawalMode;
+}
+
+/**
+ * The four refusals are reported apart rather than collapsed into a boolean.
+ *
+ * `not_model` is the one that matters: an operator who is told only "nothing happened" learns
+ * nothing about *why*, and the answer «this event was not written by the model, so this button does
+ * not apply to it» is the single most important thing this surface can say. Distinguishing it from
+ * `not_found` does reveal that an id exists, which every public read in this file is careful never to
+ * do — but the only caller is behind `/ops` Basic auth, where the caller can already list every
+ * event, and refusing to say which of two refusals happened would make the guarantee unverifiable by
+ * the person responsible for it.
+ */
+export interface AnalyticalWithdrawalResult {
+  outcome: 'withdrawn' | 'not_found' | 'not_model' | 'not_live';
+  eventId: string;
+  previousStatus: string | null;
+  origin: ThreatOrigin | null;
+  /** The `system_event_log` version the withdrawal was written at; `null` when nothing was written. */
+  version: number | null;
+}
+
+/**
+ * Ends one model-authored threat event early, and nothing else.
+ *
+ * Five statements in one transaction, in this order:
+ *
+ *  1. `SELECT ... FOR UPDATE` — the row is pinned so a concurrent `expireThreatEvents` sweep or a
+ *     merging message cannot move the status between the check and the write. The read is what
+ *     produces the *diagnosis* (`not_found` / `not_model` / `not_live`); it is not what produces the
+ *     safety, which is point 2.
+ *  2. `UPDATE ... WHERE id=$1 AND origin='model' AND status = ANY(live)` — the guarantee, restated in
+ *     the statement that actually mutates. If the `FOR UPDATE` check above were ever deleted,
+ *     reordered or refactored into a helper that forgot it, this WHERE would still update zero rows
+ *     for a deterministic event. `rowCount === 0` therefore aborts the whole transaction rather than
+ *     continuing to write an audit row for a change that did not happen.
+ *  3. `event_updates` — the same lifecycle trail every other transition in this file leaves, so the
+ *     dialog behind the marker renders «стан: відкликано» from the same table as always. The
+ *     evidence level is carried across unchanged: state and evidence are different axes, and how
+ *     well corroborated the claim was does not change because the claim was taken back.
+ *  4. `analytical_withdrawals` — the audit (migration 042), in the SAME transaction, so «withdrawn»
+ *     and «recorded as withdrawn» cannot become different sets.
+ *  5. `system_event_log` — THE SEAM. Without this row the map keeps drawing the pin until the next
+ *     full snapshot: SSE walks this table and nothing else. `threat.withdrawn` is reused rather than
+ *     a new type invented, because every consumer already handles it correctly — `web/app.js:823`
+ *     removes the marker, `analytics-scheduler.ts:67` recomputes, and `bot/outbox.ts:246` refuses to
+ *     send it, which is what keeps a withdrawal from becoming a second Telegram message about a
+ *     threat that no longer exists.
+ *
+ * **The payload carries a fixed token, never `reason` or `withdrawnBy`.** `system_event_log` is read
+ * by the public `/api/v1/stream`; an operator's free-prose note ("прибрав, канал жартує") and the ops
+ * account name are internal and would be published verbatim by the very act of recording them. The
+ * prose lives in `analytical_withdrawals`, which no public read touches.
+ */
+export async function withdrawAnalyticalEvent(
+  eventId: string, request: AnalyticalWithdrawalRequest
+): Promise<AnalyticalWithdrawalResult> {
+  const mode: AnalyticalWithdrawalMode = request.mode ?? 'operator';
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const current = await client.query<{ status: string; origin: ThreatOrigin; evidence_level: EvidenceLevel }>(
+      `SELECT status,origin,evidence_level FROM threat_events WHERE id=$1 FOR UPDATE`, [eventId]
+    );
+    const row = current.rows[0];
+    const refuse = (outcome: AnalyticalWithdrawalResult['outcome']): AnalyticalWithdrawalResult => ({
+      outcome, eventId, previousStatus: row?.status ?? null, origin: row?.origin ?? null, version: null
+    });
+    if (!row) {
+      await client.query('ROLLBACK');
+      return refuse('not_found');
+    }
+    // The check an operator sees. The one that *holds* is in the UPDATE below.
+    if (row.origin !== 'model') {
+      await client.query('ROLLBACK');
+      return refuse('not_model');
+    }
+    if (!LIVE_STATUSES.includes(row.status)) {
+      await client.query('ROLLBACK');
+      return refuse('not_live');
+    }
+    const closed = await client.query(
+      `UPDATE threat_events SET status='withdrawn',ended_at=now(),updated_at=now()
+        WHERE id=$1 AND origin='model' AND status = ANY($2::text[])`,
+      [eventId, LIVE_STATUSES]
+    );
+    // Unreachable while the `FOR UPDATE` above holds the row, and deliberately handled anyway: this
+    // branch is what makes the WHERE clause the guard rather than a duplicate of the check. Anything
+    // that ever makes the two disagree ends as a rollback, never as an audit row without a change.
+    if (!closed.rowCount) {
+      await client.query('ROLLBACK');
+      return refuse('not_live');
+    }
+    await client.query(
+      `INSERT INTO event_updates(event_id,previous_status,new_status,previous_evidence_level,
+         new_evidence_level,reason)
+       VALUES ($1,$2,'withdrawn',$3,$3,$4)`,
+      [eventId, row.status, row.evidence_level,
+        mode === 'operator' ? 'operator_withdrew_analytical_event' : 'analytical_event_unconfirmed']
+    );
+    await client.query(
+      `INSERT INTO analytical_withdrawals(event_id,previous_status,reason,withdrawn_by,mode)
+       VALUES ($1,$2,$3,$4,$5)`,
+      [eventId, row.status, request.reason, request.withdrawnBy, mode]
+    );
+    const version = await appendSystemEvent(client, 'threat.withdrawn', {
+      eventId,
+      reason: mode === 'operator' ? 'operator_withdrew_analytical_event' : 'analytical_event_unconfirmed'
+    });
+    await client.query('COMMIT');
+    return { outcome: 'withdrawn', eventId, previousStatus: row.status, origin: 'model', version };
+  } catch (error) {
+    await client.query('ROLLBACK');
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
+/**
+ * The reason a promoted event is closed by the sweep, in the audit row. A constant rather than prose
+ * at the call site so that every unattended withdrawal in the table reads identically and an operator
+ * can tell the sweep's rows from a human's by the text alone, not only by `mode`.
+ */
+const UNCONFIRMED_CLOSE_REASON =
+  'Автоматичне закриття: аналітична подія простояла без підтвердження жодним джерелом.';
+
+/**
+ * Closes model events that stood their configured time and that nothing corroborated.
+ *
+ * The case this exists for is the one an operator cannot be relied on to catch: a model whose
+ * calibration has drifted produces a steady drip of plausible-looking pins at three in the morning,
+ * each individually below the threshold of "obviously wrong" and collectively the thing that turns
+ * the unverified layer from a residue into what the map mostly shows. Nobody presses a button per
+ * pin at that hour.
+ *
+ * **Corroboration is the absence of a non-model evidence row, and that is a deliberate choice of
+ * definition.** `event_evidence.evidence_role` carries the bare independence group for a
+ * deterministic message and `model:<group>` for a promotion ({@link ingestThreat}), so a row that is
+ * NOT `model:%` means a message the deterministic rules themselves accepted has since been attached
+ * to this event — a human channel said the same thing about the same place inside the merge window.
+ * That is the identical exclusion the `two_independent_tier_a_or_b_sources` promotion above uses,
+ * which is the point: one definition of "somebody else said this too", not two that can drift.
+ * `evidence_level <> 'unverified'` is checked as well, because an official or Tier B merge raises it
+ * and the two conditions must never be able to disagree about the same row.
+ *
+ * **Off unless configured.** `minutes <= 0` returns immediately without touching the database — this
+ * function makes a published pin disappear sooner than a reader was told it would, so the shipped
+ * default (`ANALYTICAL_UNCONFIRMED_CLOSE_MINUTES`, `src/config.ts`) is 0 and switching it on is a
+ * deliberate act. A threshold above {@link THREAT_VALIDITY_MS} would be a no-op — `expireThreatEvents`
+ * already retires the row at `valid_until` — so config bounds it below that.
+ *
+ * The clock is `created_at`, never `started_at`. `started_at` is the publisher's declared time and a
+ * back-dated post would make an event "already overdue" the instant it was created; `created_at` is
+ * when WE put it on the map, which is what "стояла N хвилин" means to the person reading it.
+ *
+ * Each candidate goes through {@link withdrawAnalyticalEvent} rather than through a bulk UPDATE, so
+ * there is exactly ONE statement in this codebase that can end a model event and exactly one place
+ * where `origin='model'` has to be true. A batch UPDATE here would be faster and would be a second
+ * place to get the guard wrong. The candidate list is bounded so one pass cannot emit an unbounded
+ * number of SSE frames.
+ */
+export const UNCONFIRMED_CLOSE_BATCH_SIZE = 50;
+
+export async function withdrawUnconfirmedAnalyticalEvents(
+  minutes = config.ANALYTICAL_UNCONFIRMED_CLOSE_MINUTES,
+  limit = UNCONFIRMED_CLOSE_BATCH_SIZE
+): Promise<AnalyticalWithdrawalResult[]> {
+  if (minutes <= 0) return [];
+  const candidates = await pool.query<{ id: string }>(
+    `SELECT e.id FROM threat_events e
+      WHERE e.origin='model'
+        AND e.status = ANY($1::text[])
+        AND e.evidence_level='unverified'
+        AND e.created_at <= now() - ($2::text || ' minutes')::interval
+        AND NOT EXISTS (
+          SELECT 1 FROM event_evidence ee
+           WHERE ee.event_id=e.id AND ee.evidence_role NOT LIKE 'model:%'
+        )
+      ORDER BY e.created_at
+      LIMIT $3`,
+    [LIVE_STATUSES, String(minutes), limit]
+  );
+  const results: AnalyticalWithdrawalResult[] = [];
+  for (const candidate of candidates.rows) {
+    results.push(await withdrawAnalyticalEvent(candidate.id, {
+      reason: UNCONFIRMED_CLOSE_REASON, withdrawnBy: 'system', mode: 'auto_unconfirmed'
+    }));
+  }
+  return results;
 }

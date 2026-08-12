@@ -76,7 +76,38 @@ export interface NarrativeFacts {
   laggingSources: Array<{ sourceId: string; followUps: number; medianLagSeconds: number | null }>;
   unreadableSources: Array<{ sourceId: string; messages: number; unreadablePercent: number }>;
   indicators: Array<{ indicator: string; messages: number }>;
+  /**
+   * How much of this window a model authored rather than the rules. `0` on any installation that
+   * has never switched `analytical_threats_enabled` on (migration 040 ships it false), which is
+   * what keeps this field invisible by default.
+   */
+  modelSignals: { messages: number };
 }
+
+/**
+ * The indicator a promoted model verdict carries, and the reason this file counts it instead of
+ * joining `threat_events.origin`.
+ *
+ * `buildAnalyticalClassification` in `./shadow-classifier.ts` writes exactly this one indicator on
+ * every promotion, and `strikeComposition` in `./analytics-archive.ts` already aggregates
+ * `message_classifications.indicators` inside the same window, under the same version filter, as
+ * every other number here. So the count comes out of the overview this module was handed rather
+ * than out of a query of its own — which matters more than tidiness: {@link narrateOverview} is a
+ * pure function of a {@link StrategicOverview}, `narrativeFor` memoises on the facts it produces,
+ * and a database read hidden inside it would make the memo key depend on something the memo cannot
+ * see.
+ *
+ * The count is of MESSAGES the model raised, not of events, and the field name says so. Migration
+ * 041's `threat_events.origin` answers a different question — who authored the event — and
+ * deliberately keeps `model` when a human report later merges into a model-created event, so
+ * counting events by origin would describe corroborated ground as model guesswork.
+ *
+ * Bounded by `window.limit` (100 by default) like every other indicator row, and the classifier's
+ * indicator vocabulary is a closed list an order of magnitude smaller than that, so the truncation
+ * is theoretical. If it ever bit, the count would be understated and the disclosure would go
+ * missing — never the other way round, which is the failure direction a disclosure may have.
+ */
+export const MODEL_ANALYTICAL_INDICATOR = 'model_analytical_threat';
 
 function round(value: number, digits = 0): number {
   const factor = 10 ** digits;
@@ -169,7 +200,16 @@ export function narrativeFacts(overview: StrategicOverview): NarrativeFacts {
         sourceId: row.sourceId, messages: row.messages, unreadablePercent: round(row.unreadableShare * 100, 1)
       })),
     indicators: overview.composition.indicators.slice(0, 8)
-      .map((row) => ({ indicator: row.indicator, messages: row.messages }))
+      .map((row) => ({ indicator: row.indicator, messages: row.messages })),
+    // Summed over the WHOLE indicator list, not over the eight rows above, and over every classifier
+    // version in the window. The eight are a top-N for a paragraph to talk about; this is a
+    // disclosure, and a disclosure that disappears because the model was the ninth most common
+    // indicator that month is not one.
+    modelSignals: {
+      messages: overview.composition.indicators
+        .filter((row) => row.indicator === MODEL_ANALYTICAL_INDICATOR)
+        .reduce((sum, row) => sum + row.messages, 0)
+    }
   };
 }
 
@@ -307,7 +347,11 @@ function describe(facts: NarrativeFacts): ModelNarrative {
   return {
     headline: `За ${facts.window.days} днів: ${facts.totals.eventsRaised} подій з ${facts.totals.messages} повідомлень.`,
     findings,
-    caveats
+    // The model-contribution line belongs to the deterministic text as much as to the model's,
+    // because the numbers it qualifies are the same numbers either way. Applied here rather than at
+    // each return site so that every deterministic path — no provider, a rejected answer, the
+    // cooldown fallback in `narrativeFor` — carries it without having to remember to.
+    caveats: withModelSignalMarker(caveats, facts)
   };
 }
 
@@ -490,8 +534,8 @@ export async function narrateOverview(
         await audit('success', 'passed', provider.model, facts, parsed, Date.now() - started);
       }
       return {
-        ...parsed, caveats: withAiMarker(parsed.caveats), generatedBy: 'model', aiGenerated: true,
-        model: provider.model, rejectionReason: null, facts
+        ...parsed, caveats: withModelSignalMarker(withAiMarker(parsed.caveats), facts),
+        generatedBy: 'model', aiGenerated: true, model: provider.model, rejectionReason: null, facts
       };
     } catch (error) {
       // Malformed JSON or a reply the schema refuses. Still `'rejected'`: the model answered and
@@ -565,6 +609,37 @@ export async function narrateOverview(
  */
 export function withAiMarker(caveats: string[]): string[] {
   const marker = 'Текст переписано мовною моделлю з готових агрегатів; усі числа перевірено на збіг із детермінованим розрахунком.';
+  return caveats.includes(marker) ? caveats : [...caveats, marker];
+}
+
+/**
+ * The sentence that says part of the count came from a model rather than from a source.
+ *
+ * A different disclosure from {@link withAiMarker} and the two are not interchangeable: that one is
+ * about who wrote the PROSE, this one is about where the NUMBERS came from. A narrative can be
+ * deterministic prose over partly model-authored figures, which is precisely the case a reader has
+ * no way to spot — the paragraph reads like every other month.
+ *
+ * Nothing is said when the count is zero. The empty version («модельних сигналів: 0») would appear
+ * on every installation that never switched promotion on, and a warning printed a hundred times
+ * where it does not apply is a warning nobody reads the hundred-and-first time. Zero is also the
+ * default state: `analytical_threats_enabled` ships false (migration 040), so on an untouched
+ * deployment this function returns its input unchanged and no surface changes at all.
+ *
+ * ## Why the number here cannot break the grounding guard
+ *
+ * The guard rejects a narrative containing a number the facts do not support, and it runs in
+ * {@link verifyNarrative} over the MODEL's text only, before this line is appended. The count is
+ * nonetheless grounded by construction — it is read out of {@link NarrativeFacts}, which is exactly
+ * what {@link groundedNumbers} walks — so appending it can never produce a text that would have
+ * failed the check it bypasses. That equivalence is what the case «never states a number the guard
+ * would have rejected» beside this file pins down; deriving the count here from anything other than
+ * `facts` would silently break it.
+ */
+export function withModelSignalMarker(caveats: string[], facts: NarrativeFacts): string[] {
+  const messages = facts.modelSignals.messages;
+  if (messages <= 0) return caveats;
+  const marker = `Частину сигналів у вікні дала модель (${messages}) — вони не підтверджені джерелом і лишаються неперевіреними.`;
   return caveats.includes(marker) ? caveats : [...caveats, marker];
 }
 

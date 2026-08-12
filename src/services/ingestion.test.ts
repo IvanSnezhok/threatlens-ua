@@ -110,6 +110,7 @@ describe('metric registration', () => {
     'threatlens_threat_to_de_escalation_total',
     'threatlens_shadow_attempts_total',
     'threatlens_shadow_outcomes_total',
+    'threatlens_analytical_promotions_blocked_total',
     'threatlens_retrospective_gate_attempts_total',
     'threatlens_retrospective_gate_outcomes_total',
     'threatlens_ingestion_leg_runs_total',

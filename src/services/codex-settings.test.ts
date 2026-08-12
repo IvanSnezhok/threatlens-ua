@@ -18,7 +18,7 @@ const stored: CodexSettings = {
   model: null,
   features: {
     narrative: false, digest: false, attacks: false, shadow: false, analytical_threats: false,
-    retrospective_gate: false, tactics: false, attack_research: false
+    analytical_enrichment: false, retrospective_gate: false, tactics: false, attack_research: false
   },
   updatedAt: '2026-08-08T00:00:00.000Z'
 };
@@ -72,14 +72,14 @@ describe('applying a patch', () => {
       model: 'o5',
       features: {
         narrative: true, digest: true, attacks: false, shadow: true, analytical_threats: true,
-        retrospective_gate: true, tactics: true, attack_research: false
+        analytical_enrichment: false, retrospective_gate: true, tactics: true, attack_research: false
       }
     };
     const next = applySettingsPatch(current, { features: { digest: false } });
     expect(next.model).toBe('o5');
     expect(next.features).toEqual({
       narrative: true, digest: false, attacks: false, shadow: true, analytical_threats: true,
-      retrospective_gate: true, tactics: true, attack_research: false
+      analytical_enrichment: false, retrospective_gate: true, tactics: true, attack_research: false
     });
   });
 
@@ -97,7 +97,7 @@ describe('applying a patch', () => {
     const next = applySettingsPatch(stored, { features: { attacks: true } });
     expect(next.features).toEqual({
       narrative: false, digest: false, attacks: true, shadow: false, analytical_threats: false,
-      retrospective_gate: false, tactics: false, attack_research: false
+      analytical_enrichment: false, retrospective_gate: false, tactics: false, attack_research: false
     });
   });
 
@@ -127,6 +127,19 @@ describe('applying a patch', () => {
     expect(stored.features.analytical_threats).toBe(false);
     expect(applySettingsPatch(stored, { features: { shadow: true } }).features.analytical_threats)
       .toBe(false);
+  });
+
+  it('defaults model enrichment off, and grants it separately from publication', () => {
+    // Migration 045. The two names are similar and the authorities are not: `analytical_threats`
+    // creates a public event where the rules made none, `analytical_enrichment` only records what the
+    // model read on top of one the rules did publish. An operator granting the first must not
+    // discover they granted the second, in either direction — which is exactly what a shared flag,
+    // or a default of "follow the neighbour", would do.
+    expect(stored.features.analytical_enrichment).toBe(false);
+    expect(applySettingsPatch(stored, { features: { analytical_threats: true } })
+      .features.analytical_enrichment).toBe(false);
+    expect(applySettingsPatch(stored, { features: { analytical_enrichment: true } })
+      .features.analytical_threats).toBe(false);
   });
 
   it('defaults the tactical commentary off, because it is the only switch that writes in public', () => {

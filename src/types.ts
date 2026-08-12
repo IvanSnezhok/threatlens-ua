@@ -4,6 +4,20 @@ export const THREAT_TYPES = [
 ] as const;
 export type ThreatType = typeof THREAT_TYPES[number];
 export type EvidenceLevel = 'official' | 'confirmed' | 'monitoring' | 'unverified';
+/**
+ * Who authored a threat event — the deterministic rules, or a promoted model verdict.
+ *
+ * Deliberately NOT folded into {@link EvidenceLevel}. That type answers "how well corroborated",
+ * and a fifth value there would be read by every existing consumer as a fifth rung of the same
+ * ladder: `strongestEvidence` in `src/repositories/events.ts` would have to rank it against
+ * `official`, and `CONFIRMING_EVIDENCE` in `web/app.js` would have to decide whether it confirms.
+ * The two axes are independent — a model event is always `unverified`, but an `unverified` event is
+ * usually a human channel nobody has corroborated yet — so they are two columns and two types.
+ *
+ * The vocabulary is the pair migrations 016 and 034 already use for the same distinction — a model
+ * either wrote this or it did not; see `migrations/041_threat_event_origin.sql`.
+ */
+export type ThreatOrigin = 'deterministic' | 'model';
 export type RelationType = 'explicit_threat' | 'mentioned' | 'reported_direction' | 'official_alert' | 'aftermath';
 
 /**
@@ -100,6 +114,12 @@ export interface LiveEvent {
   threatType: ThreatType;
   status: string;
   evidenceLevel: EvidenceLevel;
+  /**
+   * Beside `evidenceLevel`, never instead of it. `web/app.js` reads the pair: `unverified` alone
+   * prints «не перевірено», and `unverified` + `model` adds «оцінка моделі», because those are two
+   * different claims and the map used to make them look identical.
+   */
+  origin: ThreatOrigin;
   title: string;
   summary: string;
   startedAt: string;

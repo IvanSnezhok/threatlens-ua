@@ -1,12 +1,14 @@
 import type { Bot } from 'grammy';
 import { Counter, type Registry } from 'prom-client';
+import { config } from '../config.js';
 import { pool } from '../db/pool.js';
 import { relatedLocationsCte } from '../repositories/events.js';
 import { onAlertPoke } from '../services/alert-poke.js';
 import {
+  MODEL_CHANNEL_ACTION, MODEL_CHANNEL_DISCLAIMER, MODEL_CHANNEL_STANDING,
   cleanSummary, confidenceLabel, evidenceRaisedLine, evidenceStatement, extensionLine,
-  geographyChangedLine, humanMoment, levelLabel, riskLevelChangedLine, threatLabel,
-  threatTypeChangedLine, validUntilLine
+  geographyChangedLine, humanMoment, levelLabel, modelAnalysisHeading, riskLevelChangedLine,
+  threatLabel, threatTypeChangedLine, validUntilLine
 } from './humanize.js';
 import {
   decideAssessmentNotification, decideThreatNotification, geographyKey, mergePublishedState,
@@ -158,6 +160,80 @@ async function rememberAssessmentState(args: {
        location_id=EXCLUDED.location_id,last_risk_level=EXCLUDED.last_risk_level,
        last_score=EXCLUDED.last_score,last_notified_at=now(),expires_at=EXCLUDED.expires_at,updated_at=now()`,
     [args.entityKey, args.chatId, args.locationId, args.riskLevel, args.score]
+  );
+}
+
+/**
+ * Below every subscriber notification, and below the quiet threshold.
+ *
+ * `deliverBatch` sends anything at priority 3 or above with `disable_notification`, and a model
+ * estimate is the last thing that should buzz a channel audience at 03:00 — the reader did not pick
+ * a territory and cannot have wanted this more than the warning it is not. 5 sits under the soft
+ * threat update (4), which is itself the quietest subscriber-facing row.
+ *
+ * Priority only orders the non-`protected` half of a batch; the class in `delivery-governor.ts` is
+ * what keeps these rows out of the alert half entirely.
+ */
+const CHANNEL_PUBLICATION_PRIORITY = 5;
+
+/**
+ * Queues one post per enabled channel for a model-authored event, at most once per event, ever.
+ *
+ * ## What the statement is shaped around
+ *
+ * Everything happens in ONE statement because two would have a gap. The claim in
+ * `channel_published_events` (migration 044) is what decides whether a message exists at all, and if
+ * it were written first and the outbox insert then failed, the event would be marked published and
+ * never queued — a silently lost post, which for a public channel means a gap a reader can see and
+ * we cannot explain. Writing the outbox row first would have the opposite failure: a post with no
+ * claim behind it, publishable again on the next pass of the fan-out cursor. The data-modifying CTE
+ * makes them the same statement, so the primary key on (channel_id, event_id) is a decision about
+ * the message rather than a note taken beside it.
+ *
+ * ## Why the origin guard is repeated in SQL
+ *
+ * The caller has already checked `origin='model'`, and the `EXISTS` below checks it again against
+ * the row itself. This is the same argument `withdrawUnconfirmedAnalyticalEvents` makes in
+ * `src/repositories/events.ts`: a guard that is a WHERE clause holds for every future caller,
+ * including one that reaches this function from somewhere else with a threat row it read
+ * differently. The domain rule it enforces is not a preference — official alerts and deterministic
+ * threat events must not reach this channel through this path at all (migration 044 header) — and a
+ * rule of that weight should not be one `if` away from being wrong.
+ *
+ * `evidence_level='unverified'` is part of the same guard rather than an extra caution. A model
+ * event keeps `origin='model'` after a human message merges into it (migration 041) while its
+ * evidence level rises, and at that point the channel format — which opens by calling itself an
+ * unconfirmed model estimate — would be describing the event incorrectly. Such an event is simply
+ * not published; it is not a model estimate any more, it is a corroborated report, and a corroborated
+ * report reaching a public channel is a separate decision nobody has made.
+ */
+async function publishModelAnalysisToChannels(args: {
+  eventId: string; threat: any; locationLabel: string; source: Record<string, string>;
+}): Promise<void> {
+  if (!config.PUBLICATION_CHANNEL_ENABLED) return;
+  if (args.threat.origin !== 'model' || args.threat.evidence_level !== 'unverified') return;
+  await pool.query(
+    `WITH claimed AS (
+       INSERT INTO channel_published_events(channel_id,event_id,outbox_id)
+       SELECT c.id,$1::uuid,gen_random_uuid() FROM publication_channels c
+       WHERE c.enabled=true AND c.publishes='model_analysis'
+         AND EXISTS (SELECT 1 FROM threat_events e
+                     WHERE e.id=$1::uuid AND e.origin='model' AND e.evidence_level='unverified')
+       ON CONFLICT (channel_id,event_id) DO NOTHING
+       RETURNING channel_id,outbox_id
+     )
+     INSERT INTO notification_outbox(id,event_id,publication_channel_id,chat_id,notification_type,
+       idempotency_key,priority,payload)
+     SELECT claimed.outbox_id,$1::uuid,claimed.channel_id,c.chat_id,'channel_publication',
+            $1||':channel:'||claimed.channel_id,$3::integer,$2::jsonb
+     FROM claimed JOIN publication_channels c ON c.id=claimed.channel_id
+     ON CONFLICT (idempotency_key) DO NOTHING`,
+    [args.eventId, JSON.stringify({
+      locationName: args.locationLabel, threatType: args.threat.threat_type,
+      summary: args.threat.summary, evidenceLevel: args.threat.evidence_level,
+      origin: args.threat.origin, validUntil: args.threat.valid_until,
+      lastObservedAt: args.threat.last_observed_at, ...args.source
+    }), CHANNEL_PUBLICATION_PRIORITY]
   );
 }
 
@@ -323,6 +399,14 @@ async function enqueueForEvent(event: any) {
         snapshot: mergePublishedState(published, snapshot)
       });
     }
+    // Subscribers first, the public channel after, and never the other way round. The people who
+    // asked to be warned are the audience this worker exists for; the channel is a publication, and
+    // a publication that went out while a warning was still being queued would have the priority of
+    // this system backwards. Both are idempotent, so a throw between them costs a retry of the whole
+    // event and nothing else.
+    await publishModelAnalysisToChannels({
+      eventId: entityId, threat, locationLabel: names, source: threatSource
+    });
     return;
   }
   if (event.event_type === 'assessment.updated') {
@@ -464,6 +548,31 @@ export function formatMessage(row: any, now: Date = new Date()): string {
         sourceLine(p)
       );
   }
+  // The public channel, and the only message in this function that is not addressed to somebody who
+  // asked for it. Three things about its shape are load-bearing rather than decorative:
+  //
+  //  * the disclaimer is the FIRST line, before the threat class and before the place. A channel post
+  //    is read forwarded and screenshotted, and whatever survives that has to carry «це не тривога»;
+  //  * the marker is 🤖 and the heading is «Аналітична оцінка · <клас>», never «<місце> — <загроза>».
+  //    The alert branches above open with 🔴/⚪ and a bold place name and the subscriber threat
+  //    message with ⚠️; a reader at 03:00 sorts these by silhouette, not by reading, so the estimate
+  //    must not have the silhouette of an alert. This is the CONTEXT.md ordering — official signals
+  //    above analysis — expressed in the one place the reader actually applies it;
+  //  * the branch sits BELOW the two alert branches, like the threat delta path does, so no payload
+  //    shape can route an official alert into a format that begins by disclaiming itself.
+  if (row.notification_type === 'channel_publication') {
+    const summary = cleanSummary(p.summary);
+    return `🤖 <i>${html(MODEL_CHANNEL_DISCLAIMER)}</i>\n\n`
+      + `<b>${html(modelAnalysisHeading(p.threatType))}</b>\n${html(p.locationName)}`
+      + (summary ? `\n\n${html(summary)}` : '')
+      + `\n\n${MODEL_CHANNEL_ACTION}`
+      + details(
+        evidenceStatement(p.evidenceLevel),
+        validUntilLine(p.validUntil, now),
+        MODEL_CHANNEL_STANDING,
+        sourceLine(p)
+      );
+  }
   if (row.notification_type === 'assessment_update') {
     const factors = Array.isArray(p.explanation?.raisingFactors) ? p.explanation.raisingFactors.slice(0, 3) : [];
     const horizon = humanMoment(p.horizonEnd, now);
@@ -504,10 +613,27 @@ export function formatMessage(row: any, now: Date = new Date()): string {
     const aiSummary = p.aiGenerated && p.aiSummary
       ? `\n\n<i>Стисло (написала мовна модель за цими ж оцінками): ${html(p.aiSummary)}</i>`
       : '';
+    // Готове речення з payload, а не число: формулювання попередження належить тому, хто знає, що
+    // саме модель зробила (`modelSignalDisclosure` у `src/services/nightly-digest.ts`), і цей
+    // форматувальник не має його переписувати. `null` там означає «модельних сигналів не було», і
+    // `details` мовчки викидає рядок — порожня згадка про модель знецінює попередження, яке має
+    // значення лише тоді, коли внесок справді є.
+    //
+    // Місце рядка обране: ПІСЛЯ загального застереження про природу індексу і ПЕРЕД вказівкою про
+    // укриття. Спершу читач дізнається, чим є цей рівень узагалі, потім — що частину сигналів під
+    // ним ніхто не підтверджував, і аж наприкінці читає, що робити. Зворотний порядок поставив би
+    // застереження про модель попереду пояснення, до якого воно є уточненням.
+    //
+    // `typeof === 'string'` тому, що payload приходить із JSONB і несе те, що записав планувальник
+    // будь-якої версії: рядок від старішого бінарника, який поля не знав, має зникнути так само
+    // тихо, як `null`, а не надрукуватися як `[object Object]`.
+    const modelDisclosure = typeof p.modelDisclosure === 'string' && p.modelDisclosure.trim()
+      ? html(p.modelDisclosure) : null;
     return `🌙 <b>Аналітика${generated ? ` станом на ${html(generated)}` : ''}</b>\n\n${lines.join('\n\n')}${omitted}${aiSummary}`
       + details(
         horizon && `Горизонт оцінки — до ${html(horizon)}`,
         'Рівень сформовано з публічних сигналів. Це не статистична ймовірність, не прогноз цілі та не офіційна тривога.',
+        modelDisclosure,
         'У разі тривоги прямуйте до визначеного укриття.'
       );
   }
@@ -617,6 +743,16 @@ async function deliverBatch(bot: Bot, log: { warn: Function }) {
           `INSERT INTO notification_deliveries(outbox_id,telegram_message_id,delivered_status,queued_at,sent_at)
            VALUES ($1,$2,'sent',$3,now())`, [row.id, messageId, row.created_at]
       );
+      // The published post, recorded against the claim that authorised it. Nothing edits a channel
+      // message today — the claim is written at enqueue time and is what stops a second post — so
+      // this is not the read-back of a decision, it is the only durable link between an event in
+      // this database and something a reader can be shown.
+      if (row.publication_channel_id) {
+        await pool.query(
+          `UPDATE channel_published_events SET telegram_message_id=$2,published_at=now()
+           WHERE outbox_id=$1`, [row.id, messageId]
+        );
+      }
       // The message id is what makes the *next* soft update an edit rather than a new push.
       if (payload.state?.key) {
         await pool.query(
@@ -636,7 +772,20 @@ async function deliverBatch(bot: Bot, log: { warn: Function }) {
           `INSERT INTO notification_deliveries(outbox_id,delivered_status,error_code,queued_at)
            VALUES ($1,'failed',$2,$3)`, [row.id, code, row.created_at]
       );
-      if (code === '403') await pool.query(`UPDATE telegram_users SET enabled=false WHERE chat_id=$1`, [row.chat_id]);
+      // 403 means the same thing for both recipient kinds — we are no longer allowed to write there
+      // — and both are switched off rather than retried. For a channel that is the bot losing its
+      // administrator rights, and leaving the row enabled would turn every later promotion into
+      // another failed post nobody reads. Which row is touched follows `publication_channel_id`
+      // rather than the chat id, because a channel id is not in `telegram_users` and the old
+      // statement would silently have updated nothing.
+      if (code === '403' && row.publication_channel_id) {
+        await pool.query(
+          `UPDATE publication_channels SET enabled=false,updated_at=now() WHERE id=$1`,
+          [row.publication_channel_id]
+        );
+      } else if (code === '403') {
+        await pool.query(`UPDATE telegram_users SET enabled=false WHERE chat_id=$1`, [row.chat_id]);
+      }
       if (code === '429') {
         // retry_after is aggregate for this bot. Put untouched claims back now instead of waiting
         // for the five-minute crash-reclaim path, persist the pause, and resume by priority later.

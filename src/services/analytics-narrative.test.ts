@@ -33,7 +33,7 @@ import {
   CODEX_COOLDOWN_REJECTION, NARRATIVE_MEMO_TTL_MS, NARRATIVE_WINDOW_QUANTUM_MS,
   canonicalNarrativeWindow, deterministicNarrative, groundedNumbers, narrateOverview, narrativeFacts,
   narrativeFor, narrativeProvider, narrativeWindowKey, resetAnalyticsNarrativeMemo, ungroundedNumber,
-  warmNarrative, withAiMarker, withinCodexCooldown,
+  warmNarrative, withAiMarker, withModelSignalMarker, withinCodexCooldown,
   type NarrativeFacts, type NarrativeProvider
 } from './analytics-narrative.js';
 import type { ResolvedCodexSettings } from './codex-settings.js';
@@ -65,7 +65,8 @@ const facts: NarrativeFacts = {
   fastestSources: [{ sourceId: 'osint-war-monitor', firstReports: 3, messages: 5 }],
   laggingSources: [{ sourceId: 'osint-aeris-rimor', followUps: 1, medianLagSeconds: 600 }],
   unreadableSources: [{ sourceId: 'osint-aeris-rimor', messages: 2, unreadablePercent: 50 }],
-  indicators: [{ indicator: 'активність МіГ-31К', messages: 1 }]
+  indicators: [{ indicator: 'активність МіГ-31К', messages: 1 }],
+  modelSignals: { messages: 0 }
 };
 
 describe('narrative grounding', () => {
@@ -548,5 +549,124 @@ describe('the cooldown predicate', () => {
     expect(withinCodexCooldown(1_900_000, 1_000_000, 900_000)).toBe(false);
     expect(withinCodexCooldown(1_899_999, 1_000_000, 900_000)).toBe(true);
     expect(withinCodexCooldown(1_000_001, 1_000_000, 0)).toBe(false);
+  });
+});
+
+// ------------------------------------------------------------------------------------------------
+// Attribution: which part of the count a model produced
+// ------------------------------------------------------------------------------------------------
+
+/**
+ * The gap these cases close is one a reader cannot see for themselves.
+ *
+ * With `analytical_threats_enabled` on (migration 040), a model verdict the deterministic rules
+ * refused becomes an `unverified` event and contributes 0.3 to the risk it is counted in
+ * (`src/repositories/events.ts`). Every number on this surface then carries a share nobody wrote —
+ * and the paragraph around it reads exactly like the paragraph of a month in which no model spoke.
+ *
+ * So: the count comes from the facts, the sentence appears only when there is something to say, and
+ * — the case that matters most — the sentence never turns into the thing the grounding guard exists
+ * to catch.
+ */
+function overviewWithIndicators(indicators: Array<{ indicator: string; messages: number; classifierVersion?: string }>): StrategicOverview {
+  const base = overviewWith(4) as unknown as { composition: { indicators: unknown[] } };
+  return {
+    ...(base as unknown as StrategicOverview),
+    composition: {
+      indicators: indicators.map((row) => ({
+        classifierVersion: row.classifierVersion ?? 'v2', indicator: row.indicator,
+        messages: row.messages, sources: 1,
+        firstSeenAt: '2026-02-01T00:00:00.000Z', lastSeenAt: '2026-02-02T00:00:00.000Z'
+      }))
+    }
+  } as unknown as StrategicOverview;
+}
+
+describe('attributing the model-authored part of the count', () => {
+  it('counts the promotion indicator across every classifier version in the window', () => {
+    const built = narrativeFacts(overviewWithIndicators([
+      { indicator: 'model_analytical_threat', messages: 4, classifierVersion: 'v1' },
+      { indicator: 'model_analytical_threat', messages: 3, classifierVersion: 'v2' },
+      { indicator: 'активність МіГ-31К', messages: 9 }
+    ]));
+    // Summed, not taken from the newest version: a window that spans a classifier bump would
+    // otherwise disclose only the half of the model's work that happened after it.
+    expect(built.modelSignals).toEqual({ messages: 7 });
+  });
+
+  it('sees the indicator even when it is nowhere near the eight the paragraph talks about', () => {
+    const noise = Array.from({ length: 12 }, (_, index) => ({ indicator: `шум-${index}`, messages: 100 }));
+    const built = narrativeFacts(overviewWithIndicators([...noise, { indicator: 'model_analytical_threat', messages: 2 }]));
+    // `facts.indicators` is a top-N for prose; the disclosure is not, and must not fall off the end
+    // of it in a month when the model happened to be the ninth most common indicator.
+    expect(built.indicators.some((row) => row.indicator === 'model_analytical_threat')).toBe(false);
+    expect(built.modelSignals.messages).toBe(2);
+  });
+
+  it('reports nothing model-authored on a deployment that never switched promotion on', () => {
+    const built = narrativeFacts(overviewWithIndicators([{ indicator: 'активність МіГ-31К', messages: 3 }]));
+    expect(built.modelSignals).toEqual({ messages: 0 });
+    // Silence, not «модельних сигналів: 0». A caveat printed on every installation that has nothing
+    // to disclose is a caveat nobody reads on the installation that does.
+    expect(deterministicNarrative(built).caveats.join(' ')).not.toContain('дала модель');
+    expect(withModelSignalMarker(['Одна версія.'], built)).toEqual(['Одна версія.']);
+  });
+
+  it('says so in the deterministic text, which is where a reader who never enabled a model lands', () => {
+    const built = { ...facts, modelSignals: { messages: 5 } };
+    const caveats = deterministicNarrative(built).caveats.join(' ');
+    expect(caveats).toContain('дала модель (5)');
+    expect(caveats).toContain('не підтверджені джерелом');
+  });
+
+  it('does not repeat itself if applied twice', () => {
+    const built = { ...facts, modelSignals: { messages: 5 } };
+    expect(withModelSignalMarker(withModelSignalMarker([], built), built)).toHaveLength(1);
+  });
+
+  it('never states a number the guard would have rejected', () => {
+    // The line is appended AFTER `verifyNarrative`, so it is the one sentence on this surface the
+    // guard never inspects. That is safe only while its number comes out of the facts themselves —
+    // this case is what makes a future "derive it from the archive instead" fail loudly.
+    const built = { ...facts, modelSignals: { messages: 5 } };
+    const allowed = groundedNumbers(built);
+    const narrative = deterministicNarrative(built);
+    for (const line of [narrative.headline, ...narrative.findings, ...narrative.caveats]) {
+      expect([line, ungroundedNumber(line, allowed)]).toEqual([line, null]);
+    }
+  });
+
+  it('marks a model-written narrative with both disclosures and still publishes it', async () => {
+    const model = modelSaying('За 28 днів рівень тримається.');
+    const value = await narrateOverview(
+      overviewWithIndicators([{ indicator: 'model_analytical_threat', messages: 3 }]),
+      { provider, fetchImpl: model.fetchImpl }
+    );
+    // Two different statements, both needed: who wrote the prose, and where the numbers came from.
+    // A deterministic paragraph over partly model-authored figures is the case a reader cannot spot.
+    expect(value.aiGenerated).toBe(true);
+    expect(value.rejectionReason).toBeNull();
+    expect(value.caveats.join(' ')).toContain('мовною моделлю');
+    expect(value.caveats.join(' ')).toContain('дала модель (3)');
+  });
+
+  it('lets the model restate the disclosed count without tripping the guard', async () => {
+    const model = modelSaying('Модель підняла 3 сигнали за вікно.');
+    const value = await narrateOverview(
+      overviewWithIndicators([{ indicator: 'model_analytical_threat', messages: 3 }]),
+      { provider, fetchImpl: model.fetchImpl }
+    );
+    expect(value.rejectionReason).toBeNull();
+    expect(value.headline).toBe('Модель підняла 3 сигнали за вікно.');
+  });
+
+  it('still rejects a count the facts do not hold', async () => {
+    const model = modelSaying('Модель підняла 47 сигналів за вікно.');
+    const value = await narrateOverview(
+      overviewWithIndicators([{ indicator: 'model_analytical_threat', messages: 3 }]),
+      { provider, fetchImpl: model.fetchImpl }
+    );
+    expect(value.rejectionReason).toBe('ungrounded_number:47');
+    expect(value.aiGenerated).toBe(false);
   });
 });

@@ -38,6 +38,14 @@ import { pool } from '../db/pool.js';
  * `unverified`, resolves every location deterministically, and cannot create a withdrawal or touch
  * official alerts.
  *
+ * `analytical_enrichment` (migration 045) sits beside `analytical_threats` and is the smaller of the
+ * two despite the similar name. Promotion creates a public event where the rules created none; this
+ * one only records what the model read ON TOP of an event the rules did publish — a course, a further
+ * settlement, a sharper class — into a table `/ops` reads and no public surface joins. It is separate
+ * because the authorities are separate: granting the model the right to fill a gap is not granting it
+ * the right to annotate a human channel's published claim, and in an incident an operator turns off
+ * whichever one is misbehaving.
+ *
  * `retrospective_gate` joined them in migration 025 and is different in kind
  * from all four. Every switch above it buys *text*: turn it off and a paragraph disappears, turn it
  * on and a paragraph appears, and the numbers underneath are the same either way. This one is the
@@ -61,8 +69,8 @@ import { pool } from '../db/pool.js';
  * never gated the public attacks page — `tactics` does, and only the commentary on it.
  */
 export const CODEX_FEATURES = [
-  'narrative', 'digest', 'attacks', 'shadow', 'analytical_threats', 'retrospective_gate', 'tactics',
-  'attack_research'
+  'narrative', 'digest', 'attacks', 'shadow', 'analytical_threats', 'analytical_enrichment',
+  'retrospective_gate', 'tactics', 'attack_research'
 ] as const;
 export type CodexFeature = (typeof CODEX_FEATURES)[number];
 
@@ -98,6 +106,7 @@ interface SettingsRow {
   attacks_enabled: boolean;
   shadow_enabled: boolean;
   analytical_threats_enabled: boolean;
+  analytical_enrichment_enabled: boolean;
   retrospective_gate_enabled: boolean;
   tactics_enabled: boolean;
   attack_research_enabled: boolean;
@@ -108,7 +117,7 @@ const DEFAULTS: CodexSettings = {
   model: null,
   features: {
     narrative: false, digest: false, attacks: false, shadow: false, analytical_threats: false,
-    retrospective_gate: false, tactics: false, attack_research: false
+    analytical_enrichment: false, retrospective_gate: false, tactics: false, attack_research: false
   },
   updatedAt: null
 };
@@ -122,6 +131,7 @@ function fromRow(row: SettingsRow): CodexSettings {
       attacks: row.attacks_enabled,
       shadow: row.shadow_enabled,
       analytical_threats: row.analytical_threats_enabled,
+      analytical_enrichment: row.analytical_enrichment_enabled,
       retrospective_gate: row.retrospective_gate_enabled,
       tactics: row.tactics_enabled,
       attack_research: row.attack_research_enabled
@@ -188,6 +198,7 @@ export function applySettingsPatch(current: CodexSettings, patch: CodexSettingsP
       attacks: patch.features?.attacks ?? current.features.attacks,
       shadow: patch.features?.shadow ?? current.features.shadow,
       analytical_threats: patch.features?.analytical_threats ?? current.features.analytical_threats,
+      analytical_enrichment: patch.features?.analytical_enrichment ?? current.features.analytical_enrichment,
       retrospective_gate: patch.features?.retrospective_gate ?? current.features.retrospective_gate,
       tactics: patch.features?.tactics ?? current.features.tactics,
       attack_research: patch.features?.attack_research ?? current.features.attack_research
@@ -199,7 +210,8 @@ export function applySettingsPatch(current: CodexSettings, patch: CodexSettingsP
 export async function readCodexSettings(): Promise<CodexSettings> {
   const result = await pool.query<SettingsRow>(
     `SELECT model,narrative_enabled,digest_enabled,attacks_enabled,shadow_enabled,analytical_threats_enabled,
-            retrospective_gate_enabled,tactics_enabled,attack_research_enabled,updated_at
+            analytical_enrichment_enabled,retrospective_gate_enabled,tactics_enabled,attack_research_enabled,
+            updated_at
        FROM codex_settings WHERE singleton`
   );
   const row = result.rows[0];
@@ -216,22 +228,24 @@ export async function saveCodexSettings(patch: CodexSettingsPatch): Promise<Code
   const next = applySettingsPatch(await readCodexSettings(), patch);
   const result = await pool.query<SettingsRow>(
     `INSERT INTO codex_settings(singleton,model,narrative_enabled,digest_enabled,attacks_enabled,
-                                shadow_enabled,analytical_threats_enabled,retrospective_gate_enabled,
-                                tactics_enabled,attack_research_enabled,updated_at)
-     VALUES (true,$1,$2,$3,$4,$5,$6,$7,$8,$9,now())
+                                shadow_enabled,analytical_threats_enabled,analytical_enrichment_enabled,
+                                retrospective_gate_enabled,tactics_enabled,attack_research_enabled,updated_at)
+     VALUES (true,$1,$2,$3,$4,$5,$6,$7,$8,$9,$10,now())
      ON CONFLICT (singleton) DO UPDATE SET
        model=EXCLUDED.model, narrative_enabled=EXCLUDED.narrative_enabled,
        digest_enabled=EXCLUDED.digest_enabled, attacks_enabled=EXCLUDED.attacks_enabled,
        shadow_enabled=EXCLUDED.shadow_enabled,
        analytical_threats_enabled=EXCLUDED.analytical_threats_enabled,
+       analytical_enrichment_enabled=EXCLUDED.analytical_enrichment_enabled,
        retrospective_gate_enabled=EXCLUDED.retrospective_gate_enabled,
        tactics_enabled=EXCLUDED.tactics_enabled,
        attack_research_enabled=EXCLUDED.attack_research_enabled, updated_at=now()
      RETURNING model,narrative_enabled,digest_enabled,attacks_enabled,shadow_enabled,analytical_threats_enabled,
-               retrospective_gate_enabled,tactics_enabled,attack_research_enabled,updated_at`,
+               analytical_enrichment_enabled,retrospective_gate_enabled,tactics_enabled,attack_research_enabled,
+               updated_at`,
     [next.model, next.features.narrative, next.features.digest, next.features.attacks,
-      next.features.shadow, next.features.analytical_threats, next.features.retrospective_gate,
-      next.features.tactics, next.features.attack_research]
+      next.features.shadow, next.features.analytical_threats, next.features.analytical_enrichment,
+      next.features.retrospective_gate, next.features.tactics, next.features.attack_research]
   );
   return fromRow(result.rows[0]!);
 }

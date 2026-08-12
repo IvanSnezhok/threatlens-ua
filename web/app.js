@@ -93,6 +93,24 @@ const iconToneGroup = { consequence: 'consequences', confirmed: 'threats', repor
 
 const levelNames = { background: 'фоновий', elevated: 'підвищений', significant: 'значний', high: 'високий', very_high: 'дуже високий' };
 const evidenceNames = { official: 'офіційно', confirmed: 'підтверджено', monitoring: 'моніторинг', unverified: 'не перевірено' };
+// Авторство — окрема вісь від доказовості, і саме її бракувало на екрані.
+//
+// «Не перевірено» вище означає рівно одне: незалежного підтвердження ще немає. Але подій із цим
+// словом два різні роди — допоміжний канал, де людина щось написала й ніхто цього ще не підтвердив,
+// і промоція моделі (src/services/shadow-classifier.ts), де ЛЮДИНА ЦЬОГО НЕ ПИСАЛА ВЗАГАЛІ: модель
+// прочитала повідомлення, з якого детермінований класифікатор загрози не побачив, і сама зробила
+// висновок. До появи `origin` обидва друкувалися однаково, тож читач бачив «не перевірене
+// повідомлення» там, де насправді стояло припущення машини.
+//
+// `deterministic` навмисно не має підпису. Це стан за замовчуванням для переважної більшості
+// подій, і слово «правила» біля кожної з них було б шумом, який знецінив би єдиний підпис, що тут
+// справді щось повідомляє. Формулювання коротке й неемоційне — воно уточнює походження, а не
+// підсилює тривогу: лякати має офіційна тривога, а не аналітика.
+const originNames = { model: 'оцінка моделі' };
+// Пояснення на один рядок — там, де є місце на речення (діалог події, панель території). Каже, що
+// саме сталося, і чого НЕ сталося, бо друге тут важливіше за перше.
+const ORIGIN_MODEL_NOTE = 'Припущення моделі за текстом повідомлення. Джерело не заявляло про цю загрозу прямо.';
+const isModelOrigin = (origin) => origin === 'model';
 const confidenceNames = { low: 'низька', medium: 'середня', high: 'висока' };
 // Рівень джерела людині нічого не каже літерою. Назва каже все, а літера лишається в дужках для тих,
 // хто читав методологію.
@@ -927,15 +945,27 @@ function eventCard(item, type) {
     <h2>${escapeHtml(item.location_name)}</h2><p>${threatNames[item.threat_type] ?? item.threat_type}</p>
     <div class="risk-row"><strong>${item.risk_score}<small>/10</small></strong><span>${levelNames[item.risk_level] ?? item.risk_level}<br><small>${item.indicative_percent ?? Math.round(item.risk_score * 10)}% індикативно · впевненість ${escapeHtml(confidenceNames[item.assessment_confidence] ?? item.assessment_confidence)}</small></span></div>
     <div class="event-foot"><b>НЕ Є ТРИВОГОЮ</b><span>до ${shortTime(item.horizon_end)}</span></div></article>`;
-  return `<article class="event-card ${item.evidenceLevel}" data-event="${item.id}">
-    <div class="event-meta"><span>${escapeHtml(evidenceNames[item.evidenceLevel] ?? item.evidenceLevel)}</span><time>${shortTime(item.lastObservedAt)}</time></div>
+  // Підпис походження стоїть ПОРУЧ із доказовістю, а не замість неї, і саме в такому порядку. Це
+  // два різні твердження — «підтвердження ще немає» і «це написала не людина» — і жодне з них не
+  // випливає з іншого; злиття їх в одне слово й було пропуском, який ця картка закриває. Клас
+  // `model-origin` навішується на всю картку, бо CSS уточнює саме семантичну смугу ліворуч
+  // (.event-card::before), а не текст всередині.
+  const model = isModelOrigin(item.origin);
+  return `<article class="event-card ${item.evidenceLevel}${model ? ' model-origin' : ''}" data-event="${item.id}">
+    <div class="event-meta"><span>${escapeHtml(evidenceNames[item.evidenceLevel] ?? item.evidenceLevel)}${model ? ` · ${escapeHtml(originNames.model)}` : ''}</span><time>${shortTime(item.lastObservedAt)}</time></div>
     <h2>${escapeHtml(item.title)}</h2><p>${escapeHtml(item.summary)}</p>
     <div class="location-tags">${item.locations.map((loc) => `<span>${escapeHtml(loc.name)}</span>`).join('')}</div>
     <div class="event-foot"><b>${escapeHtml(threatNames[item.threatType] ?? item.threatType)}</b><span>${timeAgo(item.lastObservedAt)}</span></div></article>`;
 }
 
+// `origin` їде властивістю фічі, а джерело лишається одне на обидва шари напрямку. Розводить їх
+// фільтр у `initMap()`, і саме тому набір фіч тут не треба ділити навпіл: подія, що змінила
+// походження між кадрами (злиття з людським повідомленням такого не робить, але дані приходять
+// із сервера й припущення про них тут не місце), просто перемальовується іншим шаром.
+// `?? 'deterministic'` — та сама відповідь, що й у liveThreats(): відсутнє поле означає базу без
+// міграції 041, а не невідоме походження, і лінія має намалюватися, а не зникнути.
 function directionCollection() {
-  return { type: 'FeatureCollection', features: snapshot.threats.filter((threat) => threat.geometry?.type === 'LineString').map((threat) => ({ type: 'Feature', id: threat.id, geometry: threat.geometry, properties: { title: threat.title } })) };
+  return { type: 'FeatureCollection', features: snapshot.threats.filter((threat) => threat.geometry?.type === 'LineString').map((threat) => ({ type: 'Feature', id: threat.id, geometry: threat.geometry, properties: { title: threat.title, origin: threat.origin ?? 'deterministic' } })) };
 }
 
 // ------------------------------------------------------------------------------------------------
@@ -2045,7 +2075,30 @@ function initMap() {
     }, paint: { 'text-color': '#ffd2c6', 'text-halo-color': '#06080c', 'text-halo-width': 1.7
     } }, 'crimea-ukraine-label');
     map.addSource('reported-directions', { type: 'geojson', data: directionCollection() });
-    map.addLayer({ id: 'direction-lines', type: 'line', source: 'reported-directions', paint: { 'line-color': '#ff7a4d', 'line-width': 3, 'line-dasharray': [2,2], 'line-opacity': .8 } });
+    // Два шари на одне джерело, розведені фільтром за `origin`, — і це саме та ціна, яку доводиться
+    // платити за читабельну відмінність. `line-dasharray` у style-spec лишається cross-faded і
+    // приймає лише зумові вирази: `['case', ['get','origin'], …]` тут не data-driven властивість, а
+    // помилка валідації стилю, після якої карта не будується взагалі. Ширину й непрозорість можна
+    // було б зробити виразом на одному шарі, але тоді відмінність трималася б на товщині лінії, яку
+    // на оглядовому масштабі не видно.
+    //
+    // Колір той самий в обох. Він належить класу загрози, і змінити його означало б сказати, що
+    // загроза інша; інша тут не загроза, а те, хто про неї заявив. Розріджений пунктир і менша
+    // непрозорість читаються як «слабше твердження» без жодного нового кольору на карті — і це
+    // доповнення до підпису в картці події, а не заміна йому: канонічним лишається текст.
+    const directionPaint = (model) => ({
+      'line-color': '#ff7a4d',
+      'line-width': model ? 2 : 3,
+      'line-dasharray': model ? [4, 3] : [2, 2],
+      'line-opacity': model ? .55 : .8
+    });
+    // Фільтри взаємодоповнювальні й обидва явні. Базовий шар питає `!= 'model'`, а не «все, що
+    // лишилось»: подія без поля (стара вкладка, відкрита через мить після викочування) має
+    // намалюватися саме як детермінована, а не зникнути з карти.
+    map.addLayer({ id: 'direction-lines', type: 'line', source: 'reported-directions',
+      filter: ['!=', ['get', 'origin'], 'model'], paint: directionPaint(false) });
+    map.addLayer({ id: 'direction-lines-model', type: 'line', source: 'reported-directions',
+      filter: ['==', ['get', 'origin'], 'model'], paint: directionPaint(true) });
     addVectorLayers();
     addTerritoryIconLayers();
     // Один клік має відкрити одну панель. Обробник висить на кількох шарах, і MapLibre викликає його
@@ -2252,8 +2305,17 @@ async function showThreatDetails(id) {
   // Причина зміни й новий статус зберігаються ідентифікаторами; у хронології події їх читає людина,
   // тож ідентифікатор лишається лише тоді, коли назви для нього ще немає.
   const updates = item.updates.map((update) => `<li><time>${escapeHtml(agoOrUnknown(new Date(update.created_at).getTime()))}</time> <b>${escapeHtml(sentence(updateReasonNames[update.reason] ?? update.reason))}</b><br><small>стан: ${escapeHtml(statusNames[update.new_status] ?? update.new_status)} · доказовість: ${escapeHtml(evidenceNames[update.new_evidence_level] ?? update.new_evidence_level)}</small></li>`).join('');
-  openDetail(item.title, evidenceNames[item.evidence_level] ?? item.evidence_level,
-    `<p class="detail-summary">${escapeHtml(item.summary)}</p><dl><div><dt>Тип</dt><dd>${escapeHtml(threatNames[item.threat_type] ?? item.threat_type ?? 'не визначено')}</dd></div><div><dt>Остання згадка</dt><dd>${escapeHtml(agoOrUnknown(new Date(item.last_observed_at).getTime()))}</dd></div><div><dt>Дійсна до</dt><dd>${item.valid_until ? escapeHtml(shortTime(item.valid_until)) : 'не визначено'}</dd></div><div><dt>Напрямок</dt><dd>${escapeHtml(item.direction_text || 'не повідомлявся')}</dd></div></dl>${vectorChainHtml(vector)}<h3>Джерела</h3>${sources}${updates ? `<h3>Історія змін</h3><ol class="update-list">${updates}</ol>` : ''}<div class="safety-note"><strong>Геометрія не є прогнозом</strong><p>Система показує лише дослівно повідомлену територію або напрямок і не екстраполює маршрут.</p></div>`);
+  // Діалог — єдина поверхня, де на пояснення є місце цілим реченням, тож саме тут походження
+  // проговорюється словами, а не самим лише підписом. Блок стоїть ОДРАЗУ під коротким змістом і
+  // перед характеристиками: читач має дізнатися, звідки взялося твердження, до того як почне
+  // читати його деталі, а не після переліку джерел.
+  const model = isModelOrigin(item.origin);
+  const originNote = model
+    ? `<div class="origin-note"><strong>${escapeHtml(originNames.model)}</strong><p>${escapeHtml(ORIGIN_MODEL_NOTE)}</p></div>`
+    : '';
+  openDetail(item.title,
+    `${evidenceNames[item.evidence_level] ?? item.evidence_level}${model ? ` · ${originNames.model}` : ''}`,
+    `<p class="detail-summary">${escapeHtml(item.summary)}</p>${originNote}<dl><div><dt>Тип</dt><dd>${escapeHtml(threatNames[item.threat_type] ?? item.threat_type ?? 'не визначено')}</dd></div><div><dt>Остання згадка</dt><dd>${escapeHtml(agoOrUnknown(new Date(item.last_observed_at).getTime()))}</dd></div><div><dt>Дійсна до</dt><dd>${item.valid_until ? escapeHtml(shortTime(item.valid_until)) : 'не визначено'}</dd></div><div><dt>Напрямок</dt><dd>${escapeHtml(item.direction_text || 'не повідомлявся')}</dd></div></dl>${vectorChainHtml(vector)}<h3>Джерела</h3>${sources}${updates ? `<h3>Історія змін</h3><ol class="update-list">${updates}</ol>` : ''}<div class="safety-note"><strong>Геометрія не є прогнозом</strong><p>Система показує лише дослівно повідомлену територію або напрямок і не екстраполює маршрут.</p></div>`);
 }
 
 async function showAssessmentDetails(id) {
@@ -2412,9 +2474,15 @@ function territoryLegacyHtml(locationId) {
     const namedNote = asserted
       ? (named.id === locationId ? '' : `<small>Названо: ${escapeHtml(territoryName(named.id))}</small>`)
       : `<small>Згадано джерелом${named.id === locationId ? '' : `: ${escapeHtml(territoryName(named.id))}`}</small>`;
-    return `<li class="territory-state-row" data-event="${escapeHtml(event.id)}">
+    // Той самий підпис і в тому самому місці, що й у картці події: панель території та список подій
+    // описують ті самі рядки, і читач, який перевіряє свою область після картки, не має бачити тут
+    // менше, ніж бачив там. `named` при цьому лишається окремим рядком — «названо» відповідає на
+    // питання ЯКУ територію заявлено, а не ХТО заявив.
+    const model = isModelOrigin(event.origin);
+    return `<li class="territory-state-row${model ? ' model-origin' : ''}" data-event="${escapeHtml(event.id)}">
       <b>${escapeHtml(threatNames[event.threatType] ?? event.threatType)}</b>
-      <span>${escapeHtml(statusNames[event.status] ?? event.status)} · ${escapeHtml(evidenceNames[event.evidenceLevel] ?? event.evidenceLevel)} · останнє підтвердження ${escapeHtml(agoOrUnknown(event.lastObservedAt))}</span>
+      <span>${escapeHtml(statusNames[event.status] ?? event.status)} · ${escapeHtml(evidenceNames[event.evidenceLevel] ?? event.evidenceLevel)}${model ? ` · ${escapeHtml(originNames.model)}` : ''} · останнє підтвердження ${escapeHtml(agoOrUnknown(event.lastObservedAt))}</span>
+      ${model ? `<small>${escapeHtml(ORIGIN_MODEL_NOTE)}</small>` : ''}
       ${namedNote}
       ${event.directionText ? `<small>Напрямок повідомлено джерелом: ${escapeHtml(event.directionText)}</small>` : ''}
     </li>`;
@@ -2728,7 +2796,10 @@ function renderMapPage() {
   // й не заслуговують окремого перемикача.
   const layerGroups = {
     alerts:       alertLayerIds,
-    threats:      [...threatLayerIds, 'direction-lines', ...vectorLayerIds],
+    // `direction-lines-model` іде тим самим перемикачем, що й `direction-lines`: походження — це
+    // не окреме сімейство шарів, а різна обводка тієї самої лінії напрямку, і залишити її видимою
+    // при вимкнених «Загрозах» означало б показати саме той шар, довіра до якого найменша.
+    threats:      [...threatLayerIds, 'direction-lines', 'direction-lines-model', ...vectorLayerIds],
     consequences: consequenceLayerIds,
     assessments:  analyticLayerIds
   };
@@ -2773,7 +2844,11 @@ async function renderHistory() {
     const form = $('.filter-bar', root); const params = new URLSearchParams({ limit: '100' });
     new FormData(form).forEach((value, key) => { if (value) params.set(key, key === 'from' ? `${value}T00:00:00.000Z` : String(value)); });
     const response = await fetch(`/api/v1/history?${params}`); const data = await response.json();
-    $('#history-results', root).innerHTML = data.items?.map((item) => `<article data-event="${item.id}"><time>${new Date(item.started_at).toLocaleString('uk-UA')}</time><div><span class="evidence ${item.evidence_level}">${evidenceNames[item.evidence_level]}</span><h2>${escapeHtml(item.title)}</h2><p>${escapeHtml(item.summary)}</p><button class="text-button" data-detail="${item.id}">Джерела й зміни →</button></div></article>`).join('') || '<p>За цими фільтрами подій немає.</p>';
+    // Архів — це те місце, де читач перевіряє, ЩО саме було заявлено й ким. Підпис походження стоїть
+    // окремою міткою поруч із доказовістю, а не всередині неї: фільтр «Доказовість» вище лишається
+    // фільтром доказовості, і додати до нього «оцінку моделі» ще одним варіантом означало б сказати,
+    // що це наступний щабель тієї самої шкали.
+    $('#history-results', root).innerHTML = data.items?.map((item) => `<article data-event="${item.id}"><time>${new Date(item.started_at).toLocaleString('uk-UA')}</time><div><span class="evidence ${item.evidence_level}">${evidenceNames[item.evidence_level]}</span>${isModelOrigin(item.origin) ? `<span class="evidence origin-model">${escapeHtml(originNames.model)}</span>` : ''}<h2>${escapeHtml(item.title)}</h2><p>${escapeHtml(item.summary)}</p><button class="text-button" data-detail="${item.id}">Джерела й зміни →</button></div></article>`).join('') || '<p>За цими фільтрами подій немає.</p>';
     document.querySelectorAll('[data-detail]').forEach((button) => button.addEventListener('click', () => void showThreatDetails(button.dataset.detail)));
   };
   $('.filter-bar', root).addEventListener('submit', (event) => { event.preventDefault(); void load(); });
@@ -4015,6 +4090,14 @@ const codexFeatureLabels = {
   analytical_threats: {
     title: 'Аналітичні загрози',
     note: 'Дозволяє високовпевненому вердикту моделі, який правила відхилили, створити окрему неперевірену подію. Вона зʼявиться в API/на мапі та в Telegram для підписок «усі згадки». Географію повторно перевіряє каталог; модель не може оголосити офіційну тривогу чи відбій.'
+  },
+  // Сусідній перемикач із схожою назвою і НАБАГАТО меншим правом. Попередній створює публічну подію
+  // там, де правила не створили нічого; цей лише записує те, що модель побачила ПОНАД уже
+  // опублікованою подією, окремим рядком в окремій таблиці. Підпис мусить сказати межу прямо, бо
+  // «збагачення події» звучить так, ніби подія змінюється — а вона не змінюється нічим.
+  analytical_enrichment: {
+    title: 'Доповнення моделі',
+    note: 'Коли правила вже опублікували подію, модель може записати те, що побачила понад нею: напрямок, ще одну локацію або вищий клас загрози. Запис лягає окремо й видно його лише в цій консолі: подію він не змінює — ні доказовість, ні строк дії, ні географію — і сповіщень не надсилає. Локації так само резолвить каталог.'
   },
   // Пʼятий перемикач — єдиний, чий вердикт може щось змінити на бойовому шляху, і зміна ця строго
   // одностороння: «опублікувати» → «лише архів» для повідомлень, які правила вже позначили як
@@ -5575,6 +5658,7 @@ const APP_SETTING_LABELS = {
   CODEX_ACCOUNT_ID: 'Обліковий запис Codex',
   CODEX_API_STYLE: 'Транспорт Codex',
   SHADOW_CLASSIFIER_MAX_PER_MINUTE: 'Бюджет тіньової класифікації',
+  ANALYTICAL_PROMOTIONS_MAX_PER_HOUR: 'Стеля аналітичних публікацій',
   RETROSPECTIVE_GATE_TIMEOUT_MS: 'Тайм-аут підтвердження ретроспективи',
   RETROSPECTIVE_GATE_MAX_PER_MINUTE: 'Бюджет підтвердження ретроспективи',
   CODEX_OAUTH_ISSUER: 'Видавець OAuth Codex',
@@ -5629,6 +5713,7 @@ const APP_SETTING_NOTES = {
   ANALYTICS_NARRATIVE_ENABLED: 'Жодне число від цього не змінюється — лише проза над уже порахованим.',
   CODEX_API_STYLE: '`auto` вибирає транспорт за адресою; явні значення — для проксі на оманливому URL.',
   SHADOW_CLASSIFIER_MAX_PER_MINUTE: 'Стеля витрат, а не пропускна здатність. Понадбюджетні повідомлення відкидаються, а не стають у чергу.',
+  ANALYTICAL_PROMOTIONS_MAX_PER_HOUR: 'Окреме вікно від бюджету тіньової класифікації: скільки неперевірених аналітичних подій за годину може потрапити на карту й у канал. Понад стелю порівняння все одно записується — не публікується лише подія. 0 зупиняє публікацію повністю.',
   RETROSPECTIVE_GATE_TIMEOUT_MS: 'Виклик усередині конвеєра: повідомлення, яке чекає на модель, — це повідомлення, якого ще немає на карті.',
   RETROSPECTIVE_GATE_MAX_PER_MINUTE: 'Понад бюджет ворота публікують. Вичерпана квота може коштувати придушення, ніколи — попередження.',
   OCCUPATION_SYNC_INTERVAL_SECONDS: 'Постачальник публікує приблизно раз на добу; частіше за годину відхиляється.',

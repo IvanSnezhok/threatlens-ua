@@ -14,6 +14,7 @@ import { delaySecondsFor, observeSseDeliveryLag, publicationSlice, registerPubli
 import { registerAnalyticsSchedulerMetrics } from '../services/analytics-scheduler.js';
 import { registerDeploymentMetrics } from '../services/deployment.js';
 import { registerBackfillMetrics } from '../services/source-backfill.js';
+import { registerAnalyticalOutcomeMetrics } from '../services/analytical-outcomes.js';
 import { registerAppSettingsMetrics } from '../services/app-settings.js';
 import { registerAdminNoticeMetrics } from '../bot/admin-notice.js';
 import { registerAttackResearchMetrics } from '../services/attack-research.js';
@@ -295,6 +296,12 @@ export async function buildServer(options: BuildServerOptions = {}) {
   registerTelegramCollectorMetrics(registry);
   registerDeploymentMetrics(registry);
   registerBackfillMetrics(registry);
+  // `threatlens_analytical_outcomes_total{outcome}` — what became of the events the model was
+  // allowed to publish — and `threatlens_analytical_outcomes_pending`, the backlog that separates
+  // «promotion is switched off, so there is nothing to score» from «the evaluator stopped running
+  // and the precision on /ops has been frozen since». Without this line the only calibration
+  // evidence for `ANALYTICAL_THREAT_MIN_CONFIDENCE` lives behind an operator's manual refresh.
+  registerAnalyticalOutcomeMetrics(registry);
   // `threatlens_app_settings_read_failures_total` (a boot that fell back to `.env`) and
   // `threatlens_app_settings_overrides` (how many settings the database is currently deciding).
   // `docs/OPERATIONS.md` names the first as an incident condition and the second as the number that
@@ -653,7 +660,11 @@ export async function buildServer(options: BuildServerOptions = {}) {
               CASE WHEN e.status IN ('expired','withdrawn','corrected') AND e.ended_at > $8
                    THEN 'active' ELSE e.status END AS status,
               e.status AS actual_status,
-              e.evidence_level,e.title,e.summary,e.started_at,e.last_observed_at,
+              -- origin travels with evidence_level on every public read, never without it: the
+              -- archive is where a reader checks what was claimed and by whom, and an entry that
+              -- says only «не перевірено» hides that a model wrote it. threatDetails() gets the
+              -- column for free through its e.* expansion; this list is explicit and has to name it.
+              e.evidence_level,e.origin,e.title,e.summary,e.started_at,e.last_observed_at,
               CASE WHEN e.ended_at > $8 THEN NULL ELSE e.ended_at END AS ended_at
        FROM threat_events e LEFT JOIN threat_event_locations el ON el.event_id=e.id
        WHERE ($1::text IS NULL OR EXISTS (SELECT 1 FROM related_locations r WHERE r.id=el.location_id))

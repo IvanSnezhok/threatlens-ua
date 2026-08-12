@@ -772,6 +772,23 @@ body { overflow-x: hidden; }
 .event-card.monitoring::before { opacity: .55; }
 .event-card.unverified::before { opacity: .32; }
 
+/* Походження — переривчастість мітки, і теж не інший колір.
+   Доказовість уже зайняла прозорість, і другу вісь довелося кодувати іншою властивістю тієї самої
+   смуги: третій колір у списку («модель — сіре») читався б як третій КЛАС події поруч з офіційною
+   тривогою та аналітичною оцінкою, тобто як щось, що стоїть окремо від загрози, тоді як модельна
+   подія — це та сама загроза з іншим автором. Розрив смуги — той самий словник, яким на карті
+   говорить пунктир `direction-lines-model` (web/app.js): «твердження є, але слабше».
+   Прозорість .32 успадковується від .unverified — модельна подія завжди неперевірена, і смуга не
+   має права виглядати впевненіше за свою доказовість. */
+.event-card.model-origin::before {
+  background: repeating-linear-gradient(to bottom, var(--threat) 0 2px, transparent 2px 4px);
+}
+.event-card.model-origin .event-meta span { color: var(--bone-3); }
+
+/* Той самий розрив на рядку панелі території. `border-left-style` замість власного кольору з тієї
+   самої причини: рядок і картка описують одну подію й мусять помилятися однаково. */
+.territory-state-row.model-origin { border-left-style: dashed; }
+
 .event-meta, .event-foot {
   display: flex;
   justify-content: space-between;
@@ -927,6 +944,10 @@ body { overflow-x: hidden; }
 .evidence.confirmed  { border-color: var(--bone-2); color: var(--bone); }
 .evidence.monitoring { border-color: var(--rule-2); color: var(--bone-3); }
 .evidence.unverified { border-style: dashed; border-color: var(--rule-2); color: var(--bone-4); }
+/* Друга мітка в тому самому ряду, і навмисно не сильніша за першу: походження уточнює авторство, а
+   не піднімає подію в шкалі доказовості, поруч з якою стоїть. Пунктир той самий, що в .unverified —
+   модельна подія завжди неперевірена, і суперечності між двома мітками бути не може. */
+.evidence.origin-model { margin-left: 5px; border-style: dashed; border-color: var(--rule-2); color: var(--bone-3); }
 
 /* Числові зведення. Цифри — Unbounded: у нього широкі, спокійні розрядні форми,
    які читаються як показання приладу, а не як заголовок. */
@@ -1859,6 +1880,27 @@ body { overflow-x: hidden; }
   overflow-y: auto;
 }
 .detail-summary { margin-top: 0; font-size: 15px; line-height: 1.65; color: var(--bone); }
+
+/* Походження події — уточнення, а не застереження, і виглядає воно відповідно.
+   Свідомо НЕ .safety-note: та має червону смугу й --alert-soft тло, зарезервовані за офіційною
+   тривогою (див. палітру вгорі файлу), і фарбувати ними «це припущення моделі» означало б підняти
+   найслабше твердження на карті до візуального рангу тривоги — рівно навпаки до того, що цей блок
+   повідомляє. Пунктирна межа й ахроматичне тло кажуть «читай уважніше», а не «біжи». */
+.origin-note {
+  margin: 18px 0 0;
+  padding: 14px 16px;
+  border-left: 2px dashed var(--rule-3);
+  background: var(--surface-2);
+}
+.origin-note strong {
+  display: block;
+  margin-bottom: 6px;
+  color: var(--bone-2);
+  font: 500 10px/1 var(--mono);
+  letter-spacing: .18em;
+  text-transform: uppercase;
+}
+.origin-note p { margin: 0; max-width: 68ch; color: var(--bone-2); font-size: 12.5px; line-height: 1.55; }
 .detail-body h3 {
   margin: 30px 0 12px;
   color: var(--bone-4);

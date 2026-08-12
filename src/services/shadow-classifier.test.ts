@@ -1,8 +1,10 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { config } from '../config.js';
 import { classifyMessage } from '../domain/classifier.js';
 import type { ClassifiedMessage } from '../types.js';
 import {
   buildAnalyticalClassification, deterministicVerdict, disagreementFields, normalizePlace,
+  releaseAnalyticalPromotion, reserveAnalyticalPromotion, resetAnalyticalPromotionQuota,
   resetShadowMetrics, resetShadowRateLimit, scheduleShadowClassification, shadowClassifierMetrics,
   shadowClassify, shadowSkipCounts,
   withinRateLimit, type ShadowVerdict
@@ -62,6 +64,7 @@ const input = (text: string) => ({
 
 beforeEach(() => {
   resetShadowRateLimit();
+  resetAnalyticalPromotionQuota();
   query.mockClear();
   vi.mocked(codexFeatureEnabled).mockResolvedValue(true);
 });
@@ -172,6 +175,54 @@ describe('withinRateLimit', () => {
   });
 });
 
+/**
+ * The publication budget, which is not the call budget.
+ *
+ * Two separate windows exist so that "collect more labelling material" and "publish more unverified
+ * events" stop being the same lever, and so that there is a ceiling on analytical events as such
+ * rather than only on how often the model is asked anything. The unit of this budget is a *published
+ * event*: an attempt that resolves to nothing must give its slot back, or a night of near-misses
+ * spends the quota the one real promotion needed.
+ */
+describe('reserveAnalyticalPromotion', () => {
+  beforeEach(resetAnalyticalPromotionQuota);
+
+  it('allows exactly the hourly budget and refuses the next promotion', () => {
+    const now = 1_000_000;
+    for (let promotion = 0; promotion < 3; promotion += 1) {
+      expect(reserveAnalyticalPromotion(now, 3)).toBe(true);
+    }
+    expect(reserveAnalyticalPromotion(now, 3)).toBe(false);
+  });
+
+  it('holds the slot for an hour, not for a minute', () => {
+    const now = 1_000_000;
+    expect(reserveAnalyticalPromotion(now, 1)).toBe(true);
+    expect(reserveAnalyticalPromotion(now + 120_000, 1)).toBe(false);
+    expect(reserveAnalyticalPromotion(now + 3_601_000, 1)).toBe(true);
+  });
+
+  it('refuses everything at zero, which is what makes it an off switch', () => {
+    expect(reserveAnalyticalPromotion(1_000_000, 0)).toBe(false);
+    expect(reserveAnalyticalPromotion(2_000_000, 0)).toBe(false);
+  });
+
+  it('gives back a slot that bought no event', () => {
+    const now = 1_000_000;
+    expect(reserveAnalyticalPromotion(now, 1)).toBe(true);
+    releaseAnalyticalPromotion(now);
+    expect(reserveAnalyticalPromotion(now, 1)).toBe(true);
+  });
+
+  it('does not count the shadow classifier\'s own call budget', () => {
+    // The independence is the whole point: a night that spends every model call must not be a night
+    // whose publication ceiling has already been consumed by the collection.
+    const now = 1_000_000;
+    for (let call = 0; call < 6; call += 1) withinRateLimit(now, 6);
+    expect(reserveAnalyticalPromotion(now, 1)).toBe(true);
+  });
+});
+
 describe('shadowClassify', () => {
   it('records agreement when the model reaches the same verdict', async () => {
     const chat = chatReturning(verdict());
@@ -234,6 +285,8 @@ describe('shadowClassify', () => {
   });
 
   it('does not ask the classifier to guess when a media-only transcription failed', async () => {
+    // Audio was attached and nothing came back from it: the transcription side is what an operator
+    // can go and fix, so it gets its own reason rather than the model's.
     const chat = chatReturning(verdict());
     const outcome = await shadowClassify({
       ...input(''), media: [{ kind: 'audio', mimeType: 'audio/ogg', bytes: new Uint8Array([1]) }]
@@ -241,8 +294,35 @@ describe('shadowClassify', () => {
       chat: chat as never, loadContext: async () => [],
       transcribe: async () => ({ ok: false, reason: 'endpoint_error' })
     });
-    expect(outcome).toEqual({ status: 'skipped', reason: 'model_failed' });
+    expect(outcome).toEqual({ status: 'skipped', reason: 'transcription_failed' });
     expect(chat).not.toHaveBeenCalled();
+  });
+
+  it('does not blame the model for a picture it was never shown', async () => {
+    // A sticker, an oversized photo, a video: `imageDataUrl` declines them all and the call is never
+    // made. Counting that as `model_failed` sent an operator to the provider and the quota to look
+    // for a failure that has no `ai_runs` row, because no request ever left the process.
+    const chat = chatReturning(verdict());
+    const outcome = await shadowClassify({
+      ...input(''), media: [{ kind: 'image', mimeType: 'image/svg+xml', bytes: new Uint8Array([5, 6]) }]
+    }, { chat: chat as never, loadContext: async () => [] });
+    expect(outcome).toEqual({ status: 'skipped', reason: 'media_unusable' });
+    expect(chat).not.toHaveBeenCalled();
+  });
+
+  it('names the fixable half when a message carries both unusable pictures and silent audio', async () => {
+    const chat = chatReturning(verdict());
+    const outcome = await shadowClassify({
+      ...input(''),
+      media: [
+        { kind: 'image', mimeType: 'image/svg+xml', bytes: new Uint8Array([5]) },
+        { kind: 'audio', mimeType: 'audio/ogg', bytes: new Uint8Array([1]) }
+      ]
+    }, {
+      chat: chat as never, loadContext: async () => [],
+      transcribe: async () => ({ ok: false, reason: 'not_configured' })
+    });
+    expect(outcome).toEqual({ status: 'skipped', reason: 'transcription_failed' });
   });
 
   it('records a disagreement and the axis it is on', async () => {
@@ -274,6 +354,83 @@ describe('shadowClassify', () => {
       chat: chatReturning(verdict({ confidence: 0.96 })) as never, promote
     });
     expect(promote).not.toHaveBeenCalled();
+  });
+
+  /**
+   * What an exhausted publication quota costs, and what it must not cost.
+   *
+   * `promotable` is the shape the ingestion path hands over when the deterministic rules refused a
+   * message: the envelope is present and promotion is allowed. The assertion that matters in all
+   * three cases below is the same one — the `shadow_classifications` INSERT still happens. The
+   * quota bounds what reaches the map and the channel; it is not allowed to bound the corpus, which
+   * is worth the most on exactly the nights that spend the quota first.
+   */
+  const promotable = () => {
+    const base = input('Картка загроз');
+    return {
+      ...base,
+      allowAnalyticalPromotion: true,
+      message: {
+        sourceId: 'monitor', externalId: '42', publishedAt: base.publishedAt,
+        text: 'Картка загроз', rawPayload: {}
+      }
+    };
+  };
+  const inserts = () =>
+    query.mock.calls.filter(([sql]) => String(sql).includes('INSERT INTO shadow_classifications')).length;
+
+  const withPromotionLimit = async (limit: number, run: () => Promise<void>) => {
+    const previous = config.ANALYTICAL_PROMOTIONS_MAX_PER_HOUR;
+    config.ANALYTICAL_PROMOTIONS_MAX_PER_HOUR = limit;
+    try {
+      await run();
+    } finally {
+      config.ANALYTICAL_PROMOTIONS_MAX_PER_HOUR = previous;
+    }
+  };
+
+  it('keeps collecting the corpus after the hourly promotion quota is spent', async () => {
+    const promote = vi.fn(async () => '00000000-0000-4000-8000-000000000777');
+    await withPromotionLimit(1, async () => {
+      const chat = () => chatReturning(verdict({ confidence: 0.96 })) as never;
+      expect((await shadowClassify(promotable(), { chat: chat(), promote })).promotedEventId)
+        .toBe('00000000-0000-4000-8000-000000000777');
+      const second = await shadowClassify(promotable(), { chat: chat(), promote });
+      expect(second.status).toBe('recorded');
+      expect(second.promotedEventId).toBeUndefined();
+    });
+    expect(promote).toHaveBeenCalledOnce();
+    expect(inserts()).toBe(2);
+  });
+
+  it('never publishes when the quota is zero, and still records the comparison', async () => {
+    const promote = vi.fn(async () => 'should-not-run');
+    await withPromotionLimit(0, async () => {
+      const outcome = await shadowClassify(promotable(), {
+        chat: chatReturning(verdict({ confidence: 0.96 })) as never, promote
+      });
+      expect(outcome).toMatchObject({ status: 'recorded' });
+      expect(outcome.promotedEventId).toBeUndefined();
+    });
+    expect(promote).not.toHaveBeenCalled();
+    expect(inserts()).toBe(1);
+  });
+
+  it('does not charge the ceiling for an attempt that published nothing', async () => {
+    // Most attempts publish nothing — an unresolvable place, a verdict below the confidence bar, a
+    // duplicate of an event that already exists. Charging those would make a ceiling of N events an
+    // hour into a ceiling of N questions, and the real promotion would arrive to an empty budget.
+    const promote = vi.fn()
+      .mockResolvedValueOnce(null)
+      .mockResolvedValue('00000000-0000-4000-8000-000000000778');
+    await withPromotionLimit(1, async () => {
+      const chat = () => chatReturning(verdict({ confidence: 0.96 })) as never;
+      expect((await shadowClassify(promotable(), { chat: chat(), promote })).promotedEventId)
+        .toBeUndefined();
+      expect((await shadowClassify(promotable(), { chat: chat(), promote })).promotedEventId)
+        .toBe('00000000-0000-4000-8000-000000000778');
+    });
+    expect(promote).toHaveBeenCalledTimes(2);
   });
 
   it('writes the comparison with agrees and both verdicts', async () => {
@@ -416,6 +573,7 @@ describe('shadow coverage metrics', () => {
   beforeEach(() => {
     resetShadowMetrics();
     resetShadowRateLimit();
+    resetAnalyticalPromotionQuota();
   });
 
   const value = async (name: string, labels?: Record<string, string>) => {
@@ -440,5 +598,43 @@ describe('shadow coverage metrics', () => {
     await shadowClassify(input('Ударні БпЛА у напрямку Києва'), { chat: chatFailing('endpoint_error') as never });
     expect(await value('threatlens_shadow_attempts_total')).toBe(1);
     expect(await value('threatlens_shadow_outcomes_total', { status: 'skipped', reason: 'model_failed' })).toBe(1);
+  });
+
+  it('counts a promotion the quota refused, which no other series shows', async () => {
+    // A refused promotion is a `recorded` outcome with a null `analytical_event_id` — indistinguishable
+    // in the table and in the outcome counter from the far more common "the verdict did not qualify".
+    // Without this counter, an operator cannot tell a model that stopped producing publishable
+    // verdicts from a ceiling that is now doing all the work.
+    const previous = config.ANALYTICAL_PROMOTIONS_MAX_PER_HOUR;
+    config.ANALYTICAL_PROMOTIONS_MAX_PER_HOUR = 0;
+    try {
+      const base = input('Картка загроз');
+      await shadowClassify({
+        ...base,
+        allowAnalyticalPromotion: true,
+        message: {
+          sourceId: 'monitor', externalId: '42', publishedAt: base.publishedAt,
+          text: 'Картка загроз', rawPayload: {}
+        }
+      }, {
+        chat: chatReturning(verdict({ confidence: 0.96 })) as never,
+        promote: vi.fn(async () => 'should-not-run')
+      });
+    } finally {
+      config.ANALYTICAL_PROMOTIONS_MAX_PER_HOUR = previous;
+    }
+    expect(await value('threatlens_analytical_promotions_blocked_total')).toBe(1);
+    expect(await value('threatlens_shadow_outcomes_total', { status: 'recorded', reason: 'none' })).toBe(1);
+  });
+
+  it('keeps unreadable media out of the model-failure series', async () => {
+    // The whole point of the separate reason: the series an operator alerts on must not move when a
+    // channel posts a sticker, and the loss must still be visible under a label of its own.
+    await shadowClassify(
+      { ...input(''), media: [{ kind: 'image', mimeType: 'image/svg+xml', bytes: new Uint8Array([7]) }] },
+      { chat: chatReturning(verdict()) as never, loadContext: async () => [] }
+    );
+    expect(await value('threatlens_shadow_outcomes_total', { status: 'skipped', reason: 'model_failed' })).toBe(0);
+    expect(await value('threatlens_shadow_outcomes_total', { status: 'skipped', reason: 'media_unusable' })).toBe(1);
   });
 });

@@ -336,4 +336,45 @@ describe('nightly digest AI summary line', () => {
     } });
     expect(text).not.toContain('<script>');
   });
+
+  it('discloses that part of the signals came from the model', () => {
+    // Рядок пишеться не тут: `modelSignalDisclosure` у `src/services/nightly-digest.ts` знає, що
+    // саме модель зробила, і віддає готове речення. Форматувальник відповідає лише за те, що воно
+    // взагалі доїде до читача — до цього рядка воно лежало в payload і нікуди не друкувалося.
+    const text = formatMessage({ notification_type: 'nightly_digest', payload: {
+      ...digestPayload, modelSignals: 3,
+      modelDisclosure: 'Частину сигналів (3) дала модель — вони не підтверджені джерелом.'
+    } }, now);
+    expect(text).toContain('Частину сигналів (3) дала модель');
+    // Уточнення стоїть після пояснення, до якого воно є уточненням, і перед вказівкою про укриття:
+    // спершу чим є рівень, потім чого під ним ніхто не підтверджував, і аж тоді що робити.
+    expect(text.indexOf('Рівень сформовано з публічних сигналів'))
+      .toBeLessThan(text.indexOf('Частину сигналів (3)'));
+    expect(text.indexOf('Частину сигналів (3)'))
+      .toBeLessThan(text.indexOf('У разі тривоги'));
+  });
+
+  it('sends exactly the digest it always sent when no signal came from the model', () => {
+    // Нуль модельних сигналів — типовий стан: вони існують лише за увімкненого
+    // `analytical_threats_enabled` (міграція 040, DEFAULT false). Порожня згадка про модель у цьому
+    // стані знецінила б попередження там, де воно справді потрібне, тож рядка не має бути взагалі.
+    const withoutModel = formatMessage({ notification_type: 'nightly_digest', payload: {
+      ...digestPayload, modelSignals: 0, modelDisclosure: null
+    } });
+    expect(withoutModel).not.toContain('дала модель');
+    expect(withoutModel).toBe(formatMessage({ notification_type: 'nightly_digest', payload: digestPayload }));
+  });
+
+  it('escapes the disclosure line and ignores a non-string payload value', () => {
+    // Payload приходить із JSONB і несе те, що записав планувальник БУДЬ-якої версії: рядок від
+    // старішого бінарника, який поля не знав, має зникнути так само тихо, як `null`.
+    const escaped = formatMessage({ notification_type: 'nightly_digest', payload: {
+      ...digestPayload, modelDisclosure: '<b>Частину сигналів</b> дала модель.'
+    } });
+    expect(escaped).not.toContain('<b>Частину');
+    const wrongType = formatMessage({ notification_type: 'nightly_digest', payload: {
+      ...digestPayload, modelDisclosure: 7
+    } });
+    expect(wrongType).toBe(formatMessage({ notification_type: 'nightly_digest', payload: digestPayload }));
+  });
 });

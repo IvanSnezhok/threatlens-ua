@@ -7,7 +7,7 @@ import { parseAlertChannelMessage } from '../domain/alert-parser.js';
 import { classifyMessage, CLASSIFIER_VERSION, isDeEscalation, significanceRejection } from '../domain/classifier.js';
 import {
   applyDeEscalation, cachedLocationLexemes, ingestThreat, recordClassification,
-  type ClassificationLogEntry
+  type ClassificationDecision, type ClassificationLogEntry
 } from '../repositories/events.js';
 import {
   AERIAL_MIRROR_SOURCE_ID, AERIAL_MIRROR_USER_AGENT, aerialMirrorRawUrl, parseAerialMirrorPayload,
@@ -1318,6 +1318,17 @@ async function recordUnprocessedMessage(message: NormalizedMessage, status: stri
 }
 
 /**
+ * The decisions that put an event on the map, and therefore the only ones a model may annotate.
+ *
+ * `de_escalation` is absent and that is the important omission: a withdrawal carries an event id too,
+ * and a model remark filed against a claim somebody has just taken back is the one shape of
+ * "enrichment" that could read as an argument for putting it back. The three listed here are the
+ * branches that assert something.
+ */
+const PUBLISHING_DECISIONS: ReadonlySet<ClassificationDecision> =
+  new Set<ClassificationDecision>(['event_created', 'event_merged', 'redirect']);
+
+/**
  * Archives one decision without ever letting the archive break the pipeline.
  *
  * The write is outside the ingestion transaction and its failure is a counter, not an exception:
@@ -1343,6 +1354,29 @@ async function archiveClassification(entry: ClassificationLogEntry): Promise<voi
     media: entry.media,
     message: entry.message,
     allowAnalyticalPromotion: entry.decision === 'ignored' || entry.decision === 'unrecognized',
+    // The complement of the flag above, and the reason both live on this one line: a message either
+    // was refused by the rules — in which case the model may fill the gap — or it was published, in
+    // which case the model may only annotate what was published, into a table nothing public reads
+    // (`./analytical-enrichment.ts`, migration 045). Deriving both from `entry.decision` here is what
+    // makes them exclusive by construction rather than by a rule two call sites have to remember.
+    //
+    // `entry.eventId` is set only on the branch that ran `ingestThreat`, and the decision is checked
+    // anyway: a future branch that starts carrying an event id for some other reason must not
+    // silently acquire the right to have the model write remarks against it.
+    ...(PUBLISHING_DECISIONS.has(entry.decision) && entry.eventId
+      ? {
+          publishedClaim: {
+            eventId: entry.eventId,
+            threatType: entry.classified.threatType,
+            // What the rules took out of THIS message, not what the event holds after every merge:
+            // the enrichment write re-checks each proposed place against the event as it stands, so
+            // this list only has to be the honest baseline of the current reading.
+            locationIds: entry.classified.locations.map((location) => location.id),
+            directionText: entry.classified.directionText ?? null,
+            nationalScope: entry.classified.nationalScope
+          }
+        }
+      : {}),
     historical: entry.historical
   });
   classificationDecisions.inc({ version: CLASSIFIER_VERSION, decision: entry.decision });

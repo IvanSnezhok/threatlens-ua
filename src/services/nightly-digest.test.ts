@@ -16,7 +16,7 @@ import { describe, expect, it } from 'vitest';
 
 process.env.CODEX_BASE_URL = 'https://codex.test/v1';
 
-const { digestFacts, digestSummary } = await import('./nightly-digest.js');
+const { digestFacts, digestSummary, modelSignalDisclosure } = await import('./nightly-digest.js');
 
 const settings = async () => ({
   model: 'gpt-5.2' as string | null,
@@ -57,11 +57,66 @@ describe('факти зведення', () => {
     expect(facts).toEqual({
       time: '23:20',
       locations: [
-        { locationName: 'Полтава', threatType: 'ballistic_missile', level: 'elevated', indicativePercent: 35, score: '3.5' },
-        { locationName: 'Харків', threatType: 'uav', level: 'moderate', indicativePercent: 20, score: '2.0' }
+        { locationName: 'Полтава', threatType: 'ballistic_missile', level: 'elevated', indicativePercent: 35, score: '3.5', modelSignals: 0 },
+        { locationName: 'Харків', threatType: 'uav', level: 'moderate', indicativePercent: 20, score: '2.0', modelSignals: 0 }
       ],
-      omitted: 4
+      omitted: 4,
+      modelSignals: 0
     });
+  });
+});
+
+/**
+ * Скільки з цього переліку зібрано з припущень моделі.
+ *
+ * Оцінка ризику не розрізняє, хто підняв сигнал: модельна подія дає внесок 0.3 у ті самі
+ * `risk_signals` (src/repositories/events.ts), і людина о 23:20 бачить готове число без жодної
+ * ознаки, що частину його зібрано не з повідомлень джерел. Ці випадки перевіряють дві речі:
+ * що ознака доходить до фактів (тобто до того, що бачить і модель, яка пише підсумковий рядок),
+ * і що там, де модельних сигналів немає, жодного попередження не зʼявляється.
+ */
+describe('атрибуція модельних сигналів', () => {
+  const mixed = digestFacts([
+    { location_name: 'Полтава', threat_type: 'uav', risk_level: 'elevated', indicative_percent: 35, risk_score: '3.5', model_signals: 7 },
+    { location_name: 'Харків', threat_type: 'uav', risk_level: 'moderate', indicative_percent: 20, risk_score: '2.0', model_signals: 0 }
+  ] as never[], 0, '23:20');
+
+  it('доводить модельний внесок і до переліку, і до підсумку', () => {
+    expect(mixed.locations.map((location) => location.modelSignals)).toEqual([7, 0]);
+    expect(mixed.modelSignals).toBe(7);
+  });
+
+  it('вважає відсутнє значення нулем, а не невідомим', () => {
+    // Оцінка без жодного модельного сигналу взагалі не потрапляє у відповідь підрахунку, тож
+    // «поля немає» і «модельних сигналів нуль» — це той самий стан, і другий з них має бути видимим.
+    expect(facts.modelSignals).toBe(0);
+    expect(facts.locations.every((location) => location.modelSignals === 0)).toBe(true);
+  });
+
+  it('мовчить, коли модельних сигналів немає', () => {
+    // Порожня згадка знецінює саме те попередження, заради якого рядок існує: за замовчуванням
+    // `analytical_threats_enabled` вимкнено (міграція 040), тож нуль — це стан майже кожної ночі.
+    expect(modelSignalDisclosure(0)).toBeNull();
+    expect(modelSignalDisclosure(-1)).toBeNull();
+  });
+
+  it('називає число й каже, чого воно варте, коли модельні сигнали є', () => {
+    const line = modelSignalDisclosure(mixed.modelSignals);
+    expect(line).toBe('Частину сигналів (7) дала модель — вони не підтверджені джерелом.');
+  });
+
+  it('дозволяє моделі переказати це число і не дозволяє вигадати сусіднє', async () => {
+    // Рядок від моделі перевіряється тими самими фактами, тож число модельного внеску має бути
+    // для неї грунтованим — інакше чесна згадка про нього відкидала б увесь підсумок.
+    const grounded = await digestSummary(mixed, {
+      ...base, fetchImpl: async () => completion('7 сигналів із переліку підняла модель.')
+    });
+    expect(grounded).toMatchObject({ text: '7 сигналів із переліку підняла модель.', aiGenerated: true });
+
+    const invented = await digestSummary(mixed, {
+      ...base, fetchImpl: async () => completion('8 сигналів із переліку підняла модель.')
+    });
+    expect(invented).toMatchObject({ text: null, rejectionReason: 'ungrounded_number:8' });
   });
 });
 

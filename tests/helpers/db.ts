@@ -73,7 +73,12 @@ const VOLATILE_TABLES = [
   // behind would spend the next file's allowance and refuse its first request with
   // `refused_cooldown` — a failure that reads as a bug in the governance rather than as leakage
   // between test files.
-  'ops_attack_research_classes', 'ops_attack_research_memos', 'ops_attack_research_requests'
+  'ops_attack_research_classes', 'ops_attack_research_memos', 'ops_attack_research_requests',
+  // Public channel publication (migration 044), children first. `channel_published_events` would be
+  // swept by the CASCADE anyway — it references three tables above — but `publication_channels`
+  // references nothing volatile, so a file that enabled a channel would leave it enabled for every
+  // file after it, and their model events would silently start queueing posts.
+  'channel_published_events', 'publication_channels'
 ];
 
 /**

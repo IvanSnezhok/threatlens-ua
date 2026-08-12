@@ -2,10 +2,44 @@ import { Counter, Gauge, type Registry } from 'prom-client';
 import { config } from '../config.js';
 import { pool } from '../db/pool.js';
 
-export type DeliveryClass = 'protected' | 'standard' | 'soft' | 'analytics';
+export type DeliveryClass = 'protected' | 'standard' | 'soft' | 'analytics' | 'channel';
 
+/**
+ * Which budget a queued message competes in.
+ *
+ * ## Why `channel_publication` is a class of its own, and why it is tested FIRST
+ *
+ * The public channel (migration 044) posts model estimates. Its rows share this queue, this worker
+ * and this Telegram account with the air-raid notifications, and the whole point of the governor is
+ * that ONE aggregate rate limit has to be arbitrated — so the arbitration is where the safety
+ * argument has to be made, not in a second queue.
+ *
+ * Landing in `protected` would be the serious failure: `claimDeliveryBatch` sorts
+ * `CASE WHEN class='protected' THEN 0 ELSE 1 END` first, so a channel row in that bucket would be
+ * drawn from the same head-of-queue position as «Повітряна тривога» and would spend, during a mass
+ * attack, tokens that subscribers are waiting for. It cannot reach that branch by notification type
+ * — `channel_publication` is not `alert_start`, `alert_end` or `threat_update` — but the protected
+ * branch also keys on PAYLOAD fields (`evidenceLevel`, `updateKind`), and a payload is a jsonb blob
+ * that a future caller can shape freely. Testing this type before anything else makes the exclusion
+ * structural rather than a property of which keys somebody happened not to set, exactly as the alert
+ * branches sit above the delta path in `formatMessage`.
+ *
+ * Not folded into `analytics` either, although both are "не тривога". Those two labels answer
+ * different operational questions. `analytics` rows are per-subscriber, so their backlog scales with
+ * the audience and a spike there means the fan-out produced a lot of assessments; a channel backlog
+ * is one row per event and any sustained value means the public channel itself is stuck — usually
+ * because the bot lost its administrator rights, which is a different incident with a different fix.
+ * A shared label would hide the second inside the first.
+ *
+ * The volume behind this class is bounded upstream rather than here: at most
+ * `ANALYTICAL_PROMOTIONS_MAX_PER_HOUR` events (default 12) can be promoted per hour, each producing
+ * one row per enabled channel, against a budget of `TELEGRAM_DELIVERY_RATE_PER_SECOND` (default 25)
+ * per second. There is no attack shape in which this class can crowd anything out; the ordering
+ * above is what guarantees it cannot even try.
+ */
 export function deliveryClass(row: any): DeliveryClass {
   const payload = row?.payload ?? {};
+  if (row?.notification_type === 'channel_publication') return 'channel';
   if (row?.notification_type === 'alert_start' || row?.notification_type === 'alert_end'
     || (row?.notification_type === 'threat_update'
       && (payload.evidenceLevel === 'official' || payload.updateKind === 'escalation'))) return 'protected';
@@ -16,7 +50,9 @@ export function deliveryClass(row: any): DeliveryClass {
   return 'standard';
 }
 
+/** The same decision in SQL, in the same order and for the same reason. */
 const classSql = `CASE
+  WHEN notification_type='channel_publication' THEN 'channel'
   WHEN notification_type IN ('alert_start','alert_end')
     OR (notification_type='threat_update'
       AND (payload->>'evidenceLevel'='official' OR payload->>'updateKind'='escalation')) THEN 'protected'

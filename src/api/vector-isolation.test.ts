@@ -406,7 +406,11 @@ describe('map layer order', () => {
       'alert-raion-line', 'alert-oblast-line',
       'consequence-raion-line', 'consequence-oblast-line',
       'city-hit', 'city-labels', 'crimea-ukraine-label', 'alert-oblast-label', 'alert-raion-label',
-      'direction-lines',
+      // Модельна лінія напрямку йде одразу за детермінованою й ніколи перед нею: фільтри двох шарів
+      // взаємовиключні, тож перекриття неможливе, але порядок усе одно фіксується — вставити
+      // найслабше твердження карти під найсильніше означало б зробити його видимість залежною від
+      // того, що намалює наступний шар.
+      'direction-lines', 'direction-lines-model',
       'threat-vector-sequence', 'threat-vector-direction', 'threat-vector-transit',
       'threat-vector-nodes', 'threat-vector-order',
       'threat-vector-arrowhead', 'threat-vector-class',

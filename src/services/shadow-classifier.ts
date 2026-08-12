@@ -3,10 +3,14 @@ import { z } from 'zod';
 import { config } from '../config.js';
 import { pool } from '../db/pool.js';
 import {
-  CLASSIFIER_VERSION, classifyMessage, significanceRejection, type LocationLexeme
+  CLASSIFIER_VERSION, significanceRejection, type LocationLexeme
 } from '../domain/classifier.js';
+import { THREAT_LABELS, resolveModelPlace } from '../domain/model-place.js';
 import { cachedLocationLexemes, ingestThreat } from '../repositories/events.js';
-import { THREAT_TYPES, type ClassifiedMessage, type NormalizedMessage, type ThreatType } from '../types.js';
+import { THREAT_TYPES, type ClassifiedMessage, type NormalizedMessage } from '../types.js';
+import {
+  buildEnrichments, recordAnalyticalEnrichments, type PublishedClaim
+} from './analytical-enrichment.js';
 import { codexChat, type CodexFailureReason } from './codex-client.js';
 import { codexFeatureEnabled } from './codex-settings.js';
 import { imageDataUrl, transcribeAudio } from './media-enrichment.js';
@@ -22,6 +26,13 @@ import { imageDataUrl, transcribeAudio } from './media-enrichment.js';
  * destination resolves through the deterministic location catalogue. Promotion uses the ordinary
  * event log, so the result reaches both API/map and Telegram. It cannot reach official-alert tables
  * and it deliberately strips all model retractions, so a model can never issue an all-clear.
+ *
+ * A second, independent Ops switch (`analytical_enrichment`, migration 045) covers the opposite
+ * case: a message the rules DID publish, about which the model read something more — a course, a
+ * further settlement, a sharper weapon class. That path writes one row into a table of its own
+ * (`./analytical-enrichment.ts`) and reaches no public surface at all: not the event, not the map,
+ * not `system_event_log` and therefore not Telegram. It exists so that what the model sees beyond
+ * the rules stops being lost, without any of it becoming something a reader is told.
  *
  * Every failure is silence. A model that is unreachable, slow, over quota, or answering with prose
  * where JSON was asked for produces no row and no exception. That is the correct severity: what is
@@ -52,6 +63,16 @@ import { imageDataUrl, transcribeAudio } from './media-enrichment.js';
  * (`SHADOW_CLASSIFIER_MAX_PER_MINUTE`, default 6) applied before the call, and messages over budget
  * are dropped rather than queued: a queue would hand back the spend it was meant to prevent, one
  * minute late, and label a night's material with the wrong hour.
+ *
+ * ## Two budgets, because they buy two different things
+ *
+ * The limit above buys model calls. {@link reserveAnalyticalPromotion} buys unverified pins on the
+ * public map and messages in the Telegram channel, per hour and out of its own window. Sharing one
+ * budget made the two indistinguishable: raising the call limit during an attack to collect more
+ * labelling material also raised how much a drifting model could publish, and there was no ceiling on
+ * analytical events as such — only on how often the model was asked anything. The publication budget
+ * is therefore checked in {@link shadowClassify} *after* the comparison row is written, so an
+ * exhausted quota costs the map nothing and the corpus nothing.
  */
 
 const shadowVerdictSchema = z.object({
@@ -198,6 +219,75 @@ export function withinRateLimit(now = Date.now(), limit = config.SHADOW_CLASSIFI
 }
 
 // ------------------------------------------------------------------------------------------------
+// Publication quota
+// ------------------------------------------------------------------------------------------------
+
+/**
+ * The second window, and the only ceiling that exists on analytical events as such.
+ *
+ * Deliberately not `callTimes` above. That budget is a spending limit on the model account and is
+ * raised precisely when a night is worth labelling; this one is a limit on how much unverified
+ * material a drifting model may put in front of users, and there is no night on which raising the
+ * first should raise the second. One shared window made "collect more" and "publish more" the same
+ * word.
+ *
+ * An hour rather than a minute because the failure being bounded is a drip, not a burst: a
+ * miscalibrated model produces a steady trickle that a per-minute cap of 1 passes at sixty an hour.
+ * In memory for the same reasons the minute window is (see above); one process is the deployed shape,
+ * and the price of that assumption being wrong is a ceiling per process rather than a shared one,
+ * which is the safe direction for a per-process cap on publishing.
+ */
+const promotionTimes: number[] = [];
+
+/** Test seam, exactly like {@link resetShadowRateLimit} and for the same wall-clock reason. */
+export function resetAnalyticalPromotionQuota(): void {
+  promotionTimes.length = 0;
+}
+
+/**
+ * Takes one slot out of the hour, or refuses.
+ *
+ * Reserve-and-release rather than the plain check-and-consume of {@link withinRateLimit}, because
+ * these two limiters count different things. There, one call is one unit of spend and the answer is
+ * known at the moment of asking. Here the unit is a *published event*, and most attempts publish
+ * nothing: `promoteAnalyticalThreat` below refuses a verdict that is not asserted, not confident
+ * enough, or names a place the deterministic catalogue cannot resolve, and `ingestThreat` refuses one
+ * that deduplicates onto an event that already exists. Charging those to the budget would turn a
+ * ceiling of twelve events an hour into a ceiling of twelve *questions*, and a night of near-misses
+ * would spend the quota that the one real promotion needed.
+ *
+ * The slot is taken up front rather than after the fact because {@link scheduleShadowClassification}
+ * drops the promise: several classifications are in flight at once, and a counter incremented only on
+ * success lets every one of them pass a check that no longer reflects what the others are about to
+ * do. Reserving first bounds the overshoot at zero; {@link releaseAnalyticalPromotion} hands the slot
+ * back the moment the attempt is known to have produced nothing.
+ *
+ * A limit of 0 refuses before anything is recorded — the `>= limit` comparison is what makes zero an
+ * off switch rather than a budget of one.
+ */
+export function reserveAnalyticalPromotion(
+  now = Date.now(), limit = config.ANALYTICAL_PROMOTIONS_MAX_PER_HOUR
+): boolean {
+  while (promotionTimes.length && promotionTimes[0]! <= now - 3_600_000) promotionTimes.shift();
+  if (promotionTimes.length >= limit) return false;
+  promotionTimes.push(now);
+  return true;
+}
+
+/**
+ * Returns a reserved slot that bought nothing.
+ *
+ * Entries are bare timestamps and interchangeable, so removing *an* entry with this value is exactly
+ * removing the one that was reserved; the window only ever asks how many there are and how old the
+ * oldest is. Silently does nothing when the timestamp has already aged out of the window, which is
+ * the correct behaviour for a promotion attempt that took longer than the hour it was charged to.
+ */
+export function releaseAnalyticalPromotion(reservedAt: number): void {
+  const index = promotionTimes.lastIndexOf(reservedAt);
+  if (index >= 0) promotionTimes.splice(index, 1);
+}
+
+// ------------------------------------------------------------------------------------------------
 // The call
 // ------------------------------------------------------------------------------------------------
 
@@ -212,6 +302,18 @@ export interface ShadowInput {
   message?: NormalizedMessage;
   /** True only for deterministic `unrecognized`/`no_location` refusals, never for withdrawals. */
   allowAnalyticalPromotion?: boolean;
+  /**
+   * What the deterministic rules published from this same message, when they published anything.
+   *
+   * The exact complement of {@link allowAnalyticalPromotion}, and never set together with it: that
+   * flag marks the messages the rules REFUSED, this one the messages they accepted. Promotion fills
+   * a gap; enrichment annotates a claim that exists. `./ingestion.ts` sets exactly one of the two per
+   * message, which is why neither branch below has to defend against the other.
+   *
+   * Present does not mean anything is written: `codex_settings.analytical_enrichment_enabled` is off
+   * by default, and the enrichment row lands in a table no public surface reads.
+   */
+  publishedClaim?: PublishedClaim;
   historical?: boolean;
 }
 
@@ -225,6 +327,8 @@ export interface ShadowOptions {
   transcribe?: typeof transcribeAudio;
   /** Test seam for the post-recording promotion. */
   promote?: (input: ShadowInput, verdict: ShadowVerdict, model: string) => Promise<string | null>;
+  /** Test seam for the post-recording enrichment; answers how many remarks the event accepted. */
+  enrich?: (input: ShadowInput, verdict: ShadowVerdict, model: string) => Promise<number>;
 }
 
 export async function loadShadowContext(input: ShadowInput): Promise<ShadowContextMessage[]> {
@@ -245,23 +349,14 @@ export async function loadShadowContext(input: ShadowInput): Promise<ShadowConte
 export interface ShadowOutcome {
   status: 'recorded' | 'skipped';
   /** Why nothing was recorded. Present only for `skipped`, and never surfaced to a user. */
-  reason?: 'disabled' | 'rate_limited' | 'empty_text' | 'no_provider' | 'model_failed' | 'write_failed';
+  reason?: 'disabled' | 'rate_limited' | 'empty_text' | 'media_unusable' | 'transcription_failed'
+    | 'no_provider' | 'model_failed' | 'write_failed';
   agrees?: boolean;
   fields?: DisagreementField[];
   promotedEventId?: string;
+  /** Remarks filed beside an event the rules published. Absent when none was, or none accepted. */
+  enrichments?: number;
 }
-
-const THREAT_LABELS: Record<Exclude<ThreatType, 'unknown'>, string> = {
-  uav: 'ударних БпЛА',
-  ballistic_missile: 'балістичних ракет',
-  cruise_missile: 'крилатих ракет',
-  guided_air_bomb: 'керованих авіабомб',
-  aviation: 'бойової авіації',
-  mlrs: 'реактивних систем залпового вогню',
-  artillery: 'артилерії',
-  mortar: 'мінометного обстрілу',
-  combined: 'комбінованої повітряної атаки'
-};
 
 /**
  * Turns a model verdict into the deliberately smaller event contract.
@@ -283,12 +378,14 @@ export function buildAnalyticalClassification(
   const resolved = new Map<string, { id: string; name: string }>();
   const label = THREAT_LABELS[verdict.threatType];
   for (const name of names) {
-    const check = classifyMessage(`Загроза ${label} для ${name}.`, lexemes);
-    if (significanceRejection(check) !== null || check.nationalScope || check.locations.length !== 1) {
-      return null;
-    }
-    const location = check.locations[0]!;
-    resolved.set(location.id, { id: location.id, name: location.name });
+    // The resolution itself moved to `../domain/model-place.ts` when the enrichment path
+    // (`./analytical-enrichment.ts`) needed the same guarantee. It is the same three refusals in the
+    // same order — no threat read, national scope, or more than one candidate — and it is shared
+    // rather than copied because «the model may name a place but never an id» must have exactly one
+    // implementation: a second copy is a second place for a homonym to be resolved by a coin flip.
+    const location = resolveModelPlace(name, verdict.threatType, lexemes);
+    if (!location) return null;
+    resolved.set(location.id, location);
   }
   const locations = [...resolved.values()];
   if (!locations.length) return null;
@@ -334,6 +431,39 @@ async function promoteAnalyticalThreat(
     modelPromotion: { model, confidence: verdict.confidence }
   });
   return event.created && event.published ? event.id : null;
+}
+
+/**
+ * The other half of the same verdict: what the model saw ON TOP of what the rules published.
+ *
+ * Note what this function does NOT touch, because the contrast with `promoteAnalyticalThreat` above
+ * is the whole design. That one calls `ingestThreat`, which is the writer of `threat_events`,
+ * `threat_event_locations`, `threat_assertions`, `risk_signals` and `system_event_log` — the last of
+ * which is the seam the public SSE stream and the Telegram fan-out walk. This one calls
+ * {@link recordAnalyticalEnrichments}, whose entire vocabulary is one `INSERT` into
+ * `analytical_enrichments`. A remark therefore cannot raise evidence, cannot extend `valid_until`,
+ * cannot move `last_observed_at`, cannot add a district that `decideThreatNotification` would read as
+ * `geography_changed`, and cannot append the lifecycle row without which nobody is told anything.
+ *
+ * See `./analytical-enrichment.ts` for the guards inside that statement, and
+ * `migrations/045_model_enrichment.sql` for why the row lives in a table of its own rather than in
+ * columns on the event it describes.
+ */
+async function enrichPublishedEvent(
+  input: ShadowInput, verdict: ShadowVerdict, model: string
+): Promise<number> {
+  const published = input.publishedClaim;
+  if (!published) return 0;
+  const drafts = buildEnrichments(verdict, published, await cachedLocationLexemes());
+  if (!drafts.length) return 0;
+  const written = await recordAnalyticalEnrichments({
+    eventId: published.eventId,
+    sourceMessageId: input.sourceMessageId,
+    classifierVersion: CLASSIFIER_VERSION,
+    model,
+    confidence: verdict.confidence
+  }, drafts);
+  return written.recorded;
 }
 
 /**
@@ -384,6 +514,26 @@ const shadowOutcomes = new Counter({
 });
 
 /**
+ * Promotions the hourly publication quota refused.
+ *
+ * The only place this event is visible at all. It is not a `shadow_outcomes_total` skip — the shadow
+ * row *was* written and the outcome is `recorded` — and it is not a row in `shadow_classifications`
+ * either, since a refused promotion leaves `analytical_event_id` null exactly like the far more
+ * common "the verdict did not qualify". Without a counter of its own, an operator comparing the
+ * promotion rate before and after a config change has no way to tell a model that stopped producing
+ * publishable verdicts from a ceiling that is now doing all the work, which are opposite problems
+ * with opposite fixes.
+ *
+ * Unlabelled on purpose: there is one reason to be here. If a second ever appears, it belongs in a
+ * label rather than in a second counter, so that `sum` keeps meaning "promotions the quota refused".
+ */
+const analyticalPromotionsBlocked = new Counter({
+  name: 'threatlens_analytical_promotions_blocked_total',
+  help: 'Analytical promotions refused because the hourly publication quota was already spent',
+  registers: []
+});
+
+/**
  * This module's metrics, for whoever owns the registry.
  *
  * Handed over as data rather than as a `register(registry)` function of its own so that the call
@@ -393,7 +543,8 @@ const shadowOutcomes = new Counter({
 export function shadowClassifierMetrics(): ReadonlyArray<[string, Counter<string>]> {
   return [
     ['threatlens_shadow_attempts_total', shadowAttempts as Counter<string>],
-    ['threatlens_shadow_outcomes_total', shadowOutcomes]
+    ['threatlens_shadow_outcomes_total', shadowOutcomes],
+    ['threatlens_analytical_promotions_blocked_total', analyticalPromotionsBlocked as Counter<string>]
   ];
 }
 
@@ -401,6 +552,7 @@ export function shadowClassifierMetrics(): ReadonlyArray<[string, Counter<string
 export function resetShadowMetrics(): void {
   shadowAttempts.reset();
   shadowOutcomes.reset();
+  analyticalPromotionsBlocked.reset();
 }
 
 /**
@@ -425,10 +577,15 @@ function countOutcome(outcome: ShadowOutcome): ShadowOutcome {
  */
 export async function shadowClassify(input: ShadowInput, options: ShadowOptions = {}): Promise<ShadowOutcome> {
   shadowAttempts.inc();
-  const [shadowEnabled, analyticalEnabled] = await Promise.all([
-    codexFeatureEnabled('shadow'), codexFeatureEnabled('analytical_threats')
+  // Three switches, one call. `analytical_enrichment` joins the other two here rather than gating
+  // only the write below, because the verdict this module produces is the input all three consume:
+  // an installation that wants only enrichment must still get the model asked, and one that wants
+  // none of the three must not pay for a call whose answer nothing will read.
+  const [shadowEnabled, analyticalEnabled, enrichmentEnabled] = await Promise.all([
+    codexFeatureEnabled('shadow'), codexFeatureEnabled('analytical_threats'),
+    codexFeatureEnabled('analytical_enrichment')
   ]);
-  if (!shadowEnabled && !analyticalEnabled) {
+  if (!shadowEnabled && !analyticalEnabled && !enrichmentEnabled) {
     return countOutcome({ status: 'skipped', reason: 'disabled' });
   }
   const text = input.text.trim();
@@ -440,16 +597,46 @@ export async function shadowClassify(input: ShadowInput, options: ShadowOptions 
   const context = await (options.loadContext ?? loadShadowContext)(input).catch(() => []);
   const transcribe = options.transcribe ?? transcribeAudio;
   const transcripts: string[] = [];
+  let audioSeen = false;
   for (const media of input.media ?? []) {
     if (media.kind !== 'audio') continue;
+    audioSeen = true;
     const result = await transcribe(media).catch(() => ({ ok: false as const }));
     if (result.ok && result.text) transcripts.push(result.text);
   }
   const images = (input.media ?? [])
     .map(imageDataUrl).filter((dataUrl): dataUrl is string => Boolean(dataUrl))
     .slice(0, 2).map((dataUrl) => ({ dataUrl, detail: 'high' as const }));
+  /**
+   * A media-only message the enrichment could not turn into anything to read.
+   *
+   * The `empty_text` gate above has already let this message through, because media *was* attached;
+   * what fails here is the extraction. `imageDataUrl` (src/services/media-enrichment.ts:99-103)
+   * answers null for anything that is not jpeg/png/webp/gif or is over `SHADOW_IMAGE_MAX_BYTES`, and
+   * a voice note can come back without text for reasons that range from an unconfigured
+   * transcription model to a missing `ffmpeg`. Either way there is nothing to send, so the call is
+   * not made.
+   *
+   * This used to be counted as `model_failed` — the same label the three genuine provider failures
+   * below carry. An operator watching
+   * `threatlens_shadow_outcomes_total{status="skipped",reason="model_failed"}` therefore saw a rising
+   * model-failure rate on a night with many stickers or oversized photos and went looking at the
+   * provider, the quota and `ai_runs`, where nothing was wrong and no row existed at all: the model
+   * had never been called. The separate reason is what makes those two nights distinguishable in the
+   * one place an operator actually looks.
+   *
+   * Split in two because the two halves are fixed in different places and only one of them is worth
+   * anybody's evening. `transcription_failed` means audio was attached and no attempt produced text —
+   * an ops problem (credentials, `AI_TRANSCRIPTION_MODEL`, the ffmpeg conversion in
+   * `convertTelegramVoice`) that a human can actually clear. `media_unusable` means nothing readable
+   * was attached in the first place — a format or size the pipeline deliberately declines — and is
+   * expected background noise on any channel that posts stickers or video. Audio wins when a message
+   * carries both, because the actionable cause should not be hidden behind the inert one.
+   */
   if (!text && !transcripts.length && !images.length) {
-    return countOutcome({ status: 'skipped', reason: 'model_failed' });
+    return countOutcome({
+      status: 'skipped', reason: audioSeen ? 'transcription_failed' : 'media_unusable'
+    });
   }
   const prompt = JSON.stringify({
     previousMessages: context.map((item) => ({ at: item.publishedAt.toISOString(), text: item.text })),
@@ -513,20 +700,58 @@ export async function shadowClassify(input: ShadowInput, options: ShadowOptions 
   } catch {
     return countOutcome({ status: 'skipped', reason: 'write_failed', agrees, fields });
   }
+  /**
+   * The publication half, and the two things it is gated on.
+   *
+   * The quota is asked here and not inside `promoteAnalyticalThreat` because the row above is already
+   * written by the time this runs, and that ordering is the point: a spent publication budget must
+   * cost the map an unverified pin and cost the corpus nothing. Putting the check inside the
+   * promotion would put it inside a function that is only reached on the same path, which reads the
+   * same until somebody moves the write — and then a full quota would quietly start eating the
+   * labelling material collected during exactly the hours worth labelling.
+   */
   let promotedEventId: string | null = null;
   if (analyticalEnabled && input.allowAnalyticalPromotion) {
-    promotedEventId = await (options.promote ?? promoteAnalyticalThreat)(input, verdict, result.model)
-      .catch(() => null);
-    if (promotedEventId) {
-      await pool.query(
-        `UPDATE shadow_classifications SET analytical_event_id=$3
-          WHERE source_message_id=$1 AND classifier_version=$2`,
-        [input.sourceMessageId, CLASSIFIER_VERSION, promotedEventId]
-      ).catch(() => undefined);
+    const reservedAt = now();
+    if (!reserveAnalyticalPromotion(reservedAt)) {
+      analyticalPromotionsBlocked.inc();
+    } else {
+      promotedEventId = await (options.promote ?? promoteAnalyticalThreat)(input, verdict, result.model)
+        .catch(() => null);
+      if (!promotedEventId) {
+        releaseAnalyticalPromotion(reservedAt);
+      } else {
+        await pool.query(
+          `UPDATE shadow_classifications SET analytical_event_id=$3
+            WHERE source_message_id=$1 AND classifier_version=$2`,
+          [input.sourceMessageId, CLASSIFIER_VERSION, promotedEventId]
+        ).catch(() => undefined);
+      }
     }
   }
+  /**
+   * The enrichment half, and why it is charged to no budget.
+   *
+   * `reserveAnalyticalPromotion` above meters unverified pins on a public map and messages in a
+   * Telegram channel; there is nothing here for it to meter. An enrichment appends no lifecycle row,
+   * so it reaches no reader — the ceiling that matters for it is the shape bound inside
+   * `buildEnrichments` (at most `ENRICHMENT_MAX_LOCATIONS` + 2 rows per message, all of them
+   * refused by the database unless they are genuinely additions), not an hourly publication quota.
+   * Spending the publication budget here would do the opposite of what that budget is for: a night
+   * of heavy enrichment would silence the promotions the quota exists to ration.
+   *
+   * Mutually exclusive with the promotion above by construction, not by an `else`: promotion needs
+   * `allowAnalyticalPromotion` (the rules refused this message) and enrichment needs
+   * `publishedClaim` (the rules published it), and `./ingestion.ts` sets exactly one of the two.
+   */
+  let enrichments = 0;
+  if (enrichmentEnabled && input.publishedClaim) {
+    enrichments = await (options.enrich ?? enrichPublishedEvent)(input, verdict, result.model)
+      .catch(() => 0);
+  }
   return countOutcome({
-    status: 'recorded', agrees, fields, ...(promotedEventId ? { promotedEventId } : {})
+    status: 'recorded', agrees, fields, ...(promotedEventId ? { promotedEventId } : {}),
+    ...(enrichments ? { enrichments } : {})
   });
 }
 

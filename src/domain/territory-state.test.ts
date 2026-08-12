@@ -64,6 +64,7 @@ const eventRow = (over: Partial<LiveEvent> = {}): LiveEvent => ({
   threatType: 'uav',
   status: 'active',
   evidenceLevel: 'monitoring',
+  origin: 'deterministic',
   title: 'Ударні БпЛА',
   summary: 'Група БпЛА в напрямку області.',
   startedAt: ago(30 * 60_000),

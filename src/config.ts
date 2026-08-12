@@ -223,6 +223,20 @@ export const envSchema = z.object({
     .max(60, 'A publication delay above 60s would be reported to users as stale data')
     .default(15),
 
+  // Whether the fan-out may queue anything for the project's own Telegram channel (migration 044).
+  //
+  // *Which* channels exist is data, not configuration — every `publication_channels` row with
+  // `enabled=true` is published to — exactly as ALERT_CHANNEL_ENABLED sits above the `sources`
+  // registry. This flag is the deployment-level switch above that table, and it is the one that must
+  // work when the database is the thing going wrong.
+  //
+  // Off by default, and the third switch in front of the same behaviour: nothing is published unless
+  // `codex_settings.analytical_threats_enabled` (migration 040) lets a model create an event at all,
+  // an operator has enabled a channel row, and this is true. They are not redundant — the first is
+  // «may a model publish», the second is «to whom», this one is «at all, from this deployment» — and
+  // only the last of the three is reachable without a working `codex_settings` read.
+  PUBLICATION_CHANNEL_ENABLED: z.string().default('false').transform((value) => value === 'true'),
+
   // Deployment-level kill switch for the whole event-driven recompute path. When false the worker
   // never subscribes to the event hub at all, whatever `runtime_settings.analytics_event_driven`
   // says, and the existing fifteen-minute timers are the only trigger. This exists because the
@@ -269,6 +283,47 @@ export const envSchema = z.object({
   // Below this confidence a model verdict remains comparison material only. Publication is also
   // independently gated by `codex_settings.analytical_threats_enabled` and forced to `unverified`.
   ANALYTICAL_THREAT_MIN_CONFIDENCE: z.coerce.number().min(0.5).max(1).default(0.9),
+  // A second budget, spent only by the half of the shadow classifier that PUBLISHES. The per-minute
+  // limit above buys model calls; this one buys unverified pins on the public map and messages in the
+  // Telegram channel. They are deliberately not the same window: while promotions lived inside the
+  // per-minute call budget, a mass attack — the hour when the labelling corpus is worth the most —
+  // made collecting more material and publishing more analytical events the same spend, so an
+  // operator could not raise one without raising the other.
+  //
+  // Counted per hour rather than per minute because the failure this guards against is not a burst.
+  // It is a model whose calibration has drifted, which produces a steady drip that even a per-minute
+  // cap of 1 passes at sixty events an hour. Twelve — one every five minutes — is chosen against what
+  // the layer IS: analytical events are the residue of what the deterministic rules refused, so a
+  // night that wants more than a dozen an hour is telling an operator that the rules need a new
+  // pattern (which `/ops` shows), not that the map needs more unverified pins. The ceiling of 120 is
+  // the point past which the unverified layer stops being a residue and becomes what the map mostly
+  // shows; no confidence threshold makes that reviewable by a human.
+  //
+  // Zero stops promotions entirely and is the reason this is a number and not a boolean: it is the
+  // same stop as `codex_settings.analytical_threats_enabled`, reachable from the environment when
+  // `/ops` is not, and it leaves corpus collection running — the `shadow_classifications` row is
+  // written before this budget is consulted (src/services/shadow-classifier.ts).
+  ANALYTICAL_PROMOTIONS_MAX_PER_HOUR: z.coerce.number().int().min(0).max(120).default(12),
+  // How long a model-authored event may stand with nothing corroborating it before the system closes
+  // it itself (`withdrawUnconfirmedAnalyticalEvents`, src/repositories/events.ts). The budget above
+  // bounds how many analytical pins may appear per hour; this bounds how long each wrong one stays.
+  //
+  // **0 disables the sweep and is the shipped default**, because switching it on makes a published
+  // pin disappear sooner than the reader was told it would — `valid_until` on the row states thirty
+  // minutes, and a surface that quietly stops honouring its own stated deadline is the kind of
+  // inconsistency `docs/ARCHITECTURE.md` §Consistency rules is written against. An installation that
+  // wants the shorter leash is stating that it would rather lose a true analytical warning early
+  // than keep a false one, which is a real position but not one to take on somebody's behalf.
+  //
+  // Bounded at 29 rather than at 30: `THREAT_VALIDITY_MS` retires the event at thirty minutes
+  // anyway, so 30 and above is a setting that reads as configured and does nothing — the worst kind
+  // of switch. The floor of 5 is what keeps it from becoming a way to publish a pin and remove it
+  // before anyone can read it; below that the honest change is to stop promoting, which
+  // ANALYTICAL_PROMOTIONS_MAX_PER_HOUR=0 already does.
+  ANALYTICAL_UNCONFIRMED_CLOSE_MINUTES: z.coerce.number().int().min(0).max(29).default(0)
+    .refine((value) => value === 0 || value >= 5, {
+      message: 'ANALYTICAL_UNCONFIRMED_CLOSE_MINUTES must be 0 (off) or at least 5 minutes'
+    }),
 
   // ---- Retrospective gate (model confirmation for the grey band) --------------------------------
   // The only model call in this codebase that sits *inside* the ingestion path, and the only one
@@ -807,6 +862,15 @@ export const APP_SETTINGS: Record<keyof AppConfig, SettingMeta> = {
       + 'затримки відсунуло б зріз назад і зняло б із карти вже опубліковані тривоги, тож запис '
       + 'відхиляється з 409.'
   },
+  PUBLICATION_CHANNEL_ENABLED: {
+    scope: 'db_tunable', group: 'publication', apply: 'hot', confirm: true, impact: 'publication',
+    ui: { kind: 'boolean' },
+    applyNote: 'Читається у мить фанауту, тож вимкнення діє з наступної події без перезапуску — але '
+      + 'уже поставлені в чергу повідомлення каналу воно не відкликає: їх треба зняти з '
+      + 'notification_outbox. Публікує лише події з origin=model і лише в увімкнені рядки '
+      + 'publication_channels; офіційні тривоги цим шляхом не йдуть узагалі. Одна подія — одне '
+      + 'повідомлення в канал: повторне вмикання не переопубліковує те, що вже опубліковано.'
+  },
 
   // ---- analytics ---------------------------------------------------------------------------------
   ANALYTICS_EVENT_DRIVEN_ENABLED: {
@@ -859,6 +923,27 @@ export const APP_SETTINGS: Record<keyof AppConfig, SettingMeta> = {
   ANALYTICAL_THREAT_MIN_CONFIDENCE: {
     scope: 'db_tunable', group: 'analytics', apply: 'hot',
     ui: { kind: 'number', min: 0.5, max: 1 }
+  },
+  ANALYTICAL_PROMOTIONS_MAX_PER_HOUR: {
+    scope: 'db_tunable', group: 'analytics', apply: 'hot', impact: 'publication',
+    ui: { kind: 'number', min: 0, max: 120, unit: 'на годину' },
+    applyNote: 'Вікно ковзне й лежить у памʼяті процесу, тож нове значення діє з наступної промоції, '
+      + 'але вже опубліковане за останню годину не забувається: зниження нижче за кількість уже '
+      + 'зроблених промоцій закриває публікацію до кінця цієї години. 0 зупиняє аналітичні промоції '
+      + 'повністю й не чіпає збір корпусу — тіньові порівняння пишуться далі. Підтвердження свідомо '
+      + 'немає: єдина зміна, яку роблять поспіхом, — це нуль, і вона має коштувати одне натискання.'
+  },
+  ANALYTICAL_UNCONFIRMED_CLOSE_MINUTES: {
+    scope: 'db_tunable', group: 'analytics', apply: 'hot', impact: 'publication', confirm: true,
+    ui: { kind: 'number', min: 0, max: 29, unit: 'хв' },
+    // `confirm`, unlike the ceiling above, and для протилежного напрямку. Там поспішають до нуля —
+    // це зупинка, і вона має бути дешевою. Тут поспішають ВІД нуля, і кожен крок від нуля забирає з
+    // карти позначки раніше, ніж їх власне `valid_until` пообіцяло читачеві.
+    applyNote: 'Значення читається на кожному проході, тож зміна діє з наступного — але вже відкликані '
+      + 'події не повертаються: «відкликано» термінальне. 0 (типове) вимикає прибирання повністю. '
+      + 'Дозволені значення — 0 або 5..29: від 30 і вище налаштування виглядало б увімкненим і не '
+      + 'робило б нічого, бо тридцятихвилинне вікно чинності закриває подію й без нього. Прибирання '
+      + 'не працює, доки прохід не викликано з планувальника.'
   },
   RETROSPECTIVE_GATE_TIMEOUT_MS: {
     scope: 'db_tunable', group: 'analytics', apply: 'hot',
