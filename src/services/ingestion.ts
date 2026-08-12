@@ -320,27 +320,84 @@ async function reconcileAggregateAlert(
   // `ALERT_SOURCE_LIVENESS_SECONDS` defaults to an hour — sixty times the collector heartbeat and
   // twice its own silence guard — so "dead" means comprehensively dead rather than briefly late,
   // and every discounted row increments a counter so the trade is visible rather than silent.
-  const aggregate = await client.query<{ active: boolean; started_at: Date | null; ignored: number }>(
-    `SELECT bool_or(CASE WHEN any_alive THEN would_hold AND alive ELSE would_hold END) AS active,
-            min(provider_started_at) FILTER (
-              WHERE CASE WHEN any_alive THEN would_hold AND alive ELSE would_hold END
-            ) AS started_at,
-            count(*) FILTER (WHERE any_alive AND would_hold AND NOT alive)::int AS ignored
+  // ## The API decides. Channels are the fallback, and only when there is no API at all
+  //
+  // An air-raid alert and its all-clear are declared from an API whenever one is reachable. A
+  // Telegram channel may declare them only while EVERY alert API is unreachable.
+  //
+  // The two kinds of source differ in a way that decides this. An API serves a snapshot: "here is
+  // the complete picture right now", a claim the next poll re-states, corrects or contradicts. A
+  // channel publishes events: "an alert started in X", once, and if that sentence is missed, arrives
+  // out of order, or is written in a shape the parser does not know, nothing afterwards contradicts
+  // it. A missed snapshot is self-healing. A missed event is a state that stays wrong until somebody
+  // notices — which is exactly what happened on 2026-08-12, when a frozen channel row held Kyiv
+  // under alert for six hours while the HTTP mirror had correctly cleared it at 11:33 UTC.
+  //
+  // `api_available` is deliberately GLOBAL rather than per-location, and that is the whole mechanism.
+  // A snapshot source that is alive and does not mention this location is not silent about it — it is
+  // saying there is no alert here. Scoping the check to rows that exist for this location would
+  // invert that: the moment an API cleared a location its row would go quiet, the location would
+  // look API-less, and the channels would take over and re-raise what the API had just ended.
+  //
+  // ## What this gives up
+  //
+  // A channel that is right while every API is wrong can no longer correct them. That is a real
+  // loss and it is the owner's explicit decision, made after watching the opposite failure: the
+  // channel path is the one that can freeze undetected, and on this deployment it did.
+  //
+  // Note what "available" costs to satisfy: one alert API, enabled, with a success inside
+  // `ALERT_SOURCE_LIVENESS_SECONDS`. If every API is down, dead or switched off, the channels take
+  // over automatically and the rule below is the same one that ran before this change.
+  const aggregate = await client.query<{
+    active: boolean; started_at: Date | null;
+    ignored_precedence: number; ignored_stale: number; api_available: boolean;
+  }>(
+    `WITH api AS (
+       SELECT EXISTS (
+         SELECT 1 FROM sources
+          WHERE adapter_type = ANY($5::text[]) AND enabled
+            AND last_success_at > now()-($4::int * interval '1 second')
+       ) AS available
+     )
+     SELECT bool_or(counts AND holds) AS active,
+            min(provider_started_at) FILTER (WHERE counts AND holds) AS started_at,
+            -- Two different reasons a row was not allowed to hold, kept apart because they mean
+            -- opposite things to whoever reads the metric: precedence is the rule working as
+            -- designed and is expected whenever a channel and an API disagree, while stale means a
+            -- source has gone dead and is the signal that something needs fixing.
+            count(*) FILTER (WHERE NOT counts AND would_hold)::int AS ignored_precedence,
+            count(*) FILTER (WHERE counts AND would_hold AND NOT holds)::int AS ignored_stale,
+            bool_or(api_available) AS api_available
      FROM (
-       SELECT would_hold, alive, provider_started_at, bool_or(alive) OVER () AS any_alive
+       SELECT would_hold, provider_started_at, api_available,
+              -- Which rows are allowed a vote at all: API rows when an API is reachable, every row
+              -- otherwise. A row that is not counted cannot hold the alert and cannot end it.
+              CASE WHEN api_available THEN is_api ELSE true END AS counts,
+              -- Liveness still applies inside whichever set is voting: a dead row may not outvote a
+              -- live one, and when nothing is alive the aggregate keeps what it had.
+              CASE WHEN bool_or(alive) FILTER (WHERE CASE WHEN api_available THEN is_api ELSE true END)
+                        OVER () THEN would_hold AND alive ELSE would_hold END AS holds
        FROM (
          SELECT a.active OR COALESCE(a.missing_since > now()-($3::int * interval '1 second'),false)
                   AS would_hold,
                 COALESCE(s.last_success_at > now()-($4::int * interval '1 second'),false) AS alive,
-                a.provider_started_at
+                s.adapter_type = ANY($5::text[]) AS is_api,
+                a.provider_started_at,
+                (SELECT available FROM api) AS api_available
          FROM alert_source_states a JOIN sources s ON s.id=a.source_id
          WHERE a.location_id=$1 AND a.alert_type=$2
        ) row_state
      ) source_state`,
-    [locationId, alertType, config.ALERT_END_DEBOUNCE_SECONDS, config.ALERT_SOURCE_LIVENESS_SECONDS]
+    [locationId, alertType, config.ALERT_END_DEBOUNCE_SECONDS, config.ALERT_SOURCE_LIVENESS_SECONDS,
+      [...ALERT_API_ADAPTER_TYPES]]
   );
-  const ignoredStale = aggregate.rows[0]?.ignored ?? 0;
-  if (ignoredStale > 0) alertStaleSourcesIgnored.inc({ location: locationId }, ignoredStale);
+  const row = aggregate.rows[0];
+  const ignoredStale = row?.ignored_stale ?? 0;
+  const ignoredPrecedence = row?.ignored_precedence ?? 0;
+  if (ignoredStale > 0) alertStaleSourcesIgnored.inc({ location: locationId, reason: 'stale' }, ignoredStale);
+  if (ignoredPrecedence > 0) {
+    alertStaleSourcesIgnored.inc({ location: locationId, reason: 'api_precedence' }, ignoredPrecedence);
+  }
   const global = await client.query<{ id: string }>(
     `SELECT id FROM alert_periods WHERE location_id=$1 AND alert_type=$2 AND status='active' FOR UPDATE`,
     [locationId, alertType]
@@ -786,6 +843,21 @@ async function collectAerialMirrorSnapshot(
 export const ALERT_CHANNEL_ADAPTER_TYPE = 'mtproto_alert_channel';
 
 /**
+ * Adapter types that read an air-raid API rather than somebody's prose.
+ *
+ * These decide whether a location is under alert. Telegram channels do not, unless every one of
+ * these is unreachable — see {@link reconcileAggregateAlert} for the rule and for why it exists.
+ *
+ * `aerial_alerts_mirror` is in the list despite being a community republisher rather than an
+ * authority of its own: what puts it here is the SHAPE of what it serves. It answers "here is the
+ * complete national picture right now", which is a claim that can be checked, corrected and — most
+ * importantly — falsified by the next poll. A channel post is an event with no such property: it
+ * says what changed, once, and if the sentence is missed or misread nothing later contradicts it.
+ * The distinction this list draws is snapshot versus event, not official versus unofficial.
+ */
+export const ALERT_API_ADAPTER_TYPES = ['alerts_in_ua', 'ukraine_alarm', 'aerial_alerts_mirror'] as const;
+
+/**
  * The national channel https://t.me/air_alert_ua.
  *
  * Named because it is the row `config.ALERT_CHANNEL_USERNAME` falls back to when the registry cannot
@@ -840,16 +912,24 @@ const alertChannelStuckAlerts = new Counter({
 /**
  * Rows discounted from the alert aggregate because their source showed no sign of life.
  *
- * The visible price of the liveness rule in `reconcileAggregateAlert`. Zero is the healthy value and
- * the ordinary one: a non-zero rate means some source is holding alerts while dead, which is either
- * the failure this rule exists to survive or the rule itself misfiring on a source whose normal
- * update interval is longer than `ALERT_SOURCE_LIVENESS_SECONDS`. Both readings demand a look, and
- * neither is visible anywhere else — the aggregate simply comes out different.
+ * The visible price of the two precedence rules in `reconcileAggregateAlert`, split by `reason`
+ * because the two readings are opposites.
+ *
+ * `stale` means a source is holding alerts while showing no sign of life — either the failure the
+ * liveness rule exists to survive, or that rule misfiring on a source whose normal update interval
+ * exceeds `ALERT_SOURCE_LIVENESS_SECONDS`. Both demand a look.
+ *
+ * `api_precedence` means a Telegram channel wanted to hold an alert that no API agreed with. That is
+ * the rule working as designed, and a steady low rate is normal — channels lag and lead the APIs by
+ * seconds all day. A sustained HIGH rate says something else: either the channels are seeing
+ * something the APIs are not, or a channel is stuck, and the archive is where to look next.
+ *
+ * Neither number is visible anywhere else — without it the aggregate simply comes out different.
  */
 const alertStaleSourcesIgnored = new Counter({
   name: 'threatlens_alert_stale_sources_ignored_total',
-  help: 'Alert-holding source rows discounted from the aggregate because the source was not alive',
-  labelNames: ['location'],
+  help: 'Alert-holding source rows discounted from the aggregate, by why they were not counted',
+  labelNames: ['location', 'reason'],
   registers: []
 });
 const monitorMessages = new Counter({
@@ -1206,6 +1286,24 @@ export async function expireStuckAlertChannelAlerts(log?: { warn: Function }): P
   } finally {
     client.release();
   }
+}
+
+/**
+ * The newest Telegram message id already stored for a source, or null when none is.
+ *
+ * Used by the reconnect backfill to tell whether its bounded window actually met the archive or
+ * stopped short of it, leaving a stretch of the channel nobody has ever read. `external_id` is text
+ * because other adapters put non-numeric ids there; the cast is guarded so a source that has ever
+ * stored one cannot make this throw and take the backfill down with it.
+ */
+export async function newestStoredExternalId(sourceId: string): Promise<number | null> {
+  const result = await pool.query<{ newest: string | null }>(
+    `SELECT max(external_id::bigint)::text AS newest FROM source_messages
+      WHERE source_id=$1 AND external_id ~ '^[0-9]+$'`,
+    [sourceId]
+  );
+  const newest = Number(result.rows[0]?.newest ?? Number.NaN);
+  return Number.isFinite(newest) ? newest : null;
 }
 
 export interface AlertTelegramChannel {

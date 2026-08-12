@@ -3,7 +3,7 @@ import { notifyAdmin, type AdminNoticeReason } from '../bot/admin-notice.js';
 import { config } from '../config.js';
 import {
   ALERT_CHANNEL_SOURCE_ID, MONITOR_ADAPTER_TYPE, ingestAlertChannelMessages, loadAlertChannels,
-  loadMonitoredTelegramChannels, processMessage,
+  loadMonitoredTelegramChannels, newestStoredExternalId, processMessage,
   type AlertChannelMessage, type AlertTelegramChannel, type MonitoredTelegramChannel
 } from '../services/ingestion.js';
 import { markSourceError, markSourceSuccess } from '../services/operations.js';
@@ -143,13 +143,26 @@ const collectorSilentHeartbeats = new Counter({
   help: 'Heartbeat passes that withheld source freshness because no update had arrived in the window',
   registers: []
 });
+/**
+ * Reconnect backfills whose window stopped short of the newest message already stored.
+ *
+ * Every increment is a stretch of an official alert channel that nobody has read and nobody will:
+ * the live stream starts after it and the window ended before it. Non-zero means the bounds need
+ * raising — the WARN beside it names which one bit.
+ */
+const alertBackfillGaps = new Counter({
+  name: 'threatlens_alert_backfill_gaps_total',
+  help: 'Reconnect backfills that left unread messages between the archive and the window',
+  labelNames: ['source'], registers: []
+});
 
 const COLLECTOR_METRICS: ReadonlyArray<[string, Counter<string> | Gauge<string>]> = [
   ['threatlens_telegram_flood_waits_total', collectorFloodWaits],
   ['threatlens_telegram_resolve_failures_total', collectorResolveFailures],
   ['threatlens_telegram_collector_ready', collectorReady],
   ['threatlens_telegram_seconds_since_update', collectorSecondsSinceUpdate],
-  ['threatlens_telegram_silent_heartbeats_total', collectorSilentHeartbeats]
+  ['threatlens_telegram_silent_heartbeats_total', collectorSilentHeartbeats],
+  ['threatlens_alert_backfill_gaps_total', alertBackfillGaps]
 ];
 
 /**
@@ -554,12 +567,73 @@ async function backfillAlertChannel(
     }
     if (page.length < limit) break;
   }
+  // What the window did NOT reach, measured before anything is written.
+  //
+  // The window has two bounds, and when either one bites the read simply stops — leaving messages
+  // between the newest post already stored and the oldest post just fetched that nobody will ever
+  // read. On 2026-08-12 that gap was twenty-three minutes wide and contained the all-clear for Kyiv:
+  // the collector had messages up to 11:09 UTC, the window began at 11:53, and the alert stayed on
+  // the map for the rest of the day because the sentence that ended it fell between the two.
+  //
+  // Telegram ids are per-channel and monotonic, so the size of the hole is arithmetic rather than
+  // guesswork. It is reported as a WARN with the id range and the reason the window ended, because
+  // the operator's next move differs by reason: `count` means raise
+  // `ALERT_CHANNEL_BACKFILL_MESSAGES`, `age` means raise `ALERT_CHANNEL_BACKFILL_SECONDS`, and
+  // `exhausted` means the channel itself has nothing older and there is no gap to close.
+  const gap = await alertBackfillGap(route.sourceId, messages);
+  if (gap) {
+    alertBackfillGaps.inc({ source: route.sourceId });
+    log.warn?.({
+      sourceId: route.sourceId, channel: route.username,
+      missingMessages: gap.missing, storedThrough: gap.storedThrough, windowFrom: gap.windowFrom,
+      windowEnded: reachedCutoff ? 'age' : read >= config.ALERT_CHANNEL_BACKFILL_MESSAGES ? 'count' : 'exhausted'
+    }, 'alert channel backfill did not reach the newest stored message; messages in between were never read');
+  }
+
   const summary = await ingestAlertChannelMessages(route.sourceId, messages, log as { warn: Function });
   log.info({
     sourceId: route.sourceId, channel: route.username, read, inWindow: messages.length,
     events: summary.events, applied: summary.applied, skippedStale: summary.skippedStale,
-    unrecognized: summary.unrecognized, unresolved: summary.unresolved.length
+    unrecognized: summary.unrecognized, unresolved: summary.unresolved.length,
+    missedBeforeWindow: gap?.missing ?? 0
   }, 'alert channel backlog reconciled after connect');
+}
+
+export interface AlertBackfillGap {
+  /** How many Telegram ids lie between the newest stored message and the oldest one just read. */
+  missing: number;
+  /** Newest id already in `source_messages` for this source. */
+  storedThrough: number;
+  /** Oldest id this backfill pass fetched. */
+  windowFrom: number;
+}
+
+/**
+ * The hole between what we already had and what this pass reached, or null when the two meet.
+ *
+ * Pure arithmetic over ids rather than a second history request: asking Telegram to prove a gap
+ * would cost exactly the calls the bounded window exists to avoid, and the ids alone answer the
+ * question that matters — "is there a stretch of this channel nobody has read?".
+ *
+ * Null when the archive is empty (nothing to be discontinuous with), when the window reached back
+ * past the newest stored message (the normal, healthy case: the two overlap), and when the pass read
+ * nothing at all.
+ *
+ * The count is an upper bound: Telegram ids also cover service messages and deleted posts, so some
+ * of the missing numbers may never have been readable. An upper bound is the right error direction
+ * here — it can overstate a hole, never hide one.
+ */
+export async function alertBackfillGap(
+  sourceId: string, fetched: ReadonlyArray<{ externalId: string }>
+): Promise<AlertBackfillGap | null> {
+  const oldestFetched = fetched.reduce<number | null>((lowest, message) => {
+    const id = Number(message.externalId);
+    return Number.isFinite(id) && (lowest === null || id < lowest) ? id : lowest;
+  }, null);
+  if (oldestFetched === null) return null;
+  const stored = await newestStoredExternalId(sourceId);
+  if (stored === null || stored >= oldestFetched - 1) return null;
+  return { missing: oldestFetched - stored - 1, storedThrough: stored, windowFrom: oldestFetched };
 }
 
 // ------------------------------------------------------------------------------------------------

@@ -239,8 +239,16 @@ export const envSchema = z.object({
   // @air_alert_ua publishes about fifty messages an hour, so ~300 fill the six-hour window — while
   // an oblast administration publishes one to three an hour and finishes in a single page. That is
   // what keeps the cost of enabling another channel proportional to what it actually publishes.
-  ALERT_CHANNEL_BACKFILL_MESSAGES: z.coerce.number().int().min(0).max(500).default(300),
-  ALERT_CHANNEL_BACKFILL_SECONDS: z.coerce.number().int().min(0).default(21600),
+  //
+  // Both bounds were raised on 2026-08-12, after a reconnect window stopped twenty-three minutes
+  // short of the newest stored message and the all-clear for Kyiv fell into the hole. 300 messages
+  // and six hours were calibrated to a collector that reconnects promptly; they are the wrong size
+  // for one that has been silent for hours, which is precisely when the backfill is the only thing
+  // that can repair the state. 500 and twelve hours cost one extra history request per channel on a
+  // quiet one — paging stops as soon as it runs past the age bound — and cover an outage long enough
+  // to matter. `threatlens_alert_backfill_gaps_total` says when they are still not enough.
+  ALERT_CHANNEL_BACKFILL_MESSAGES: z.coerce.number().int().min(0).max(500).default(500),
+  ALERT_CHANNEL_BACKFILL_SECONDS: z.coerce.number().int().min(0).default(43200),
 
   // ---- OSINT air-threat monitoring channels ----------------------------------------------------
   // Which channels are read is data, not configuration: the list lives in `sources` and each row is
