@@ -47,7 +47,10 @@ const configState = vi.hoisted(() => ({
   CLASSIFIER_BACKFILL_MAX_PAGES: 5, CLASSIFIER_BACKFILL_PAGE_SIZE: 100,
   CLASSIFIER_BACKFILL_MAX_SOURCES_PER_SWEEP: 10, CLASSIFIER_BACKFILL_SOURCE_DELAY_MS: 0,
   CLASSIFIER_BACKFILL_MIN_RERUN_SECONDS: 3600, CLASSIFIER_BACKFILL_CHECK_INTERVAL_SECONDS: 0,
-  SHADOW_IMAGE_MAX_BYTES: 8_000_000, SHADOW_AUDIO_MAX_BYTES: 25_000_000
+  SHADOW_IMAGE_MAX_BYTES: 8_000_000, SHADOW_AUDIO_MAX_BYTES: 25_000_000,
+  // The silence guard the heartbeat now consults. Mutated by the block at the end of this file and
+  // restored there; every other test in this file wants the production default.
+  TELEGRAM_SILENCE_ALERT_SECONDS: 1800
 }));
 
 const registry = vi.hoisted(() => ({
@@ -108,7 +111,7 @@ vi.mock('../services/operations.js', () => ({
 
 import { resetAdminNotices, setAdminNoticeBot } from '../bot/admin-notice.js';
 import {
-  floodWaitSeconds, requestTelegramCollectorReload, resetTelegramCollectorStatus, resolveChannelPeers, startTelegramCollector,
+  floodWaitSeconds, noteCollectorUpdate, requestTelegramCollectorReload, resetTelegramCollectorStatus, resolveChannelPeers, startTelegramCollector,
   telegramAdvisoryMedia, telegramCollectorStatus, type ChannelRoute, type TelegramCollectorRuntime
 } from './telegram.js';
 
@@ -838,5 +841,133 @@ describe('operator notices', () => {
       await new Promise((resolve) => setTimeout(resolve, 10));
       expect(sent).toEqual([]);
     } finally { await stop?.(); }
+  });
+});
+
+// ------------------------------------------------------------------------------------------------
+// The heartbeat may only claim what it can prove
+// ------------------------------------------------------------------------------------------------
+//
+// On 2026-08-12 this deployment held `collector_ready 1` and advanced `last_success_at` every minute
+// for four and a half hours while receiving nothing at all. An air-raid all-clear for Kyiv published
+// inside that window never reached the map, and every surface an operator could look at — the source
+// table, the readiness gauge, `/ops` — reported the collector as healthy. The heartbeat was writing
+// `markSourceSuccess` on a timer, and a timer knows only that the process is alive.
+//
+// These tests pin the distinction the incident turned on: being subscribed is not receiving.
+
+describe('heartbeat silence guard', () => {
+  const HEARTBEAT_MS = 5;
+  /** Waits for at least two heartbeat passes, so «wrote nothing» is a decision rather than a race. */
+  const passes = () => new Promise((resolve) => setTimeout(resolve, HEARTBEAT_MS * 4));
+
+  /**
+   * Backdates the last update instead of waiting for the window to elapse in real time.
+   *
+   * The first version of these tests slept 1100ms to age past a one-second window. They passed
+   * alone and timed out in the full suite, because a test whose assertion depends on wall-clock
+   * progress is a test that fails when the machine is busy — and a flaky guard is worse than none,
+   * since the first thing anyone does with one is stop believing it.
+   *
+   * `noteCollectorUpdate` already takes the instant as a parameter, so the silence is simply
+   * declared. Nothing about the code under test is stubbed: the heartbeat reads the same module
+   * state it always reads.
+   */
+  const silentFor = (seconds: number) => noteCollectorUpdate(Date.now() - seconds * 1000);
+
+  it('marks sources fresh while updates are arriving', async () => {
+    const fake = fakeClient();
+    const stop = await start(fake, [], HEARTBEAT_MS);
+    try {
+      operations.successes = [];
+      // An update from ANY channel is the evidence; this one is routed and ingested like any other.
+      expect(await deliver(fake, 'new', channelMessage(MONITOR_CHANNELS[0]!))).toBe(true);
+      await passes();
+      expect(operations.successes.length).toBeGreaterThan(0);
+    } finally { await stop?.(); }
+  });
+
+  it('withholds freshness once nothing has arrived for longer than the window', async () => {
+    const fake = fakeClient();
+    // A minute of tolerated silence, and two minutes declared — no sleeping involved.
+    configState.TELEGRAM_SILENCE_ALERT_SECONDS = 60;
+    const stop = await start(fake, [], HEARTBEAT_MS);
+    try {
+      operations.successes = [];
+      silentFor(120);
+      await passes();
+      const afterWindow = operations.successes.length;
+      await passes();
+      // Nothing new after the window elapsed. The rows are left to `updateSourceFreshness`, which
+      // is the point: the collector says nothing rather than saying something it cannot back.
+      expect(operations.successes.length).toBe(afterWindow);
+      // And it does NOT invent a per-source fault — silence is one transport failing, not
+      // fifty-four channels each developing their own.
+      expect(operations.errors).toEqual([]);
+    } finally {
+      configState.TELEGRAM_SILENCE_ALERT_SECONDS = 1800;
+      await stop?.();
+    }
+  });
+
+  it('resumes marking as soon as one update arrives', async () => {
+    const fake = fakeClient();
+    configState.TELEGRAM_SILENCE_ALERT_SECONDS = 60;
+    const stop = await start(fake, [], HEARTBEAT_MS);
+    try {
+      silentFor(120);
+      await passes();
+      operations.successes = [];
+      await passes();
+      expect(operations.successes).toEqual([]);
+      // One update is enough. Recovery must not need a restart — a transport that comes back on its
+      // own has to be able to say so, or the guard becomes a second stuck state.
+      expect(await deliver(fake, 'new', channelMessage(MONITOR_CHANNELS[0]!))).toBe(true);
+      await passes();
+      expect(operations.successes.length).toBeGreaterThan(0);
+    } finally {
+      configState.TELEGRAM_SILENCE_ALERT_SECONDS = 1800;
+      await stop?.();
+    }
+  });
+
+  it('treats zero as «guard off», not as «zero seconds of silence allowed»', async () => {
+    const fake = fakeClient();
+    // The comparison is `silentFor >= threshold`, which at zero is true on every pass — so the
+    // documented disable switch would have withheld freshness forever, manufacturing the exact
+    // failure it turns off. This test exists because the first draft of the guard did that.
+    configState.TELEGRAM_SILENCE_ALERT_SECONDS = 0;
+    const stop = await start(fake, [], HEARTBEAT_MS);
+    try {
+      operations.successes = [];
+      silentFor(86_400);
+      await passes();
+      expect(operations.successes.length).toBeGreaterThan(0);
+    } finally {
+      configState.TELEGRAM_SILENCE_ALERT_SECONDS = 1800;
+      await stop?.();
+    }
+  });
+
+  it('counts an update the router discards as proof the transport is alive', async () => {
+    const fake = fakeClient();
+    configState.TELEGRAM_SILENCE_ALERT_SECONDS = 60;
+    const stop = await start(fake, [], HEARTBEAT_MS);
+    try {
+      silentFor(120);
+      await passes();
+      operations.successes = [];
+      await passes();
+      expect(operations.successes).toEqual([]);
+      // A post with neither text nor media returns early in `processEvent` and ingests nothing —
+      // and it still proves the updates loop is delivering, which is the only thing being measured.
+      expect(await deliver(fake, 'new', channelMessage(MONITOR_CHANNELS[0]!, { message: '' }))).toBe(true);
+      expect(ingested.classifier).toEqual([]);
+      await passes();
+      expect(operations.successes.length).toBeGreaterThan(0);
+    } finally {
+      configState.TELEGRAM_SILENCE_ALERT_SECONDS = 1800;
+      await stop?.();
+    }
   });
 });

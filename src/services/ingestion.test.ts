@@ -102,6 +102,7 @@ describe('metric registration', () => {
     'threatlens_aerial_mirror_raw_regions',
     'threatlens_alert_channel_messages_total',
     'threatlens_alert_channel_stuck_alerts_total',
+    'threatlens_alert_stale_sources_ignored_total',
     'threatlens_monitor_messages_total',
     'threatlens_classification_log_failures_total',
     'threatlens_threat_withdrawals_total',

@@ -275,15 +275,72 @@ async function reconcileAggregateAlert(
   // The debounce is keyed on `missing_since`, which only the snapshot path ever sets. A source that
   // publishes an explicit all-clear leaves it NULL, so its rows drop out of the aggregate the moment
   // the all-clear lands: the window is for sources that go quiet, not for sources that speak.
-  const aggregate = await client.query<{ active: boolean; started_at: Date | null }>(
-    `SELECT bool_or(holds) AS active,min(provider_started_at) FILTER (WHERE holds) AS started_at
+  // ## Why a source also has to be ALIVE to hold an alert
+  //
+  // The debounce above is one half of a pair and, until 2026-08-12, the only half that existed. It
+  // answers "a source went quiet for a moment" — hold the alert, one missed poll must not clear the
+  // map. What nothing answered was the mirror image: how long may a source hold an alert while
+  // showing no sign of life at all?
+  //
+  // On 2026-08-12 the MTProto collector stopped receiving updates while remaining subscribed and
+  // connected. Its `alert_source_states` row for Kyiv stayed `active=true`, frozen at 09:53 UTC. The
+  // HTTP mirror — an independent source polling the same executive-authority state — cleared Kyiv at
+  // 11:33 UTC, correctly and on time. The map still showed an alert at 16:23, because `bool_or`
+  // weighs a row nobody has touched in five hours exactly as heavily as one written a minute ago.
+  //
+  // So liveness is now a condition of holding. `sources.last_success_at` is the signal, and it is
+  // usable for this ONLY because the collector heartbeat stopped lying in the same change: it used
+  // to advance every minute on a timer regardless of whether anything was arriving, which made this
+  // column true by construction. See `TELEGRAM_SILENCE_ALERT_SECONDS` in `src/sources/telegram.ts`.
+  //
+  // NOT `alert_source_states.last_seen_at`, which would look like the obvious choice and is a trap:
+  // for an event-driven channel that column only moves when a message about THIS location arrives,
+  // so a genuine hours-long alert nobody has posted about since it began carries a stale value.
+  // Expiring on it would manufacture false all-clears on exactly the alerts that matter most.
+  //
+  // ## The condition that makes this safe: `any_alive`
+  //
+  // A dead row is discounted ONLY while some other source for the same location is alive. When
+  // every source has fallen silent — a database outage, a network partition, the whole process
+  // restarting, a test harness that resets `last_success_at` — the rule switches off entirely and
+  // the aggregate falls back to what it always was.
+  //
+  // This is not caution for its own sake. The first version of this change omitted the condition,
+  // and the existing alert suite answered immediately: twenty-one of twenty-six tests went red,
+  // every one of them because `resetDatabase` nulls `last_success_at` and so every source looked
+  // dead at once. That is the shape of the real failure too. Without `any_alive`, "we have lost
+  // contact with everything" and "everyone has published an all-clear" become the same state, and
+  // the map would clear itself during precisely the outage in which nobody can correct it — a
+  // false "Офіційний відбій", which `CONTEXT.md` treats as the unrecoverable failure.
+  //
+  // With it, the rule says something much narrower and much more defensible: a source that is
+  // demonstrably dead may not outvote a source that is demonstrably alive. Losing everything
+  // changes nothing, which is the correct behaviour when the honest answer is "we do not know".
+  //
+  // `ALERT_SOURCE_LIVENESS_SECONDS` defaults to an hour — sixty times the collector heartbeat and
+  // twice its own silence guard — so "dead" means comprehensively dead rather than briefly late,
+  // and every discounted row increments a counter so the trade is visible rather than silent.
+  const aggregate = await client.query<{ active: boolean; started_at: Date | null; ignored: number }>(
+    `SELECT bool_or(CASE WHEN any_alive THEN would_hold AND alive ELSE would_hold END) AS active,
+            min(provider_started_at) FILTER (
+              WHERE CASE WHEN any_alive THEN would_hold AND alive ELSE would_hold END
+            ) AS started_at,
+            count(*) FILTER (WHERE any_alive AND would_hold AND NOT alive)::int AS ignored
      FROM (
-       SELECT active OR COALESCE(missing_since > now()-($3::int * interval '1 second'),false) AS holds,
-              provider_started_at
-       FROM alert_source_states WHERE location_id=$1 AND alert_type=$2
+       SELECT would_hold, alive, provider_started_at, bool_or(alive) OVER () AS any_alive
+       FROM (
+         SELECT a.active OR COALESCE(a.missing_since > now()-($3::int * interval '1 second'),false)
+                  AS would_hold,
+                COALESCE(s.last_success_at > now()-($4::int * interval '1 second'),false) AS alive,
+                a.provider_started_at
+         FROM alert_source_states a JOIN sources s ON s.id=a.source_id
+         WHERE a.location_id=$1 AND a.alert_type=$2
+       ) row_state
      ) source_state`,
-    [locationId, alertType, config.ALERT_END_DEBOUNCE_SECONDS]
+    [locationId, alertType, config.ALERT_END_DEBOUNCE_SECONDS, config.ALERT_SOURCE_LIVENESS_SECONDS]
   );
+  const ignoredStale = aggregate.rows[0]?.ignored ?? 0;
+  if (ignoredStale > 0) alertStaleSourcesIgnored.inc({ location: locationId }, ignoredStale);
   const global = await client.query<{ id: string }>(
     `SELECT id FROM alert_periods WHERE location_id=$1 AND alert_type=$2 AND status='active' FOR UPDATE`,
     [locationId, alertType]
@@ -780,6 +837,21 @@ const alertChannelStuckAlerts = new Counter({
   labelNames: ['source'],
   registers: []
 });
+/**
+ * Rows discounted from the alert aggregate because their source showed no sign of life.
+ *
+ * The visible price of the liveness rule in `reconcileAggregateAlert`. Zero is the healthy value and
+ * the ordinary one: a non-zero rate means some source is holding alerts while dead, which is either
+ * the failure this rule exists to survive or the rule itself misfiring on a source whose normal
+ * update interval is longer than `ALERT_SOURCE_LIVENESS_SECONDS`. Both readings demand a look, and
+ * neither is visible anywhere else — the aggregate simply comes out different.
+ */
+const alertStaleSourcesIgnored = new Counter({
+  name: 'threatlens_alert_stale_sources_ignored_total',
+  help: 'Alert-holding source rows discounted from the aggregate because the source was not alive',
+  labelNames: ['location'],
+  registers: []
+});
 const monitorMessages = new Counter({
   name: 'threatlens_monitor_messages_total',
   help: 'Messages read from the OSINT monitoring channels, by classification outcome',
@@ -864,6 +936,7 @@ export function registerAlertChannelMetrics(registry: Registry): void {
     ['threatlens_aerial_mirror_raw_regions', aerialMirrorRawRegions],
     ['threatlens_alert_channel_messages_total', alertChannelMessages],
     ['threatlens_alert_channel_stuck_alerts_total', alertChannelStuckAlerts],
+    ['threatlens_alert_stale_sources_ignored_total', alertStaleSourcesIgnored],
     ['threatlens_monitor_messages_total', monitorMessages],
     ['threatlens_classification_log_failures_total', classificationLogFailures],
     ['threatlens_threat_withdrawals_total', threatWithdrawals],

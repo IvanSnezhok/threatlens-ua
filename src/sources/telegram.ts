@@ -114,12 +114,68 @@ const collectorReady = new Gauge({
   help: '1 when both MTProto event handlers are resolved and every registry channel is bound',
   registers: []
 });
+/**
+ * Seconds since the last update ANY subscribed channel delivered, or -1 before the first one.
+ *
+ * The one number `collector_ready` cannot give. Readiness answers «are we subscribed», which stays
+ * true for as long as the process lives: on 2026-08-12 the collector reported `ready 1` and a
+ * `last_success_at` of the current minute for four and a half hours during which it received
+ * nothing at all, and an air-raid all-clear published inside that window never reached the map.
+ * Subscription is not delivery, and this is the series that separates them.
+ *
+ * Fed from every event the handlers are given, before routing: an update for a channel no registry
+ * row claims is still proof that the transport is alive, which is exactly what is being measured.
+ */
+const collectorSecondsSinceUpdate = new Gauge({
+  name: 'threatlens_telegram_seconds_since_update',
+  help: 'Seconds since the last MTProto update from any subscribed channel; -1 before the first',
+  registers: []
+});
+/**
+ * Heartbeats that refused to mark the sources fresh because nothing had arrived for too long.
+ *
+ * A non-zero rate is the alert condition: it means the collector is subscribed, connected and
+ * silent, which on this deployment looked identical to «calm night» until somebody compared the
+ * archive against the channel by hand.
+ */
+const collectorSilentHeartbeats = new Counter({
+  name: 'threatlens_telegram_silent_heartbeats_total',
+  help: 'Heartbeat passes that withheld source freshness because no update had arrived in the window',
+  registers: []
+});
 
 const COLLECTOR_METRICS: ReadonlyArray<[string, Counter<string> | Gauge<string>]> = [
   ['threatlens_telegram_flood_waits_total', collectorFloodWaits],
   ['threatlens_telegram_resolve_failures_total', collectorResolveFailures],
-  ['threatlens_telegram_collector_ready', collectorReady]
+  ['threatlens_telegram_collector_ready', collectorReady],
+  ['threatlens_telegram_seconds_since_update', collectorSecondsSinceUpdate],
+  ['threatlens_telegram_silent_heartbeats_total', collectorSilentHeartbeats]
 ];
+
+/**
+ * When the last update arrived, in epoch milliseconds, or null when none has since the last attach.
+ *
+ * Module scope rather than a field on the runtime because both the event handler and the heartbeat
+ * need it and they are created in different closures; reset on every attach pass so a reconnect
+ * starts its silence window from the reconnect, not from an update the previous session received.
+ */
+let lastUpdateAt: number | null = null;
+
+/** Test seam and status source: how long the collector has been receiving nothing. */
+export function secondsSinceLastUpdate(now = Date.now()): number | null {
+  return lastUpdateAt === null ? null : Math.max(0, Math.round((now - lastUpdateAt) / 1000));
+}
+
+/**
+ * Records that the transport delivered something. Called for EVERY event, before routing.
+ *
+ * Exported for the test that drives the real event builders; production callers are the two
+ * handlers this module attaches.
+ */
+export function noteCollectorUpdate(now = Date.now()): void {
+  lastUpdateAt = now;
+  collectorSecondsSinceUpdate.set(0);
+}
 
 /** Attaches this module's metrics to the one HTTP registry. Idempotent, like its neighbours. */
 export function registerTelegramCollectorMetrics(registry: Registry): void {
@@ -712,6 +768,13 @@ export async function startTelegramCollector(
   let stopped = false;
 
   const processEvent = async (event: any) => {
+    // FIRST, and before every guard below. This records that the transport delivered something,
+    // which is a different claim from «this update was useful»: a service message, a channel the
+    // registry no longer claims, a post with no text and no media — all of them prove the updates
+    // loop is alive, and all of them return early further down. Counting only the useful ones would
+    // put a quiet hour and a dead socket back into the same bucket, which is the confusion this
+    // whole series exists to end.
+    noteCollectorUpdate();
     const message = event?.message;
     if (!message || (!message.message && !message.photo && !message.voice && !message.audio)) return;
     let route: ChannelRoute | undefined;
@@ -931,7 +994,49 @@ export async function startTelegramCollector(
       await markUnresolved(new Error('Telegram channel is not resolvable; the collector is not subscribed to it'));
     }
 
+    // The silence window starts НОВЕ on every attach. Carrying the previous session's last update
+    // across a reconnect would let a freshly reattached collector inherit a window that is already
+    // half spent, and — worse in the other direction — a reconnect after a long outage would trip
+    // the guard immediately on a transport that has simply not had a message yet.
+    lastUpdateAt = Date.now();
+    collectorSecondsSinceUpdate.set(0);
+
+    /**
+     * Heartbeat, and what it is now allowed to claim.
+     *
+     * It used to write `markSourceSuccess` unconditionally, once a minute, for as long as the
+     * process ran. That is the bug this guard closes: `markSourceSuccess` means «this source is
+     * being collected», and a timer cannot know that — it only knows the process is alive. On
+     * 2026-08-12 the collector held `ready 1` and a `last_success_at` of the current minute for four
+     * and a half hours while receiving nothing, an air-raid all-clear published inside that window
+     * never reached the map, and every surface an operator could look at said the sources were fine.
+     *
+     * So freshness is now asserted only against evidence: an update from ANY subscribed channel
+     * inside `TELEGRAM_SILENCE_ALERT_SECONDS`. Past that, the heartbeat stops writing and lets
+     * `updateSourceFreshness` move the rows to `stale` on its own — the collector says nothing
+     * rather than saying something it cannot back. Deliberately NOT `markSourceError`: silence is
+     * not per-source evidence of a per-source fault, and attributing a transport failure to
+     * fifty-four channels individually would bury the one fact that matters.
+     *
+     * The window is measured across ALL channels together on purpose. One channel going quiet for
+     * half an hour is an ordinary night; all fifty-four going quiet at once is a dead transport, and
+     * only the aggregate can tell those apart.
+     */
     heartbeat = setInterval(() => {
+      const silentFor = secondsSinceLastUpdate();
+      collectorSecondsSinceUpdate.set(silentFor ?? -1);
+      // `> 0` first, and it is not defensive noise: with the threshold at zero the comparison below
+      // is true on every pass, so the documented «zero disables the guard» would instead have
+      // withheld freshness forever — the exact failure this guard exists to report, manufactured by
+      // the switch meant to turn it off.
+      const threshold = config.TELEGRAM_SILENCE_ALERT_SECONDS;
+      if (threshold > 0 && silentFor !== null && silentFor >= threshold) {
+        collectorSilentHeartbeats.inc();
+        log.warn?.({
+          silentSeconds: silentFor, threshold, channels: liveSources.size
+        }, 'MTProto collector is subscribed and connected but has received nothing; source freshness withheld');
+        return;
+      }
       for (const sourceId of liveSources) {
         markSourceSuccess(sourceId).catch((error) => log.error({ error, sourceId }, 'MTProto heartbeat failed'));
       }

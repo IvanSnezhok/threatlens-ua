@@ -152,6 +152,30 @@ export const envSchema = z.object({
   ALERT_END_DEBOUNCE_SECONDS: z.coerce.number().int()
     .min(30, 'Alert end debounce must span at least two 15-second polls of the slowest alert leg')
     .default(60),
+  /**
+   * How long a source may hold an air-raid alert while showing no sign of life.
+   *
+   * The mirror image of the debounce above, and the half that was missing until 2026-08-12. The
+   * debounce says a source that goes briefly quiet keeps holding its alerts, so one missed poll
+   * cannot clear the map. This says the same source stops holding them once it has been silent long
+   * enough that "briefly" no longer describes it.
+   *
+   * That day the MTProto collector held Kyiv under alert from 09:53 UTC while receiving nothing at
+   * all; the independent HTTP mirror cleared Kyiv at 11:33 UTC, on time and correctly, and the map
+   * still showed an alert at 16:23 — because the aggregate weighed a five-hour-old row exactly as
+   * heavily as a one-minute-old one.
+   *
+   * An hour is deliberately generous: sixty times the collector's heartbeat interval and twice its
+   * own silence guard (`TELEGRAM_SILENCE_ALERT_SECONDS`), so a source has to be comprehensively dead
+   * rather than merely late. Raise it — never lower it — if a legitimately slow source starts being
+   * discounted; `threatlens_alert_stale_sources_ignored_total` is where that shows up first.
+   *
+   * The floor is ten minutes. Below that this stops being a liveness check and becomes a second,
+   * much blunter debounce, with a false "Офіційний відбій" as its failure mode.
+   */
+  ALERT_SOURCE_LIVENESS_SECONDS: z.coerce.number().int()
+    .min(600, 'Alert source liveness window must be at least ten minutes')
+    .default(3600),
 
   // ---- Official alert channels, collected over MTProto -----------------------------------------
   // These sources publish events, not snapshots, so they have their own reconciliation path and
@@ -178,8 +202,35 @@ export const envSchema = z.object({
   // failure this system treats as unrecoverable, a false "Офіційний відбій". If it ever fires, a
   // message was missed: it is logged at warn level and counted, not swallowed. The floor is one
   // hour so a misconfiguration cannot turn the backstop into a routine all-clear.
+  //
+  // Lowered from 86400 to 43200 on 2026-08-12, after a stuck Kyiv alert sat on the map for hours
+  // with a full day still to run before this could have touched it. The reasoning above has NOT
+  // changed and the trade-off is real: a frontline raion can genuinely hold an alert most of a day,
+  // and at twelve hours this guard will end some of those early — which is the failure mode the
+  // paragraph above calls unrecoverable. What changed is that the backstop is no longer the first
+  // line of defence. `TELEGRAM_SILENCE_ALERT_SECONDS` below now catches a collector that has stopped
+  // receiving within half an hour, which is the fault that actually produced the stuck alert, so
+  // this bound can be what it was always meant to be — a last resort — instead of the only one.
+  //
+  // If a frontline deployment reports a premature відбій, raise this back rather than reaching for
+  // the silence guard: they protect against different failures and neither substitutes for the other.
   ALERT_CHANNEL_MAX_ALERT_SECONDS: z.coerce.number().int()
-    .min(3600, 'Alert channel maximum alert duration must be at least one hour').default(86400),
+    .min(3600, 'Alert channel maximum alert duration must be at least one hour').default(43200),
+  /**
+   * How long the collector may receive NOTHING before it stops claiming its sources are fresh.
+   *
+   * Measured across every subscribed channel at once, which is what makes the number safe to keep
+   * this low: one channel silent for half an hour is an ordinary night, while all of them silent
+   * together is a dead updates loop. On 2026-08-12 that state lasted four and a half hours while
+   * `collector_ready` stayed 1 and `last_success_at` advanced every minute, and an air-raid
+   * all-clear published inside it never reached the map.
+   *
+   * Thirty minutes is roughly ten times the longest gap observed between updates across the
+   * fifty-four collected channels, so a real lull cannot trip it, and it is short enough that the
+   * operator learns about a dead transport within one alert cycle rather than one working day.
+   * Zero disables the guard and restores the old unconditional heartbeat.
+   */
+  TELEGRAM_SILENCE_ALERT_SECONDS: z.coerce.number().int().min(0).default(1800),
   // Reconnect backfill. Bounded twice, by count and by age; the window is folded to one terminal
   // state per location before anything is written, so old events are never replayed as new ones.
   //
@@ -818,6 +869,14 @@ export const APP_SETTINGS: Record<keyof AppConfig, SettingMeta> = {
     scope: 'db_tunable', group: 'official', apply: 'hot', confirm: true, impact: 'alerts',
     ui: { kind: 'number', min: 30, unit: 'с' }
   },
+  ALERT_SOURCE_LIVENESS_SECONDS: {
+    scope: 'db_tunable', group: 'official', apply: 'hot', confirm: true, impact: 'alerts',
+    ui: { kind: 'number', min: 600, unit: 'с' },
+    applyNote: 'Скільки джерело може тримати тривогу, не подаючи ознак життя (last_success_at). '
+      + 'Понад це вікно його рядок не враховується в агрегаті, і живе джерело може зняти тривогу. '
+      + 'Піднімати, а не знижувати: занизьке вікно дає хибний «Офіційний відбій». Слідкуйте за '
+      + 'threatlens_alert_stale_sources_ignored_total.'
+  },
 
   // ---- official: канал офіційних тривог ----------------------------------------------------------
   ALERT_CHANNEL_ENABLED: {
@@ -836,6 +895,14 @@ export const APP_SETTINGS: Record<keyof AppConfig, SettingMeta> = {
   ALERT_CHANNEL_MAX_ALERT_SECONDS: {
     scope: 'db_tunable', group: 'official', apply: 'hot', confirm: true, impact: 'alerts',
     ui: { kind: 'number', min: 3600, unit: 'с' }
+  },
+  TELEGRAM_SILENCE_ALERT_SECONDS: {
+    scope: 'db_tunable', group: 'official', apply: 'hot', confirm: true, impact: 'alerts',
+    ui: { kind: 'number', min: 0, unit: 'с' },
+    applyNote: 'Скільки колектор може не отримувати ЖОДНОГО оновлення, перш ніж перестане '
+      + 'позначати джерела свіжими. Рахується по всіх каналах разом. Нуль вимикає перевірку й '
+      + 'повертає стару поведінку, коли heartbeat щохвилини стверджував успіх незалежно від того, '
+      + 'чи щось надходило.'
   },
   ALERT_CHANNEL_BACKFILL_MESSAGES: {
     scope: 'db_tunable', group: 'official', apply: 'hot', ui: { kind: 'number', min: 0, max: 500 }
