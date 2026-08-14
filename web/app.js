@@ -958,14 +958,14 @@ function activePage() {
 }
 
 function eventCard(item, type) {
-  if (type === 'alert') return `<article class="event-card priority" data-location="${item.location_id}">
+  if (type === 'alert') return `<article class="event-card priority" data-location="${escapeHtml(item.location_id)}">
     <div class="event-meta"><span>ОФІЦІЙНА ТРИВОГА</span><time>${shortTime(item.started_at)}</time></div>
     <h2>${escapeHtml(item.location_name)}</h2><p>Активне офіційне повідомлення. Дотримуйтеся вказівок служб.</p>
     <div class="event-foot"><b>ТРИВАЄ</b><span>${timeAgo(item.started_at)}</span></div></article>`;
-  if (type === 'assessment') return `<article class="event-card analytical" data-assessment="${item.id}" data-location="${item.location_id}">
+  if (type === 'assessment') return `<article class="event-card analytical" data-assessment="${escapeHtml(item.id)}" data-location="${escapeHtml(item.location_id)}">
     <div class="event-meta"><span>АНАЛІТИЧНА ОЦІНКА</span><time>${shortTime(item.generated_at)}</time></div>
-    <h2>${escapeHtml(item.location_name)}</h2><p>${threatNames[item.threat_type] ?? item.threat_type}</p>
-    <div class="risk-row"><strong>${item.risk_score}<small>/10</small></strong><span>${levelNames[item.risk_level] ?? item.risk_level}<br><small>${item.indicative_percent ?? Math.round(item.risk_score * 10)}% індикативно · впевненість ${escapeHtml(confidenceNames[item.assessment_confidence] ?? item.assessment_confidence)}</small></span></div>
+    <h2>${escapeHtml(item.location_name)}</h2><p>${escapeHtml(threatNames[item.threat_type] ?? item.threat_type)}</p>
+    <div class="risk-row"><strong>${item.risk_score}<small>/10</small></strong><span>${escapeHtml(levelNames[item.risk_level] ?? item.risk_level)}<br><small>${item.indicative_percent ?? Math.round(item.risk_score * 10)}% індикативно · впевненість ${escapeHtml(confidenceNames[item.assessment_confidence] ?? item.assessment_confidence)}</small></span></div>
     <div class="event-foot"><b>НЕ Є ТРИВОГОЮ</b><span>до ${shortTime(item.horizon_end)}</span></div></article>`;
   // Підпис походження стоїть ПОРУЧ із доказовістю, а не замість неї, і саме в такому порядку. Це
   // два різні твердження — «підтвердження ще немає» і «це написала не людина» — і жодне з них не
@@ -973,7 +973,7 @@ function eventCard(item, type) {
   // `model-origin` навішується на всю картку, бо CSS уточнює саме семантичну смугу ліворуч
   // (.event-card::before), а не текст всередині.
   const model = isModelOrigin(item.origin);
-  return `<article class="event-card ${item.evidenceLevel}${model ? ' model-origin' : ''}" data-event="${item.id}">
+  return `<article class="event-card ${escapeHtml(item.evidenceLevel)}${model ? ' model-origin' : ''}" data-event="${escapeHtml(item.id)}">
     <div class="event-meta"><span>${escapeHtml(evidenceNames[item.evidenceLevel] ?? item.evidenceLevel)}${model ? ` · ${escapeHtml(originNames.model)}` : ''}</span><time>${shortTime(item.lastObservedAt)}</time></div>
     <h2>${escapeHtml(item.title)}</h2><p>${escapeHtml(item.summary)}</p>
     <div class="location-tags">${item.locations.map((loc) => `<span>${escapeHtml(loc.name)}</span>`).join('')}</div>
@@ -3271,7 +3271,7 @@ async function renderHistory() {
     //
     // Чекбокс стоїть ПЕРЕД часом і поза блоком тексту: він належить рядку цілком, а не заголовку, і
     // будь-яке інше місце зробило б його частиною однієї з міток.
-    $('#history-results', root).innerHTML = loaded.map((item) => `<article data-event="${item.id}"><label class="pick"><input type="checkbox" data-pick="${escapeHtml(item.id)}"><span class="visually-hidden">Позначити для вигрузки</span></label><time>${new Date(item.started_at).toLocaleString('uk-UA')}</time><div><span class="evidence ${item.evidence_level}">${evidenceNames[item.evidence_level]}</span>${isModelOrigin(item.origin) ? `<span class="evidence origin-model">${escapeHtml(originNames.model)}</span>` : ''}<h2>${escapeHtml(item.title)}</h2><p>${escapeHtml(item.summary)}</p><button class="text-button" data-detail="${item.id}">Джерела й зміни →</button></div></article>`).join('') || '<p>За цими фільтрами подій немає.</p>';
+    $('#history-results', root).innerHTML = loaded.map((item) => `<article data-event="${escapeHtml(item.id)}"><label class="pick"><input type="checkbox" data-pick="${escapeHtml(item.id)}"><span class="visually-hidden">Позначити для вигрузки</span></label><time>${new Date(item.started_at).toLocaleString('uk-UA')}</time><div><span class="evidence ${escapeHtml(item.evidence_level)}">${evidenceNames[item.evidence_level]}</span>${isModelOrigin(item.origin) ? `<span class="evidence origin-model">${escapeHtml(originNames.model)}</span>` : ''}<h2>${escapeHtml(item.title)}</h2><p>${escapeHtml(item.summary)}</p><button class="text-button" data-detail="${escapeHtml(item.id)}">Джерела й зміни →</button></div></article>`).join('') || '<p>За цими фільтрами подій немає.</p>';
     document.querySelectorAll('[data-detail]').forEach((button) => button.addEventListener('click', () => void showThreatDetails(button.dataset.detail)));
     $('#history-results', root).querySelectorAll('[data-pick]').forEach((box) => box.addEventListener('change', () => {
       if (box.checked) selected.add(box.dataset.pick); else selected.delete(box.dataset.pick);
@@ -3347,7 +3347,7 @@ async function renderAnalytics() {
     const params = new URLSearchParams({ month: `${values.month}-01` }); if (values.location) params.set('location', String(values.location));
     const response = await fetch(`/api/v1/analytics/monthly?${params}`); const data = await response.json(); const risk = snapshot.assessments.filter((item) => !values.location || item.location_id === values.location);
     const durationHours = data.alerts.reduce((sum, item) => sum + Number(item.total_duration?.hours ?? 0), 0);
-    $('#analytics-results', root).innerHTML = `<div class="metric-grid"><div><span>Тривоги</span><strong>${data.alerts.reduce((s, x) => s + x.alerts_count, 0)}</strong><small>завершених інтервалів</small></div><div><span>Загрози</span><strong>${data.threats.reduce((s, x) => s + x.threat_events, 0)}</strong><small>зафіксованих подій</small></div><div><span>Оцінки</span><strong>${risk.length}</strong><small>актуальних горизонтів</small></div></div><div class="analytics-note">Підрахунок загроз означає кількість нормалізованих інформаційних подій, а не атак, пусків або влучань.</div><div class="assessment-table">${risk.map((item) => `<article data-assessment="${item.id}"><div><span>${escapeHtml(item.location_name)}</span><strong>${threatNames[item.threat_type] ?? item.threat_type}</strong></div><b>${item.risk_score}<small>/10</small></b><p>${levelNames[item.risk_level]} · ${item.indicative_percent ?? Math.round(item.risk_score * 10)}% індикативно · впевненість ${escapeHtml(confidenceNames[item.assessment_confidence] ?? item.assessment_confidence)}</p><button class="text-button">Пояснення →</button></article>`).join('') || '<p>Актуальних оцінок немає.</p>'}</div>`;
+    $('#analytics-results', root).innerHTML = `<div class="metric-grid"><div><span>Тривоги</span><strong>${data.alerts.reduce((s, x) => s + x.alerts_count, 0)}</strong><small>завершених інтервалів</small></div><div><span>Загрози</span><strong>${data.threats.reduce((s, x) => s + x.threat_events, 0)}</strong><small>зафіксованих подій</small></div><div><span>Оцінки</span><strong>${risk.length}</strong><small>актуальних горизонтів</small></div></div><div class="analytics-note">Підрахунок загроз означає кількість нормалізованих інформаційних подій, а не атак, пусків або влучань.</div><div class="assessment-table">${risk.map((item) => `<article data-assessment="${escapeHtml(item.id)}"><div><span>${escapeHtml(item.location_name)}</span><strong>${escapeHtml(threatNames[item.threat_type] ?? item.threat_type)}</strong></div><b>${item.risk_score}<small>/10</small></b><p>${levelNames[item.risk_level]} · ${item.indicative_percent ?? Math.round(item.risk_score * 10)}% індикативно · впевненість ${escapeHtml(confidenceNames[item.assessment_confidence] ?? item.assessment_confidence)}</p><button class="text-button">Пояснення →</button></article>`).join('') || '<p>Актуальних оцінок немає.</p>'}</div>`;
     document.querySelectorAll('.assessment-table [data-assessment]').forEach((card) => card.addEventListener('click', () => void showAssessmentDetails(card.dataset.assessment)));
   };
   $('.filter-bar', root).addEventListener('submit', (event) => { event.preventDefault(); void load(); }); await load();
@@ -3399,7 +3399,7 @@ function attackDelta(row) {
   // Без попереднього періоду ділити нема на що, і «+∞%» тут було б не числом, а фігурою мови.
   if (row.deltaPercent === null) return '<em class="trend new" title="у попередньому періоді згадок не було">уперше</em>';
   const mark = attackTrendMarks[row.trend] ?? '·';
-  return `<em class="trend ${row.trend}" title="проти попереднього періоду">${mark} ${row.deltaPercent > 0 ? '+' : ''}${Math.round(row.deltaPercent)}%</em>`;
+  return `<em class="trend ${escapeHtml(row.trend)}" title="проти попереднього періоду">${mark} ${row.deltaPercent > 0 ? '+' : ''}${Math.round(row.deltaPercent)}%</em>`;
 }
 
 // ---- Тактичний блок: що змінилось за 24 години -------------------------------------------------
@@ -3729,7 +3729,7 @@ async function renderSources() {
   const root = contentShell('Прозорість', 'Джерела та стан', 'Кожне повідомлення має provenance; перепублікації одного першоджерела не рахуються як незалежні докази.');
   const statuses = { current: 'актуальне', stale: 'дані застаріли', error: 'помилка', unknown: 'очікуємо дані', unconfigured: 'потребує токена', disabled: 'вимкнено' };
   const channels = await fetch('/api/v1/channels').then((response) => response.json());
-  root.innerHTML = `<div class="source-grid">${snapshot.sourceHealth.map((source) => `<article><span class="source-tier">TIER ${source.tier}</span><h2>${escapeHtml(source.name)}</h2><p>${source.official ? 'Офіційне джерело' : 'Допоміжне джерело'}${source.last_success_at ? ` · останній успіх ${timeAgo(source.last_success_at)}` : ''}</p><div class="source-status ${source.status}">${statuses[source.status] ?? source.status}</div>${source.status === 'error' && source.last_error ? `<small>${escapeHtml(source.last_error)}</small>` : ''}</article>`).join('')}</div>
+  root.innerHTML = `<div class="source-grid">${snapshot.sourceHealth.map((source) => `<article><span class="source-tier">TIER ${escapeHtml(source.tier)}</span><h2>${escapeHtml(source.name)}</h2><p>${source.official ? 'Офіційне джерело' : 'Допоміжне джерело'}${source.last_success_at ? ` · останній успіх ${timeAgo(source.last_success_at)}` : ''}</p><div class="source-status ${escapeHtml(source.status)}">${escapeHtml(statuses[source.status] ?? source.status)}</div>${source.status === 'error' && source.last_error ? `<small>${escapeHtml(source.last_error)}</small>` : ''}</article>`).join('')}</div>
     <section class="channel-section"><header><p>Підписки</p><h2>Рекомендовані Telegram-канали</h2><span>Каталог формує адміністратор. Позначка ✓ означає ручну перевірку запису.</span></header>
     <div class="channel-grid">${channels.items.map((channel) => `<a href="${escapeHtml(channel.url)}" target="_blank" rel="noreferrer"><span>${channel.verified ? '✓ перевірено' : escapeHtml(channel.category)}</span><h3>${escapeHtml(channel.title)}</h3><p>${escapeHtml(channel.description)}</p><footer>@${escapeHtml(channel.username)}${channel.location_name ? ` · ${escapeHtml(channel.location_name)}` : ''}</footer></a>`).join('') || '<p>Каталог поки порожній.</p>'}</div></section>`;
 }
@@ -4700,7 +4700,7 @@ function shadowVerdictLine(label, verdict) {
       ? `${verdict.originLocations?.join(', ') || 'невідомо'} → ${verdict.destinationLocations?.join(', ') || 'невідомо'}`
       : '');
   const context = verdict.threatState
-    ? ` · ${states[verdict.threatState] || verdict.threatState}${movement ? ` · ${escapeHtml(movement)}` : ''}`
+    ? ` · ${escapeHtml(states[verdict.threatState] || verdict.threatState)}${movement ? ` · ${escapeHtml(movement)}` : ''}`
     : '';
   return `<p><strong>${escapeHtml(label)}:</strong> ${escapeHtml(verdict.threatType)} · ${escapeHtml(places)} · ${significance}${confidence}${context}</p>`;
 }
@@ -5982,7 +5982,7 @@ async function renderOps() {
         <label class="check-field"><input name="verified" type="checkbox"> Перевірено адміністратором</label>
         <button type="submit">Додати до каталогу</button><output id="channel-form-status"></output>
       </form>
-      <div class="ops-channel-list">${data.channels.map((channel) => `<article class="${channel.active ? '' : 'is-disabled'}"><div><span>${channel.verified ? '✓ перевірено' : escapeHtml(channel.category)}</span><h3>${escapeHtml(channel.title)}</h3><p>@${escapeHtml(channel.username)}${channel.location_name ? ` · ${escapeHtml(channel.location_name)}` : ''}</p></div><div class="ops-channel-actions"><a href="${escapeHtml(channel.url)}" target="_blank" rel="noreferrer">Відкрити ↗</a><button data-channel-toggle="verified" data-id="${channel.id}" data-value="${channel.verified}">${channel.verified ? 'Зняти перевірку' : 'Перевірити'}</button><button data-channel-toggle="active" data-id="${channel.id}" data-value="${channel.active}">${channel.active ? 'Приховати' : 'Активувати'}</button></div></article>`).join('')}</div>
+      <div class="ops-channel-list">${data.channels.map((channel) => `<article class="${channel.active ? '' : 'is-disabled'}"><div><span>${channel.verified ? '✓ перевірено' : escapeHtml(channel.category)}</span><h3>${escapeHtml(channel.title)}</h3><p>@${escapeHtml(channel.username)}${channel.location_name ? ` · ${escapeHtml(channel.location_name)}` : ''}</p></div><div class="ops-channel-actions"><a href="${escapeHtml(channel.url)}" target="_blank" rel="noreferrer">Відкрити ↗</a><button data-channel-toggle="verified" data-id="${escapeHtml(channel.id)}" data-value="${channel.verified}">${channel.verified ? 'Зняти перевірку' : 'Перевірити'}</button><button data-channel-toggle="active" data-id="${escapeHtml(channel.id)}" data-value="${channel.active}">${channel.active ? 'Приховати' : 'Активувати'}</button></div></article>`).join('')}</div>
     </section>
     </div>
     <div class="ops-col ops-col--full">
@@ -7051,6 +7051,25 @@ document.addEventListener('click', (event) => {
 });
 window.addEventListener('popstate', renderCurrentRoute);
 
+/**
+ * Розгортає міні-застосунок на повну висоту, якщо ми всередині Telegram.
+ *
+ * SDK вантажиться з `async` (див. коментар біля тега в `public/index.html`), тож на момент `boot()`
+ * його може ще не бути — і це нормальний стан, а не помилка. Поза Telegram його не буде ніколи, і
+ * тоді функція просто нічого не робить: обидва виклики й раніше стояли під `?.`, тобто відсутність
+ * SDK ніколи не була умовою роботи застосунку.
+ *
+ * Одноразовий `load` замість опитування таймером: подія приходить рівно тоді, коли скрипт справді
+ * виконався, а `{ once: true }` знімає слухача сам — жодного стану, який треба прибирати при зміні
+ * маршруту. Якщо тег відсутній або скрипт не завантажився, не станеться нічого, і це правильно.
+ */
+function applyTelegramChrome() {
+  const webApp = window.Telegram?.WebApp;
+  if (webApp) { webApp.ready(); webApp.expand(); return; }
+  document.getElementById('telegram-webapp-sdk')
+    ?.addEventListener('load', () => { window.Telegram?.WebApp?.ready(); window.Telegram?.WebApp?.expand(); }, { once: true });
+}
+
 async function boot() {
   const [loadedConfig, loadedLocations, loadedCountry, loadedAdmin] = await Promise.all([
     fetch('/api/v1/config').then((r) => r.json()),
@@ -7063,7 +7082,7 @@ async function boot() {
   indexRegionFeatures();
   $('#demo-label').hidden = !config.demoMode;
   if (location.pathname === '/tv') document.body.classList.add('tv-mode');
-  window.Telegram?.WebApp?.ready(); window.Telegram?.WebApp?.expand();
+  applyTelegramChrome();
   void loadRaionBoundaries(); // районна геометрія важка й не мусить затримувати першу картинку
   void loadOccupation(); // довідковий шар вантажиться окремо й не блокує старт карти
   await loadSnapshot(); connectStream();

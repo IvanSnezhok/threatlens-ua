@@ -107,7 +107,15 @@
     </section>
   </template>
 
-  <script src="https://telegram.org/js/telegram-web-app.js"></script>
+  <!--
+    `async`, і саме тому, що цей SDK не обовʼязковий. Класичний <script> без атрибута зупиняє
+    парсер, а модуль нижче відкладений і виконується ПІСЛЯ всіх відкладених у порядку документа —
+    тож поки telegram.org не віддасть файл, `boot()` не почнеться: ні знімка, ні карти, ні стріму.
+    Для застосунку тривог це найгірший можливий вид залежності, бо відмовляє він рівно там, де
+    мережа й так під тиском. З `async` завантаження ні на що не чекає, а порядок нам не потрібен:
+    єдиний споживач — `applyTelegramChrome()` — сам вирішує, що робити, коли SDK ще немає.
+  -->
+  <script async id="telegram-webapp-sdk" src="https://telegram.org/js/telegram-web-app.js"></script>
   <script type="module" src="/assets/app.js"></script>
 </body>
 </html>
