@@ -231,6 +231,24 @@ export const envSchema = z.object({
    * Zero disables the guard and restores the old unconditional heartbeat.
    */
   TELEGRAM_SILENCE_ALERT_SECONDS: z.coerce.number().int().min(0).default(1800),
+  /**
+   * How long the collector may receive NOTHING before it rebuilds the transport instead of only
+   * reporting it.
+   *
+   * `TELEGRAM_SILENCE_ALERT_SECONDS` above is a detector, and on 2026-08-14 that turned out to be
+   * half a fix. Telegram closed the DC 2 connection on 12.08 at 18:34 UTC, teleproto spent its five
+   * `connectionRetries` against a refused socket, gave up permanently, and the process then sat
+   * `ready` and silent for forty-one hours. The detector saw it correctly and wrote the warning
+   * every single minute of those forty-one hours. Nothing acted on it, because nothing was wired to.
+   *
+   * So the same evidence now also triggers a reconnect: drop the socket, dial again, re-subscribe.
+   * Kept separate from the alert window rather than folded into it because the two answer different
+   * questions — how long before we stop *claiming* freshness, versus how long before we stop
+   * *waiting*. Reporting should stay cheap and early; reconnecting costs a `resolveChannelPeers`
+   * pass and can draw a flood wait, which is why it is rate-limited on top of this threshold.
+   * Zero disables recovery and leaves the detector reporting alone.
+   */
+  TELEGRAM_SILENCE_RECOVERY_SECONDS: z.coerce.number().int().min(0).default(1800),
   // Reconnect backfill. Bounded twice, by count and by age; the window is folded to one terminal
   // state per location before anything is written, so old events are never replayed as new ones.
   //
@@ -911,6 +929,16 @@ export const APP_SETTINGS: Record<keyof AppConfig, SettingMeta> = {
       + 'позначати джерела свіжими. Рахується по всіх каналах разом. Нуль вимикає перевірку й '
       + 'повертає стару поведінку, коли heartbeat щохвилини стверджував успіх незалежно від того, '
       + 'чи щось надходило.'
+  },
+  TELEGRAM_SILENCE_RECOVERY_SECONDS: {
+    scope: 'db_tunable', group: 'official', apply: 'hot', confirm: true, impact: 'alerts',
+    ui: { kind: 'number', min: 0, unit: 'с' },
+    applyNote: 'Скільки колектор може мовчати, перш ніж САМ перепідключить транспорт і '
+      + 'перепідпишеться на канали. Відрізняється від порогу свіжості вище: той лише перестає '
+      + 'стверджувати, що джерела живі, а цей діє. Спроби рознесені зростаючою паузою, бо кожна '
+      + 'коштує повного resolve каналів і може впертись у flood wait. Нуль вимикає відновлення — '
+      + 'колектор знову тільки повідомлятиме про мертвий транспорт, як 12.08.2026, коли він '
+      + 'пролежав сорок одну годину, щохвилини правильно про це попереджаючи.'
   },
   ALERT_CHANNEL_BACKFILL_MESSAGES: {
     scope: 'db_tunable', group: 'official', apply: 'hot', ui: { kind: 'number', min: 0, max: 500 }

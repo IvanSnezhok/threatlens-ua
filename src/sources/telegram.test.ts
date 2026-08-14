@@ -50,7 +50,11 @@ const configState = vi.hoisted(() => ({
   SHADOW_IMAGE_MAX_BYTES: 8_000_000, SHADOW_AUDIO_MAX_BYTES: 25_000_000,
   // The silence guard the heartbeat now consults. Mutated by the block at the end of this file and
   // restored there; every other test in this file wants the production default.
-  TELEGRAM_SILENCE_ALERT_SECONDS: 1800
+  TELEGRAM_SILENCE_ALERT_SECONDS: 1800,
+  // Recovery is off for every test that is not about recovery. It is on in production, but leaving
+  // it on here would put a reconnect and a full re-resolve behind any test that happens to declare a
+  // long silence, which is a side effect none of them are asserting on.
+  TELEGRAM_SILENCE_RECOVERY_SECONDS: 0
 }));
 
 const registry = vi.hoisted(() => ({
@@ -170,16 +174,26 @@ interface FakeClientOptions {
   dialogsError?: Error | null;
   /** Consulted for every `getPeerId`; returning an Error makes that lookup fail. */
   onGetPeerId?: (username: string, callIndex: number) => Error | void;
+  /** Makes the pre-reconnect `disconnect` throw, the way a already-broken socket does. */
+  disconnectError?: Error;
+  /** Makes the reconnect itself fail, as an unreachable DC does. */
+  connectError?: Error;
 }
 
 interface FakeClient {
   client: Record<string, any>;
-  calls: { dialogScans: number; peerLookups: string[]; inputEntities: unknown[]; disconnects: number };
+  calls: {
+    dialogScans: number; peerLookups: string[]; inputEntities: unknown[];
+    disconnects: number; connects: number;
+  };
   handlers: Array<[(event: any) => Promise<void>, any]>;
 }
 
 function fakeClient(options: FakeClientOptions = {}): FakeClient {
-  const calls = { dialogScans: 0, peerLookups: [] as string[], inputEntities: [] as unknown[], disconnects: 0 };
+  const calls = {
+    dialogScans: 0, peerLookups: [] as string[], inputEntities: [] as unknown[],
+    disconnects: 0, connects: 0
+  };
   const handlers: Array<[(event: any) => Promise<void>, any]> = [];
   const visible = options.dialogs ?? ALL_CHANNELS;
   const client = {
@@ -209,7 +223,14 @@ function fakeClient(options: FakeClientOptions = {}): FakeClient {
         if (entry && (entry[0] === callback || entry[1] === builder)) handlers.splice(index, 1);
       }
     },
-    async disconnect() { calls.disconnects += 1; },
+    async disconnect() {
+      calls.disconnects += 1;
+      if (options.disconnectError) throw options.disconnectError;
+    },
+    async connect() {
+      calls.connects += 1;
+      if (options.connectError) throw options.connectError;
+    },
     _log: { error: () => undefined, warn: () => undefined }
   };
   return { client, calls, handlers };
@@ -967,6 +988,133 @@ describe('heartbeat silence guard', () => {
       expect(operations.successes.length).toBeGreaterThan(0);
     } finally {
       configState.TELEGRAM_SILENCE_ALERT_SECONDS = 1800;
+      await stop?.();
+    }
+  });
+});
+
+// The other half of the same incident, found on 2026-08-14.
+//
+// The guard above was deployed on 12.08 and it worked exactly as designed: at 18:34 UTC Telegram
+// closed the DC 2 connection, teleproto spent its five `connectionRetries` on a socket that answered
+// `ECONNREFUSED`, logged `Failed to reconnect to dc 2`, and stopped. From 18:38 the heartbeat wrote
+// «subscribed and connected but has received nothing» once a minute — correctly, and for the next
+// forty-one hours, during which the collector ingested nothing at all and nobody was woken up by a
+// log line. Detection without recovery is a detector watching the thing it detected.
+//
+// These tests pin the action, and the restraint on it: reconnecting is the cure, and reconnecting on
+// every heartbeat is a flood wait.
+
+describe('silent transport recovery', () => {
+  const HEARTBEAT_MS = 5;
+  const passes = () => new Promise((resolve) => setTimeout(resolve, HEARTBEAT_MS * 4));
+  const silentFor = (seconds: number) => noteCollectorUpdate(Date.now() - seconds * 1000);
+
+  it('rebuilds the connection once silence passes the recovery window', async () => {
+    const fake = fakeClient();
+    configState.TELEGRAM_SILENCE_RECOVERY_SECONDS = 60;
+    const stop = await start(fake, [], HEARTBEAT_MS);
+    try {
+      const scansAtStart = fake.calls.dialogScans;
+      silentFor(120);
+      await passes();
+      // Dropped and re-dialled — a live client object around a dead socket is what the incident was,
+      // so the socket itself has to be replaced rather than merely re-registered against.
+      expect(fake.calls.disconnects).toBeGreaterThan(0);
+      expect(fake.calls.connects).toBeGreaterThan(0);
+      // And re-subscribed. Builders are bound to the previous connection's update loop and do not
+      // survive it, so a reconnect that skipped this would come back connected and still deaf.
+      expect(fake.calls.dialogScans).toBeGreaterThan(scansAtStart);
+      expect(fake.handlers.length).toBeGreaterThan(0);
+    } finally {
+      configState.TELEGRAM_SILENCE_RECOVERY_SECONDS = 0;
+      await stop?.();
+    }
+  });
+
+  it('spaces attempts instead of reconnecting on every heartbeat', async () => {
+    const fake = fakeClient();
+    configState.TELEGRAM_SILENCE_RECOVERY_SECONDS = 60;
+    const stop = await start(fake, [], HEARTBEAT_MS);
+    try {
+      silentFor(120);
+      await passes();
+      const afterFirst = fake.calls.connects;
+      expect(afterFirst).toBe(1);
+      // Silence again, immediately, and for many more heartbeat passes than the first attempt took.
+      // The backoff is a minute, so the correct number of further reconnects is none: each one costs
+      // a full `resolveChannelPeers`, and fifty-four `contacts.ResolveUsername` calls a minute is
+      // how the flood wait was earned in the first place.
+      silentFor(120);
+      await passes();
+      await passes();
+      expect(fake.calls.connects).toBe(afterFirst);
+    } finally {
+      configState.TELEGRAM_SILENCE_RECOVERY_SECONDS = 0;
+      await stop?.();
+    }
+  });
+
+  it('does not reconnect while updates are arriving', async () => {
+    const fake = fakeClient();
+    configState.TELEGRAM_SILENCE_RECOVERY_SECONDS = 60;
+    const stop = await start(fake, [], HEARTBEAT_MS);
+    try {
+      expect(await deliver(fake, 'new', channelMessage(MONITOR_CHANNELS[0]!))).toBe(true);
+      await passes();
+      await passes();
+      expect(fake.calls.connects).toBe(0);
+      expect(fake.calls.disconnects).toBe(0);
+    } finally {
+      configState.TELEGRAM_SILENCE_RECOVERY_SECONDS = 0;
+      await stop?.();
+    }
+  });
+
+  it('treats zero as «recovery off» and leaves the detector reporting alone', async () => {
+    const fake = fakeClient();
+    configState.TELEGRAM_SILENCE_RECOVERY_SECONDS = 0;
+    const stop = await start(fake, [], HEARTBEAT_MS);
+    try {
+      // A day of silence, which is past every threshold in the file. Zero has to mean off, and not
+      // «zero seconds of silence tolerated» — the sibling guard shipped that bug once already.
+      silentFor(86_400);
+      await passes();
+      await passes();
+      expect(fake.calls.connects).toBe(0);
+    } finally { await stop?.(); }
+  });
+
+  it('survives a socket that refuses to close, because a broken one usually does', async () => {
+    const fake = fakeClient({ disconnectError: new Error('NOT_CONNECTED') });
+    configState.TELEGRAM_SILENCE_RECOVERY_SECONDS = 60;
+    const stop = await start(fake, [], HEARTBEAT_MS);
+    try {
+      silentFor(120);
+      await passes();
+      // The `disconnect` throwing must not abort the pass: it is the expected outcome against the
+      // dead socket being recovered from, and the `connect` after it is the entire point.
+      expect(fake.calls.connects).toBe(1);
+    } finally {
+      configState.TELEGRAM_SILENCE_RECOVERY_SECONDS = 0;
+      await stop?.();
+    }
+  });
+
+  it('does not wedge when the reconnect itself fails', async () => {
+    const fake = fakeClient({ connectError: new Error('ECONNREFUSED') });
+    configState.TELEGRAM_SILENCE_RECOVERY_SECONDS = 60;
+    const stop = await start(fake, [], HEARTBEAT_MS);
+    try {
+      silentFor(120);
+      await passes();
+      await passes();
+      // Exactly one attempt: the failure is caught and backed off, not retried in a tight loop and
+      // not left with the in-flight flag stuck on, which would disable recovery for the process.
+      expect(fake.calls.connects).toBe(1);
+      // The collector is still alive and still watching — `stop` resolving is that assertion.
+    } finally {
+      configState.TELEGRAM_SILENCE_RECOVERY_SECONDS = 0;
       await stop?.();
     }
   });

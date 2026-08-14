@@ -156,12 +156,27 @@ const alertBackfillGaps = new Counter({
   labelNames: ['source'], registers: []
 });
 
+/**
+ * Transport rebuilds the silence guard ordered because nothing was arriving.
+ *
+ * Read it against `threatlens_telegram_silent_heartbeats_total`: silent heartbeats climbing while
+ * this stays flat is the 2026-08-12 shape — the detector sees a dead transport and nobody acts.
+ * Both climbing together is recovery working. This one climbing without the silence counter falling
+ * back to flat means the reconnect itself is not taking, and the socket is not the fault.
+ */
+const collectorTransportRecoveries = new Counter({
+  name: 'threatlens_telegram_transport_recoveries_total',
+  help: 'Reconnect attempts started because the collector had received nothing for too long',
+  labelNames: ['outcome'], registers: []
+});
+
 const COLLECTOR_METRICS: ReadonlyArray<[string, Counter<string> | Gauge<string>]> = [
   ['threatlens_telegram_flood_waits_total', collectorFloodWaits],
   ['threatlens_telegram_resolve_failures_total', collectorResolveFailures],
   ['threatlens_telegram_collector_ready', collectorReady],
   ['threatlens_telegram_seconds_since_update', collectorSecondsSinceUpdate],
   ['threatlens_telegram_silent_heartbeats_total', collectorSilentHeartbeats],
+  ['threatlens_telegram_transport_recoveries_total', collectorTransportRecoveries],
   ['threatlens_alert_backfill_gaps_total', alertBackfillGaps]
 ];
 
@@ -173,6 +188,15 @@ const COLLECTOR_METRICS: ReadonlyArray<[string, Counter<string> | Gauge<string>]
  * starts its silence window from the reconnect, not from an update the previous session received.
  */
 let lastUpdateAt: number | null = null;
+
+/**
+ * Consecutive reconnects that have not yet been followed by an update, for spacing the next one.
+ *
+ * Module scope for the same reason as `lastUpdateAt`: the heartbeat that reads it and the handler
+ * that clears it are built in different closures. Deliberately NOT reset by `attach`, only by a real
+ * update — see `noteCollectorUpdate`.
+ */
+let transportRecoveryAttempts = 0;
 
 /** Test seam and status source: how long the collector has been receiving nothing. */
 export function secondsSinceLastUpdate(now = Date.now()): number | null {
@@ -188,6 +212,11 @@ export function secondsSinceLastUpdate(now = Date.now()): number | null {
 export function noteCollectorUpdate(now = Date.now()): void {
   lastUpdateAt = now;
   collectorSecondsSinceUpdate.set(0);
+  // An update is the only proof the transport works, so it is also the only thing that may forgive
+  // the backoff. Resetting on a successful `attach` instead would be wrong in the case that matters:
+  // the socket reconnects and subscribes cleanly while updates still never arrive, which is exactly
+  // what «subscribed, connected and silent» means. That path must keep backing off, not start over.
+  transportRecoveryAttempts = 0;
 }
 
 /** Attaches this module's metrics to the one HTTP registry. Idempotent, like its neighbours. */
@@ -728,6 +757,26 @@ function createBackfillPort(client: any, byPeerId: () => Map<string, ChannelRout
 const HEARTBEAT_INTERVAL_MS = 60_000;
 
 /**
+ * Spacing between reconnect attempts, doubling from the first to a ceiling.
+ *
+ * A reconnect is not free: it re-runs `resolveChannelPeers`, and on a cache-cold pass that is up to
+ * fifty-four `contacts.ResolveUsername` calls — the exact request pattern that drew the flood wait on
+ * 2026-08-12. Retrying every heartbeat against a Telegram-side outage would therefore turn a
+ * transport failure into an account-level penalty and make the outage longer than it had to be.
+ *
+ * One minute first, because most of these are a socket that died alone and comes back immediately.
+ * The doubling exists for the other case — Telegram unreachable for hours — where the right
+ * behaviour is to keep trying forever but cheaply. Sixteen minutes as the ceiling keeps the worst
+ * case recovery well inside one alert cycle.
+ */
+const RECOVERY_BACKOFF_BASE_MS = 60_000;
+const RECOVERY_BACKOFF_MAX_MS = 960_000;
+
+function recoveryBackoffMs(attempts: number): number {
+  return Math.min(RECOVERY_BACKOFF_MAX_MS, RECOVERY_BACKOFF_BASE_MS * 2 ** Math.max(0, attempts));
+}
+
+/**
  * How long the collector waits before retrying a pass that ended without a flood wait.
  *
  * A flood wait always uses the interval Telegram named instead of this one. This covers the other
@@ -948,6 +997,68 @@ export async function startTelegramCollector(
     }
     void attach();
   };
+  let recovering = false;
+  let nextRecoveryAt = 0;
+
+  /**
+   * Rebuild the transport after the silence guard has proved it is not delivering.
+   *
+   * The guard above can only ever *withhold* a claim; this is what acts on the same evidence. On
+   * 2026-08-12 Telegram closed the DC 2 connection, teleproto burned its five `connectionRetries`
+   * against a socket that was refusing, logged `Failed to reconnect to dc 2`, and never tried again.
+   * The library's retry budget is per-disconnect and it does not renew, so once it is spent the
+   * client stays a live object wrapped around a dead socket for as long as the process runs — which
+   * was forty-one hours. Nothing below the collector will fix that, so the collector must.
+   */
+  const recoverTransport = async (silentSeconds: number, attempt: number): Promise<void> => {
+    recovering = true;
+    try {
+      log.warn?.({ silentSeconds, attempt },
+        'MTProto transport silent past the recovery window; rebuilding the connection');
+      // Tolerated, and not merely defensively: the socket being recovered from is broken by
+      // definition, so `disconnect` throwing is an ordinary outcome on this path. Letting it abort
+      // the pass would skip the `connect` that is the entire point of the call.
+      try {
+        await client.disconnect();
+      } catch (error) {
+        log.warn?.({ error }, 'MTProto transport did not close cleanly before reconnect');
+      }
+      if (stopped) return;
+      await client.connect();
+      if (stopped) return;
+      // Re-subscribe through `attach`, not by hand. The builders were bound to the previous
+      // connection's update loop and do not survive it, and `attach` is the single pass that rebinds
+      // them, re-marks the live sources and restarts the silence window. Reusing it means a
+      // recovered collector lands in the same state startup produces rather than a second, less
+      // exercised one — and it inherits the flood-wait and «bound nothing» handling already there.
+      await attach();
+      collectorTransportRecoveries.inc({ outcome: 'reconnected' });
+    } catch (error) {
+      collectorTransportRecoveries.inc({ outcome: 'failed' });
+      log.error({ error, attempt }, 'MTProto transport reconnect failed');
+    } finally {
+      recovering = false;
+    }
+  };
+
+  /**
+   * The rate limiter in front of it, and why recovery is not simply attempted every heartbeat.
+   *
+   * Each attempt re-runs `resolveChannelPeers`, which on a cache-cold pass is up to fifty-four
+   * `contacts.ResolveUsername` calls — the request pattern that drew the flood wait during the same
+   * incident. Reconnecting once a minute against a Telegram-side outage would convert a transport
+   * failure into an account penalty and make the outage strictly longer, so the backoff is part of
+   * the fix rather than politeness.
+   */
+  const maybeRecoverTransport = (silentSeconds: number | null, now = Date.now()): void => {
+    const threshold = config.TELEGRAM_SILENCE_RECOVERY_SECONDS;
+    if (threshold <= 0 || silentSeconds === null || silentSeconds < threshold) return;
+    if (recovering || stopped || now < nextRecoveryAt) return;
+    nextRecoveryAt = now + recoveryBackoffMs(transportRecoveryAttempts);
+    transportRecoveryAttempts += 1;
+    void recoverTransport(silentSeconds, transportRecoveryAttempts);
+  };
+
   const attachPass = async (): Promise<void> => {
     const routes = await resolveChannelRoutes(log);
     const resolution = await resolveChannelPeers(client, routes, log);
@@ -1099,6 +1210,12 @@ export async function startTelegramCollector(
     heartbeat = setInterval(() => {
       const silentFor = secondsSinceLastUpdate();
       collectorSecondsSinceUpdate.set(silentFor ?? -1);
+      // Before the freshness decision below, and on its own threshold, because the two are separate
+      // questions asked of the same evidence: this one is «stop waiting and rebuild the transport»,
+      // the one below is «stop claiming the sources are fresh». Nesting recovery inside the
+      // withholding branch would silently tie it to the alert window and make the recovery knob a
+      // lie whenever the two thresholds differ.
+      maybeRecoverTransport(silentFor);
       // `> 0` first, and it is not defensive noise: with the threshold at zero the comparison below
       // is true on every pass, so the documented «zero disables the guard» would instead have
       // withheld freshness forever — the exact failure this guard exists to report, manufactured by
@@ -1180,6 +1297,12 @@ export async function startTelegramCollector(
     stopClassifierBackfill = null;
     detach();
     setCollectorStatus({ ...INITIAL_STATUS, detail: 'stopped' });
-    await client.disconnect();
+    // Shutdown must not depend on the socket being healthy. `disconnect` throws on a connection that
+    // is already broken, and that is precisely the state the collector is most likely to be stopped
+    // in — a transport that died is what makes anyone restart the process. Rejecting here would
+    // propagate out of the shutdown sequence and leave whatever runs after it unrun.
+    await client.disconnect().catch((error: unknown) => {
+      log.warn?.({ error }, 'MTProto transport did not close cleanly on shutdown');
+    });
   };
 }
