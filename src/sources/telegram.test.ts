@@ -1055,6 +1055,39 @@ describe('silent transport recovery', () => {
     }
   });
 
+  it('declines to reconnect while a flood wait is still running', async () => {
+    // The one silence that reconnecting cannot cure, and can only deepen. Inside a penalty the
+    // collector is quiet BECAUSE it is being penalised, so the silence is not evidence about the
+    // socket — and a rebuild spends up to fifty-four `contacts.ResolveUsername` calls out of the
+    // quota that is already exhausted. `requestTelegramCollectorReload` has always refused here;
+    // until this guard the unattended heartbeat was the one caller allowed to hammer.
+    const fake = fakeClient();
+    const scan = fake.client.getDialogs;
+    let flooding = false;
+    fake.client.getDialogs = async () => {
+      if (flooding) { fake.calls.dialogScans += 1; throw new FloodWaitError({ capture: 1200 }); }
+      return scan();
+    };
+    configState.TELEGRAM_SILENCE_RECOVERY_SECONDS = 60;
+    const stop = await start(fake, [], HEARTBEAT_MS);
+    try {
+      flooding = true;
+      requestTelegramCollectorReload();
+      await vi.waitFor(() => expect(telegramCollectorStatus().floodWaitSeconds).toBe(1200));
+      const connectsAtFlood = fake.calls.connects;
+      const disconnectsAtFlood = fake.calls.disconnects;
+
+      silentFor(120);
+      await passes();
+      await passes();
+      expect(fake.calls.connects).toBe(connectsAtFlood);
+      expect(fake.calls.disconnects).toBe(disconnectsAtFlood);
+    } finally {
+      configState.TELEGRAM_SILENCE_RECOVERY_SECONDS = 0;
+      await stop?.();
+    }
+  });
+
   it('does not reconnect while updates are arriving', async () => {
     const fake = fakeClient();
     configState.TELEGRAM_SILENCE_RECOVERY_SECONDS = 60;

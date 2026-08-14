@@ -1042,18 +1042,37 @@ export async function startTelegramCollector(
   };
 
   /**
-   * The rate limiter in front of it, and why recovery is not simply attempted every heartbeat.
+   * The rate limiter in front of it, and what each guard actually bounds.
    *
    * Each attempt re-runs `resolveChannelPeers`, which on a cache-cold pass is up to fifty-four
    * `contacts.ResolveUsername` calls — the request pattern that drew the flood wait during the same
-   * incident. Reconnecting once a minute against a Telegram-side outage would convert a transport
-   * failure into an account penalty and make the outage strictly longer, so the backoff is part of
-   * the fix rather than politeness.
+   * incident. Three separate things keep that from becoming an account penalty, and they are not
+   * interchangeable:
+   *
+   *  1. **An active flood wait refuses outright.** A collector inside a penalty is silent *because*
+   *     it is being penalised, so its silence is not evidence of a dead socket and reconnecting
+   *     cannot help — it can only spend more of the quota that is already exhausted. `collectorReload`
+   *     has always refused here; the automatic path did not, which meant the unattended caller was
+   *     the one allowed to hammer. The manual path re-arms for the remaining wait because a human
+   *     asked for a pass; this one simply declines, since the heartbeat will ask again anyway.
+   *  2. **The backoff ladder bounds a FAILING connect.** When `client.connect()` throws, `attach()`
+   *     never runs, so nothing resets the silence window and the heartbeat keeps arriving with the
+   *     guard already tripped. That is the path where `now < nextRecoveryAt` does the work, and the
+   *     doubling from one minute to sixteen is what keeps a Telegram-side outage cheap.
+   *  3. **The silence threshold bounds a SUCCEEDING one.** A reconnect that completes runs `attach()`,
+   *     which restarts the silence window, so the next attempt cannot arrive before another
+   *     `TELEGRAM_SILENCE_RECOVERY_SECONDS` of renewed silence — thirty minutes by default, which is
+   *     already wider than the ladder's own ceiling. The ladder is therefore never consulted on this
+   *     path, and `transportRecoveryAttempts` surviving a successful attach changes nothing here.
+   *     That is deliberate: the cadence that matters is the wider of the two, and it is this one.
    */
   const maybeRecoverTransport = (silentSeconds: number | null, now = Date.now()): void => {
     const threshold = config.TELEGRAM_SILENCE_RECOVERY_SECONDS;
     if (threshold <= 0 || silentSeconds === null || silentSeconds < threshold) return;
     if (recovering || stopped || now < nextRecoveryAt) return;
+    const floodUntil = collectorStatus.floodWaitUntil
+      ? Date.parse(collectorStatus.floodWaitUntil) : Number.NaN;
+    if (Number.isFinite(floodUntil) && floodUntil > now) return;
     nextRecoveryAt = now + recoveryBackoffMs(transportRecoveryAttempts);
     transportRecoveryAttempts += 1;
     void recoverTransport(silentSeconds, transportRecoveryAttempts);
