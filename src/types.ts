@@ -11,7 +11,7 @@ export type EvidenceLevel = 'official' | 'confirmed' | 'monitoring' | 'unverifie
  * імпортує нічого й не має починати. Каталог зон із координатами та патернами читає цей тип, а не
  * навпаки.
  */
-export type OriginZoneId = 'black_sea' | 'azov_sea' | 'northern_approach' | 'eastern_approach';
+export type OriginZoneId = 'black_sea' | 'azov_sea';
 /**
  * Who authored a threat event — the deterministic rules, or a promoted model verdict.
  *

@@ -14,9 +14,15 @@ describe('origin zones are read, never inferred', () => {
     expect(detectOriginZone('Ворожі БпЛА з Азовського моря')?.id).toBe('azov_sea');
   });
 
-  it('reads a compass approach a source actually named', () => {
-    expect(detectOriginZone('БпЛА з півночі на Чернігівщину')?.id).toBe('northern_approach');
-    expect(detectOriginZone('Ворожі цілі зі сходу')?.id).toBe('eastern_approach');
+  it('treats a compass bearing as an approach to a city, not as a zone of origin', () => {
+    // Найдорожчий урок цього каталогу, і він прийшов із реального трафіку, а не з тестів. За сім
+    // днів «з півночі»/«зі сходу» трапилося 96 разів, і майже завжди у вигляді «БпЛА курсом на Київ
+    // з півночі» — тобто це бік, з якого цілі заходять на КОНКРЕТНЕ місто, а не зона старту за
+    // кордоном. Іконка на широті 52.9° стверджувала б місце, про яке ніхто не говорив; цей бік уже
+    // описує directionText.
+    expect(detectOriginZone('БпЛА курсом на Київ з півночі')).toBeNull();
+    expect(detectOriginZone('Київщина: 6 на Бровари зі сходу')).toBeNull();
+    expect(detectOriginZone('Ворожі цілі зі сходу')).toBeNull();
   });
 
   it('stays silent when the message names no origin at all', () => {
