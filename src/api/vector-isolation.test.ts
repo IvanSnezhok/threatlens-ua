@@ -340,6 +340,7 @@ function executionOrderSource(): string {
   return styleLoadBlock()
     .replace('addOccupationLayers();', bodyOf('addOccupationLayers'))
     .replace('addVectorLayers();', bodyOf('addVectorLayers'))
+    .replace('addThreatDotLayers();', bodyOf('addThreatDotLayers'))
     .replace('addTerritoryIconLayers();', bodyOf('addTerritoryIconLayers'));
 }
 
@@ -414,6 +415,11 @@ describe('map layer order', () => {
       'threat-vector-sequence', 'threat-vector-direction', 'threat-vector-transit',
       'threat-vector-nodes', 'threat-vector-order',
       'threat-vector-arrowhead', 'threat-vector-class',
+      // Крапка загрози замінила собою заливку полігона, тож вона малюється тут, над ланцюгом і під
+      // стеками іконок: клас зброї важливіший за факт наявності загрози, а факт — важливіший за
+      // пояснення того, як сигнал сюди дійшов. Хвиля йде першою, бо кільце має розходитися З-ПІД
+      // крапки, а не поверх неї.
+      'threat-dot-wave', 'threat-dot',
       'territory-icon-slot-0', 'territory-icon-slot-1', 'territory-icon-slot-2', 'territory-icon-badge'
     ]);
   });
@@ -1468,6 +1474,99 @@ describe('the settings registry tables', () => {
  * will ever supersede it. That is also what keeps a raion alert on the map while ADM2 is in flight —
  * `claim()` files it as `unmapped` on the oblast, since the raion has no feature to light yet.
  */
+/**
+ * Крапка загрози замінила заливку полігона, і разом із роллю успадкувала її правила.
+ *
+ * Заливка стверджувала більше, ніж сказало джерело: «БпЛА курсом на Павлоград» заливало весь
+ * Синельниківський район, ніби загроза стосується кожного його села. Крапка стверджує рівно факт —
+ * на цій території є загроза, — а площу лишає тривозі, яку держава дійсно оголошує на територію.
+ *
+ * Але перший варіант крапки успадкував від стеків іконок поріг масштабу, і всі активні загрози
+ * зникали з карти країни: заливки вже не було, а крапку на оглядовому масштабі ще не малювали.
+ * Ці тести тримають обидві половини — і що крапка є там, де була заливка, і що хвиля лишається
+ * привілеєм територій, які джерело НАЗВАЛО.
+ */
+/** Виклик `map.addLayer({ id: '<id>' … })` цілком, із тіла названої функції. */
+function layerCallIn(functionName: string, id: string): string {
+  const body = bodyOf(functionName);
+  const at = body.indexOf(`id: '${id}'`);
+  if (at === -1) throw new Error(`${id} not declared in ${functionName}()`);
+  const open = body.lastIndexOf('map.addLayer(', at);
+  return body.slice(open, balanced(body, body.indexOf('(', open), '(', ')') + 1);
+}
+
+describe('threat dots inherit the fill they replaced', () => {
+  const collection = bodyOf('threatDotCollection');
+  // Коментарі знімаються: вони ПОЯСНЮЮТЬ, чому порогу масштабу тут немає, і мусять мати право
+  // назвати його. Перевіряється поведінка, а не текст навколо неї.
+  const code = collection.replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/[^\n]*/g, '');
+
+  it('draws at every zoom, exactly as the raion fill did', () => {
+    // Регрес, знайдений на живій карті: `iconTier` тут означав «нижче 6.8 районів не показуємо»,
+    // і вісім активних загроз ставали невидимими на масштабі, з якого починає кожен користувач.
+    // Поріг належить ГЛІФАМ (136 заяв про клас зброї), а не крапці в 3.4 px.
+    expect(code).not.toMatch(/iconTier/);
+    expect(code).not.toMatch(/ICON_TIER_ZOOM/);
+  });
+
+  it('lights the same condition the fill lit', () => {
+    // `threatActive` — те саме поле, яким користується territoryCoverageFromStates для заливки.
+    expect(code).toMatch(/territory\.threatActive/);
+  });
+
+  it('carries assertion as a property, so the wave can filter on it', () => {
+    expect(code).toMatch(/asserted/);
+  });
+
+  it('keeps the invisible fills as the raion hit target', () => {
+    // Прозорість нульова, але шар живий: `raionFillLayerIds` шукає в ньому район під кліком, і без
+    // нього район, на який оголошено лише загрозу, перестав би відкривати свою панель.
+    const fill = layerCallIn('initMap', 'threat-raion-fill');
+    expect(fill).toMatch(/'fill-opacity':\s*0\b/);
+    expect(APP_SOURCE).toMatch(/raionFillLayerIds\s*=\s*\[[^\]]*'threat-raion-fill'/);
+  });
+
+  it('gives the wave only to territories a source named', () => {
+    const wave = layerCallIn('addThreatDotLayers', 'threat-dot-wave');
+    expect(wave).toMatch(/filter:\s*\['==',\s*\['get',\s*'asserted'\],\s*true\]/);
+  });
+
+  it('hides the whole threat display behind one toggle', () => {
+    // Крапка й хвиля — теж показ загрози; перемикач, що гасить заливку й контур, але лишає крапку,
+    // показував би те, що користувач вимкнув.
+    expect(APP_SOURCE).toMatch(/threatLayerIds\s*=\s*\[[^\]]*'threat-dot-wave'[^\]]*'threat-dot'/);
+  });
+});
+
+/**
+ * Рух на карті — єдиний у цьому інтерфейсі, і він мусить бути вимикним.
+ *
+ * `web/styles.css` глушить анімації через `* { animation: none !important }`, але це правило CSS і
+ * до пейнт-властивостей MapLibre не дотягується. Без явної перевірки хвиля стала б ЄДИНИМ рухом на
+ * сторінці саме для тих, хто рух вимкнув.
+ */
+describe('the radar wave respects reduced motion and the map lifecycle', () => {
+  it('asks the user agent before animating anything', () => {
+    expect(bodyOf('startThreatWave')).toMatch(/motionAllowed\(\)/);
+    expect(APP_SOURCE).toMatch(/prefers-reduced-motion/);
+  });
+
+  it('leaves a visible static ring when motion is refused', () => {
+    // Не «нічого не малюємо»: те саме твердження, лише нерухоме. Інакше вимкнений рух прибирав би
+    // з карти інформацію, а не анімацію.
+    const wave = layerCallIn('addThreatDotLayers', 'threat-dot-wave');
+    expect(wave).toMatch(/motionAllowed\(\)\s*\?\s*7\s*:\s*15/);
+    expect(wave).toMatch(/motionAllowed\(\)\s*\?\s*\.5\s*:\s*\.28/);
+  });
+
+  it('stops the frame before the map that owns the layer is destroyed', () => {
+    // Кадр, замовлений до map.remove(), виконався б уже після нього і звернувся б до знищеного
+    // стилю. try/catch усередині це витримає, але не планувати роботу дешевше, ніж ловити виняток.
+    const teardown = APP_SOURCE.slice(APP_SOURCE.indexOf('stopThreatWave(); threatDotLayersReady'));
+    expect(teardown.indexOf('stopThreatWave()')).toBeLessThan(teardown.indexOf('map.remove()'));
+  });
+});
+
 describe('raion polygons are a statement, not a zoom level', () => {
   const RAION_LAYERS = [
     'threat-raion-fill', 'alert-raion-fill', 'consequence-raion-fill',

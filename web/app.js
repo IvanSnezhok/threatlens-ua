@@ -153,7 +153,21 @@ const occupationColor = ['case', ['==',['get','status'],'occupied'], '#ff7a4d', 
 //   sequence  — два різні повідомлення в різний час; порядок наш, рух не стверджував ніхто: крапкова.
 // Порядок у масиві збігається з порядком додавання шарів і, отже, з їхнім z-порядком.
 const vectorLayerIds = ['threat-vector-sequence','threat-vector-direction','threat-vector-transit','threat-vector-nodes','threat-vector-order','threat-vector-arrowhead','threat-vector-class'];
-const vectorColor = '#ff7a4d';
+// БІЛИЙ, і це виправлення, а не смак. Досі тут стояв #ff7a4d — той самий хекс, що й `threatColor`,
+// тобто ланцюг малювався кольором стану, поверх якого він і лежить. На помаранчевій заливці загрози
+// вектор не мав ЖОДНОЇ колірної відмінності, а на червоній тривозі (#ff4747, різниця 15° за тоном)
+// давав контраст 1.9:1 для крапкової лінії й 2.9:1 для штрихової — нижче за 3:1 навіть для
+// найтовщої. Пунктир і прозорість цього не рятують: вони розрізняють вектори МІЖ СОБОЮ, а не
+// вектор і підкладку.
+//
+// Білий — єдиний вільний колір на цій карті. Кожен інший уже зайнятий станом і взяти його означало
+// б збрехати: #ff4747 — офіційна тривога, #ffcf8a — наслідки, #8f9b94 — аналітика, #72d6ca —
+// суверенітет. Білий не належить жодному стану, і саме тому він може належати ПОЯСНЕННЮ: ланцюг
+// каже, як сигнал рухався між територіями, а не який стан на території.
+//
+// Він же єдиний, що не залежить від того, на чому лежить: підкладка карти темна (dark-стиль), і
+// всі чотири заливки станів композитуються в діапазон #6A2124…#8A5A3A — білий дає ≥7:1 на кожній.
+const vectorColor = '#f4f7fa';
 const vectorBasisLabels = {
   reported_transit: 'джерело повідомило сам рух',
   reported_direction: 'джерело повідомило напрямок',
@@ -193,11 +207,14 @@ const alertColor = '#ff4747';
 // Дзеркало --threat / --consequence / --analytic із web/styles.css. Карта й інтерфейс мусять
 // називати ту саму річ тим самим кольором. Змінюєш тут — зміни й там.
 // Червоний зарезервовано за офіційною тривогою: жоден інший стан його не бере.
-const threatColor = '#ff7a4d';        // той самий відтінок, що й vectorColor, і з тієї ж причини
+const threatColor = '#ff7a4d';
 const consequenceColor = '#ffcf8a';
 const analyticColor = '#8f9b94';
 const alertLayerIds = ['alert-oblast-fill','alert-raion-fill','alert-raion-line','alert-oblast-line','alert-oblast-label','alert-raion-label'];
-const threatLayerIds      = ['threat-oblast-fill','threat-raion-fill','threat-raion-line','threat-oblast-line'];
+// Крапки й хвиля входять сюди, бо перемикач «Загрози» мусить ховати ВЕСЬ показ загрози. Заливки
+// лишаються в списку, хоч і невидимі: перемикання гасить їх через `visibility`, а це те саме, що
+// прибирає їх із `queryRenderedFeatures` — вимкнена загроза не має ловити клік по району.
+const threatLayerIds      = ['threat-oblast-fill','threat-raion-fill','threat-raion-line','threat-oblast-line','threat-dot-wave','threat-dot'];
 const consequenceLayerIds = ['consequence-oblast-fill','consequence-raion-fill','consequence-raion-line','consequence-oblast-line'];
 const analyticLayerIds    = ['analytic-raion-line','analytic-oblast-line'];
 // Районний полігон під курсором шукаємо в усіх районних заливках, а не лише в тривожній:
@@ -686,6 +703,7 @@ async function loadRaionBoundaries() {
     // Центроїдів районів не існує, поки не приїхав ADM2, тож стеки іконок для них треба
     // перевипустити саме тут: прибуття файлу асинхронне й нефатальне.
     updateTerritoryIcons();
+    updateThreatDots();
   } catch { /* без районних контурів карта працює на рівні областей */ }
 }
 
@@ -1173,8 +1191,10 @@ function vectorArrowImage(filled) {
   ctx.lineTo(box / 2, box - 5.4);
   ctx.lineTo(2.4, box - 2.2);
   ctx.closePath();
-  // Темний обвід іде першим і ширшим за саму фігуру: помаранчеве вістря лежить на помаранчевій
-  // лінії й на помаранчевій заливці загрози, і без обводу зливається з обома.
+  // Темний обвід іде першим і ширшим за саму фігуру. Він був потрібен, коли вістря було помаранчевим
+  // на помаранчевій лінії, і лишається потрібним тепер, коли воно біле: підкладка карти темна, але
+  // вістря сідає на кінець лінії, на підпис міста або на світлий гліф іконки — обвід відділяє його
+  // від будь-чого, а не лише від того, задля чого його додали.
   ctx.strokeStyle = '#06080c'; ctx.lineWidth = 2.6; ctx.lineJoin = 'round'; ctx.stroke();
   if (filled) {
     ctx.fillStyle = vectorColor; ctx.fill();
@@ -1220,13 +1240,19 @@ function addVectorLayers() {
   // і воно позначене формою, а не лише в тексті легенди.
   map.addLayer({ id: 'threat-vector-nodes', type: 'circle', source: 'threat-vector-points', paint: {
     'circle-radius': ['interpolate',['linear'],['zoom'],5,3.2,9,6],
-    'circle-color': ['case',['get','approximate'],'rgba(255,122,77,.10)',vectorColor],
-    'circle-opacity': .9, 'circle-stroke-width': 1.6, 'circle-stroke-color': vectorColor, 'circle-stroke-opacity': .85
+    // Порожнє коло лишається порожнім, але темним, а не прозорим. Раніше тут стояло
+    // rgba(255,122,77,.10) — крізь нього просвічувала заливка тривоги, і «наближена координата»
+    // на червоному полігоні читалася як залита. Темна серцевина тримає форму на будь-якій підкладці,
+    // а різниця «залите/порожнє» лишається тією самою різницею, лише тепер видимою.
+    'circle-color': ['case',['get','approximate'],'rgba(6,8,12,.72)',vectorColor],
+    'circle-opacity': .95, 'circle-stroke-width': 1.6, 'circle-stroke-color': vectorColor, 'circle-stroke-opacity': .95
   } }, anchor);
   map.addLayer({ id: 'threat-vector-order', type: 'symbol', source: 'threat-vector-points', minzoom: 5.6, layout: {
     'text-field': ['get','order'], 'text-size': 10, 'text-offset': [0,-1.3], 'text-anchor': 'bottom',
     'text-font': ['Noto Sans Regular'], 'text-allow-overlap': true
-  }, paint: { 'text-color': '#ffd9c9', 'text-halo-color': '#06080c', 'text-halo-width': 1.5 } }, anchor);
+    // Номер належить ланцюгу, тож бере його колір. Теплий #ffd9c9 тут був відлунням помаранчевого
+    // вектора і на червоній заливці зникав разом із ним.
+  }, paint: { 'text-color': vectorColor, 'text-halo-color': '#06080c', 'text-halo-width': 1.6 } }, anchor);
   // Голови ланцюга додаються ПІСЛЯ всієї сімʼї threat-vector-*, тобто над нею: вістря мусить лежати
   // на кінці своєї лінії, а не під нею. Якір той самий, тож підписи лишаються вище за все це.
   let arrowsReady = false;
@@ -1615,6 +1641,47 @@ function territoryAriaSentence(territory, shownIcons, overflow) {
 
 // Пріоритет стека рахує сервер (`territories[].icons` + `iconOverflow`). Браузер його НЕ
 // перераховує: інакше карта й тести сортували б за двома різними реалізаціями одного правила.
+/**
+ * Крапки активної загрози — те, чим замінено заливку полігона.
+ *
+ * Крапка стверджує рівно те, що сказало джерело: «на цій території є загроза». Заливка стверджувала
+ * більше — що загроза стосується всієї її площі, — і саме цю зайву заяву прибрано. Точка ставиться
+ * в центроїд контуру, той самий, який уже рахує `regionCentroid` для стеків іконок: іншої точки в
+ * районів KATOTTG не існує взагалі, а вигадувати «місце удару» всередині району заборонено
+ * (CONTEXT.md, межі безпеки).
+ *
+ * `asserted` вирішує, чи навколо крапки піде хвиля. Воно приходить із сервера й означає, що джерело
+ * НАЗВАЛО цю територію як ціль або напрямок (ASSERTING_RELATIONS: explicit_threat,
+ * reported_direction, aftermath). Територія, яку джерело лише згадало мимохідь («повз Миколаїв»),
+ * приходить з `asserted: false` і хвилі не отримує — інакше транзит читався б як ціль.
+ */
+function threatDotCollection() {
+  const features = [];
+  for (const territory of snapshotTerritories()) {
+    if (!territory.threatActive) continue;
+    // БЕЗ порогу масштабу, і це не недогляд, а те саме правило, за яким районні полігони світилися
+    // на кожному масштабі: «район — це твердження, а не рівень наближення». Крапка успадкувала роль
+    // заливки, тож вона мусить успадкувати й це. ICON_TIER_ZOOM ділить стеки ІКОНОК, бо гліф — заява
+    // про клас зброї, і 136 таких заяв оглядовий масштаб не витримує; крапка ж має 3.4 px і не
+    // конкурує ні з чим. Перший варіант цієї функції поріг успадкував — і всі вісім активних загроз
+    // зникали з карти країни повністю, бо заливки вже не було, а крапку ще не малювали.
+    //
+    // Дубля область+район це не створює: `territories[]` тримає їх окремими записами з власним
+    // `threatActive`, тож дві крапки з’являються рівно тоді, коли джерело назвало і те, і те.
+    const point = regionCentroid(territory.locationId);
+    if (!point) continue;
+    const threats = territory.threats ?? [];
+    const asserted = threats.some((threat) => threat.asserted);
+    features.push({
+      type: 'Feature',
+      id: `td-${territory.locationId}`,
+      geometry: { type: 'Point', coordinates: point },
+      properties: { locationId: territory.locationId, tier: territory.tier, asserted }
+    });
+  }
+  return { type: 'FeatureCollection', features };
+}
+
 function territoryIconCollection() {
   const features = [];
   const tier = iconTier ?? 'oblast';
@@ -1678,6 +1745,93 @@ const slotLayout = (index) => ({
   'icon-ignore-placement': false,
   'icon-padding': 2
 });
+
+// Період одного проходу хвилі. 2.2 с — повільніше за пульс і повільніше за будь-яку анімацію входу
+// в цьому інтерфейсі: хвиля мусить читатися як «сигнал живий», а не як «щось блимає».
+const THREAT_WAVE_PERIOD_MS = 2200;
+const THREAT_DOT_LAYER_IDS = ['threat-dot-wave', 'threat-dot'];
+let threatWaveFrame = null;
+let threatDotLayersReady = false;
+
+/**
+ * Чи погодився користувач на рух взагалі.
+ *
+ * `web/styles.css` глушить будь-яку анімацію через `* { animation: none !important }` у
+ * `prefers-reduced-motion`, але це правило CSS — до пейнт-властивостей MapLibre воно не дотягується
+ * ніяк. Тобто без цієї перевірки хвиля стала б ЄДИНИМ рухом на сторінці саме для тих, хто рух
+ * вимкнув. Статичне кільце нижче — не запасний варіант, а повноцінна форма того самого твердження.
+ */
+const motionAllowed = () => !window.matchMedia?.('(prefers-reduced-motion: reduce)')?.matches;
+
+/**
+ * Радар навколо крапки: хвиля розходиться й гасне.
+ *
+ * Анімується `circle-radius` і `circle-opacity` одного шару, а не додаються кадри-зображення: коло
+ * MapLibre малює вектором, тож воно лишається різким на будь-якому масштабі й не коштує жодного
+ * бітмапа. Фаза береться з `performance.now()`, а не з лічильника кадрів, тож пропущені кадри
+ * зміщують хвилю в часі, а не сповільнюють її.
+ */
+function startThreatWave() {
+  if (threatWaveFrame !== null) return;
+  if (!motionAllowed()) return;
+  const step = () => {
+    threatWaveFrame = null;
+    if (!map || !map.getLayer('threat-dot-wave')) return;
+    const phase = (performance.now() % THREAT_WAVE_PERIOD_MS) / THREAT_WAVE_PERIOD_MS;
+    // Радіус росте лінійно, а прозорість гасне квадратично: лінійне згасання читається як кільце,
+    // що тьмяніє рівномірно, а квадратичне — як хвиля, що вибігає й розчиняється. Друге і є радар.
+    const base = 7 + phase * 20;
+    const fade = (1 - phase) ** 2 * .5;
+    try {
+      map.setPaintProperty('threat-dot-wave', 'circle-radius', base);
+      map.setPaintProperty('threat-dot-wave', 'circle-opacity', 0);
+      map.setPaintProperty('threat-dot-wave', 'circle-stroke-opacity', fade);
+    } catch { return; }      // стиль перезавантажили просто зараз — наступний attach заведе хвилю знову
+    threatWaveFrame = requestAnimationFrame(step);
+  };
+  threatWaveFrame = requestAnimationFrame(step);
+}
+
+function stopThreatWave() {
+  if (threatWaveFrame === null) return;
+  cancelAnimationFrame(threatWaveFrame);
+  threatWaveFrame = null;
+}
+
+function addThreatDotLayers() {
+  map.addSource('threat-dots', { type: 'geojson', data: threatDotCollection() });
+  // Хвиля — ТІЛЬКИ навколо територій, які джерело назвало. Фільтр стоїть на шарі, а не в збірці
+  // колекції, щоб крапка існувала для кожної активної загрози, а хвиля — лише для названої: два
+  // різні твердження про одну точку лишаються двома різними шарами.
+  map.addLayer({ id: 'threat-dot-wave', type: 'circle', source: 'threat-dots',
+    filter: ['==', ['get', 'asserted'], true], paint: {
+      // Кільце, а не диск: заливка вкрила б і крапку, і підпис під нею. Стартові значення — це вже
+      // й статичний вигляд для reduced-motion, тож шар ніколи не буває порожнім.
+      'circle-radius': motionAllowed() ? 7 : 15,
+      'circle-color': threatColor,
+      'circle-opacity': 0,
+      'circle-stroke-width': 2,
+      'circle-stroke-color': threatColor,
+      'circle-stroke-opacity': motionAllowed() ? .5 : .28
+    } });
+  map.addLayer({ id: 'threat-dot', type: 'circle', source: 'threat-dots', paint: {
+    'circle-radius': ['interpolate', ['linear'], ['zoom'], 4, 3.4, 9, 6.2],
+    'circle-color': threatColor,
+    'circle-opacity': .95,
+    // Темний обвід із тієї ж причини, що й у вістря вектора: крапка сідає на підпис області, на
+    // державний кордон і на заливку тривоги, і без обводу зливається з кожним по черзі.
+    'circle-stroke-width': 1.4,
+    'circle-stroke-color': '#06080c',
+    'circle-stroke-opacity': .85
+  } });
+  threatDotLayersReady = true;
+  startThreatWave();
+}
+
+function updateThreatDots() {
+  if (!threatDotLayersReady) return;
+  map.getSource('threat-dots')?.setData(threatDotCollection());
+}
 
 function addTerritoryIconLayers() {
   if (!iconImagesReady) return;   // без зображень шар малював би прозорі пікселі 1×1
@@ -1872,6 +2026,7 @@ function initMap() {
     if (next === iconTier) return;           // шторм панорамування нічого не коштує
     iconTier = next;
     updateTerritoryIcons();
+    updateThreatDots();
   });
   map.addControl(new maplibregl.NavigationControl({ showCompass: false }), 'top-right');
   map.addControl(new maplibregl.AttributionControl({ compact: true }), 'bottom-left');
@@ -1935,13 +2090,26 @@ function initMap() {
     // ---- активна загроза -----------------------------------------------------------------------
     // Слабша за офіційну тривогу навмисно: це повідомлення моніторингу, а не рішення держави.
     // Заливка йде ПІД тривожну: додається раніше під тим самим якорем, тож червоне завжди виграє.
+    //
+    // ЗАГРОЗА БІЛЬШЕ НЕ ЗАЛИВАЄ ПОЛІГОН — вона позначається крапкою (`threat-dot-*` нижче). Причина
+    // не косметична: залита область стверджує, що загроза стосується ВСІЄЇ її площі, а повідомлення
+    // «БпЛА курсом на Павлоград» не робить такої заяви ні про Синельниківський район, ні тим паче
+    // про область. Тривога — робить: її оголошує держава дослівно на територію, і саме тому заливка
+    // лишилася рівно за нею. Дві різні заяви перестали виглядати як одна, слабша й сильніша.
+    //
+    // Але шари ЛИШАЮТЬСЯ, з нульовою прозорістю, і це не залишок. Вони — зона влучання курсору:
+    // `raionFillLayerIds` шукає районний полігон під кліком саме в них, і район, на який оголошено
+    // лише загрозу (без тривоги й наслідків), без цього шару перестав би відкривати свою панель
+    // зовсім. `queryRenderedFeatures` читає геометрію й фільтр, а не прозорість, тож невидимий
+    // полігон лишається клікабельним; `fill-opacity: 0` тут — рішення про видимість, а не про
+    // існування. Порядок шарів і тести кліку, що спираються на feature-state, теж лишаються цілі.
     map.addLayer({ id: 'threat-oblast-fill', type: 'fill', source: 'ukraine-admin', paint: {
       'fill-color': threatColor,
-      'fill-opacity': ['case', threatFlag, .22, threatUnmappedFlag, .16, 0]
+      'fill-opacity': 0
     } }, 'ukraine-sovereignty-fill');
     map.addLayer({ id: 'threat-raion-fill', type: 'fill', source: 'ukraine-raions', paint: {
       'fill-color': threatColor,
-      'fill-opacity': ['case', threatFlag, .28, threatUnmappedFlag, .20, 0]
+      'fill-opacity': 0
     } }, 'ukraine-sovereignty-fill');
     // Заливки тривоги йдуть під ukraine-sovereignty-fill і додаються ПЕРЕД addOccupationLayers(),
     // тож окупаційні шари вставляються поверх них і лишаються читабельними, як і раніше.
@@ -2103,6 +2271,7 @@ function initMap() {
     map.addLayer({ id: 'direction-lines-model', type: 'line', source: 'reported-directions',
       filter: ['==', ['get', 'origin'], 'model'], paint: directionPaint(true) });
     addVectorLayers();
+    addThreatDotLayers();
     addTerritoryIconLayers();
     // Один клік має відкрити одну панель. Обробник висить на кількох шарах, і MapLibre викликає його
     // окремо для кожного, у якому під точкою є фіча, — тож роботу робимо один раз на один DOM-клік
@@ -2159,6 +2328,7 @@ function initMap() {
     applyVectors();
     iconTier = map.getZoom() >= ICON_TIER_ZOOM ? 'raion' : 'oblast';
     updateTerritoryIcons();
+    updateThreatDots();
   });
   $('#fit-ukraine').addEventListener('click', () => map.fitBounds([[21.5,43.2],[41.2,52.5]], { padding: 36, duration: 700 }));
 }
@@ -2169,6 +2339,7 @@ function updateMap() {
   applyTerritoryLayers();
   applyVectors();
   updateTerritoryIcons();
+  updateThreatDots();
   refreshOpenTerritoryPanel();
 }
 
@@ -2814,6 +2985,7 @@ function renderMapPage() {
     // Іконки — не пʼятий перемикач: кожен тон іде за своїм сімейством. Перевипускаємо джерело на
     // КОЖЕН клік, інакше стек іконок і полігони під ним казали б різне.
     updateTerritoryIcons();
+    updateThreatDots();
     if (button.dataset.layer === 'occupation') {
       occupationVisible = active;
       applyOccupationVisibility();
@@ -6618,7 +6790,13 @@ function renderCurrentRoute(options = {}) {
   const route = activePage();
   const fromSnapshot = options?.fromSnapshot === true;
   // Карту знімаємо лише коли справді йдемо з маршруту карти — на місці вона переживає оновлення знімка.
-  if (map && route !== '/') { map.remove(); map = null; mapLayersReady = false; }
+  // Хвиля гаситься ПЕРЕД map.remove(): її кадр звертається до шару, і кадр, замовлений до знищення
+  // карти, виконався б уже після нього. Всередині є try/catch, але покладатися на нього означало б
+  // ловити виняток там, де достатньо не планувати роботу.
+  if (map && route !== '/') {
+    stopThreatWave(); threatDotLayersReady = false;
+    map.remove(); map = null; mapLayersReady = false;
+  }
   // Опитування стану входу Codex і стану оновлення привʼязані до вузлів, яких поза консоллю вже
   // немає. Таймер оновлення особливо: він перемальовує #deploy-section, а на карті такого вузла
   // не існує, тож кожні три секунди він шукав би його марно.
