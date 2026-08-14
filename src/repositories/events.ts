@@ -501,8 +501,8 @@ export async function recordClassification(entry: ClassificationLogEntry): Promi
       `INSERT INTO message_classifications(source_message_id,source_id,classifier_version,published_at,
          decision,intent,created_event,ignored_reason,threat_type,candidate_threat_types,indicators,
          national_scope,direction_text,event_id,retraction_coverage,retracted_threat_types,
-         withdrawn_assertions,withdrawn_event_ids,last_assertion_at,decayed_risk_signals)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18::uuid[],$19,$20)
+         withdrawn_assertions,withdrawn_event_ids,last_assertion_at,decayed_risk_signals,origin_zone)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18::uuid[],$19,$20,$21)
        ON CONFLICT (source_message_id,classifier_version) DO NOTHING
        RETURNING id`,
       [
@@ -512,7 +512,8 @@ export async function recordClassification(entry: ClassificationLogEntry): Promi
         classified.nationalScope, classified.directionText ?? null, entry.eventId ?? null,
         retraction?.coverage ?? null, retraction ? retraction.threatTypes : null,
         withdrawal?.withdrawnAssertions ?? null, withdrawal?.touchedEventIds ?? null,
-        withdrawal?.lastAssertionAt ?? null, withdrawal?.decayedSignals ?? null
+        withdrawal?.lastAssertionAt ?? null, withdrawal?.decayedSignals ?? null,
+        classified.originZone ?? null
       ]
     );
     const classificationId = inserted.rows[0]?.id;

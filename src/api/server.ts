@@ -10,6 +10,7 @@ import { pool } from '../db/pool.js';
 import { composeTerritoryStates } from '../domain/territory-state.js';
 import { activeAlerts, assessmentDetails, currentAssessments, liveThreats, locationTimeline, relatedLocationsCte, territoryAncestry, threatDetails } from '../repositories/events.js';
 import { createEventRelay, eventHub, publishedEnvelope, type SystemEvent } from '../services/sse.js';
+import { activeOriginZones } from '../services/origin-activity.js';
 import { delaySecondsFor, observeSseDeliveryLag, publicationSlice, registerPublicationMetrics, sliceMeta } from '../services/publication.js';
 import { registerAnalyticsSchedulerMetrics } from '../services/analytics-scheduler.js';
 import { registerDeploymentMetrics } from '../services/deployment.js';
@@ -518,11 +519,14 @@ export async function buildServer(options: BuildServerOptions = {}) {
    */
   const snapshotView = cachedBody(async () => {
     const slice = await publicationSlice();
-    const [health, alerts, threats, assessments] = await Promise.all([
+    const [health, alerts, threats, assessments, originZones] = await Promise.all([
       sourceHealth(),
       activeAlerts(slice.cutoffAt),
       liveThreats(slice.cutoffAt),
-      currentAssessments(slice.cutoffAt)
+      currentAssessments(slice.cutoffAt),
+      // Окремим запитом і поруч із рештою: зона походження нічого не стверджує про територію, тож
+      // вона не входить ні у `territories`, ні в дерево предків, ні в набір referenced-локацій.
+      activeOriginZones()
     ]);
     const officialConfigured = health.filter((source) => source.official && source.configured);
     const systemStatus = officialConfigured.some((source) => source.status === 'current') ? 'current'
@@ -543,7 +547,7 @@ export async function buildServer(options: BuildServerOptions = {}) {
       version: slice.cutoffVersion,
       generatedAt: slice.cutoffAt.toISOString(),
       systemStatus,
-      sourceHealth: health, alerts, threats, assessments,
+      sourceHealth: health, alerts, threats, assessments, originZones,
       // `publication.mode` is NOT itself gated — it reports the setting in force right now, so the
       // UI can never claim to be live while data is being held back.
       publication: sliceMeta(slice, now),

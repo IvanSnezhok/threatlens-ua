@@ -5,6 +5,14 @@ export const THREAT_TYPES = [
 export type ThreatType = typeof THREAT_TYPES[number];
 export type EvidenceLevel = 'official' | 'confirmed' | 'monitoring' | 'unverified';
 /**
+ * Зона поза Україною, з якої джерело повідомило походження загрози.
+ *
+ * Живе тут, а не в `src/domain/origin-zones.ts`, щоб напрям залежності лишався один: `types.ts` не
+ * імпортує нічого й не має починати. Каталог зон із координатами та патернами читає цей тип, а не
+ * навпаки.
+ */
+export type OriginZoneId = 'black_sea' | 'azov_sea' | 'northern_approach' | 'eastern_approach';
+/**
  * Who authored a threat event — the deterministic rules, or a promoted model verdict.
  *
  * Deliberately NOT folded into {@link EvidenceLevel}. That type answers "how well corroborated",
@@ -90,6 +98,14 @@ export interface ClassifiedMessage {
   nationalScope: boolean;
   indicators: string[];
   directionText?: string;
+  /**
+   * Зона, з якої джерело повідомило походження загрози, або `null`.
+   *
+   * Це ЄДИНА географія поза Україною, яку система визнає, і вона зчитується з тексту, а не
+   * виводиться з класу зброї: повідомлення про зліт авіації не називає аеродрому, тож зона, здогадана
+   * за типом індикатора, була б нашим припущенням у вигляді карти. Див. `src/domain/origin-zones.ts`.
+   */
+  originZone?: OriginZoneId | null;
   title: string;
   summary: string;
   /** Present for `de_escalation` and `redirect`. Never a state change on its own. */

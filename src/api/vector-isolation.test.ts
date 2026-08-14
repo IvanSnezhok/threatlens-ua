@@ -341,6 +341,7 @@ function executionOrderSource(): string {
     .replace('addOccupationLayers();', bodyOf('addOccupationLayers'))
     .replace('addVectorLayers();', bodyOf('addVectorLayers'))
     .replace('addThreatDotLayers();', bodyOf('addThreatDotLayers'))
+    .replace('addOriginZoneLayers();', bodyOf('addOriginZoneLayers'))
     .replace('addTerritoryIconLayers();', bodyOf('addTerritoryIconLayers'));
 }
 
@@ -420,6 +421,10 @@ describe('map layer order', () => {
       // пояснення того, як сигнал сюди дійшов. Хвиля йде першою, бо кільце має розходитися З-ПІД
       // крапки, а не поверх неї.
       'threat-dot-wave', 'threat-dot',
+      // Зони походження — над крапками загрози й під стеками іконок. Вони поза Україною й ні з чим
+      // там не конкурують, але «звідки повідомили» слабше за «що саме тут»: якби зона лягла вище
+      // стеку, бік стрілки заступив би її вістря.
+      'origin-zone-wave', 'origin-zone-icon',
       'territory-icon-slot-0', 'territory-icon-slot-1', 'territory-icon-slot-2', 'territory-icon-badge'
     ]);
   });
@@ -670,6 +675,13 @@ describe('vector heads', () => {
   const headSource = lazy(() => [
     constDeclaration('ARROW_BASIS_IMAGES'),
     bearingSource(),
+    // Вістря бере курс із дотичної в кінці ДУГИ, а не з хорди, тож зріз мусить нести і саму дугу.
+    // Інакше тести компілювалися б, а падали на `vectorArc is not defined` — тобто повідомляли б
+    // про власну неповноту, а не про поведінку, яку перевіряють.
+    constDeclaration('VECTOR_ARC_BEND'),
+    constDeclaration('VECTOR_ARC_STEPS'),
+    `function mercatorLatitude(y) ${bodyOf('mercatorLatitude')}`,
+    `function vectorArc(from, to) ${bodyOf('vectorArc')}`,
     `function vectorClassTone(evidenceLevel) ${bodyOf('vectorClassTone')}`,
     `function vectorHeadCollection() ${bodyOf('vectorHeadCollection')}`
   ].join('\n'));
@@ -771,7 +783,11 @@ describe('vector heads', () => {
       }]);
       const [arrow] = arrows(features);
       expect((arrow as unknown as { geometry: { coordinates: number[] } }).geometry.coordinates).toEqual([36, 50]);
-      expect(arrow!.properties.bearing).toBeCloseTo(90, 9);
+      // Курс — ДОТИЧНА в кінці дуги, а не азимут хорди. Полтава→Харків це рівно на схід, тобто
+      // хорда дає 90°; лінія ж вигнута, і в точці прибуття вона входить під ~102°. Вістря мусить
+      // продовжувати ту лінію, на якій сидить, інакше воно стоїть до неї під кутом — тим помітнішим,
+      // чим довший відрізок. Відхилення визначає VECTOR_ARC_BEND: atan(2 × 0.11) ≈ 12.4°.
+      expect(arrow!.properties.bearing).toBeCloseTo(102, 0);
     });
 
     it('draws no arrow on a leg the map is not drawing', () => {
@@ -1486,6 +1502,67 @@ describe('the settings registry tables', () => {
  * Ці тести тримають обидві половини — і що крапка є там, де була заливка, і що хвиля лишається
  * привілеєм територій, які джерело НАЗВАЛО.
  */
+/**
+ * Дуга відрізка: форма без твердження.
+ *
+ * Заборони на ФОРМУ лінії в цій системі немає — заборонені поточне положення й передбачена
+ * траєкторія. Дуга під це не підпадає рівно доти, доки вона однакова для кожного відрізка й нічим
+ * не керується: тоді вона розводить лінії, що йдуть в одну область, і не претендує на шлях, якого
+ * ніхто не спостерігав. Ці тести тримають саме цю межу — і арифметику, у якій вона вже одного разу
+ * поїхала.
+ */
+describe('vector arcs bend without asserting a path', () => {
+  const arcSource = [
+    constDeclaration('VECTOR_ARC_BEND'),
+    constDeclaration('VECTOR_ARC_STEPS'),
+    `function mercatorY(latitude) ${bodyOf('mercatorY')}`,
+    `function mercatorLatitude(y) ${bodyOf('mercatorLatitude')}`,
+    `function vectorArc(from, to) ${bodyOf('vectorArc')}`
+  ].join('\n');
+  const arc = evaluateSlice<(from: number[], to: number[]) => number[][]>(arcSource, 'vectorArc');
+
+  it('starts and ends exactly where the two messages named', () => {
+    // Вигинається лише середина. Кінці — це місця, названі джерелами, і зсунути їх означало б
+    // намалювати не те місце, про яке йшлося.
+    const points = arc([34, 50], [36, 50]);
+    expect(points[0]![0]).toBeCloseTo(34, 9);
+    expect(points[0]![1]).toBeCloseTo(50, 9);
+    expect(points[points.length - 1]![0]).toBeCloseTo(36, 9);
+    expect(points[points.length - 1]![1]).toBeCloseTo(50, 9);
+  });
+
+  it('bends by a fraction of the chord, not by half a radian', () => {
+    // Регрес, знайдений тестом вістря: довгота бралася в градусах, а ордината Меркатора в радіанах,
+    // тож `hypot` над ними давав довжину, у якій одна вісь у ~57 разів «довша». Прогин, узятий як
+    // частка тієї довжини, виносив дугу на пів радіана широти — вістря дивилося на 175° замість 102°.
+    const points = arc([34, 50], [36, 50]);
+    const mid = points[Math.floor(points.length / 2)]!;
+    const rise = Math.abs(mid[1]! - 50);
+    expect(rise).toBeGreaterThan(0.02);   // дуга помітна
+    expect(rise).toBeLessThan(0.5);       // і не є вигаданим маневром
+  });
+
+  it('always bends to the same side, so the curve is a style and not a signal', () => {
+    // Два відрізки в протилежних напрямках вигинаються дзеркально відносно власної хорди — тобто
+    // однаково відносно напрямку руху. Якби бік залежав від географії, читач шукав би в ньому сенс.
+    const east = arc([34, 50], [36, 50]);
+    const west = arc([36, 50], [34, 50]);
+    const eastMid = east[Math.floor(east.length / 2)]![1]!;
+    const westMid = west[Math.floor(west.length / 2)]![1]!;
+    expect(Math.sign(eastMid - 50)).toBe(-Math.sign(westMid - 50));
+    // Не до дев'ятого знака: прогин симетричний у ПРОЄКЦІЇ, а назад у широту він повертається через
+    // нелінійну `mercatorLatitude`, тож у градусах півночі й півдня від хорди виходить різниця в
+    // сотих частках кутової хвилини. Вимагати тут повної рівності означало б вимагати, щоб Меркатор
+    // був лінійним.
+    expect(Math.abs(eastMid - 50)).toBeCloseTo(Math.abs(westMid - 50), 3);
+  });
+
+  it('degenerates safely when both ends are the same point', () => {
+    // Нульова хорда: ділення на довжину дало б NaN у кожній точці й порожню лінію на карті.
+    expect(arc([34, 50], [34, 50])).toEqual([[34, 50], [34, 50]]);
+  });
+});
+
 /** Виклик `map.addLayer({ id: '<id>' … })` цілком, із тіла названої функції. */
 function layerCallIn(functionName: string, id: string): string {
   const body = bodyOf(functionName);
@@ -1562,7 +1639,13 @@ describe('the radar wave respects reduced motion and the map lifecycle', () => {
   it('stops the frame before the map that owns the layer is destroyed', () => {
     // Кадр, замовлений до map.remove(), виконався б уже після нього і звернувся б до знищеного
     // стилю. try/catch усередині це витримає, але не планувати роботу дешевше, ніж ловити виняток.
-    const teardown = APP_SOURCE.slice(APP_SOURCE.indexOf('stopThreatWave(); threatDotLayersReady'));
+    // Шукаємо в самому блоці демонтажу, а не в усьому файлі: `map.remove()` згадується ще й у
+    // коментарі про addImage набагато раніше, і пошук по файлу порівнював би коментар із кодом.
+    const marker = APP_SOURCE.indexOf("if (map && route !== '/')");
+    expect(marker).toBeGreaterThan(-1);
+    const teardown = APP_SOURCE.slice(marker, marker + 600);
+    expect(teardown).toMatch(/stopThreatWave\(\)/);
+    expect(teardown).toMatch(/stopVectorDraw\(\)/);
     expect(teardown.indexOf('stopThreatWave()')).toBeLessThan(teardown.indexOf('map.remove()'));
   });
 });

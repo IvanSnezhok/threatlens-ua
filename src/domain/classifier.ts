@@ -1,3 +1,4 @@
+import { detectOriginZone } from './origin-zones.js';
 import type { ClassifiedMessage, RelationType, ThreatType } from '../types.js';
 import {
   ADMIN_CONNECTORS, inflections, isBlockedPlaceToken, nameTokens, OBLAST_HEADS, type PlaceToken,
@@ -1318,6 +1319,9 @@ export function classifyMessage(text: string, locations: LocationLexeme[]): Clas
     nationalScope,
     indicators: [...assertedIndicators.map(({ name }) => name), ...matchedContext.map(({ name }) => name)],
     directionText: direction,
+    // Зона походження — з ТЕКСТУ, не з класу зброї. `detectOriginZone` мовчить, коли джерело не
+    // назвало, звідки саме; порожнє значення тут — нормальний і найчастіший результат.
+    originZone: detectOriginZone(text)?.id ?? null,
     title: labels[threatType],
     summary,
     ...(isRedirect

@@ -46,7 +46,8 @@ const MIGRATION_FILES = [
   '042_analytical_withdrawal.sql',
   '043_analytical_outcomes.sql',
   '044_publication_channels.sql',
-  '045_model_enrichment.sql'
+  '045_model_enrichment.sql',
+  '046_origin_zone.sql'
 ];
 
 /**

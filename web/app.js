@@ -704,6 +704,7 @@ async function loadRaionBoundaries() {
     // перевипустити саме тут: прибуття файлу асинхронне й нефатальне.
     updateTerritoryIcons();
     updateThreatDots();
+    updateOriginZones();
   } catch { /* без районних контурів карта працює на рівні областей */ }
 }
 
@@ -1000,8 +1001,92 @@ function directionCollection() {
 // означало б звалити дві семантики в одне джерело й втратити саме ту різницю, заради якої ланцюг і
 // будується. Тому — окремі шари; порядок наявних не змінюється.
 
-function vectorSegmentCollection() {
+// Стріла прогину дуги як частка довжини хорди, і скільки точок її зображують.
+//
+// 0.11 підібрано за єдиним критерієм, який тут щось означає: дуга мусить бути помітно НЕ прямою —
+// інакше вона не розводить два відрізки, що йдуть в ту саму область, — і водночас не мусить
+// вигинатися так, щоб хтось прочитав у ній маневр. Вигин однаковий для КОЖНОГО відрізка й завжди в
+// один бік; саме ця одноманітність і робить його стилем, а не твердженням. Форму шляху джерело не
+// повідомляє ніколи, тож дуга, що змінювалася б від відрізка до відрізка, малювала б вигадану
+// траєкторію — те, що CONTEXT.md забороняє прямо.
+const VECTOR_ARC_BEND = 0.11;
+const VECTOR_ARC_STEPS = 28;
+
+/** Обернена до `mercatorY`: з ординати веб-Меркатора назад у широту. */
+function mercatorLatitude(y) {
+  return (2 * Math.atan(Math.exp(y)) - Math.PI / 2) * 180 / Math.PI;
+}
+
+/**
+ * Квадратична крива від A до Б, порахована В ПРОЄКЦІЇ, а не в градусах.
+ *
+ * Та сама причина, що й у `segmentBearing`: MapLibre малює LineString прямою в проєкованих
+ * координатах, тож дуга, побудована на градусах широти, вигиналася б на екрані тим сильніше, чим
+ * північніше лежить відрізок. У меркаторських одиницях вигин однаковий скрізь — а однаковість тут
+ * і є вимогою.
+ */
+function vectorArc(from, to) {
+  // Довгота переводиться в РАДІАНИ, бо `mercatorY` повертає ординату саме в них. Перший варіант
+  // рахував x у градусах, а y у радіанах: `Math.hypot` над такою парою дає число, у якому одна вісь
+  // у ~57 разів «довша» за іншу, і прогин, узятий як частка цієї довжини, виносив дугу на пів
+  // радіана широти. Вістря при цьому дивилося на 175° там, де мало на 102°.
+  const RAD = Math.PI / 180;
+  const ax = from[0] * RAD, ay = mercatorY(from[1]);
+  const bx = to[0] * RAD, by = mercatorY(to[1]);
+  const dx = bx - ax, dy = by - ay;
+  const length = Math.hypot(dx, dy);
+  if (!length) return [from, to];
+  // Контрольна точка — на серединному перпендикулярі до хорди, завжди з одного її боку. Нормаль до
+  // (dx, dy) це (−dy, dx); одинична, помножена на прогин від довжини, дає саме (−dy, dx) × BEND.
+  const cx = (ax + bx) / 2 - dy * VECTOR_ARC_BEND;
+  const cy = (ay + by) / 2 + dx * VECTOR_ARC_BEND;
+  const points = [];
+  for (let step = 0; step <= VECTOR_ARC_STEPS; step += 1) {
+    const t = step / VECTOR_ARC_STEPS;
+    const inv = 1 - t;
+    const x = inv * inv * ax + 2 * inv * t * cx + t * t * bx;
+    const y = inv * inv * ay + 2 * inv * t * cy + t * t * by;
+    points.push([x / RAD, mercatorLatitude(y)]);
+  }
+  return points;
+}
+
+/**
+ * Скільки часу лінія промальовується від A до Б, і що ця анімація стверджує.
+ *
+ * Вона стверджує ПОРЯДОК і НАПРЯМОК: відрізок починається там, де його назвало перше повідомлення,
+ * і закінчується там, де друге. Вона НЕ стверджує положення цілі, і це не формальність — система
+ * такого твердження зробити й не могла б. `elapsedSeconds` більший за нуль існує рівно на ланці
+ * `observation_sequence`, тобто там, де рух не стверджувало жодне джерело; на `reported_transit` і
+ * `reported_direction`, де рух ствердили, він ЗАВЖДИ нуль. Прив’язати проходження лінії до часу
+ * означало б вигадати швидкість там, де немає навіть тривалості.
+ *
+ * Тому промальовування одноразове й однакової тривалості для кожного відрізка: воно триває доти,
+ * доки око встигає простежити напрямок, і більше не повертається. Лінія, що вічно біжить, читалася б
+ * як рух, який триває зараз.
+ */
+const VECTOR_DRAW_MS = 850;
+const vectorDrawStart = new Map();
+let vectorDrawFrame = null;
+
+/** Частка дуги, намальована на цей момент. `1` — відрізок домальовано й він більше не анімується. */
+function vectorDrawProgress(id, now) {
+  if (!motionAllowed()) return 1;
+  const started = vectorDrawStart.get(id);
+  if (started === undefined) { vectorDrawStart.set(id, now); return 0; }
+  return Math.min(1, (now - started) / VECTOR_DRAW_MS);
+}
+
+/** Дуга, обрізана до частки `progress`. Завжди щонайменше дві точки: LineString з однієї невалідний. */
+function partialArc(points, progress) {
+  if (progress >= 1) return points;
+  const last = Math.max(1, Math.round((points.length - 1) * progress));
+  return points.slice(0, last + 1);
+}
+
+function vectorSegmentCollection(now = performance.now()) {
   const features = [];
+  const live = new Set();
   for (const vector of vectors) {
     for (const [order, segment] of (vector.segments ?? []).entries()) {
       // Відрізок без координат лишається у відповіді й у діалозі як факт, але не малюється:
@@ -1010,14 +1095,43 @@ function vectorSegmentCollection() {
       const from = vector.nodes[segment.from];
       const to = vector.nodes[segment.to];
       if (!from?.coordinates || !to?.coordinates) continue;
-      features.push({ type: 'Feature', id: `vs-${vector.eventId}-${order}`,
-        geometry: { type: 'LineString', coordinates: [from.coordinates, to.coordinates] },
+      const id = `vs-${vector.eventId}-${order}`;
+      live.add(id);
+      const arc = vectorArc(from.coordinates, to.coordinates);
+      features.push({ type: 'Feature', id,
+        geometry: { type: 'LineString', coordinates: partialArc(arc, vectorDrawProgress(id, now)) },
         properties: { eventId: vector.eventId, basis: segment.basis, evidence: segment.evidenceLevel,
           approximate: from.coordinatePrecision === 'approximate' || to.coordinatePrecision === 'approximate',
           label: `${from.name} → ${to.name}` } });
     }
   }
+  // Відрізок, що зник із відповіді, забирає з собою й свій час початку: інакше мапа росла б увесь
+  // час роботи вкладки, а ланцюг, який повернувся б із тим самим id, промальовувався б миттєво.
+  for (const id of [...vectorDrawStart.keys()]) if (!live.has(id)) vectorDrawStart.delete(id);
   return { type: 'FeatureCollection', features };
+}
+
+/** Крутить промальовування, поки є хоч один недомальований відрізок, і зупиняється сам. */
+function runVectorDraw() {
+  if (vectorDrawFrame !== null) return;
+  if (!motionAllowed()) return;
+  const step = () => {
+    vectorDrawFrame = null;
+    if (!map || !map.getSource('threat-vector-segments')) return;
+    const now = performance.now();
+    const pending = [...vectorDrawStart.entries()].some(([, started]) => now - started < VECTOR_DRAW_MS);
+    try {
+      map.getSource('threat-vector-segments')?.setData(vectorSegmentCollection(now));
+    } catch { return; }
+    if (pending) vectorDrawFrame = requestAnimationFrame(step);
+  };
+  vectorDrawFrame = requestAnimationFrame(step);
+}
+
+function stopVectorDraw() {
+  if (vectorDrawFrame === null) return;
+  cancelAnimationFrame(vectorDrawFrame);
+  vectorDrawFrame = null;
 }
 
 function vectorNodeCollection() {
@@ -1110,7 +1224,11 @@ function vectorHeadCollection() {
       const from = vector.nodes[segment.from];
       const to = vector.nodes[segment.to];
       if (!from?.coordinates || !to?.coordinates) continue;
-      const bearing = segmentBearing(from.coordinates, to.coordinates);
+      // Курс береться з ДОТИЧНОЇ в кінці дуги — двох останніх її точок, — а не з хорди A→Б. Відколи
+      // лінія вигнута, вістря, повернуте за хордою, стояло б під кутом до власного кінця: тим
+      // помітнішим, чим довший відрізок. Вістря мусить продовжувати ту лінію, на якій сидить.
+      const arc = vectorArc(from.coordinates, to.coordinates);
+      const bearing = segmentBearing(arc[arc.length - 2], arc[arc.length - 1]);
       if (bearing === null) continue;
       features.push(arrow(`va-${vector.eventId}-${order}`, to.coordinates, bearing, image,
         segment.basis, `${from.name} → ${to.name}`));
@@ -1160,6 +1278,10 @@ function applyVectors() {
     // Голови приходять із ДВОХ джерел даних — /api/v1/vectors і snapshot.threats — тож їх
     // перевидає саме applyVectors(): і loadVectors(), і updateMap() проходять через нього.
     map.getSource('threat-vector-heads')?.setData(vectorHeadCollection());
+    // Щойно з’явився відрізок, якого ще не малювали, `vectorDrawProgress` уже записав йому час
+    // початку — лишається крутити кадри, доки він доросте до одиниці. Кадр зупиняється сам, тож
+    // повторний виклик на кожен знімок нічого не коштує.
+    runVectorDraw();
   }
   renderVectorLegend();
 }
@@ -1798,6 +1920,95 @@ function stopThreatWave() {
   threatWaveFrame = null;
 }
 
+/**
+ * Зони походження: те, що джерело сказало про «звідки», а не про «де».
+ *
+ * Єдині точки на цій карті поза Україною, і межа тут вужча, ніж деінде. Зона з’являється рівно тоді,
+ * коли її назвав текст повідомлення («пуски з акваторії Чорного моря», «БпЛА з півночі»), і ніколи
+ * не виводиться з класу зброї: повідомлення про зліт авіації не називає аеродрому, тож зона,
+ * здогадана за типом індикатора, була б припущенням системи у вигляді карти.
+ *
+ * Іконка бере клас зброї, названий разом із зоною, і має ту саму пульсацію, що й крапка загрози —
+ * але означає протилежний бік стрілки: не «сюди летить», а «звідти повідомили активність».
+ */
+function originZoneCollection() {
+  const features = [];
+  for (const zone of snapshot?.originZones ?? []) {
+    if (!Array.isArray(zone.anchor) || zone.anchor.length !== 2) continue;
+    // Клас беремо перший названий; решта лишається в підказці. Стек із трьох гліфів, як у територій,
+    // тут зайвий: зона — це не місце, у якому щось відбувається, а бік, з якого про це сказали.
+    const threatType = zone.threatTypes?.[0] ?? 'unknown';
+    features.push({
+      type: 'Feature',
+      id: `oz-${zone.zoneId}`,
+      geometry: { type: 'Point', coordinates: zone.anchor },
+      properties: {
+        zoneId: zone.zoneId,
+        name: zone.name,
+        icon: iconImageId(threatType, 'reported'),
+        reports: zone.reports ?? 0,
+        sources: zone.sources ?? 0
+      }
+    });
+  }
+  return { type: 'FeatureCollection', features };
+}
+
+function addOriginZoneLayers() {
+  if (!iconImagesReady) return;
+  map.addSource('origin-zones', { type: 'geojson', data: originZoneCollection() });
+  map.addLayer({ id: 'origin-zone-wave', type: 'circle', source: 'origin-zones', paint: {
+    'circle-radius': motionAllowed() ? 9 : 19,
+    'circle-color': threatColor,
+    'circle-opacity': 0,
+    'circle-stroke-width': 2,
+    'circle-stroke-color': threatColor,
+    'circle-stroke-opacity': motionAllowed() ? .45 : .26
+  } });
+  map.addLayer({ id: 'origin-zone-icon', type: 'symbol', source: 'origin-zones', layout: {
+    'icon-image': ['get', 'icon'],
+    'icon-size': ['interpolate', ['linear'], ['zoom'], 4, .72, 8, 1],
+    // Колізію ігнорує: зон одиниці, вони стоять у морі або за кордоном, де конкурувати нема з чим,
+    // а погашена іконка перетворила б заяву джерела на порожнє місце.
+    'icon-allow-overlap': true,
+    'icon-ignore-placement': true
+  } });
+  originZoneLayersReady = true;
+  startOriginWave();
+}
+
+function updateOriginZones() {
+  if (!originZoneLayersReady) return;
+  map.getSource('origin-zones')?.setData(originZoneCollection());
+}
+
+const ORIGIN_WAVE_PERIOD_MS = 2600;
+let originWaveFrame = null;
+let originZoneLayersReady = false;
+
+/** Та сама хвиля, що й у крапки загрози, лише повільніша: походження — фон епізоду, а не його вістря. */
+function startOriginWave() {
+  if (originWaveFrame !== null) return;
+  if (!motionAllowed()) return;
+  const step = () => {
+    originWaveFrame = null;
+    if (!map || !map.getLayer('origin-zone-wave')) return;
+    const phase = (performance.now() % ORIGIN_WAVE_PERIOD_MS) / ORIGIN_WAVE_PERIOD_MS;
+    try {
+      map.setPaintProperty('origin-zone-wave', 'circle-radius', 9 + phase * 26);
+      map.setPaintProperty('origin-zone-wave', 'circle-stroke-opacity', (1 - phase) ** 2 * .45);
+    } catch { return; }
+    originWaveFrame = requestAnimationFrame(step);
+  };
+  originWaveFrame = requestAnimationFrame(step);
+}
+
+function stopOriginWave() {
+  if (originWaveFrame === null) return;
+  cancelAnimationFrame(originWaveFrame);
+  originWaveFrame = null;
+}
+
 function addThreatDotLayers() {
   map.addSource('threat-dots', { type: 'geojson', data: threatDotCollection() });
   // Хвиля — ТІЛЬКИ навколо територій, які джерело назвало. Фільтр стоїть на шарі, а не в збірці
@@ -2027,6 +2238,7 @@ function initMap() {
     iconTier = next;
     updateTerritoryIcons();
     updateThreatDots();
+    updateOriginZones();
   });
   map.addControl(new maplibregl.NavigationControl({ showCompass: false }), 'top-right');
   map.addControl(new maplibregl.AttributionControl({ compact: true }), 'bottom-left');
@@ -2272,6 +2484,7 @@ function initMap() {
       filter: ['==', ['get', 'origin'], 'model'], paint: directionPaint(true) });
     addVectorLayers();
     addThreatDotLayers();
+    addOriginZoneLayers();
     addTerritoryIconLayers();
     // Один клік має відкрити одну панель. Обробник висить на кількох шарах, і MapLibre викликає його
     // окремо для кожного, у якому під точкою є фіча, — тож роботу робимо один раз на один DOM-клік
@@ -2329,6 +2542,7 @@ function initMap() {
     iconTier = map.getZoom() >= ICON_TIER_ZOOM ? 'raion' : 'oblast';
     updateTerritoryIcons();
     updateThreatDots();
+    updateOriginZones();
   });
   $('#fit-ukraine').addEventListener('click', () => map.fitBounds([[21.5,43.2],[41.2,52.5]], { padding: 36, duration: 700 }));
 }
@@ -2340,6 +2554,7 @@ function updateMap() {
   applyVectors();
   updateTerritoryIcons();
   updateThreatDots();
+  updateOriginZones();
   refreshOpenTerritoryPanel();
 }
 
@@ -2986,6 +3201,7 @@ function renderMapPage() {
     // КОЖЕН клік, інакше стек іконок і полігони під ним казали б різне.
     updateTerritoryIcons();
     updateThreatDots();
+    updateOriginZones();
     if (button.dataset.layer === 'occupation') {
       occupationVisible = active;
       applyOccupationVisibility();
@@ -6794,7 +7010,11 @@ function renderCurrentRoute(options = {}) {
   // карти, виконався б уже після нього. Всередині є try/catch, але покладатися на нього означало б
   // ловити виняток там, де достатньо не планувати роботу.
   if (map && route !== '/') {
-    stopThreatWave(); threatDotLayersReady = false;
+    stopThreatWave(); stopOriginWave(); stopVectorDraw();
+    threatDotLayersReady = false; originZoneLayersReady = false;
+    // Часи початку теж скидаються: карту буде створено заново, і ланцюги, що переживуть перехід,
+    // мусять промалюватися ще раз, а не з’явитися вже готовими.
+    vectorDrawStart.clear();
     map.remove(); map = null; mapLayersReady = false;
   }
   // Опитування стану входу Codex і стану оновлення привʼязані до вузлів, яких поза консоллю вже
