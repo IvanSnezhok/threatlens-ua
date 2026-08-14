@@ -2,6 +2,7 @@ import { EventEmitter } from 'node:events';
 import { pool } from '../db/pool.js';
 import type { PublicationMode } from '../types.js';
 import { onAlertPoke } from './alert-poke.js';
+import { deliverableRun } from './event-log-cursor.js';
 import { delaySecondsFor, observeSseDeliveryLag } from './publication.js';
 import { resolveRuntimeSettingsWithStatus } from './runtime-settings.js';
 
@@ -195,13 +196,12 @@ class EventHub extends EventEmitter {
         //     head(t₀⁺) >= head(t₀⁻), so emission does not even pause across a live→delayed_15s
         //     flip; the hold ramps in over `delaySeconds`.
         //  4. The internal feed below is never gated. Two cursors, one tick, one extra statement.
-        //  5. The commit-order gap is narrowed, not closed. A row that is still INVISIBLE when the
-        //     head is computed cannot be seen by any bound: a transaction that takes a low version
-        //     early and commits after a higher-versioned one was already emitted still loses its row,
-        //     exactly as it can today in live mode. That residual gap is bounded by transaction
-        //     duration, and nothing in this process caps transaction duration — see the comment in
-        //     `src/db/pool.ts` for why `idle_in_transaction_session_timeout` does not, and for the
-        //     escalation path if a real bound is ever wanted.
+        //  5. The commit-order gap is closed, but NOT by this bound. A row still INVISIBLE when the
+        //     head is computed cannot be seen by any bound derived from visible rows, so the head
+        //     stops the cursor before a HELD row and never before an UNCOMMITTED one. The emit loop
+        //     below takes only the contiguous run of versions, which does — see
+        //     `src/services/event-log-cursor.ts`. Both halves are needed: the head decides what is
+        //     releasable, the run decides what is complete.
         //
         // In `live` mode `delaySeconds = 0`, `now() - make_interval(secs => 0)` is `now()`, no
         // VISIBLE row can carry a created_at newer than this transaction's own start, the first
@@ -223,7 +223,11 @@ class EventHub extends EventEmitter {
         );
         const releasedAt = new Date();
         const mode: PublicationMode = delaySeconds > 0 ? 'delayed_15s' : 'live';
-        for (const row of result.rows) {
+        // Property 5 above — the commit-order gap — is what this closes. The head bound stops the
+        // cursor before a row still HELD; it cannot stop it before a row still INVISIBLE, because no
+        // bound computed from visible rows can see one. Taking only the contiguous run does, and it
+        // is the same rule the notification fan-out now applies to its durable cursor.
+        for (const row of deliverableRun(result.rows, cursor, releasedAt.getTime())) {
           this.lastVersion = Number(row.version);
           const envelope = publishedEnvelope(row, mode, releasedAt);
           observeSseDeliveryLag('live', (releasedAt.getTime() - row.created_at.getTime()) / 1000);
@@ -236,11 +240,14 @@ class EventHub extends EventEmitter {
         // recorded, whatever the publication mode is. «внутрішній перерахунок може завершитися
         // раніше».
         // ----------------------------------------------------------------------------------------
+        const internalCursor = this.internalVersion ?? 0;
         const internal = await pool.query(
           `SELECT version,event_type,payload,created_at FROM system_event_log
-           WHERE version > $1 ORDER BY version LIMIT 200`, [this.internalVersion ?? 0]
+           WHERE version > $1 ORDER BY version LIMIT 200`, [internalCursor]
         );
-        for (const row of internal.rows) {
+        // Unbounded in TIME, not in ORDER. This feed skips the publication hold on purpose; skipping
+        // a row whose transaction had not committed yet was never part of that intent.
+        for (const row of deliverableRun(internal.rows, internalCursor, releasedAt.getTime())) {
           this.internalVersion = Number(row.version);
           this.emit('internal-event', publishedEnvelope(row, mode, releasedAt));
         }

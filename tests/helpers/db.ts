@@ -305,6 +305,33 @@ export async function runFanout(): Promise<void> {
   if (errors.length) throw errors[0];
 }
 
+/**
+ * One fanout pass, when the cursor is expected NOT to reach the newest version.
+ *
+ * `runFanout` waits for the cursor to catch up to `max(version)`, which is the right completion
+ * signal only while every version below the head is deliverable. A test that deliberately holds a
+ * write transaction open has a head the cursor MUST stop short of — the fanout takes only the
+ * contiguous run, see `src/services/event-log-cursor.ts` — so that wait would time out by design and
+ * the timeout would look like a regression instead of the behaviour being asserted.
+ *
+ * There is no cursor value to wait for here (the assertion is that it does not move) and no other
+ * observable the worker leaves behind on an empty pass, so completion is a settling window instead:
+ * `startNotificationWorkers` runs `fanoutRun()` synchronously on start and again every second, so a
+ * window longer than one tick guarantees at least one completed pass. Bounded and generous rather
+ * than tight, because the assertion it supports is negative.
+ */
+export async function runFanoutSettling(settleMs = 1_500): Promise<void> {
+  const { startNotificationWorkers } = await import('../../src/bot/outbox.js');
+  const errors: unknown[] = [];
+  const stop = startNotificationWorkers(null, { warn: () => undefined, error: (e: unknown) => errors.push(e) });
+  try {
+    await new Promise((resolve) => setTimeout(resolve, settleMs));
+  } finally {
+    stop();
+  }
+  if (errors.length) throw errors[0];
+}
+
 export interface FakeBotCall { chatId: string; text: string; options: Record<string, unknown> }
 export interface FakeBotEdit { chatId: string; messageId: number; text: string }
 

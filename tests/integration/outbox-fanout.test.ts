@@ -2,8 +2,9 @@ import { beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import {
   CITY_IN_OBLAST, OBLAST, OTHER_OBLAST,
   appendSystemEvent, count, ensureMigrated, integrationDatabaseAvailable,
-  resetDatabase, runFanout, seedSubscription, seedThreatEvent, seedUser, sql
+  resetDatabase, runFanout, runFanoutSettling, seedSubscription, seedThreatEvent, seedUser, sql
 } from '../helpers/db.js';
+import { pool } from '../../src/db/pool.js';
 
 /**
  * Covers the eight-parameter fanout query in `src/bot/outbox.ts`.
@@ -508,6 +509,52 @@ describe.skipIf(!integrationDatabaseAvailable)('subscription fanout', () => {
         `SELECT cursor_value FROM worker_state WHERE worker_name='notification-fanout'`
       );
       expect(Number(state.rows[0]!.cursor_value)).toBe(version);
+    });
+
+    it('does not step over a version whose transaction has not committed yet', async () => {
+      // The incident this closes. `version` is a `bigserial` handed out at INSERT, but a row appears
+      // at COMMIT — so `persistOfficialAlertSnapshot`, which holds one transaction over every oblast
+      // and writes `alert.started` inside the loop, takes a LOW version early and commits late. A
+      // short ingestion transaction meanwhile takes a HIGHER version and commits first.
+      //
+      // The fan-out cursor is durable, so stepping over the low version is not a delay: the row sits
+      // below the stored cursor for the rest of the deployment's life and its notification is never
+      // sent. Reproduced against this database before the fix, on the single most important event
+      // type the product has.
+      await seedUser(9520);
+      await seedSubscription({ chatId: 9520, locationId: OBLAST });
+      const held = await seedThreatEvent({ locationIds: [OBLAST] });
+      const overtaking = await seedThreatEvent({ locationIds: [OBLAST] });
+
+      const long = await pool.connect();
+      try {
+        await long.query('BEGIN');
+        const inserted = await long.query<{ version: string }>(
+          `INSERT INTO system_event_log(event_type,payload) VALUES ('threat.updated',$1) RETURNING version`,
+          [JSON.stringify({ eventId: held })]
+        );
+        const heldVersion = Number(inserted.rows[0]!.version);
+        const laterVersion = await appendSystemEvent('threat.updated', { eventId: overtaking });
+        expect(laterVersion).toBeGreaterThan(heldVersion);
+
+        // A pass that can see only the higher version must take nothing at all: the gap below it is
+        // indistinguishable, from here, from a row that is about to arrive.
+        await runFanoutSettling();
+        const parked = await sql<{ cursor_value: string }>(
+          `SELECT cursor_value FROM worker_state WHERE worker_name='notification-fanout'`
+        );
+        expect(Number(parked.rows[0]!.cursor_value)).toBeLessThan(heldVersion);
+        expect(await count('notification_outbox')).toBe(0);
+
+        await long.query('COMMIT');
+      } finally {
+        long.release();
+      }
+
+      // Committed, contiguous, and now both are delivered — the held one included.
+      await runFanout();
+      expect(await chatsNotifiedFor(held)).toEqual([9520]);
+      expect(await chatsNotifiedFor(overtaking)).toEqual([9520]);
     });
 
     it('never enqueues expired threats', async () => {

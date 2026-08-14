@@ -4,6 +4,7 @@ import { config } from '../config.js';
 import { pool } from '../db/pool.js';
 import { relatedLocationsCte } from '../repositories/events.js';
 import { onAlertPoke } from '../services/alert-poke.js';
+import { deliverableRun } from '../services/event-log-cursor.js';
 import {
   MODEL_CHANNEL_ACTION, MODEL_CHANNEL_DISCLAIMER, MODEL_CHANNEL_STANDING,
   cleanSummary, confidenceLabel, evidenceRaisedLine, evidenceStatement, extensionLine,
@@ -487,7 +488,9 @@ async function fanoutNewEvents() {
     let cursor = Number(state.rows[0].cursor_value);
     const events = await client.query(`SELECT * FROM system_event_log WHERE version>$1 ORDER BY version LIMIT 100`, [cursor]);
     await client.query('COMMIT');
-    for (const event of events.rows) {
+    // Лише безперервний відрізок версій. Курсор тут довговічний, тож перестрибнута версія — це не
+    // затримка, а непроведене сповіщення назавжди; див. `src/services/event-log-cursor.ts`.
+    for (const event of deliverableRun(events.rows, cursor, Date.now())) {
       await enqueueForEvent(event);
       cursor = Number(event.version);
       await pool.query(`UPDATE worker_state SET cursor_value=$2,updated_at=now() WHERE worker_name=$1`, ['notification-fanout', cursor]);

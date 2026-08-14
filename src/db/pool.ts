@@ -21,14 +21,17 @@ export const pool = new Pool({
    * transaction — a `reconcileAggregateAlert` loop over every oblast, hundreds of round trips with
    * no idle gap between them, comfortably past fifteen seconds during a nationwide alert.
    *
-   * So the residual risk is NARROWED (an app stall can no longer hold a transaction open forever),
-   * not closed, and the remainder is pre-existing in `live` mode, where the hold is zero and any
-   * commit reorder does the same thing. Escalation paths if a real bound is ever wanted: PostgreSQL
-   * 17's `transaction_timeout` (node-pg forwards `options: '-c transaction_timeout=…'` verbatim —
-   * note this ABORTS an over-long nationwide snapshot rather than merely reporting it, so it is a
-   * behaviour change and needs its own decision), or bounding the head additionally by the oldest
-   * in-flight write (`SELECT min(backend_xmin) …`, or an explicit `publication_watermark` row
-   * advanced after commit).
+   * So this setting NARROWS an app stall and nothing else. The reorder it does not bound used to
+   * lose rows outright — a reader whose cursor is `version > $1` stepped over a lower version that
+   * was still invisible, and the notification fan-out, whose cursor is durable, never came back for
+   * it. That is now closed on the READER side rather than here: both readers take only the
+   * contiguous run of versions and stop before a gap, so an uncommitted lower version holds the
+   * cursor instead of being overtaken by it. See `src/services/event-log-cursor.ts`.
+   *
+   * Bounding transaction duration itself was the other candidate and was not taken. PostgreSQL 17's
+   * `transaction_timeout` (node-pg forwards `options: '-c transaction_timeout=…'` verbatim) ABORTS
+   * an over-long nationwide snapshot rather than merely reporting it — trading a delayed alert for a
+   * discarded one, which is the wrong direction for this product.
    */
   idle_in_transaction_session_timeout: 10_000,
   application_name: 'threatlens-ua'
