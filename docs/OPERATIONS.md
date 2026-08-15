@@ -324,6 +324,38 @@ Two clamps, and knowing about them is the difference between reading the graph a
   A p95 pinned at exactly 300 therefore means «щось дуже старе», not «п'ять хвилин затримки» — look
   at `alert_periods.started_at` for the alerts in that window before treating it as latency.
 
+### Splitting that number into ours and theirs
+
+`threatlens_alert_propagation_seconds` measures the whole road and cannot say which half is slow.
+`threatlens_source_cache_age_seconds{source,feed}` is the other half read directly: **how old the
+data was when the provider handed it over**, by the provider's own stamp. Subtract it from the
+propagation reading and what is left is ours — the poll interval, the resolve loop, the snapshot
+transaction.
+
+```promql
+# Ціна деталізації, в секундах. `raw` — деталізований фід, `aggregated` — обласний.
+threatlens_source_cache_age_seconds{source="aerial-alerts-mirror"}
+```
+
+Measured on the live mirror, 15.08.2026, by polling `cachedat`:
+
+| фід | оновлення | вік відповіді |
+|---|---|---|
+| агрегований (`states`) | ~3 с | 0.5–3.1 с |
+| `?source=skog&raw` | ~3 с | 0.5–2.9 с |
+| `?source=klimenko&raw` | ~3 с | 0.2–3.6 с |
+| `?source=aiu&raw` | ~20 с | 19.7–23.7 с, один 429 із пʼяти |
+| **`?source=ual&raw`** — наш | **121 с** | 21.8–110.3 с, у середньому ~60 с |
+
+`ual` is the only feed with raion and hromada granularity (see `AERIAL_MIRROR_RAW_SOURCE`), so the
+granularity costs about a minute of warning. That is not a fault to escalate — it is the standing
+trade-off, and the row above is what makes it visible. The same period measured end to end on
+production data: **p50 74 s** from the provider's own start stamp to our log row through the mirror,
+against **2.5 s** through an oblast-administration Telegram channel, which caches nothing.
+
+The way out is not a tuning knob in this repository: it is a direct API credential
+(`ALERTS_IN_UA_TOKEN`, 7 s floor) or more `mtproto_alert_channel` sources enabled.
+
 The last reading is also served at `GET /ops/api/runtime` as `propagation` and rendered as the
 «Затримка тривоги» chip on the console. It is **process state**: `null` after every restart and on
 any night with no alerts, which is why the chip shows a dash rather than a zero and carries the age
@@ -332,10 +364,13 @@ of the measurement in its tooltip. `/metrics` is the durable record; the chip is
 ### Incident conditions
 
 ```promql
-# The acquisition path is slower than the cadence can explain. At the default floors the p95 should
-# sit inside ~10 s; sustained above 30 s means a leg is in backoff, an upstream is stalling, or the
-# snapshot transaction is contending for the pool.
-histogram_quantile(0.95, sum by (le) (rate(threatlens_alert_propagation_seconds_bucket[15m]))) > 30
+# The acquisition path is slower than the cadence AND the provider's cache can explain. Read this
+# per source, never in aggregate: the mirror's `ual` feed alone contributes ~60 s of provider cache
+# (see «Splitting that number»), so a global p95 of 74 s is the standing state and not an incident.
+# Subtract `threatlens_source_cache_age_seconds` before escalating; what is left above ~10 s means a
+# leg is in backoff, an upstream is stalling, or the snapshot transaction is contending for the pool.
+histogram_quantile(0.95, sum by (le, source) (rate(threatlens_alert_propagation_seconds_bucket[15m])))
+  - avg by (source) (threatlens_source_cache_age_seconds) > 30
 
 # A leg has been failing long enough to be in the backoff cap.
 threatlens_ingestion_leg_interval_seconds >= 120

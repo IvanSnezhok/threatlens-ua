@@ -531,8 +531,15 @@ async function enqueueForEvent(event: any) {
   }
 }
 
-async function fanoutNewEvents() {
+/**
+ * Проводить журнал у чергу й каже, чи був серед проведеного початок тривоги.
+ *
+ * Повертається саме булеве значення, а не кількість: єдиний споживач питає «чи будити відправника
+ * негайно», і на це питання «сім» відповідає не краще за «так».
+ */
+async function fanoutNewEvents(): Promise<boolean> {
   const client = await pool.connect();
+  let raisedAlert = false;
   try {
     await client.query('BEGIN');
     await client.query(`INSERT INTO worker_state(worker_name,cursor_value) VALUES ('notification-fanout',0) ON CONFLICT DO NOTHING`);
@@ -544,6 +551,7 @@ async function fanoutNewEvents() {
     // затримка, а непроведене сповіщення назавжди; див. `src/services/event-log-cursor.ts`.
     for (const event of deliverableRun(events.rows, cursor, Date.now())) {
       await enqueueForEvent(event);
+      if (event.event_type === 'alert.started') raisedAlert = true;
       cursor = Number(event.version);
       await pool.query(`UPDATE worker_state SET cursor_value=$2,updated_at=now() WHERE worker_name=$1`, ['notification-fanout', cursor]);
     }
@@ -551,6 +559,7 @@ async function fanoutNewEvents() {
     await client.query('ROLLBACK').catch(() => undefined);
     throw error;
   } finally { client.release(); }
+  return raisedAlert;
 }
 
 /**
@@ -865,13 +874,27 @@ async function deliverBatch(bot: Bot, log: { warn: Function }) {
 /**
  * The two workers, plus the one signal that can make the fan-out run early.
  *
- * ## Why the fan-out is poked and the delivery worker is not
+ * ## Why the fan-out is poked, and why the delivery worker now is too
  *
  * The fan-out is the step that turns a committed `alert.started` into outbox rows, and it is pure
  * database work with no external service in it — running it a second earlier costs one statement
- * and buys a second off every subscriber's warning. The delivery worker is the step that talks to
- * Telegram: it is rate-limited by somebody else, it already batches twenty-five at a time, and
- * poking it would spend that budget to save a fraction of the second the API itself takes.
+ * and buys a second off every subscriber's warning.
+ *
+ * The delivery worker was left on its bare timer, on the argument that poking it would spend the
+ * Telegram budget to save «a fraction of the second the API itself takes». Тепер це виміряно, і
+ * частка виявилася цілою секундою: на бойових даних за тиждень від рядка в черзі до `sent_at`
+ * минало p50 **1.04 с**, p90 1.49 с, максимум 2.46 с. Це не тривалість запиту до Telegram — це
+ * очікування наступного тіку, рівномірно розподілене на [0, 1 с]. Сам запит ховається всередині
+ * цієї секунди.
+ *
+ * Тож відправника теж будять — але лише на початок тривоги, і будить його той самий прохід
+ * фан-ауту, що поставив рядок у чергу (`fanoutNewEvents` повертає, чи був серед проведеного
+ * `alert.started`). Бюджет Telegram при цьому не витрачається зайвим: `claimDeliveryBatch` бере
+ * `FOR UPDATE` на рядку governor'а, тож зайвий виклик або бачить порожній кошик токенів, або
+ * чекає на той, що вже виконується. Раніше прокидається доставка — не збільшується її дозвіл.
+ *
+ * Відбій не будить нікого: асиметрія «початок швидко, відбій неспішно» тут та сама, що і в
+ * `src/services/alert-poke.ts` та в `ALERT_END_DEBOUNCE_SECONDS`.
  *
  * ## The publication hold does not apply here, and that is not new
  *
@@ -893,13 +916,16 @@ async function deliverBatch(bot: Bot, log: { warn: Function }) {
  * read its window before the poking transaction was visible.
  */
 export function startNotificationWorkers(bot: Bot | null, log: { warn: Function; error: Function }) {
+  const deliveryRun = () => bot && deliverBatch(bot, log).catch((error) => log.error({ error }, 'notification delivery failed'));
   let fanoutRunning = false;
   let fanoutRearm = false;
   const fanoutRun = async (): Promise<void> => {
     if (fanoutRunning) return;
     fanoutRunning = true;
     try {
-      await fanoutNewEvents();
+      // Прохід, який щойно поставив у чергу початок тривоги, і будить відправника: черга вже
+      // наповнена, і чекати на тік немає чого. Помилка доставки лишається в її власному `catch`.
+      if (await fanoutNewEvents()) void deliveryRun();
     } catch (error) {
       log.error({ error }, 'notification fanout failed');
     } finally {
@@ -912,7 +938,6 @@ export function startNotificationWorkers(bot: Bot | null, log: { warn: Function;
     if (fanoutRunning) { fanoutRearm = true; return; }
     void fanoutRun();
   });
-  const deliveryRun = () => bot && deliverBatch(bot, log).catch((error) => log.error({ error }, 'notification delivery failed'));
   const delivery = bot ? setInterval(deliveryRun, 1_000) : undefined; delivery?.unref(); if (bot) void deliveryRun();
   return () => { clearInterval(fanout); if (delivery) clearInterval(delivery); detachPoke(); };
 }

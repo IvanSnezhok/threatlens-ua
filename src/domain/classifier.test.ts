@@ -17,7 +17,8 @@ const locations = [
   { id: 'test-boryspil', name: 'Бориспіль', aliases: ['борисполя', 'борисполі'] },
   { id: 'test-kyrykivka', name: 'Кириківка', aliases: ['кириківки'] },
   { id: 'test-trostianets', name: 'Тростянець', aliases: ['тростянця'] },
-  { id: 'test-huty', name: 'Гути', aliases: ['гутів'] }
+  { id: 'test-huty', name: 'Гути', aliases: ['гутів'] },
+  { id: 'test-kropyvnytskyi', name: 'Кропивницький', aliases: ['кропивницького'] }
 ];
 
 const classify = (text: string) => classifyMessage(text, locations);
@@ -28,6 +29,59 @@ describe('classifyMessage', () => {
     expect(result.threatType).toBe('uav');
     expect(result.locations[0]).toMatchObject({ id: 'ua-80', relationType: 'reported_direction' });
     expect(result.directionText).toContain('у напрямку Києва');
+  });
+
+  // ---- Курс: один словник для типу звʼязку і для тексту в картці ---------------------------------
+  //
+  // Знайдено не читанням коду, а бойовою карткою: заголовок «Крилата ракета повз Нечаївку продовжує
+  // рух на Кропивницький!», а під ним поле «Напрямок: не повідомлявся». `relationFor` курс упізнав
+  // (місце дістало `reported_direction`), окремий перелік фраз у видобувачі тексту — ні.
+
+  it('takes the direction from a transit sentence that names no other heading phrase', () => {
+    // Дослівне повідомлення з продакшену. «повз … рух на …» не є ані фразою курсу, ані стрілкою —
+    // курс тут несе сама конструкція транзиту, і саме її раніше не читав видобувач тексту.
+    const result = classify('⚠️Крилата ракета повз Гути продовжує рух на Кропивницький!');
+    expect(result.locations.find((location) => location.id === 'test-kropyvnytskyi')?.relationType)
+      .toBe('reported_direction');
+    // Дослівно, разом зі словом «рух»: картка підписує це поле «напрямок повідомлено джерелом», і
+    // будь-яке скорочення зробило б підпис неправдою.
+    expect(result.directionText).toBe('рух на Кропивницький');
+  });
+
+  it('reads "у бік" as a direction in the card, not only in the relation', () => {
+    // `relationFor` знав «у бік» від початку, видобувач тексту — ні. Розходження двох переліків.
+    const result = classify('Ударні БпЛА у бік Одеси');
+    expect(result.locations.find((location) => location.id === 'ua-city-odesa')?.relationType)
+      .toBe('reported_direction');
+    expect(result.directionText).toBe('у бік Одеси');
+  });
+
+  it('reads "рухається на" as well as "рухається до"', () => {
+    // Перелік мав тільки «до». «Рухається на Київ» — звичайна фраза моніторингових каналів.
+    const result = classify('Крилата ракета рухається на Київ');
+    expect(result.locations.find((location) => location.id === 'ua-80')?.relationType)
+      .toBe('reported_direction');
+    expect(result.directionText).toBe('рухається на Київ');
+  });
+
+  it('marks the far end of "повз A до B" as a direction, the same as "повз A на B"', () => {
+    // `REDIRECT_PATTERN` читав «до» як звʼязку транзиту, а `relationFor` — ні, тож Бориспіль лишався
+    // звичайною згадкою. Наслідок видно на карті: `planStep` будує відрізок A→B лише тоді, коли
+    // дальній кінець має тип `reported_direction`.
+    const result = classify('Балістика повз Бровари до Борисполя');
+    expect(result.locations.find((location) => location.id === 'test-boryspil')?.relationType)
+      .toBe('reported_direction');
+    expect(result.intent).toBe('redirect');
+    // Речення не має ані фрази курсу, ані стрілки — текст напрямку тут може дати ЛИШЕ розбір
+    // транзиту. Це і є той шлях, задля якого `directionPhrase` читає результат `REDIRECT_PATTERN`.
+    expect(result.directionText).toBe('до Борисполя');
+  });
+
+  it('does not call an altitude a direction', () => {
+    // Чому в переліку немає «летить на»: у картці це дало б «напрямок: на висоті 300 метрів».
+    // `relationFor` від такої помилки боронить каталог, видобувач тексту — ні.
+    const result = classify('Ударні БпЛА над Одещиною, летить на висоті 300 метрів');
+    expect(result.directionText).toBeUndefined();
   });
 
   it('recognizes ballistic threat and regional alias', () => {

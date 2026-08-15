@@ -570,14 +570,57 @@ const DE_ESCALATION_PHRASES = /((?<!\p{L})відбій\s+загроз|загро
 const ANTICIPATION_MARKERS = /((?<!\p{L})очікує|(?<!\p{L})чекає|сподіва|незабаром|(?<!\p{L})скоро(?!\p{L})|згодом|пильност|пильність|не\s+втрача|залишайт|(?<!\p{L})ще\s+не(?!\p{L}))/iu;
 
 /**
+ * Як джерело промовляє курс: один словник на всі три місця, де курс розпізнається.
+ *
+ * ================================================================================================
+ * Чому це константа, а не три регулярки
+ * ================================================================================================
+ *
+ * Курс читають ТРИ незалежні місця: `relationFor` (щоб позначити місце як `reported_direction`),
+ * `directionPhrase` (щоб зберегти дослівний текст у картку) і `REDIRECT_PATTERN` (щоб упізнати
+ * транзит «повз A на B»). Доки кожне мало власний перелік фраз, вони розходилися — і розходження
+ * було видно читачеві.
+ *
+ * Живий приклад, з якого це переписано: «Крилата ракета повз Нечаївку продовжує рух на
+ * Кропивницький!». `relationFor` упізнав транзит і позначив Кропивницький як напрямок; окремий
+ * перелік у видобувачі тексту слова «рух на» не мав — і картка написала «напрямок: не
+ * повідомлявся» під заголовком, у якому напрямок названо прямо.
+ *
+ * ================================================================================================
+ * Чому саме ці фрази
+ * ================================================================================================
+ *
+ * Тільки ті, де прийменник веде за собою МІСЦЕ: «курсом на», «рухається на», «прямує до», «у бік».
+ * Дієслова загального руху — «летить на», «йде на» — свідомо не входять: «летить на висоті 50
+ * метрів» дало б у картку «напрямок: на висоті 50 метрів». `relationFor` від такої помилки
+ * захищений каталогом (після фрази має стояти впізнане місце), а видобувач тексту — ні, і саме він
+ * потрапляє людині на очі.
+ */
+const HEADING_LEAD =
+  '[ув]\\s+напрямку|курс(?:ом)?\\s+на|руха(?:ється|ються)\\s+(?:до|на)|пряму(?:є|ють)\\s+(?:до|на)'
+  + '|[ув]\\s+бік|рух(?:у)?\\s+на';
+
+/** Стрілкові зведення: «→Кириківка/Тростянець». Той самий курс, записаний знаком. */
+const ARROW_LEAD = '→|➡|⮕|➤|-->|->';
+
+/** Чим джерело звʼязує «повз A» з «B». Спільне для `REDIRECT_PATTERN` і для `relationFor`. */
+const TRANSIT_LEAD = 'на|у\\s+напрямку|в\\s+напрямку|до';
+
+/**
  * A threat moving past one place towards another.
  *
  * Both halves have to resolve for this to be a redirect: at least one catalogue location inside the
  * "повз …" span and at least one inside the "… на …" span. When only one side resolves the message
  * is classified as an ordinary threat for whatever it did name — asserting a threat that has moved
  * on is a smaller error than withdrawing one that has not.
+ *
+ * Групи іменовані, бо `lead` тепер читається окремо: саме з нього й `towards` складається текст
+ * напрямку для картки, коли інших ознак курсу в реченні немає.
  */
-const REDIRECT_PATTERN = /(?<!\p{L})повз\s+([^.!?\n]{2,60}?)\s+(?:на|у\s+напрямку|в\s+напрямку|до)\s+([^.!?\n]{2,80})/iu;
+const REDIRECT_PATTERN = new RegExp(
+  `(?<!\\p{L})повз\\s+(?<passed>[^.!?\\n]{2,60}?)\\s+(?<lead>${TRANSIT_LEAD})\\s+(?<towards>[^.!?\\n]{2,80})`,
+  'iu'
+);
 
 // ------------------------------------------------------------------------------------------------
 // Retrospection and narration (`v5`)
@@ -840,20 +883,25 @@ const labels: Record<ThreatType, string> = {
 
 function relationFor(text: string, alias: string): RelationType {
   const escaped = alias.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-  if (new RegExp(`([ув] напрямку|курс(?:ом)? на|руха(?:ється|ються) до|прямує до|[ув] бік)\\s+(?:.{0,24})${escaped}`, 'iu').test(text)) {
+  if (new RegExp(`(?:${HEADING_LEAD})\\s+(?:.{0,24})${escaped}`, 'iu').test(text)) {
     return 'reported_direction';
   }
   // The arrow bulletin marks its targets with an arrow and separates them with a slash:
   // "→Кириківка/Тростянець". Everything after the arrow up to the sentence end is a target list, so
   // the second name is as much a direction as the first.
-  if (new RegExp(`(?:→|➡|⮕|➤|-->|->)\\s*[^.!?\\n]{0,40}?${escaped}`, 'iu').test(text)) {
+  if (new RegExp(`(?:${ARROW_LEAD})\\s*[^.!?\\n]{0,40}?${escaped}`, 'iu').test(text)) {
     return 'reported_direction';
   }
   // Transit: "Балістика повз Бровари на Бориспіль". The place being passed and the place being
   // approached carry different meanings for a reader under it, and only the second is a direction.
   // The first keeps `mentioned`, which is what "повз" says — something went by, it was not aimed
   // there.
-  if (new RegExp(`повз\\s+[^.!\\n]{0,40}?на\\s+(?:.{0,10})${escaped}`, 'iu').test(text)) {
+  //
+  // Звʼязка береться з `TRANSIT_LEAD`, а не з голого «на». Доки тут стояло саме «на», «повз Бровари
+  // ДО Борисполя» лишало Бориспіль звичайною згадкою — при тому що `REDIRECT_PATTERN` те саме
+  // речення вже читав як транзит. Наслідок був не косметичний: `planStep` будує відрізок «A→B» лише
+  // коли другий кінець має тип `reported_direction`, тож вектор для такого речення не малювався.
+  if (new RegExp(`повз\\s+[^.!\\n]{0,40}?(?:${TRANSIT_LEAD})\\s+(?:.{0,10})${escaped}`, 'iu').test(text)) {
     return 'reported_direction';
   }
   if (new RegExp(`(загроза|небезпека|увага для)(?:.{0,45})${escaped}`, 'iu').test(text)) {
@@ -861,6 +909,29 @@ function relationFor(text: string, alias: string): RelationType {
   }
   if (/наслідк|влучан|пошкоджен|вибух/iu.test(text)) return 'aftermath';
   return 'mentioned';
+}
+
+const HEADING_PHRASE = new RegExp(`(?:${HEADING_LEAD})\\s+[^.!\\n]{2,80}`, 'iu');
+const ARROW_PHRASE = new RegExp(`(?:${ARROW_LEAD})\\s*[^.!?\\n]{2,80}`, 'u');
+
+/**
+ * Дослівний уривок, у якому джерело назвало курс, або `undefined`.
+ *
+ * Порядок — від найпрямішого до найкосвеннішого, і третій крок є головним у цій функції: коли
+ * речення не має ані фрази курсу, ані стрілки, але Є транзитом «повз A на B», курс у ньому названо
+ * не менш прямо — просто іншою конструкцією. `REDIRECT_PATTERN` цей розбір уже зробив, тож замість
+ * четвертої регулярки береться його результат.
+ *
+ * Повертається саме те, що написало джерело, без переказу: картка підписує це поле словами
+ * «напрямок повідомлено джерелом», і будь-яке наше перефразування зробило б підпис неправдою.
+ */
+function directionPhrase(text: string, redirect: RegExpExecArray | null): string | undefined {
+  const heading = text.match(HEADING_PHRASE)?.[0];
+  if (heading) return heading.trim();
+  const arrow = text.match(ARROW_PHRASE)?.[0];
+  if (arrow) return arrow.trim();
+  const groups = redirect?.groups;
+  return groups?.lead && groups.towards ? `${groups.lead} ${groups.towards}`.trim() : undefined;
 }
 
 /** The classification of a message that carries no Ukrainian air threat and withdraws nothing. */
@@ -1298,12 +1369,11 @@ export function classifyMessage(text: string, locations: LocationLexeme[]): Clas
   // Transit. Both spans have to name a catalogue location for this to be a redirect; otherwise the
   // message stays an ordinary threat report about whatever it did name.
   const redirect = REDIRECT_PATTERN.exec(text);
-  const passedBy = redirect ? locationsWithin(redirect[1]!, found) : [];
-  const towards = redirect ? locationsWithin(redirect[2]!, found) : [];
+  const passedBy = redirect ? locationsWithin(redirect.groups!.passed!, found) : [];
+  const towards = redirect ? locationsWithin(redirect.groups!.towards!, found) : [];
   const isRedirect = passedBy.length > 0 && towards.length > 0;
 
-  const direction = text.match(/(?:[ув] напрямку|курс(?:ом)? на|руха(?:ється|ються) до|прямує до)\s+([^.!\n]{2,80})/iu)?.[0]
-    ?? text.match(/(?:→|➡|⮕|➤|-->|->)\s*([^.!?\n]{2,80})/u)?.[0];
+  const direction = directionPhrase(text, redirect);
   const assertion: ClassifiedMessage = {
     // `redirect` is still an assertion and still raises an event; what it adds is the statement that
     // the places in the "повз …" span are being passed rather than approached. Those locations stay

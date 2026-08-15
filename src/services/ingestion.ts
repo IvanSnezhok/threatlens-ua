@@ -21,7 +21,8 @@ import { markSourceError, markSourceSuccess } from './operations.js';
 // One-way import, on purpose: the observations are ops instrumentation and this file stays free of
 // ops code by calling four named functions rather than by growing a second metrics block.
 import {
-  countChannelError, observeAlertPropagation, observeClassificationDuration, observeIngestionLag
+  countChannelError, observeAlertPropagation, observeClassificationDuration, observeIngestionLag,
+  observeSourceCacheAge
 } from './publication.js';
 import { retrospectiveGate, retrospectiveGateMetrics } from './retrospective-gate.js';
 import { scheduleShadowClassification, shadowClassifierMetrics } from './shadow-classifier.js';
@@ -763,17 +764,28 @@ async function collectAerialMirrorSnapshot(
 ): Promise<AerialMirrorSnapshot> {
   const stale = config.AERIAL_MIRROR_STALE_SECONDS;
   const upstream = config.AERIAL_MIRROR_RAW_SOURCE.trim();
+  // Вік того, що фід щойно віддав, — за його власним `cachedat`. Записується на КОЖНОМУ читанні, і
+  // саме тому обидва тіла мають свою мітку: різниця між ними і є ціною деталізації. Виміряно на
+  // ubilling.net.ua 15.08.2026: агрегований фід оновлюється за ~3 с, `?source=ual&raw` — рівно раз
+  // на 121 с, тобто в середньому віддає стан хвилинної давності. Ця хвилина була найбільшим
+  // доданком у затримці сповіщення й ніде не була видна.
+  const record = <T extends AerialMirrorSnapshot>(feed: string, snapshot: T): T => {
+    observeSourceCacheAge(AERIAL_MIRROR_SOURCE_ID, feed, snapshot.ageSeconds);
+    return snapshot;
+  };
   if (!upstream) {
     aerialMirrorPolls.inc({ mode: 'unified_only' });
-    return parseAerialMirrorPayload(await fetchAerialMirror(config.AERIAL_MIRROR_URL), now, stale);
+    return record(
+      'aggregated', parseAerialMirrorPayload(await fetchAerialMirror(config.AERIAL_MIRROR_URL), now, stale)
+    );
   }
 
   let raw: AerialMirrorRawSnapshot | null = null;
   let reason = '';
   try {
-    raw = parseAerialMirrorRawPayload(
+    raw = record('raw', parseAerialMirrorRawPayload(
       await fetchAerialMirror(aerialMirrorRawUrl(config.AERIAL_MIRROR_URL, upstream)), now, stale
-    );
+    ));
   } catch (error) {
     reason = error instanceof Error ? error.message : String(error);
   }
@@ -791,9 +803,9 @@ async function collectAerialMirrorSnapshot(
   if (config.AERIAL_MIRROR_REQUEST_GAP_MS > 0) {
     await new Promise((resolve) => setTimeout(resolve, config.AERIAL_MIRROR_REQUEST_GAP_MS));
   }
-  const unified = parseAerialMirrorPayload(
+  const unified = record('aggregated', parseAerialMirrorPayload(
     await fetchAerialMirror(config.AERIAL_MIRROR_URL), now, stale
-  );
+  ));
   const unifiedActive = unified.regions.filter((region) => region.active).length;
 
   if (raw && !unifiedActive) {

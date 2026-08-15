@@ -1,5 +1,6 @@
 import { readFileSync } from 'node:fs';
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
+import { Registry } from 'prom-client';
 import { ensureMigrated, integrationDatabaseAvailable, resetDatabase, sql } from '../helpers/db.js';
 
 /**
@@ -599,6 +600,31 @@ describe.skipIf(!integrationDatabaseAvailable)('community aerial-alert mirror', 
 
       expect(await holdingLocations()).toEqual([CHUHUIV_RAION]);
       expect(await activePeriods()).toEqual([CHUHUIV_RAION]);
+    });
+
+    it('reports how old the data in the feed was, per feed', async () => {
+      // Ціна деталізації, зроблена видимою. Виміряно на бойовому дзеркалі 15.08.2026: агрегований
+      // фід оновлюється за ~3 с, а `?source=ual&raw` — рівно раз на 121 с. Тобто громадна
+      // деталізація коштує в середньому хвилини затримки попередження, і доти це число ніде не
+      // зберігалося: `ageSeconds` рахувався лише для того, щоб кинути виняток на замерзлому
+      // дзеркалі, і зникав.
+      const { registerPublicationMetrics } = await import('../../src/services/publication.js');
+      rawResponse.body = { source: RAW_FIXTURE.source, cachedat: kyivNow(90), raw: RAW_FIXTURE.raw };
+      await poll();
+
+      const registry = new Registry();
+      registerPublicationMetrics(registry);
+      const text = await registry.metrics();
+      const sample = new RegExp(
+        `threatlens_source_cache_age_seconds\\{source="${SOURCE}",feed="raw"\\} (\\d+)`
+      ).exec(text);
+      expect(sample).not.toBeNull();
+      // Не рівність: `cachedat` друкується з точністю до секунди, тож між ним і `now` завжди є
+      // дробовий залишок, і `Math.round` дає 90 або 91 залежно від того, о котрій частці секунди
+      // почався тест. Перша редакція вимагала рівно 90 і падала в повному прогоні, а поодинці
+      // проходила — рівність тут була б не суворістю, а невідтворюваністю.
+      expect(Number(sample![1])).toBeGreaterThanOrEqual(90);
+      expect(Number(sample![1])).toBeLessThanOrEqual(91);
     });
 
     it('resolves an ambiguous hromada name to nothing, and says so', async () => {

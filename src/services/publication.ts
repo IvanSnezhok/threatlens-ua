@@ -138,6 +138,26 @@ const alertPropagation = new Histogram({
   help: 'Seconds between an upstream reporting an alert start and our system_event_log row for it',
   labelNames: ['source'], buckets: [1, 2, 3, 5, 8, 12, 20, 30, 60, 120, 300], registers: []
 });
+/**
+ * Вік даних, які провайдер сам оголосив у відповіді, на момент нашого читання.
+ *
+ * Окрема серія від `threatlens_alert_propagation_seconds`, і різниця між ними — це і є відповідь на
+ * питання «хто саме гальмує». Propagation вимірює ВСЮ дорогу від годинника влади до нашого рядка й
+ * не розрізняє в ній наших доданків і чужих. Ця ж читає єдине число, яке провайдер друкує про себе
+ * самого: наскільки застаріле те, що він щойно віддав.
+ *
+ * Чому це варте власної серії. `?source=ual&raw` — єдиний фід дзеркала з громадною деталізацією —
+ * виміряно оновлюється рівно раз на 121 с, тобто в середньому віддає стан хвилинної давності; решта
+ * його фідів оновлюються за три секунди, але знають лише область. Ціна деталізації — хвилина
+ * затримки попередження — досі не була видна ніде: `ageSeconds` рахувався тільки для того, щоб
+ * кинути виняток на замерзлому дзеркалі, і зникав. Ставити швидкість опитування, поріг застарілості
+ * чи вибір фіда, не бачачи цього числа, означає налаштовувати наш бік дороги наосліп.
+ */
+const sourceCacheAge = new Gauge({
+  name: 'threatlens_source_cache_age_seconds',
+  help: 'How old the data in a provider response was, by the provider own cache stamp',
+  labelNames: ['source', 'feed'], registers: []
+});
 
 const METRICS: ReadonlyArray<[string, Counter<string> | Gauge<string> | Histogram<string>]> = [
   ['threatlens_ingestion_lag_seconds', ingestionLag],
@@ -149,6 +169,7 @@ const METRICS: ReadonlyArray<[string, Counter<string> | Gauge<string> | Histogra
   ['threatlens_sse_delivery_lag_seconds', sseDeliveryLag],
   ['threatlens_channel_errors_total', channelErrors],
   ['threatlens_alert_propagation_seconds', alertPropagation],
+  ['threatlens_source_cache_age_seconds', sourceCacheAge],
   // Declared in `runtime-settings.ts` — the failure it counts happens inside
   // `resolveRuntimeSettings()`, and declaring it here would close an import cycle. Registered here
   // because this is the registrar `buildServer()` calls; without this row the series never appears
@@ -271,6 +292,18 @@ export function observeAlertPropagation(
   alertPropagation.observe({ source: sourceId }, seconds);
   lastPropagation = { seconds, source: sourceId, at: publishedAt.toISOString() };
   return seconds;
+}
+
+/**
+ * Записує вік відповіді провайдера. `feed` розрізняє два тіла одного джерела — деталізоване й
+ * агреговане, — бо саме між ними й пролягає вибір, який ця серія має зробити видимим.
+ *
+ * Відʼємне значення (годинник провайдера попереду нашого) записується як нуль з тієї самої причини,
+ * що й у `alertPropagationSeconds`: «наскільки застаріле» не буває менше за «не застаріле».
+ */
+export function observeSourceCacheAge(sourceId: string, feed: string, ageSeconds: number): void {
+  if (!Number.isFinite(ageSeconds)) return;
+  sourceCacheAge.set({ source: sourceId, feed }, Math.max(0, ageSeconds));
 }
 
 /**

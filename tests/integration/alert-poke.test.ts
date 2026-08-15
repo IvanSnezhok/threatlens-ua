@@ -1,7 +1,7 @@
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { Registry } from 'prom-client';
 import {
-  OBLAST, OTHER_OBLAST, delay, ensureMigrated, integrationDatabaseAvailable, outboxRows,
+  OBLAST, OTHER_OBLAST, delay, ensureMigrated, fakeBot, integrationDatabaseAvailable, outboxRows,
   resetDatabase, seedSubscription, seedUser, sql
 } from '../helpers/db.js';
 
@@ -180,6 +180,34 @@ describe.skipIf(!integrationDatabaseAvailable)('instant propagation of an alert 
       console.log(`[measured] alert.started → notification_outbox row: ${ms} ms`);
       expect((await outboxRows())[0]).toMatchObject({ notification_type: 'alert_start' });
       expect(ms).toBeLessThan(500);
+    } finally {
+      stop();
+    }
+  });
+
+  it('sends the alert to Telegram without waiting for the delivery tick', async () => {
+    // Знайдено вимірюванням на бойових даних, не читанням коду: від рядка в черзі до `sent_at`
+    // минало p50 1.04 с, p90 1.49 с. Це не тривалість запиту до Telegram — це очікування наступного
+    // тіку відправника, рівномірне на [0, 1 с]. Фан-аут будили, відправника — ні.
+    await seedUser(9332);
+    await seedSubscription({ chatId: 9332, locationId: OBLAST, notifyAlertStart: true });
+    const telegram = fakeBot();
+    const { startNotificationWorkers } = await import('../../src/bot/outbox.js');
+    const stop = startNotificationWorkers(
+      telegram.bot as never, { warn: () => undefined, error: () => undefined }
+    );
+    try {
+      await delay(60);
+      await pollUkraineAlarm(alarmBody([{ regionId: OBLAST, regionName: 'Київська область' }]));
+      const ms = await elapsedUntil(
+        () => telegram.calls.length > 0, 'the poked delivery pass to reach Telegram'
+      );
+      console.log(`[measured] alert.started → Telegram sendMessage: ${ms} ms`);
+      expect(telegram.calls[0]?.text).toContain('Повітряна тривога');
+      // Два таймери по 1 с стояли послідовно; без поштовху відправника очікування самої лише
+      // доставки — ~500 мс у середньому. Бюджет нижчий за нього, і при цьому на порядок вищий за
+      // те, чого коштує поштовх.
+      expect(ms).toBeLessThan(400);
     } finally {
       stop();
     }
