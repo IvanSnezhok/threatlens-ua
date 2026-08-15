@@ -32,6 +32,8 @@ const TOKEN = 'sk-super-secret-access-token';
 const credentials = async () => ({ accessToken: TOKEN, accountId: 'acct-42' });
 const settings = async () => ({
   model: 'gpt-5.2' as string | null,
+  effort: 'medium' as const,
+  serviceTier: 'priority' as const,
   features: { narrative: true, digest: true, attacks: true },
   updatedAt: null,
   effectiveModel: 'gpt-5.2' as string | null,

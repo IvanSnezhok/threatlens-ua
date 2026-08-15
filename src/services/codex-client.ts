@@ -91,7 +91,7 @@ export interface CodexChatRequest {
    * the same commit or the build does not pass.
    */
   surface: 'narrative' | 'digest' | 'attacks' | 'shadow' | 'risk' | 'retrospective_gate'
-    | 'tactics' | 'attack_research';
+    | 'tactics' | 'attack_research' | 'movement_summary';
   /** Recorded as `ai_runs.classifier_version` when the caller knows which rules produced its input. */
   classifierVersion?: string;
   system: string;
@@ -293,11 +293,14 @@ export async function codexChat(request: CodexChatRequest, deps: CodexClientDeps
     return fail('not_configured', 'CODEX_BASE_URL не задано', request.model ?? null);
   }
 
-  let model = request.model?.trim() ?? '';
-  if (!model) {
-    const settings = await (deps.settings ?? resolveCodexSettings)();
-    model = settings.effectiveModel ?? '';
-  }
+  // Налаштування читаються ЗАВЖДИ, а не лише коли модель не задана явно.
+  //
+  // Раніше вони були потрібні тільки для того, щоб дізнатися модель, і тому лежали всередині
+  // гілки «модель не обрано». Тепер вони несуть ще й швидкість виклику — глибину міркування та
+  // чергу, — а ці двоє потрібні й тоді, коли викликач назвав модель сам: інакше `/ops` міняв би
+  // effort, а половина шляхів його б не бачила.
+  const settings = await (deps.settings ?? resolveCodexSettings)();
+  const model = (request.model?.trim() || settings.effectiveModel) ?? '';
   if (!model) return fail('model_not_selected', 'Модель не обрано ні в /ops, ні в CODEX_MODEL', null);
 
   const session = await (deps.credentials ?? codexCredentials)().catch(() => null);
@@ -319,6 +322,16 @@ export async function codexChat(request: CodexChatRequest, deps: CodexClientDeps
         headers: { ...headers, Accept: 'text/event-stream', 'OpenAI-Beta': 'responses=experimental', originator: 'codex_cli_rs' },
         body: JSON.stringify({
           model,
+          // Швидкість виклику: скільки модель думає й у якій черзі стоїть.
+          //
+          // `reasoning` — вкладене поле, `service_tier` — верхнього рівня; це не симетрія, це форма,
+          // яку приймає бекенд. `priority` і є тим, що Codex CLI зве fast-режимом.
+          //
+          // Обидва їдуть із `codex_settings`, тобто оператор міняє їх у /ops під час події, а не
+          // перезапуском. Для узагальнення руху загроз важливіша черга, а не глибина: текст, який
+          // приходить після того, як загроза минула, не вартий нічого, хоч би як добре написаний.
+          reasoning: { effort: settings.effort },
+          service_tier: settings.serviceTier,
           instructions: request.json ? `${request.system}\n\n${JSON_ONLY_NOTE}` : request.system,
           input: [{
             type: 'message', role: 'user', content: [

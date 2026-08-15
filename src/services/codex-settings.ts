@@ -70,15 +70,40 @@ import { pool } from '../db/pool.js';
  */
 export const CODEX_FEATURES = [
   'narrative', 'digest', 'attacks', 'shadow', 'analytical_threats', 'analytical_enrichment',
-  'retrospective_gate', 'tactics', 'attack_research'
+  'retrospective_gate', 'tactics', 'attack_research',
+  // Переказ руху однієї загрози з кількох каналів, у сповіщення передплатникам. Вимкнено за
+  // замовчуванням, як і решта: модельний текст біля попередження вмикають свідомо.
+  'movement_summary'
 ] as const;
 export type CodexFeature = (typeof CODEX_FEATURES)[number];
 
 export type CodexFeatureFlags = Record<CodexFeature, boolean>;
 
+/**
+ * Глибина міркування моделі, як її називає бекенд `/responses`.
+ *
+ * Їде вкладеним полем `reasoning.effort`. Це не про якість відповіді як таку, а про те, скільки
+ * модель думатиме перед нею — і для переказу вже зібраних фактів різниця між `medium` і `high`
+ * купується секундами затримки.
+ */
+export const CODEX_EFFORTS = ['low', 'medium', 'high', 'xhigh', 'max'] as const;
+export type CodexEffort = (typeof CODEX_EFFORTS)[number];
+
+/**
+ * Черга обслуговування. `priority` — це те, що Codex CLI зве fast-режимом.
+ *
+ * Поле ВЕРХНЬОГО рівня в тілі запиту, на відміну від `reasoning`. Для сповіщень про загрозу воно
+ * важливіше за глибину: текст, який приходить після того, як загроза минула, не вартий нічого, хоч
+ * би як добре був написаний.
+ */
+export const CODEX_SERVICE_TIERS = ['priority', 'default', 'flex'] as const;
+export type CodexServiceTier = (typeof CODEX_SERVICE_TIERS)[number];
+
 export interface CodexSettings {
   /** The operator's explicit choice, or null when they have deferred to `CODEX_MODEL`. */
   model: string | null;
+  effort: CodexEffort;
+  serviceTier: CodexServiceTier;
   features: CodexFeatureFlags;
   updatedAt: string | null;
 }
@@ -101,6 +126,8 @@ export const FALLBACK_CODEX_MODELS = ['gpt-5.6-luna', 'gpt-5.2', 'gpt-5.2-codex'
 
 interface SettingsRow {
   model: string | null;
+  reasoning_effort: string;
+  service_tier: string;
   narrative_enabled: boolean;
   digest_enabled: boolean;
   attacks_enabled: boolean;
@@ -110,14 +137,18 @@ interface SettingsRow {
   retrospective_gate_enabled: boolean;
   tactics_enabled: boolean;
   attack_research_enabled: boolean;
+  movement_summary_enabled: boolean;
   updated_at: Date;
 }
 
 const DEFAULTS: CodexSettings = {
   model: null,
+  effort: 'medium',
+  serviceTier: 'priority',
   features: {
     narrative: false, digest: false, attacks: false, shadow: false, analytical_threats: false,
-    analytical_enrichment: false, retrospective_gate: false, tactics: false, attack_research: false
+    analytical_enrichment: false, retrospective_gate: false, tactics: false, attack_research: false,
+    movement_summary: false
   },
   updatedAt: null
 };
@@ -125,6 +156,12 @@ const DEFAULTS: CodexSettings = {
 function fromRow(row: SettingsRow): CodexSettings {
   return {
     model: row.model && row.model.trim() ? row.model.trim() : null,
+    // Значення з-поза словника читається як замовчування, а не кидає: CHECK у міграції не пускає
+    // такого рядка, але база може бути старішою за код під час викочування.
+    effort: (CODEX_EFFORTS as readonly string[]).includes(row.reasoning_effort)
+      ? row.reasoning_effort as CodexEffort : 'medium',
+    serviceTier: (CODEX_SERVICE_TIERS as readonly string[]).includes(row.service_tier)
+      ? row.service_tier as CodexServiceTier : 'priority',
     features: {
       narrative: row.narrative_enabled,
       digest: row.digest_enabled,
@@ -134,7 +171,8 @@ function fromRow(row: SettingsRow): CodexSettings {
       analytical_enrichment: row.analytical_enrichment_enabled,
       retrospective_gate: row.retrospective_gate_enabled,
       tactics: row.tactics_enabled,
-      attack_research: row.attack_research_enabled
+      attack_research: row.attack_research_enabled,
+      movement_summary: row.movement_summary_enabled
     },
     updatedAt: row.updated_at.toISOString()
   };
@@ -177,6 +215,8 @@ export function mergeModelCatalogue(
 
 export interface CodexSettingsPatch {
   model?: string | null;
+  effort?: string | null;
+  serviceTier?: string | null;
   features?: Partial<CodexFeatureFlags>;
 }
 
@@ -190,8 +230,14 @@ export interface CodexSettingsPatch {
  */
 export function applySettingsPatch(current: CodexSettings, patch: CodexSettingsPatch): CodexSettings {
   const model = patch.model === undefined ? current.model : (patch.model?.trim() || null);
+  // Невідоме значення лишає поточне, а не падає на замовчування: форма, надіслана старим клієнтом
+  // або рукою, не має тихо перемкнути швидкість виклику на щось інше, ніж оператор бачив на екрані.
+  const pick = <T extends string>(value: string | null | undefined, allowed: readonly T[], fallback: T): T =>
+    (value != null && (allowed as readonly string[]).includes(value)) ? value as T : fallback;
   return {
     model,
+    effort: pick(patch.effort, CODEX_EFFORTS, current.effort),
+    serviceTier: pick(patch.serviceTier, CODEX_SERVICE_TIERS, current.serviceTier),
     features: {
       narrative: patch.features?.narrative ?? current.features.narrative,
       digest: patch.features?.digest ?? current.features.digest,
@@ -201,7 +247,8 @@ export function applySettingsPatch(current: CodexSettings, patch: CodexSettingsP
       analytical_enrichment: patch.features?.analytical_enrichment ?? current.features.analytical_enrichment,
       retrospective_gate: patch.features?.retrospective_gate ?? current.features.retrospective_gate,
       tactics: patch.features?.tactics ?? current.features.tactics,
-      attack_research: patch.features?.attack_research ?? current.features.attack_research
+      attack_research: patch.features?.attack_research ?? current.features.attack_research,
+      movement_summary: patch.features?.movement_summary ?? current.features.movement_summary
     },
     updatedAt: current.updatedAt
   };
@@ -209,8 +256,9 @@ export function applySettingsPatch(current: CodexSettings, patch: CodexSettingsP
 
 export async function readCodexSettings(): Promise<CodexSettings> {
   const result = await pool.query<SettingsRow>(
-    `SELECT model,narrative_enabled,digest_enabled,attacks_enabled,shadow_enabled,analytical_threats_enabled,
-            analytical_enrichment_enabled,retrospective_gate_enabled,tactics_enabled,attack_research_enabled,
+    `SELECT model,reasoning_effort,service_tier,
+            narrative_enabled,digest_enabled,attacks_enabled,shadow_enabled,analytical_threats_enabled,
+            analytical_enrichment_enabled,retrospective_gate_enabled,tactics_enabled,attack_research_enabled,movement_summary_enabled,
             updated_at
        FROM codex_settings WHERE singleton`
   );
@@ -227,25 +275,31 @@ export async function resolveCodexSettings(): Promise<ResolvedCodexSettings> {
 export async function saveCodexSettings(patch: CodexSettingsPatch): Promise<CodexSettings> {
   const next = applySettingsPatch(await readCodexSettings(), patch);
   const result = await pool.query<SettingsRow>(
-    `INSERT INTO codex_settings(singleton,model,narrative_enabled,digest_enabled,attacks_enabled,
+    `INSERT INTO codex_settings(singleton,model,reasoning_effort,service_tier,
+                                narrative_enabled,digest_enabled,attacks_enabled,
                                 shadow_enabled,analytical_threats_enabled,analytical_enrichment_enabled,
-                                retrospective_gate_enabled,tactics_enabled,attack_research_enabled,updated_at)
-     VALUES (true,$1,$2,$3,$4,$5,$6,$7,$8,$9,$10,now())
+                                retrospective_gate_enabled,tactics_enabled,attack_research_enabled,movement_summary_enabled,updated_at)
+     VALUES (true,$1,$11,$12,$2,$3,$4,$5,$6,$7,$8,$9,$10,$13,now())
      ON CONFLICT (singleton) DO UPDATE SET
-       model=EXCLUDED.model, narrative_enabled=EXCLUDED.narrative_enabled,
+       model=EXCLUDED.model,
+       reasoning_effort=EXCLUDED.reasoning_effort, service_tier=EXCLUDED.service_tier,
+       narrative_enabled=EXCLUDED.narrative_enabled,
        digest_enabled=EXCLUDED.digest_enabled, attacks_enabled=EXCLUDED.attacks_enabled,
        shadow_enabled=EXCLUDED.shadow_enabled,
        analytical_threats_enabled=EXCLUDED.analytical_threats_enabled,
        analytical_enrichment_enabled=EXCLUDED.analytical_enrichment_enabled,
        retrospective_gate_enabled=EXCLUDED.retrospective_gate_enabled,
        tactics_enabled=EXCLUDED.tactics_enabled,
-       attack_research_enabled=EXCLUDED.attack_research_enabled, updated_at=now()
-     RETURNING model,narrative_enabled,digest_enabled,attacks_enabled,shadow_enabled,analytical_threats_enabled,
-               analytical_enrichment_enabled,retrospective_gate_enabled,tactics_enabled,attack_research_enabled,
+       attack_research_enabled=EXCLUDED.attack_research_enabled,
+       movement_summary_enabled=EXCLUDED.movement_summary_enabled, updated_at=now()
+     RETURNING model,reasoning_effort,service_tier,
+               narrative_enabled,digest_enabled,attacks_enabled,shadow_enabled,analytical_threats_enabled,
+               analytical_enrichment_enabled,retrospective_gate_enabled,tactics_enabled,attack_research_enabled,movement_summary_enabled,
                updated_at`,
     [next.model, next.features.narrative, next.features.digest, next.features.attacks,
       next.features.shadow, next.features.analytical_threats, next.features.analytical_enrichment,
-      next.features.retrospective_gate, next.features.tactics, next.features.attack_research]
+      next.features.retrospective_gate, next.features.tactics, next.features.attack_research,
+      next.effort, next.serviceTier, next.features.movement_summary]
   );
   return fromRow(result.rows[0]!);
 }

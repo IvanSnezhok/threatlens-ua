@@ -2,7 +2,7 @@ import { beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import {
   CITY_IN_OBLAST, OBLAST, OTHER_OBLAST,
   appendSystemEvent, count, ensureMigrated, integrationDatabaseAvailable,
-  resetDatabase, runFanout, runFanoutSettling, seedSubscription, seedThreatEvent, seedUser, sql
+  outboxRows, resetDatabase, runFanout, runFanoutSettling, seedSubscription, seedThreatEvent, seedUser, sql
 } from '../helpers/db.js';
 import { pool } from '../../src/db/pool.js';
 
@@ -555,6 +555,49 @@ describe.skipIf(!integrationDatabaseAvailable)('subscription fanout', () => {
       await runFanout();
       expect(await chatsNotifiedFor(held)).toEqual([9520]);
       expect(await chatsNotifiedFor(overtaking)).toEqual([9520]);
+    });
+
+    it('names only the direction each subscriber asked for', async () => {
+      // Скарга читачів дослівно: сповіщення згадують чужі напрямки, а перелік міст надто довгий.
+      // Це виявилося однією помилкою: перелік рахувався ОДИН РАЗ на загрозу, до циклу по
+      // підписниках, тож підписаний на Київщину читав і полтавські міста, і «та ще N» на додачу.
+      const kyiv = await seedBranch('scope-kyiv');
+      const poltava = await seedBranch('scope-poltava');
+      await seedUser(9530);
+      await seedUser(9531);
+      await seedSubscription({ chatId: 9530, locationId: kyiv.oblast });
+      await seedSubscription({ chatId: 9531, locationId: poltava.oblast });
+      const eventId = await seedThreatEvent({ locationIds: [kyiv.city, poltava.city] });
+      await appendSystemEvent('threat.updated', { eventId });
+
+      await runFanout();
+
+      const rows = await outboxRows();
+      const byChat = new Map(rows.map((row) => [String(row.chat_id), row.payload as { locationName: string }]));
+      expect(byChat.get('9530')?.locationName).toBe(kyiv.city);
+      expect(byChat.get('9531')?.locationName).toBe(poltava.city);
+      // І жоден не бачить чужого — це і є те, про що просили.
+      expect(byChat.get('9530')?.locationName).not.toContain(poltava.city);
+      expect(byChat.get('9531')?.locationName).not.toContain(kyiv.city);
+    });
+
+    it('still shows the whole picture to a subscriber whose direction covers it', async () => {
+      // Звуження не має перетворитися на приховування: підписка на область бачить усі свої міста.
+      const branch = await seedBranch('scope-wide');
+      const second = `${branch.city}-2`;
+      await sql(`INSERT INTO locations(id,parent_id,type,name_uk) VALUES ($1,$2,'city',$1)`,
+        [second, branch.raion]);
+      await seedUser(9532);
+      await seedSubscription({ chatId: 9532, locationId: branch.oblast });
+      const eventId = await seedThreatEvent({ locationIds: [branch.city, second] });
+      await appendSystemEvent('threat.updated', { eventId });
+
+      await runFanout();
+
+      const rows = await outboxRows();
+      const payload = rows.find((row) => String(row.chat_id) === '9532')?.payload as { locationName: string };
+      expect(payload.locationName).toContain(branch.city);
+      expect(payload.locationName).toContain(second);
     });
 
     it('never enqueues expired threats', async () => {

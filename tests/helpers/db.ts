@@ -116,6 +116,12 @@ const VOLATILE_TABLES = [
  * it — a stale reading there affects `/metrics` and no assertion about behaviour.
  */
 export async function resetDatabase(): Promise<void> {
+  // Каталог локацій кешується на годину (`src/services/location-labels.ts`), а кожен тест ліпить
+  // собі власну гілку область→район→місто. Без скидання перший тест «нагріває» кеш, і всі наступні
+  // не бачать своїх же локацій — підписи лишаються без уточнень, а звуження за напрямком мовчки
+  // випадає на запасний шлях «показати все». Саме так це й спіймалося.
+  const { resetLocationCatalogue } = await import('../../src/services/location-labels.js');
+  resetLocationCatalogue();
   await sql(`TRUNCATE ${VOLATILE_TABLES.join(',')} RESTART IDENTITY CASCADE`);
   await sql(`DELETE FROM locations WHERE id LIKE 'test-%'`);
   await sql(`UPDATE sources SET last_success_at=NULL,last_error_at=NULL,last_error=NULL,health_status='unknown'`);

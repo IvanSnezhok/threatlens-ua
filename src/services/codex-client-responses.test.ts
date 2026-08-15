@@ -21,6 +21,8 @@ const TOKEN = 'sk-super-secret-access-token';
 const credentials = async () => ({ accessToken: TOKEN, accountId: 'acct-42' });
 const settings = async () => ({
   model: 'gpt-5.2' as string | null,
+  effort: 'medium' as const,
+  serviceTier: 'priority' as const,
   features: { narrative: true, digest: true, attacks: true },
   updatedAt: null,
   effectiveModel: 'gpt-5.2' as string | null,
@@ -74,6 +76,10 @@ describe('the request the ChatGPT backend accepts', () => {
     // The knobs this backend rejects must not be sent at all.
     expect(body.temperature).toBeUndefined();
     expect(body.response_format).toBeUndefined();
+    // Швидкість виклику. `reasoning` вкладене, `service_tier` — верхнього рівня: це не симетрія, а
+    // форма, яку приймає бекенд, і саме тому вона перевіряється, а не мається на увазі.
+    expect(body.reasoning).toEqual({ effort: 'medium' });
+    expect(body.service_tier).toBe('priority');
     expect(result).toMatchObject({ ok: true, content: '{"ok":true}' });
   });
 
@@ -192,5 +198,31 @@ describe('the model catalogue against this backend', () => {
     expect(catalogue.source).toBe('fallback');
     expect(catalogue.models).toContain('gpt-5.2');
     expect(catalogue.error).toContain('не публікує');
+  });
+});
+
+describe('the speed knobs travel with every call', () => {
+  it('sends what the operator chose, not what the code defaults to', async () => {
+    // `/ops` міняє effort і чергу під час події; якби клієнт брав їх лише тоді, коли модель не
+    // задана явно, половина шляхів працювала б на старих значеннях і ніхто б цього не побачив.
+    let body = '';
+    await codexChat({ ...request, model: 'gpt-5.6-luna' }, {
+      credentials, audit,
+      settings: async () => ({
+        model: 'gpt-5.6-luna' as string | null,
+        effort: 'xhigh' as const,
+        serviceTier: 'flex' as const,
+        features: { narrative: true, digest: true, attacks: true },
+        updatedAt: null,
+        effectiveModel: 'gpt-5.6-luna' as string | null,
+        modelSource: 'stored' as const
+      }),
+      fetchImpl: async (_input, init) => { body = String(init?.body); return sse([completedEvent('{}')]); }
+    });
+    const parsed = JSON.parse(body);
+    // Модель прийшла від викликача, а швидкість — з налаштувань. Саме ця пара й ламалася раніше.
+    expect(parsed.model).toBe('gpt-5.6-luna');
+    expect(parsed.reasoning).toEqual({ effort: 'xhigh' });
+    expect(parsed.service_tier).toBe('flex');
   });
 });

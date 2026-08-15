@@ -4273,6 +4273,7 @@ const aiRunSurfaceNames = {
   risk: 'Оцінка ризику',
   retrospective_gate: 'Ретроспективний гейт',
   tactics: 'Тактика: коментар',
+  movement_summary: 'Переказ руху загрози в сповіщеннях',
   attack_research: 'Дослідження області'
 };
 const aiRunValidationNames = { passed: 'звірку пройдено', rejected: 'звірку не пройдено', skipped: 'звірка не застосовна' };
@@ -4890,6 +4891,18 @@ function opsCodexSettingsSection(payload) {
     <div class="codex-settings">
       <label class="codex-model">Модель<select data-codex-model>${options}</select></label>
       <p class="legend-note">${source} ${effective}</p>
+      <label class="codex-model">Глибина міркування<select data-codex-effort>${
+        ['low','medium','high','xhigh','max'].map((value) => `<option value="${value}"${
+          settings.effort === value ? ' selected' : ''}>${value}</option>`).join('')
+      }</select></label>
+      <label class="codex-model">Черга обслуговування<select data-codex-tier>${
+        [['priority','priority — швидка'],['default','default — звичайна'],['flex','flex — дешевша й повільніша']]
+          .map(([value, label]) => `<option value="${value}"${
+            settings.serviceTier === value ? ' selected' : ''}>${escapeHtml(label)}</option>`).join('')
+      }</select></label>
+      <p class="legend-note">Глибина керує тим, скільки модель думає, черга — скільки чекає.
+        Для узагальнення руху загроз черга важить більше: текст, що прийшов після того, як загроза
+        минула, не вартий нічого, хоч би як добре був написаний.</p>
       <div class="codex-features">
         ${Object.keys(codexFeatureLabels).map((key) => codexFeatureField(key, settings.features[key])).join('')}
       </div>
@@ -4914,7 +4927,12 @@ function wireCodexSettingsSection(root, onSaved) {
     const result = await opsFetch('/ops/codex/settings', {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ model: $('[data-codex-model]', root)?.value || null, features })
+      body: JSON.stringify({
+        model: $('[data-codex-model]', root)?.value || null,
+        effort: $('[data-codex-effort]', root)?.value || null,
+        serviceTier: $('[data-codex-tier]', root)?.value || null,
+        features
+      })
     }).catch(() => null);
     if (!result?.ok) { status.textContent = 'Не вдалося зберегти.'; return; }
     status.textContent = 'Збережено.';

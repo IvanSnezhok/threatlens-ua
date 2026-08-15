@@ -3,7 +3,9 @@ import { z } from 'zod';
 import { hasValidOpsAuth, opsUnauthorized } from './ops-auth.js';
 import { beginCodexLogin, cancelPendingLogin, codexStatus, disconnectCodex } from '../services/codex-auth.js';
 import { listCodexModels } from '../services/codex-client.js';
-import { readCodexSettings, resolveSettings, saveCodexSettings } from '../services/codex-settings.js';
+import {
+  CODEX_EFFORTS, CODEX_SERVICE_TIERS, readCodexSettings, resolveSettings, saveCodexSettings
+} from '../services/codex-settings.js';
 import { shadowAgreement } from '../services/shadow-classifier.js';
 import { enrichmentReport } from '../services/analytical-enrichment.js';
 import { withdrawAnalyticalEvent } from '../repositories/events.js';
@@ -100,6 +102,11 @@ const opsCodexRoutes: FastifyPluginAsync = async (app) => {
    */
   const settingsBody = z.object({
     model: z.string().max(120).nullish(),
+    // Швидкість виклику: глибина міркування й черга обслуговування (міграція 047). Значення поза
+    // словником не приймається тут, а не мовчки виправляється далі — оператор має побачити 400, а
+    // не дізнатися про хибний вибір із поведінки моделі під час події.
+    effort: z.enum(CODEX_EFFORTS).nullish(),
+    serviceTier: z.enum(CODEX_SERVICE_TIERS).nullish(),
     features: z.object({
       narrative: z.boolean(),
       digest: z.boolean(),

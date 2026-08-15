@@ -4,6 +4,9 @@ import { config } from '../config.js';
 import { pool } from '../db/pool.js';
 import { relatedLocationsCte } from '../repositories/events.js';
 import { onAlertPoke } from '../services/alert-poke.js';
+import { scopeToSubscription } from '../domain/location-label.js';
+import { locationCatalogue } from '../services/location-labels.js';
+import { summariseMovement } from '../services/movement-summary.js';
 import { deliverableRun } from '../services/event-log-cursor.js';
 import {
   MODEL_CHANNEL_ACTION, MODEL_CHANNEL_DISCLAIMER, MODEL_CHANNEL_STANDING,
@@ -93,6 +96,14 @@ interface ThreatCandidate {
   last_valid_until: Date | null;
   content_hash: string | null;
   telegram_message_id: string | null;
+  /**
+   * На що саме підписаний цей чат — усі його підписки, які зачепила ця загроза.
+   *
+   * Без цього поля перелік місць був однаковий для всіх: він рахувався один раз на загрозу, до
+   * циклу по підписниках. Підписаний на Київ читав «Українськ, Бровари, Вишневе та ще 11», де його
+   * стосувалися два міста з чотирнадцяти.
+   */
+  subscribed_location_ids: string[];
 }
 
 async function threatCandidates(args: {
@@ -100,8 +111,12 @@ async function threatCandidates(args: {
 }): Promise<ThreatCandidate[]> {
   const result = await pool.query<ThreatCandidate>(
     `${relatedLocationsCte('ANY($1::text[])')}
-     SELECT DISTINCT s.chat_id,ns.last_threat_type,ns.last_evidence_level,ns.last_geography_key,
-            ns.last_valid_until,ns.content_hash,ns.telegram_message_id
+     SELECT s.chat_id,ns.last_threat_type,ns.last_evidence_level,ns.last_geography_key,
+            ns.last_valid_until,ns.content_hash,ns.telegram_message_id,
+            -- Групування замість DISTINCT: рядок і далі один на чат, але тепер він несе ще й ті
+            -- підписки, через які чат сюди потрапив. notification_state приєднано по chat_id, тож
+            -- усі його колонки функційно залежні від нього й у GROUP BY нічого не ламають.
+            array_agg(DISTINCT s.location_id) AS subscribed_location_ids
      FROM subscriptions s
      JOIN telegram_users u ON u.chat_id=s.chat_id
      LEFT JOIN notification_state ns
@@ -110,7 +125,9 @@ async function threatCandidates(args: {
        AND EXISTS (SELECT 1 FROM related_locations r WHERE r.id=s.location_id)
        AND (s.threat_type='*' OR s.threat_type=$3)
        AND CASE $4 WHEN 'official' THEN 3 WHEN 'confirmed' THEN 2 WHEN 'monitoring' THEN 1 ELSE 0 END >=
-           CASE s.minimum_evidence_level WHEN 'official' THEN 3 WHEN 'confirmed' THEN 2 WHEN 'monitoring' THEN 1 ELSE 0 END`,
+           CASE s.minimum_evidence_level WHEN 'official' THEN 3 WHEN 'confirmed' THEN 2 WHEN 'monitoring' THEN 1 ELSE 0 END
+     GROUP BY s.chat_id,ns.last_threat_type,ns.last_evidence_level,ns.last_geography_key,
+              ns.last_valid_until,ns.content_hash,ns.telegram_message_id`,
     [args.locationIds, args.entityId, args.threatType, args.evidenceLevel]
   );
   return result.rows;
@@ -238,11 +255,26 @@ async function publishModelAnalysisToChannels(args: {
   );
 }
 
-/** Location names as one label; long lists are trimmed rather than turned into a wall of names. */
+/**
+ * Назви місць одним рядком; довгий перелік обрізається, а не перетворюється на стіну імен.
+ *
+ * «та ще 11» читачі назвали незрозумілим, і небезпідставно: число висіло без одиниці виміру, тож
+ * «ще 11» могло означати що завгодно — міст, повідомлень, хвилин. Тепер одиниця названа.
+ *
+ * Головне скорочення тут робить не ця функція, а `scopeToSubscription` вище: перелік довгий тоді,
+ * коли він чужий. Після звуження до напрямку підписки більшість повідомлень мають одну-дві назви, і
+ * гілка з обрізанням лишається для того, хто підписався на цілу область під час масованої атаки.
+ */
 function locationLabel(names: string[]): string {
   const unique = [...new Set(names.filter(Boolean))];
   if (unique.length <= 3) return unique.join(', ');
-  return `${unique.slice(0, 3).join(', ')} та ще ${unique.length - 3}`;
+  const rest = unique.length - 3;
+  // Форма однини тут недосяжна — гілка працює від чотирьох назв, тобто rest завжди ≥ 1 — але
+  // «21 населений пункт» вимагає однини, і саме тому правило написане повністю, а не для двійки.
+  const noun = rest % 10 === 1 && rest % 100 !== 11 ? 'населений пункт'
+    : (rest % 10 >= 2 && rest % 10 <= 4 && (rest % 100 < 10 || rest % 100 >= 20))
+        ? 'населені пункти' : 'населених пунктів';
+  return `${unique.slice(0, 3).join(', ')} і ще ${rest} ${noun}`;
 }
 
 /**
@@ -352,7 +384,16 @@ async function enqueueForEvent(event: any) {
       locationIds: threats.rows.map((row) => String(row.location_id)),
       validUntil: threat.valid_until ? new Date(threat.valid_until).toISOString() : null
     };
-    const names = locationLabel(threats.rows.map((row) => String(row.name_uk)));
+    // Каталог читається РАЗ на подію, а не на кожного підписника: підписи залежать від усього
+    // каталогу, а не від того, хто читає, і фан-аут ходить сюди раз на секунду.
+    const catalogue = await locationCatalogue();
+    // Переказ рахується РАЗ на подію, а не на підписника: текст той самий для всіх, і виклик моделі
+    // на кожного з них був би тією самою відповіддю, помноженою на кількість чатів. Повертає `null`
+    // тихо — вимкнена функція, один канал, відхилений абзац і мертва мережа тут нерозрізненні, і
+    // жодне з цього не має права затримати попередження.
+    const movement = await summariseMovement(entityId);
+    const threatLocationIds = threats.rows.map((row) => String(row.location_id));
+    const nameById = new Map(threats.rows.map((row) => [String(row.location_id), String(row.name_uk)]));
     const candidates = await threatCandidates({
       locationIds: snapshot.locationIds, entityId,
       threatType: snapshot.threatType, evidenceLevel: snapshot.evidenceLevel
@@ -372,6 +413,12 @@ async function enqueueForEvent(event: any) {
           };
       const decision = decideThreatNotification(published, snapshot);
       if (decision.action === 'skip') continue;
+      // Перелік місць — ПЕР ПІДПИСНИКА. Рішення про те, СЛАЛИ чи ні, і далі приймається за всією
+      // загрозою (`snapshot` вище): загроза, що виросла на другу область, — це одна новина, і
+      // геть звузивши знімок, ми б перестали бачити її зростання. Звужується тільки те, що
+      // читач БАЧИТЬ у тексті.
+      const scopedIds = scopeToSubscription(threatLocationIds, candidate.subscribed_location_ids ?? [], catalogue.rows);
+      const names = locationLabel(scopedIds.map((id) => catalogue.labels.get(id) ?? nameById.get(id) ?? id));
       // A soft update is a courtesy, not a warning: it rides at the quiet priority even when the
       // threat itself is official, because the only thing it says is "still standing, until later".
       const priority = decision.kind === 'soft' ? 4 : (snapshot.evidenceLevel === 'official' ? 1 : 3);
@@ -383,6 +430,7 @@ async function enqueueForEvent(event: any) {
           `${entityId}:${candidate.chat_id}:threat_update:${Number(event.version)}`, priority,
           JSON.stringify({
             locationName: names, threatType: snapshot.threatType, summary: threat.summary,
+            modelSummary: movement?.summary ?? null, modelSources: movement?.sources ?? null,
             evidenceLevel: snapshot.evidenceLevel, lastObservedAt: threat.last_observed_at,
             validUntil: threat.valid_until, ...threatSource,
             updateKind: decision.kind, changes: decision.changes,
@@ -406,7 +454,11 @@ async function enqueueForEvent(event: any) {
     // this system backwards. Both are idempotent, so a throw between them costs a retry of the whole
     // event and nothing else.
     await publishModelAnalysisToChannels({
-      eventId: entityId, threat, locationLabel: names, source: threatSource
+      // Канал — це публікація, а не підписка: у нього немає напрямку, який можна було б звузити,
+      // тож він отримує ВСІ місця загрози. Однозначними їх робить той самий каталог.
+      eventId: entityId, threat, source: threatSource,
+      locationLabel: locationLabel(threatLocationIds.map(
+        (id) => catalogue.labels.get(id) ?? nameById.get(id) ?? id))
     });
     return;
   }
@@ -648,9 +700,18 @@ export function formatMessage(row: any, now: Date = new Date()): string {
   // be reachable from this path: alerts carry no `updateKind`, are never suppressed and are never
   // edited, and keeping their branches above this one is what guarantees it structurally.
   if (p.updateKind && p.updateKind !== 'initial') return formatThreatDelta(p, now);
-  const summary = cleanSummary(p.summary);
+  // Модельний переказ заміщає детермінований опис, коли він є, і НІКОЛИ не з'являється без джерел:
+  // `summariseMovement` не повертає абзаца, для якого не впізнав жодного каналу. Позначка 🤖 та сама,
+  // що й у каналі, — читач має розрізняти, де його попереджають правила, а де переказує модель.
+  const modelSources = Array.isArray(p.modelSources) ? p.modelSources.filter(Boolean) : [];
+  const modelSummary = modelSources.length ? cleanSummary(p.modelSummary) : '';
+  const summary = modelSummary || cleanSummary(p.summary);
+  const attribution = modelSummary
+    ? `\n\n🤖 <i>Переказ моделі за повідомленнями: ${html(modelSources.join(', '))}</i>`
+    : '';
   return `⚠️ <b>${html(p.locationName)} — ${html(threatLabel(p.threatType))}</b>`
     + (summary ? `\n\n${html(summary)}` : '')
+    + attribution
     + '\n\nЯкщо ви в цьому районі — перейдіть до укриття або до приміщення без вікон '
     + 'і дочекайтеся офіційного сповіщення.'
     + details(
