@@ -170,6 +170,42 @@ const collectorTransportRecoveries = new Counter({
   labelNames: ['outcome'], registers: []
 });
 
+/**
+ * Маршрути останнього проходу резолву, за тим, ЗВІДКИ вони взялися.
+ *
+ * ================================================================================================
+ * Що саме розрізняє ця мітка
+ * ================================================================================================
+ *
+ * `resolveChannelPeers` шукає у два кроки: спершу сканує список діалогів, потім добирає решту через
+ * `contacts.ResolveUsername`. Peer id дають обидва кроки, і `resolved` рахує їх разом — але
+ * рівноцінні вони лише на папері. Оновлення Telegram надсилає **тільки для діалогів, у яких акаунт
+ * є**. Канал, добраний резолвом за юзернеймом, зв'язано правильно, він лічиться як `resolved`,
+ * обробники для нього «готові» — і жодне його повідомлення ніколи не прийде живим потоком.
+ *
+ * ================================================================================================
+ * Чому це окрема серія, а не рядок у логу
+ * ================================================================================================
+ *
+ * Це не гіпотеза, а виміряний стан цього розгортання. За вісім діб (07–15.08.2026) частка
+ * повідомлень, що дійшли швидше ніж за 10 с від публікації: монітори — 76–94 %, канали тривог —
+ * **1–8 %**, медіана затримки ~2 години. Канали тривог наповнювалися лише дозбором на реконекті,
+ * тобто сплесками в години рестартів. `@air_alert_ua` за тиждень опублікував 2887 повідомлень; живим
+ * потоком прийшло ОДНЕ.
+ *
+ * Увесь цей час `/health/ready` писав `resolved: 54, unresolved: []` і `handlersReady: true`.
+ * Стан був не просто невидимий — він читався як здоровий. Саме тому мітка тут, а не в логу, який
+ * ніхто не грепає: `origin="username"` на маршруті kind="alert" означає «цей канал тривог не
+ * доставлятиме нічого вчасно», і лікується це підпискою акаунта, а не кодом.
+ *
+ * Здорове значення — увесь `channels` у `origin="dialogs"`.
+ */
+const collectorRoutes = new Gauge({
+  name: 'threatlens_telegram_collector_routes',
+  help: 'Routes bound by the last resolve pass, by where the peer id came from and what the route carries',
+  labelNames: ['origin', 'kind'], registers: []
+});
+
 const COLLECTOR_METRICS: ReadonlyArray<[string, Counter<string> | Gauge<string>]> = [
   ['threatlens_telegram_flood_waits_total', collectorFloodWaits],
   ['threatlens_telegram_resolve_failures_total', collectorResolveFailures],
@@ -177,6 +213,7 @@ const COLLECTOR_METRICS: ReadonlyArray<[string, Counter<string> | Gauge<string>]
   ['threatlens_telegram_seconds_since_update', collectorSecondsSinceUpdate],
   ['threatlens_telegram_silent_heartbeats_total', collectorSilentHeartbeats],
   ['threatlens_telegram_transport_recoveries_total', collectorTransportRecoveries],
+  ['threatlens_telegram_collector_routes', collectorRoutes],
   ['threatlens_alert_backfill_gaps_total', alertBackfillGaps]
 ];
 
@@ -253,6 +290,15 @@ export interface TelegramCollectorStatus {
   resolved: number;
   /** Usernames the last resolve pass could not bind. */
   unresolved: string[];
+  /**
+   * Зв'язані канали, яких немає серед діалогів акаунта: живих оновлень від них не буде.
+   *
+   * Стоїть поруч із `resolved` навмисне. Саме тут читалася неправда: `/health/ready` вісім діб
+   * поспіль писав `resolved: 54, unresolved: []`, поки шість із семи каналів тривог не доставляли
+   * нічого живим потоком і наповнювалися тільки дозбором на реконекті. Порожній перелік — здорове
+   * значення; непорожній називає ті канали, на які треба підписати акаунт колектора.
+   */
+  unsubscribed: string[];
   /** ISO 8601 — end of the interval Telegram named, or null when no wait is in force. */
   floodWaitUntil: string | null;
   floodWaitSeconds: number | null;
@@ -262,7 +308,8 @@ export interface TelegramCollectorStatus {
 
 const INITIAL_STATUS: TelegramCollectorStatus = {
   state: 'disabled', since: new Date(0).toISOString(), handlersReady: false, channels: 0,
-  resolved: 0, unresolved: [], floodWaitUntil: null, floodWaitSeconds: null, detail: null
+  resolved: 0, unresolved: [], unsubscribed: [], floodWaitUntil: null, floodWaitSeconds: null,
+  detail: null
 };
 
 let collectorStatus: TelegramCollectorStatus = { ...INITIAL_STATUS };
@@ -275,7 +322,11 @@ let collectorStatus: TelegramCollectorStatus = { ...INITIAL_STATUS };
  * nothing about their existing answers changes.
  */
 export function telegramCollectorStatus(): TelegramCollectorStatus {
-  return { ...collectorStatus, unresolved: [...collectorStatus.unresolved] };
+  return {
+    ...collectorStatus,
+    unresolved: [...collectorStatus.unresolved],
+    unsubscribed: [...collectorStatus.unsubscribed]
+  };
 }
 
 let collectorReload: (() => void) | null = null;
@@ -411,6 +462,15 @@ export interface ChannelPeerResolution {
   byPeerId: Map<string, ChannelRoute>;
   /** Registry usernames this pass could not bind, in registry order. */
   unresolved: string[];
+  /**
+   * Зв'язані, але НЕ знайдені серед діалогів — тобто акаунт на них не підписаний.
+   *
+   * Окремий перелік від `unresolved`, бо це протилежні відмови й лікуються по-різному. Не зв'язаний
+   * канал видно одразу: він ніде не рахується. Не підписаний рахується всюди — у `resolved`, у
+   * `channels`, у `handlersReady` — і мовчить. Живих оновлень для нього Telegram не надсилає, тож
+   * повідомлення приходять лише дозбором на реконекті.
+   */
+  unsubscribed: string[];
   /** Per-username lookups that were attempted after the dialog pass. Zero is the healthy value. */
   usernameLookups: number;
   /** Set when Telegram named a wait; the pass STOPPED at that point and issued nothing further. */
@@ -469,9 +529,16 @@ export async function resolveChannelPeers(
   const byPeerId = new Map<string, ChannelRoute>();
   const pending = new Map<string, ChannelRoute>(routes);
   const unresolved: string[] = [];
+  const unsubscribed: string[] = [];
   let usernameLookups = 0;
   let floodWait: number | null = null;
   let floodWaitPhase: 'dialogs' | 'username' | null = null;
+  // Скидається щопрохід і перезаповнюється нижче: це знімок ЦЬОГО резолву, а не накопичення. Без
+  // скидання канал, на який щойно підписалися, лишався б у серії `origin="username"` назавжди.
+  collectorRoutes.reset();
+  const countRoute = (origin: 'dialogs' | 'username', route: ChannelRoute): void => {
+    collectorRoutes.inc({ origin, kind: route.kind === 'alert' ? 'alert' : 'classifier' });
+  };
 
   try {
     const dialogs = await client.getDialogs({ limit: DIALOG_SCAN_LIMIT });
@@ -482,6 +549,7 @@ export async function resolveChannelPeers(
         const route = pending.get(handle);
         if (!route) continue;
         byPeerId.set(peerId, route);
+        countRoute('dialogs', route);
         pending.delete(handle);
       }
     }
@@ -511,6 +579,10 @@ export async function resolveChannelPeers(
       const peerId = String(await client.getPeerId(username));
       if (!peerId || peerId === 'undefined' || peerId === 'null') throw new Error('empty peer id');
       byPeerId.set(peerId, route);
+      // Зв'язали — але не зі списку діалогів. Див. `unsubscribed`: цей маршрут лічитиметься
+      // здоровим і не доставить жодного повідомлення живим потоком.
+      countRoute('username', route);
+      unsubscribed.push(username);
     } catch (error) {
       const seconds = floodWaitSeconds(error);
       if (seconds != null) {
@@ -529,7 +601,10 @@ export async function resolveChannelPeers(
     }
   }
 
-  return { byPeerId, unresolved, usernameLookups, floodWaitSeconds: floodWait, floodWaitPhase };
+  return {
+    byPeerId, unresolved, unsubscribed, usernameLookups,
+    floodWaitSeconds: floodWait, floodWaitPhase
+  };
 }
 
 /**
@@ -1117,6 +1192,7 @@ export async function startTelegramCollector(
       channels: routes.size,
       resolved: resolution.byPeerId.size,
       unresolved: resolution.unresolved,
+      unsubscribed: resolution.unsubscribed,
       floodWaitSeconds: resolution.floodWaitSeconds,
       floodWaitUntil: floodUntil?.toISOString() ?? null
     };
@@ -1264,10 +1340,23 @@ export async function startTelegramCollector(
     });
     log.info({
       chats, channels: routes.size, resolved: resolution.byPeerId.size,
-      unresolved: resolution.unresolved, usernameLookups: resolution.usernameLookups,
+      unresolved: resolution.unresolved, unsubscribed: resolution.unsubscribed,
+      usernameLookups: resolution.usernameLookups,
       alertChannels: [...resolution.byPeerId.values()].filter((route) => route.kind === 'alert').length,
       sources: liveSources.size
     }, 'MTProto collector handlers ready');
+    // Окремим рядком і саме WARN, бо серед «готових» каналів є ті, що ніколи не заговорять живим
+    // потоком. Названо лише канали тривог: мовчання монітора коштує спостереження, мовчання каналу
+    // тривог — попередження. Лікується підпискою акаунта, не кодом.
+    const silentAlerts = [...resolution.byPeerId.values()]
+      .filter((route) => route.kind === 'alert' && resolution.unsubscribed.includes(route.username));
+    if (silentAlerts.length) {
+      log.warn?.({
+        channels: silentAlerts.map((route) => route.username),
+        sources: silentAlerts.map((route) => route.sourceId)
+      }, 'alert channels are bound but the account is not subscribed: no live update will arrive, '
+        + 'and their messages will only be read by the reconnect backfill');
+    }
 
     for (const [peerId, route] of resolution.byPeerId) {
       if (route.kind !== 'alert' || backfilled.has(route.sourceId)) continue;

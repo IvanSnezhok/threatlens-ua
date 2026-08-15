@@ -113,9 +113,11 @@ vi.mock('../services/operations.js', () => ({
   }
 }));
 
+import { Registry } from 'prom-client';
 import { resetAdminNotices, setAdminNoticeBot } from '../bot/admin-notice.js';
 import {
-  floodWaitSeconds, noteCollectorUpdate, requestTelegramCollectorReload, resetTelegramCollectorStatus, resolveChannelPeers, startTelegramCollector,
+  floodWaitSeconds, noteCollectorUpdate, registerTelegramCollectorMetrics,
+  requestTelegramCollectorReload, resetTelegramCollectorStatus, resolveChannelPeers, startTelegramCollector,
   telegramAdvisoryMedia, telegramCollectorStatus, type ChannelRoute, type TelegramCollectorRuntime
 } from './telegram.js';
 
@@ -752,6 +754,65 @@ describe('resolveChannelPeers', () => {
     expect(resolution.byPeerId.size).toBe(5);
     expect(resolution.usernameLookups).toBe(3);
     expect(resolution.floodWaitSeconds).toBeNull();
+  });
+
+  it('names the channels the account is not subscribed to, separately from the unbound ones', async () => {
+    // Знайдено вимірюванням продакшену, не читанням коду: за вісім діб канали тривог доставляли
+    // живим потоком 1–8 % повідомлень (медіана затримки ~2 год), монітори — 76–94 %. Код для обох
+    // однаковий; різниця в тому, що Telegram шле оновлення лише для діалогів, у яких акаунт є.
+    // Резолв за юзернеймом дає peer id і для решти, і саме тому вони лічилися здоровими.
+    const fake = fakeClient({ dialogs: MONITOR_CHANNELS.slice(0, 2) });
+    const resolution = await resolveChannelPeers(fake.client, routesFor(MONITOR_CHANNELS.slice(0, 5)), silentLog);
+    // Зв'язані всі п'ять — це і є та частина, що читалася як здоровʼя.
+    expect(resolution.byPeerId.size).toBe(5);
+    expect(resolution.unresolved).toEqual([]);
+    // Але живі оновлення прийдуть лише для двох.
+    expect(resolution.unsubscribed).toEqual(MONITOR_CHANNELS.slice(2, 5));
+  });
+
+  it('reports nothing unsubscribed when every channel came from the dialog list', async () => {
+    const fake = fakeClient({ dialogs: MONITOR_CHANNELS.slice(0, 5) });
+    const resolution = await resolveChannelPeers(fake.client, routesFor(MONITOR_CHANNELS.slice(0, 5)), silentLog);
+    expect(resolution.unsubscribed).toEqual([]);
+    expect(resolution.usernameLookups).toBe(0);
+  });
+
+  it('splits the route count by where the peer id came from', async () => {
+    const registry = new Registry();
+    registerTelegramCollectorMetrics(registry);
+    const fake = fakeClient({ dialogs: MONITOR_CHANNELS.slice(0, 2) });
+    await resolveChannelPeers(fake.client, routesFor(MONITOR_CHANNELS.slice(0, 5)), silentLog);
+
+    const text = await registry.metrics();
+    expect(text).toContain('threatlens_telegram_collector_routes{origin="dialogs",kind="classifier"} 2');
+    expect(text).toContain('threatlens_telegram_collector_routes{origin="username",kind="classifier"} 3');
+  });
+
+  it('forgets the previous pass instead of accumulating across passes', async () => {
+    // Знімок, а не лічильник: канал, на який щойно підписалися, мусить зникнути з `origin="username"`
+    // на першому ж проході після підписки. Інакше метрика показувала б стару хворобу вічно.
+    const registry = new Registry();
+    registerTelegramCollectorMetrics(registry);
+    const before = fakeClient({ dialogs: MONITOR_CHANNELS.slice(0, 2) });
+    await resolveChannelPeers(before.client, routesFor(MONITOR_CHANNELS.slice(0, 5)), silentLog);
+    const after = fakeClient({ dialogs: MONITOR_CHANNELS.slice(0, 5) });
+    await resolveChannelPeers(after.client, routesFor(MONITOR_CHANNELS.slice(0, 5)), silentLog);
+
+    const text = await registry.metrics();
+    expect(text).toContain('threatlens_telegram_collector_routes{origin="dialogs",kind="classifier"} 5');
+    expect(text).not.toContain('origin="username"');
+  });
+
+  it('does not call an unbound channel unsubscribed', async () => {
+    // Протилежні відмови, і плутати їх не можна: незв'язаний канал не читається взагалі й видно
+    // одразу, а не підписаний рахується всюди як здоровий і мовчить.
+    const broken = MONITOR_CHANNELS[0]!;
+    const fake = fakeClient({ dialogs: [], onGetPeerId: (username) =>
+      username === broken ? new Error('no such channel') : undefined });
+    const resolution = await resolveChannelPeers(fake.client, routesFor(MONITOR_CHANNELS.slice(0, 3)), silentLog);
+    expect(resolution.unresolved).toEqual([broken]);
+    expect(resolution.unsubscribed).not.toContain(broken);
+    expect(resolution.unsubscribed).toEqual(MONITOR_CHANNELS.slice(1, 3));
   });
 
   it('names the phase the wait landed in', async () => {

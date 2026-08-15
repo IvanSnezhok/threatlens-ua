@@ -324,6 +324,33 @@ Two clamps, and knowing about them is the difference between reading the graph a
   A p95 pinned at exactly 300 therefore means «щось дуже старе», not «п'ять хвилин затримки» — look
   at `alert_periods.started_at` for the alerts in that window before treating it as latency.
 
+### Підписка колектора: чому «resolved» не означає «читається»
+
+`resolveChannelPeers` зв'язує канали у два кроки — скан діалогів, потім `contacts.ResolveUsername`
+для решти. Peer id дають обидва, і `resolved` рахує їх разом. Але оновлення Telegram надсилає лише
+для діалогів, у яких акаунт є: канал, добраний резолвом за юзернеймом, зв'язано правильно, він
+лічиться здоровим, обробники для нього «готові» — і жодне його повідомлення не прийде живим
+потоком. Читатиме його тільки дозбір на реконекті.
+
+```promql
+# Здорове значення — увесь `channels` у origin="dialogs".
+threatlens_telegram_collector_routes{origin="username"}
+
+# Те саме, але лише те, що коштує попереджень.
+threatlens_telegram_collector_routes{origin="username",kind="alert"} > 0
+```
+
+`GET /health/ready` несе той самий факт як `collector.unsubscribed` — перелік хендлів, і він же є
+списком того, на що треба підписати акаунт. `unresolved` і `unsubscribed` — протилежні відмови:
+перша видна одразу (канал ніде не рахується), друга рахується всюди як здоровʼя і мовчить.
+
+Виміряно 15.08.2026, вісім діб поспіль, частка повідомлень, що дійшли швидше ніж за 10 с:
+монітори — 76–94 % (медіана 3.3 с), канали тривог — **1–8 %** (медіана ~2 год). `@air_alert_ua` за
+тиждень опублікував 2887 повідомлень; живим потоком прийшло одне. Увесь цей час `/health/ready`
+писав `resolved: 54, unresolved: []`.
+
+Лікується підпискою акаунта колектора на ці канали — не кодом і не перезапуском.
+
 ### Splitting that number into ours and theirs
 
 `threatlens_alert_propagation_seconds` measures the whole road and cannot say which half is slow.
