@@ -293,7 +293,7 @@ const APP_SOURCE = read('web/app.js');
  */
 const VECTOR_LAYER_IDS = [
   'threat-vector-sequence', 'threat-vector-direction', 'threat-vector-transit',
-  'threat-vector-nodes', 'threat-vector-order',
+  'threat-vector-nodes', 'threat-vector-travel', 'threat-vector-place',
   'threat-vector-arrowhead', 'threat-vector-class'
 ];
 
@@ -414,7 +414,7 @@ describe('map layer order', () => {
       // того, що намалює наступний шар.
       'direction-lines', 'direction-lines-model',
       'threat-vector-sequence', 'threat-vector-direction', 'threat-vector-transit',
-      'threat-vector-nodes', 'threat-vector-order',
+      'threat-vector-nodes', 'threat-vector-travel', 'threat-vector-place',
       'threat-vector-arrowhead', 'threat-vector-class',
       // Крапка загрози замінила собою заливку полігона, тож вона малюється тут, над ланцюгом і під
       // стеками іконок: клас зброї важливіший за факт наявності загрози, а факт — важливіший за
@@ -691,7 +691,10 @@ describe('vector heads', () => {
     return evaluateSlice<() => { features: Head[] }>(headSource(), 'vectorHeadCollection', {
       vectors,
       snapshot: { threats },
-      iconImageId: (threatType: string, tone: string) => `ti-${threatType}-${tone}`
+      iconImageId: (threatType: string, tone: string) => `ti-${threatType}-${tone}`,
+      // Реальна таблиця, а не заглушка: підпис класу на голові ланцюга — це те, що читач бачить
+      // замість гліфа, коли гліфа не знає, тож тест має ловити й клас, для якого підпису немає.
+      threatIconLabels: THREAT_ICON_LABELS_UK
     })().features;
   }
 
@@ -890,6 +893,29 @@ describe('vector heads', () => {
     expect(legend).toContain('Вістря — рух ствердило саме джерело.');
     expect(legend).toContain('На крапковій лінії вістря немає ніколи');
   });
+
+  it('flies the class glyph itself, with a fallback for a class the catalogue does not know', () => {
+    // Підпис класу з карти прибрано: тепер «що летить» каже сам рухомий гліф. Тож перевіряємо не
+    // текст, а те, що рухомий символ бере ПРАВИЛЬНЕ зображення — і не ламається на невідомому класі,
+    // бо `iconImageId` мовчки склав би id неіснуючої картинки, а MapLibre замінив би її прозорим
+    // пікселем: рух зник би без жодної помилки в консолі.
+    const travel = bodyOf('vectorTravelCollection');
+    expect(travel).toMatch(/iconImageId\(\s*segment\.threatType\s*\?\?\s*vector\.threatType\s*\?\?\s*'unknown'/);
+    // Тон береться з доказовості саме цієї ланки, як і у фішки на голові.
+    expect(travel).toContain('vectorClassTone(segment.evidenceLevel)');
+  });
+
+  it('keeps the head chip carrying an icon and no text', () => {
+    const chips = heads([{
+      eventId: 'e1', threatType: 'uav',
+      nodes: [node('Миколаїв', [32, 47]), node('Херсон', [32.6, 46.6])],
+      segments: [leg(0, 1, 'reported_transit', { threatType: 'uav' })]
+    }]).filter((feature) => feature.properties.kind === 'class');
+    expect(chips).toHaveLength(1);
+    expect(chips[0]!.properties.icon).toBe('ti-uav-reported');
+    expect(chips[0]!.properties).not.toHaveProperty('typeLabel');
+  });
+
 });
 
 function* permutations<T>(items: T[]): Generator<T[]> {
@@ -1572,6 +1598,51 @@ function layerCallIn(functionName: string, id: string): string {
   return body.slice(open, balanced(body, body.indexOf('(', open), '(', ')') + 1);
 }
 
+describe('the vector says what is moving and where, not how many', () => {
+  // Карта показувала біля білих крапок самотні «3», «4», «5» — порядковий номер вузла в ланцюзі.
+  // Число було правдиве й нечитне: щоб його зрозуміти, треба було вже знати, що ланцюг — це
+  // послідовність повідомлень. Ці перевірки тримають те, що прийшло на його місце, і тримають
+  // межу, через яку кількість цілей на карту не потрапляє.
+
+  it('labels a chain node with the place, not its position in the chain', () => {
+    const place = layerCallIn('addVectorLayers', 'threat-vector-place');
+    expect(place).toContain("'text-field': ['get','name']");
+    expect(place).not.toContain("['get','order']");
+  });
+
+  it('draws the place label even where the basemap is crowded', () => {
+    // Перша редакція цієї заміни лишала колізії ввімкненими, і на карті підписи зникали рівно там,
+    // де густо, — тобто саме там, де читач і питає «звідки й куди». Базові підписи вигравали місце,
+    // і ланцюг знову лишався без кінців. Перевірено на живій карті, а не виведено з міркувань.
+    const place = layerCallIn('addVectorLayers', 'threat-vector-place');
+    expect(place).toContain("'text-allow-overlap': true");
+    // Але не `ignore-placement`: підпис вектора мусить і далі відштовхувати чужі символи, інакше
+    // стеки територій друкувалися б просто крізь нього.
+    expect(place).not.toContain('text-ignore-placement');
+  });
+
+  it('shortens only the generic half of a place name', () => {
+    const shorten = evaluateSlice<(name: string) => string>(
+      `function shortPlace(name) ${bodyOf('shortPlace')}`, 'shortPlace');
+    expect(shorten('Дніпропетровська область')).toBe('Дніпропетровська обл.');
+    expect(shorten('Броварський район')).toBe('Броварський р-н');
+    // Власна назва — це і є відповідь на «звідки», і вона не скорочується ніколи.
+    expect(shorten('Миколаїв')).toBe('Миколаїв');
+    expect(shorten('Кривий Ріг')).toBe('Кривий Ріг');
+  });
+
+  it('never puts a target count on the map', () => {
+    // Класифікатор чисел не витягує (`ClassifiedMessage` не має такого поля), тож будь-яка
+    // кількість поруч із типом була б нашим припущенням, а не заявою джерела. Ця перевірка
+    // впаде рівно тоді, коли хтось спробує порахувати щось замість джерела.
+    const chip = layerCallIn('addVectorLayers', 'threat-vector-class');
+    const place = layerCallIn('addVectorLayers', 'threat-vector-place');
+    for (const call of [chip, place]) {
+      expect(call).not.toMatch(/\bcount\b|\blength\b|['"]\+\s*\$\{/);
+    }
+  });
+});
+
 describe('threat dots inherit the fill they replaced', () => {
   const collection = bodyOf('threatDotCollection');
   // Коментарі знімаються: вони ПОЯСНЮЮТЬ, чому порогу масштабу тут немає, і мусять мати право
@@ -1646,7 +1717,117 @@ describe('the radar wave respects reduced motion and the map lifecycle', () => {
     const teardown = APP_SOURCE.slice(marker, marker + 600);
     expect(teardown).toMatch(/stopThreatWave\(\)/);
     expect(teardown).toMatch(/stopVectorDraw\(\)/);
+    expect(teardown).toMatch(/stopVectorTravel\(\)/);
     expect(teardown.indexOf('stopThreatWave()')).toBeLessThan(teardown.indexOf('map.remove()'));
+    expect(teardown.indexOf('stopVectorTravel()')).toBeLessThan(teardown.indexOf('map.remove()'));
+  });
+});
+
+describe('the travelling dot shows a direction, never a position', () => {
+  // Точка, що їде дугою, — найризикованіший елемент на цій карті: вона виглядає як телеметрія.
+  // Ці перевірки тримають єдине, що відрізняє схему від телеметрії, — те, що її фаза не має
+  // жодного стосунку до годинника, і те, що вона ніколи не зупиняється в кінці.
+
+  const travel = bodyOf('vectorTravelCollection');
+
+  it('takes its phase from a loop, not from the clock', () => {
+    // `now % duration` — те саме число для однієї й тієї ж мілісекунди доби, тобто воно не може
+    // кодувати «скільки минуло, відколи ціль пролетіла A».
+    expect(travel).toMatch(/now\s*%\s*duration/);
+    // Жодного звернення до часу спостереження чи тривалості ланки: якби фаза бралася звідти, точка
+    // почала б стверджувати положення.
+    for (const forbidden of ['elapsedSeconds', 'observedAt', 'lastObservedAt', 'Date.now']) {
+      expect(travel).not.toContain(forbidden);
+    }
+  });
+
+  it('says nothing at all when the reader refused motion', () => {
+    // На відміну від радарної хвилі тут немає «нерухомого еквівалента»: нерухома точка посеред
+    // дуги — це і є твердження про положення, тобто рівно те, чого ця карта не робить. Тож при
+    // вимкненому русі шар лишається порожнім, а напрямок читається з вістря, яке нікуди не зникає.
+    expect(travel).toMatch(/if\s*\(!motionAllowed\(\)\)\s*return\s*\{\s*type:\s*'FeatureCollection'/);
+    expect(bodyOf('runVectorTravel')).toMatch(/motionAllowed\(\)/);
+  });
+
+  it('never runs ahead of the line it travels along', () => {
+    expect(travel).toMatch(/now\s*-\s*started\s*<\s*VECTOR_DRAW_MS/);
+    // І читає час початку з мапи, а не через `vectorDrawProgress`: той на першому виклику сам
+    // записує час, і тоді порядок двох збірок вирішував би, хто почав анімацію.
+    expect(travel).toContain('vectorDrawStart.get(');
+    expect(travel).not.toContain('vectorDrawProgress(');
+  });
+
+  it('keeps running while chains exist, not merely while something is moving right now', () => {
+    // Перша редакція спинялася на порожньому наборі — і рух не вмикався ніколи: на першому кадрі
+    // після завантаження жоден відрізок ще не домальовано, тож набір порожній за визначенням.
+    // Спіймано на живій карті (`travelDots: 0`), а не виведено з коду.
+    const loop = bodyOf('runVectorTravel');
+    expect(loop).toMatch(/collection\.features\.length\s*\|\|\s*vectorDrawStart\.size/);
+  });
+
+  it('still stops when the last chain leaves the map', () => {
+    // `vectorDrawStart` чиститься від зниклих відрізків у `vectorSegmentCollection`, тож порожня
+    // мапа означає «ланцюгів немає» і цикл виходить. Без цього вкладка крутила б кадри вічно.
+    expect(bodyOf('vectorSegmentCollection')).toMatch(/vectorDrawStart\.delete\(/);
+  });
+
+  it('takes longer over a longer leg, and less over a faster class', () => {
+    // Скарга, з якої це почалося: усі точки долали будь-яку відстань за однакові 2.6 с, і карта
+    // тим самим стверджувала, що «Шахед» і крилата ракета — те саме.
+    const duration = evaluateSlice<(from: number[], to: number[], type: string) => number>(
+      [
+        constDeclaration('THREAT_CRUISE_KMH'),
+        constDeclaration('VECTOR_TIME_COMPRESSION'),
+        constDeclaration('VECTOR_TRAVEL_MIN_MS'),
+        constDeclaration('VECTOR_TRAVEL_MAX_MS'),
+        `function haversineKm(from, to) ${bodyOf('haversineKm')}`,
+        `function vectorTravelDurationMs(from, to, threatType) ${bodyOf('vectorTravelDurationMs')}`
+      ].join('\n'), 'vectorTravelDurationMs');
+
+    const mykolaiv = [31.99, 46.97];
+    const dnipro = [35.05, 48.46];
+    const kherson = [32.62, 46.64];
+
+    // Довший відрізок того самого класу триває довше.
+    expect(duration(mykolaiv, dnipro, 'uav')).toBeGreaterThan(duration(mykolaiv, kherson, 'uav'));
+    // Швидший клас долає ТОЙ САМИЙ відрізок швидше.
+    expect(duration(mykolaiv, dnipro, 'cruise_missile')).toBeLessThan(duration(mykolaiv, dnipro, 'uav'));
+    expect(duration(mykolaiv, dnipro, 'ballistic_missile')).toBeLessThan(duration(mykolaiv, dnipro, 'cruise_missile'));
+    // Невідомий клас не валить анімацію, а падає на запасне значення.
+    expect(duration(mykolaiv, dnipro, 'not_a_class')).toBe(duration(mykolaiv, dnipro, 'unknown'));
+  });
+
+  it('keeps every leg inside a watchable band', () => {
+    const duration = evaluateSlice<(from: number[], to: number[], type: string) => number>(
+      [
+        constDeclaration('THREAT_CRUISE_KMH'),
+        constDeclaration('VECTOR_TIME_COMPRESSION'),
+        constDeclaration('VECTOR_TRAVEL_MIN_MS'),
+        constDeclaration('VECTOR_TRAVEL_MAX_MS'),
+        `function haversineKm(from, to) ${bodyOf('haversineKm')}`,
+        `function vectorTravelDurationMs(from, to, threatType) ${bodyOf('vectorTravelDurationMs')}`
+      ].join('\n'), 'vectorTravelDurationMs');
+    // Сусідні райони балістикою — інакше було б миготіння; кінці країни «Шахедом» — інакше точка
+    // просто стояла б, і рух знову нічого не казав би.
+    expect(duration([30.5, 50.4], [30.6, 50.5], 'ballistic_missile')).toBeGreaterThanOrEqual(4000);
+    expect(duration([22.1, 48.6], [40.2, 47.1], 'uav')).toBeLessThanOrEqual(90000);
+  });
+
+  it('never lets the class speed escape the animation', () => {
+    // Типова швидкість класу — це припущення про ЗБРОЮ, а не спостереження за ціллю. Воно має право
+    // жити рівно в тривалості кадрів; у тексті, в API чи в оцінці ризику це вже було б вигадане
+    // знання про конкретну загрозу.
+    const body = bodyOf('vectorTravelDurationMs');
+    const occurrences = (text: string) => text.split('THREAT_CRUISE_KMH').length - 1;
+    expect(occurrences(body)).toBeGreaterThan(0);
+    // Поза єдиним читачем лишається рівно оголошення — і нічого більше.
+    expect(occurrences(APP_SOURCE) - occurrences(body)).toBe(1);
+  });
+
+  it('is drawn above the lines it explains and below the arrowhead that asserts the movement', () => {
+    const ids = VECTOR_LAYER_IDS;
+    expect(ids.indexOf('threat-vector-travel')).toBeGreaterThan(ids.indexOf('threat-vector-transit'));
+    expect(ids.indexOf('threat-vector-travel')).toBeLessThan(ids.indexOf('threat-vector-arrowhead'));
   });
 });
 
