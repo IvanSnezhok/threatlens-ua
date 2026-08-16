@@ -560,7 +560,9 @@ export async function narrateOverview(
       user: JSON.stringify(facts),
       json: true,
       model: provider.model,
-      timeoutMs: options.timeoutMs,
+      // Власний бюджет поверхні, а не спільний: на `AI_TIMEOUT_MS` наш же таймер убивав 37%
+      // наративів — див. `AI_NARRATIVE_TIMEOUT_MS` у `src/config.ts` за вимірюванням.
+      timeoutMs: options.timeoutMs ?? config.AI_NARRATIVE_TIMEOUT_MS,
       auditInput: facts
     }, { fetchImpl: options.fetchImpl, credentials: options.credentials, settings: options.settings });
     if (!result.ok) return deterministic(`${result.reason}: ${result.detail}`);
@@ -581,7 +583,9 @@ export async function narrateOverview(
           { role: 'user', content: JSON.stringify(facts) }
         ]
       }),
-      signal: AbortSignal.timeout(options.timeoutMs ?? config.AI_TIMEOUT_MS)
+      // Той самий бюджет, що й на шляху Codex: стеля належить поверхні, а не тому, через якого
+      // провайдера її сьогодні викликають.
+      signal: AbortSignal.timeout(options.timeoutMs ?? config.AI_NARRATIVE_TIMEOUT_MS)
     });
     if (!response.ok) throw new Error(`narrative endpoint ${response.status}`);
     const body = await response.json() as { choices?: Array<{ message?: { content?: string } }> };

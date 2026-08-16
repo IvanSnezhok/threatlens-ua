@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 /**
  * The memo tests drive `narrativeFor` over a stubbed provider, so the two edges it would otherwise
@@ -36,6 +36,7 @@ import {
   warmNarrative, withAiMarker, withModelSignalMarker, withinCodexCooldown,
   type NarrativeFacts, type NarrativeProvider
 } from './analytics-narrative.js';
+import { config } from '../config.js';
 import type { ResolvedCodexSettings } from './codex-settings.js';
 import { resolveWindow, type StrategicOverview } from './analytics-archive.js';
 
@@ -343,6 +344,60 @@ describe('the narrative memo', () => {
     // Nothing was memoised, so the very next call with a provider still reaches the model.
     await narrativeFor(window, overview, { provider, fetchImpl: model.fetchImpl, now: 2_000 });
     expect(model.calls).toBe(1);
+  });
+});
+
+describe('the narrative budget', () => {
+  /**
+   * Знайдено скаргою «звернення до codex не працюють» і підтверджено `ai_runs` за три доби:
+   * 175 наративів із 478 падали РІВНО на 20 004 мс — тобто їх убивав наш власний
+   * `AbortSignal.timeout`, а не модель. Успішні впиралися в ту саму стіну з p90 19 466 мс.
+   *
+   * Тест розрізняє два бюджети, і саме в цьому його сенс: наратив мусить слухати СВІЙ, а не
+   * спільний. Інакше поверненню до `AI_TIMEOUT_MS` ніщо не завадить.
+   */
+  const narrativeBudget = config.AI_NARRATIVE_TIMEOUT_MS;
+  const sharedBudget = config.AI_TIMEOUT_MS;
+  afterEach(() => {
+    config.AI_NARRATIVE_TIMEOUT_MS = narrativeBudget;
+    config.AI_TIMEOUT_MS = sharedBudget;
+  });
+
+  /**
+   * `modelSaying` тут не годиться: його заглушка не слухає `signal`, а весь предмет цих двох тестів
+   * — саме переривання за сигналом. Справжній `fetch` на abort ВІДХИЛЯЄ проміс, і цей робить так
+   * само; інакше тест міряв би не той таймер, який ламався в бою.
+   */
+  function modelAnswering(afterMs: number, headline = 'Встигне.') {
+    return ((_url: unknown, init?: { signal?: AbortSignal }) => new Promise<Response>((resolve, reject) => {
+      const timer = setTimeout(() => resolve(new Response(
+        JSON.stringify({ choices: [{ message: { content: JSON.stringify({ headline, findings: ['Одне джерело.'], caveats: [] }) } }] }),
+        { status: 200, headers: { 'Content-Type': 'application/json' } }
+      )), afterMs);
+      init?.signal?.addEventListener('abort', () => {
+        clearTimeout(timer);
+        reject(init.signal!.reason);
+      });
+    })) as unknown as typeof fetch;
+  }
+
+  it('aborts on its own budget', async () => {
+    config.AI_NARRATIVE_TIMEOUT_MS = 25;
+    const value = await narrativeFor(window, overviewWith(4), {
+      provider, fetchImpl: modelAnswering(5_000), now: 1_000
+    });
+    expect(value).toMatchObject({ generatedBy: 'deterministic', aiGenerated: false });
+  });
+
+  it('does not take the shared budget for its own', async () => {
+    // Стеля, виставлена ВСІМ поверхням, наративу не адресована: саме під нею він і вмирав — 175
+    // відмов рівно на 20 004 мс. Модель тут відповідає повільніше за спільний бюджет і швидше за
+    // власний, тож старий код віддав би запасний текст, а новий — модельний.
+    config.AI_TIMEOUT_MS = 25;
+    const value = await narrativeFor(window, overviewWith(4), {
+      provider, fetchImpl: modelAnswering(120), now: 1_000
+    });
+    expect(value).toMatchObject({ aiGenerated: true, headline: 'Встигне.' });
   });
 });
 
