@@ -1,6 +1,8 @@
 import { config } from '../config.js';
 import { pool } from '../db/pool.js';
+import { attackStatsDigestLines } from '../domain/attack-stats-report.js';
 import { groundedNumbers, ungroundedNumber } from './analytics-narrative.js';
+import { attackStatsForDigest, regionsForLocations, type AttackStatsDigestEntry } from './attack-stats.js';
 import { codexChat, type CodexClientDeps } from './codex-client.js';
 import { codexFeatureEnabled } from './codex-settings.js';
 
@@ -200,6 +202,79 @@ export async function digestSummary(facts: DigestFacts, deps: DigestSummaryDeps 
   return { text: summary.trim(), aiGenerated: true, rejectionReason: null };
 }
 
+// ------------------------------------------------------------------------------------------------
+// Статистика ударів і ймовірності по регіонах підписника
+// ------------------------------------------------------------------------------------------------
+//
+// Другий блок зведення, з міграції 048. Це НЕ оцінка ризику й не сигнал: це добовий продукт моделі —
+// скільки днів із атаками було по області за період, який середній інтервал і яка звідси
+// пуассонівська ймовірність на найближчі ночі, — зібраний з відкритих джерел і перерахований
+// детерміновано (`src/domain/attack-stats-report.ts`). Він їде в тому самому повідомленні, що й
+// оцінки, бо це той самий час і той самий читач; але власним блоком, з власним дисклеймером першим
+// рядком, і після оцінок — оцінки лишаються тим, заради чого повідомлення надіслано.
+//
+// Чат отримує зведення, якщо в нього є АБО оцінки, АБО статистика по його регіонах: спокійний вечір
+// без оцінок — це саме той вечір, коли підписник хоче почути, що каже базова частота. Для чату без
+// жодного з двох нічого не змінилося — він і далі не отримує нічого.
+
+export interface DigestAttackStats {
+  regionId: string;
+  regionName: string;
+  reportId: string;
+  generatedAt: string;
+  model: string | null;
+  verification: 'passed' | 'inconsistent' | 'rejected' | 'skipped';
+  /** Готові рядки без HTML; форматувальник екранує сам. */
+  lines: string[];
+  disclaimer: string;
+}
+
+export function digestAttackStatsEntry(entry: AttackStatsDigestEntry): DigestAttackStats {
+  return {
+    regionId: entry.regionId,
+    regionName: entry.regionName,
+    reportId: entry.reportId,
+    generatedAt: entry.finishedAt,
+    model: entry.model,
+    verification: entry.verification,
+    lines: attackStatsDigestLines(entry.summary),
+    disclaimer: entry.summary.disclaimer
+  };
+}
+
+/**
+ * Статистика по регіонах кожного чату, якому сьогодні ще не надсилали. Три запити на весь прогін, а не
+ * на чат: підписки (обмежені їхньою кількістю й тим самим NOT EXISTS, що й перелік оцінок), область над
+ * кожною підписаною локацією і найсвіжіший придатний звіт по кожній області. Порожня мапа — звичайний
+ * стан інсталяції з вимкненим перемикачем, і коштує вона один запит.
+ */
+export async function digestAttackStats(digestDate: string): Promise<Map<string, DigestAttackStats[]>> {
+  const subscriptions = await pool.query<{ chat_id: string; location_id: string }>(
+    `SELECT s.chat_id::text, s.location_id
+       FROM subscriptions s
+       JOIN telegram_users u ON u.chat_id=s.chat_id AND u.enabled=true
+      WHERE s.enabled=true AND s.notify_analytics=true
+        AND NOT EXISTS (SELECT 1 FROM nightly_digest_runs r WHERE r.digest_date=$1 AND r.chat_id=s.chat_id)`,
+    [digestDate]
+  );
+  if (!subscriptions.rows.length) return new Map();
+  const regionOf = await regionsForLocations([...new Set(subscriptions.rows.map((row) => row.location_id))]);
+  const entries = await attackStatsForDigest([...new Set(regionOf.values())]);
+  if (!entries.size) return new Map();
+  const byChat = new Map<string, Map<string, DigestAttackStats>>();
+  for (const row of subscriptions.rows) {
+    const regionId = regionOf.get(row.location_id);
+    const entry = regionId ? entries.get(regionId) : undefined;
+    if (!entry) continue;
+    const regions = byChat.get(row.chat_id) ?? new Map<string, DigestAttackStats>();
+    if (!regions.has(entry.regionId)) regions.set(entry.regionId, digestAttackStatsEntry(entry));
+    byChat.set(row.chat_id, regions);
+  }
+  return new Map([...byChat].map(([chatId, regions]) => [
+    chatId, [...regions.values()].sort((a, b) => a.regionName.localeCompare(b.regionName, 'uk'))
+  ]));
+}
+
 export async function enqueueNightlyDigests(now = new Date()): Promise<number> {
   const current = kyivParts(now);
   const [targetHour, targetMinute] = config.NIGHTLY_DIGEST_TIME.split(':').map(Number);
@@ -246,14 +321,21 @@ export async function enqueueNightlyDigests(now = new Date()): Promise<number> {
   );
   const sent = new Set(alreadySent.rows.map((row) => row.chat_id));
 
+  // Статистика ударів по регіонах — для тих самих чатів, тим самим фільтром «сьогодні ще не
+  // надсилали». Чат зі статистикою, але без жодної чинної оцінки, теж отримує зведення (див. блок
+  // вище); чат без обох не отримує нічого, як і раніше.
+  const attackStats = await digestAttackStats(current.date);
+  const recipients = new Set<string>([...grouped.keys(), ...attackStats.keys()]);
+
   let queued = 0;
   // Один виклик моделі на КОМБІНАЦІЮ оцінок, а не на підписника. Тисяча людей, підписаних на Київ,
   // отримує той самий перелік, і питати модель тисячу разів про однакові дані означало б витратити
   // квоту акаунта на буквальні дублікати. Кеш живе рівно один прогін: наступного вечора дані інші.
   const summaries = new Map<string, DigestSummary>();
 
-  for (const [chatId, rows] of grouped) {
+  for (const chatId of recipients) {
     if (sent.has(chatId)) continue;
+    const rows = grouped.get(chatId) ?? [];
     const selected = rows.slice(0, 12);
     const facts = digestFacts(selected, Math.max(0, rows.length - selected.length), current.time);
     const key = JSON.stringify(facts);
@@ -273,7 +355,9 @@ export async function enqueueNightlyDigests(now = new Date()): Promise<number> {
       const outbox = await client.query<{ id: string }>(
         `INSERT INTO notification_outbox(assessment_id,chat_id,notification_type,idempotency_key,priority,payload)
          VALUES ($1,$2,'nightly_digest',$3,4,$4) RETURNING id`,
-        [selected[0]!.id, chatId, `nightly:${current.date}:${chatId}`, JSON.stringify({
+        // `assessment_id` порожній, коли зведення складається з самої статистики — міграція 048
+        // дозволяє це рівно для `nightly_digest`.
+        [selected[0]?.id ?? null, chatId, `nightly:${current.date}:${chatId}`, JSON.stringify({
           generatedTime: current.time,
           date: current.date,
           assessments: selected.map((row) => ({
@@ -297,7 +381,11 @@ export async function enqueueNightlyDigests(now = new Date()): Promise<number> {
           // зробила, а не форматувальнику повідомлень. `null` означає «модельних сигналів не було»,
           // і саме на цьому `null` форматувальник має мовчати: порожня згадка знецінює попередження.
           modelSignals: facts.modelSignals,
-          modelDisclosure: modelSignalDisclosure(facts.modelSignals)
+          modelDisclosure: modelSignalDisclosure(facts.modelSignals),
+          // Статистика ударів і ймовірності по регіонах підписника — готовими рядками з дисклеймером,
+          // щоб форматувальник не перераховував нічого й не вигадував формулювань. Порожній масив —
+          // звичайний стан, коли перемикач вимкнено або звітів по цих регіонах ще немає.
+          attackStats: attackStats.get(chatId) ?? []
         })]
       );
       await client.query(

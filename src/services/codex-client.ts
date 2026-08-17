@@ -2,8 +2,25 @@ import { config } from '../config.js';
 import { pool } from '../db/pool.js';
 import { codexCredentials, type CodexCredentials } from './codex-auth.js';
 import {
-  FALLBACK_CODEX_MODELS, mergeModelCatalogue, resolveCodexSettings, type ResolvedCodexSettings
+  FALLBACK_CODEX_MODELS, mergeModelCatalogue, resolveCodexSettings,
+  type CodexEffort, type ResolvedCodexSettings
 } from './codex-settings.js';
+
+/** A hosted tool the Responses backend executes itself. Only web search is asked for today. */
+export interface CodexHostedTool {
+  type: 'web_search' | 'web_search_preview';
+}
+
+/**
+ * The `signal` for one call, or none.
+ *
+ * `null` is the only way to get «none»: a caller that wants no bound has to say so with a literal
+ * that cannot be confused with a duration. See {@link CodexChatRequest.timeoutMs}.
+ */
+export function abortSignalFor(timeoutMs: number | null | undefined): AbortSignal | undefined {
+  if (timeoutMs === null) return undefined;
+  return AbortSignal.timeout(timeoutMs ?? config.AI_TIMEOUT_MS);
+}
 
 /**
  * The one place that talks to the Codex chat endpoint.
@@ -91,7 +108,7 @@ export interface CodexChatRequest {
    * the same commit or the build does not pass.
    */
   surface: 'narrative' | 'digest' | 'attacks' | 'shadow' | 'risk' | 'retrospective_gate'
-    | 'tactics' | 'attack_research' | 'movement_summary';
+    | 'tactics' | 'attack_research' | 'movement_summary' | 'attack_stats';
   /** Recorded as `ai_runs.classifier_version` when the caller knows which rules produced its input. */
   classifierVersion?: string;
   system: string;
@@ -101,7 +118,34 @@ export interface CodexChatRequest {
   /** Ask for a JSON object back. Callers that parse the reply should always set this. */
   json?: boolean;
   model?: string;
-  timeoutMs?: number;
+  /**
+   * The call's own budget. `undefined` takes the shared `AI_TIMEOUT_MS`; a positive number is the
+   * surface's ceiling (`AI_NARRATIVE_TIMEOUT_MS` is the precedent); **`null` means no `AbortSignal`
+   * at all** — the request runs until the endpoint answers or the transport fails.
+   *
+   * `null` rather than `0` or `Infinity` on purpose: `AbortSignal.timeout(0)` aborts on the first
+   * tick and `AbortSignal.timeout(Infinity)` throws, so either literal would be a footgun that reads
+   * like «unbounded» and behaves like «instantly dead». Exactly one surface asks for it — the
+   * open-source attack statistics (`attack_stats`), whose task is minutes of hosted web search and
+   * whose owner instruction is «на цю задачу не має бути таймауту». Callers that pass `null` are
+   * expected to bound the work by other means (single flight, a daily cap), and to supply a
+   * `fetchImpl` whose transport does not carry idle timeouts of its own — see
+   * `src/services/attack-stats.ts` for the patient dispatcher.
+   */
+  timeoutMs?: number | null;
+  /**
+   * Hosted tools to offer on the Responses transport, e.g. `[{ type: 'web_search' }]`. The backend
+   * runs them itself and streams the final message; nothing here loops on tool calls. Ignored on the
+   * chat/completions transport, which has no hosted tools — a caller that needs them should not be
+   * pointed at that transport.
+   */
+  tools?: CodexHostedTool[];
+  /**
+   * Reasoning depth for THIS call, overriding the operator's `/ops` choice. Unset means the stored
+   * setting, which is what every retelling surface wants; a surface that does analysis over sources
+   * it has to find (attack statistics) asks for more.
+   */
+  reasoningEffort?: CodexEffort;
   /**
    * What to record as `ai_runs.input` instead of the raw messages.
    *
@@ -330,7 +374,10 @@ export async function codexChat(request: CodexChatRequest, deps: CodexClientDeps
           // Обидва їдуть із `codex_settings`, тобто оператор міняє їх у /ops під час події, а не
           // перезапуском. Для узагальнення руху загроз важливіша черга, а не глибина: текст, який
           // приходить після того, як загроза минула, не вартий нічого, хоч би як добре написаний.
-          reasoning: { effort: settings.effort },
+          // Виклик може попросити глибшого міркування для себе — статистика ударів робить аналіз над
+          // джерелами, які їй ще треба знайти, а не переказ готової таблиці. Решта поверхонь
+          // лишаються на виборі оператора.
+          reasoning: { effort: request.reasoningEffort ?? settings.effort },
           service_tier: settings.serviceTier,
           instructions: request.json ? `${request.system}\n\n${JSON_ONLY_NOTE}` : request.system,
           input: [{
@@ -341,14 +388,16 @@ export async function codexChat(request: CodexChatRequest, deps: CodexClientDeps
               }))
             ]
           }],
-          tools: [],
+          // Вбудовані інструменти бекенду (вебпошук). Він виконує їх сам і стрімить уже фінальне
+          // повідомлення; клієнт не крутить циклу викликів. Порожній масив — те, що було завжди.
+          tools: request.tools ?? [],
           tool_choice: 'auto',
           parallel_tool_calls: false,
           store: false,
           stream: true,
           include: []
         }),
-        signal: AbortSignal.timeout(request.timeoutMs ?? config.AI_TIMEOUT_MS)
+        signal: abortSignalFor(request.timeoutMs)
       });
     } else {
       response = await doFetch(endpoint('/chat/completions'), {
@@ -373,7 +422,7 @@ export async function codexChat(request: CodexChatRequest, deps: CodexClientDeps
             }
           ]
         }),
-        signal: AbortSignal.timeout(request.timeoutMs ?? config.AI_TIMEOUT_MS)
+        signal: abortSignalFor(request.timeoutMs)
       });
     }
   } catch (error) {

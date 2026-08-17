@@ -691,6 +691,24 @@ whitelist; the page states plainly that it reads open sources and is neither a f
 official record. When the previous period is empty the prose says there is no baseline instead of
 claiming a comparison it does not have.
 
+### Attack statistics and probabilities from open sources
+
+The block under those aggregates is a different animal and is built as one (ADR 0001,
+`docs/adr/`). `src/services/attack-stats.ts` keeps a queue in `attack_stats_reports` — one active
+row per region by partial unique index — and a worker that runs one report at a time: it hands the
+model the owner's OSINT task with the region, period, horizon and N filled in
+(`src/domain/attack-stats-report.ts`, `attack-stats-v1`), asks the Responses backend for its hosted
+web search, and sends no `AbortSignal` at all (`timeoutMs: null` in the Codex client, plus its own
+undici `Agent` without idle timeouts). The reply's JSON block is parsed by a zod schema; the pure
+module then recomputes λ, p and the ±σ scenarios from the intervals the model named and grades the
+report `passed`, `inconsistent` or `rejected`. Interest (`attack_stats_interest`) is what readers
+selected on the page; the daily pass at `ATTACK_STATS_RUN_TIME` queues the regions bot subscribers
+live in and the ones readers selected, and `enqueueNightlyDigests` attaches each subscriber's regions'
+freshest passing report to the digest — a chat with a report and no assessment now receives one
+too. Public routes are cacheable and read-only except for `POST …/requests`, which records interest
+and may queue a bounded run; the page learns of a finished report through `attack_stats.updated` on
+the shared SSE stream, never by polling.
+
 ### Dynamic source trust
 
 `sources.tier` says what a channel is *allowed* to be — it is written by hand in a migration and by

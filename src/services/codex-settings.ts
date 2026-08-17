@@ -73,7 +73,12 @@ export const CODEX_FEATURES = [
   'retrospective_gate', 'tactics', 'attack_research',
   // Переказ руху однієї загрози з кількох каналів, у сповіщення передплатникам. Вимкнено за
   // замовчуванням, як і решта: модельний текст біля попередження вмикають свідомо.
-  'movement_summary'
+  'movement_summary',
+  // Статистика ударів і пуассонівський прогноз по регіонах з відкритих джерел (міграція 048).
+  // Останній у списку не за авторитетом над конвеєром — його немає взагалі, — а за тим, що це
+  // єдиний перемикач, який публікує РОЗРАХУНОК ПРО МАЙБУТНЄ: ймовірність дня атаки, з дисклеймером,
+  // на публічній сторінці атак і в нічній аналітиці бота. Вимкнено за замовчуванням.
+  'attack_stats'
 ] as const;
 export type CodexFeature = (typeof CODEX_FEATURES)[number];
 
@@ -138,6 +143,7 @@ interface SettingsRow {
   tactics_enabled: boolean;
   attack_research_enabled: boolean;
   movement_summary_enabled: boolean;
+  attack_stats_enabled: boolean;
   updated_at: Date;
 }
 
@@ -148,7 +154,7 @@ const DEFAULTS: CodexSettings = {
   features: {
     narrative: false, digest: false, attacks: false, shadow: false, analytical_threats: false,
     analytical_enrichment: false, retrospective_gate: false, tactics: false, attack_research: false,
-    movement_summary: false
+    movement_summary: false, attack_stats: false
   },
   updatedAt: null
 };
@@ -172,7 +178,8 @@ function fromRow(row: SettingsRow): CodexSettings {
       retrospective_gate: row.retrospective_gate_enabled,
       tactics: row.tactics_enabled,
       attack_research: row.attack_research_enabled,
-      movement_summary: row.movement_summary_enabled
+      movement_summary: row.movement_summary_enabled,
+      attack_stats: row.attack_stats_enabled
     },
     updatedAt: row.updated_at.toISOString()
   };
@@ -248,7 +255,8 @@ export function applySettingsPatch(current: CodexSettings, patch: CodexSettingsP
       retrospective_gate: patch.features?.retrospective_gate ?? current.features.retrospective_gate,
       tactics: patch.features?.tactics ?? current.features.tactics,
       attack_research: patch.features?.attack_research ?? current.features.attack_research,
-      movement_summary: patch.features?.movement_summary ?? current.features.movement_summary
+      movement_summary: patch.features?.movement_summary ?? current.features.movement_summary,
+      attack_stats: patch.features?.attack_stats ?? current.features.attack_stats
     },
     updatedAt: current.updatedAt
   };
@@ -259,6 +267,7 @@ export async function readCodexSettings(): Promise<CodexSettings> {
     `SELECT model,reasoning_effort,service_tier,
             narrative_enabled,digest_enabled,attacks_enabled,shadow_enabled,analytical_threats_enabled,
             analytical_enrichment_enabled,retrospective_gate_enabled,tactics_enabled,attack_research_enabled,movement_summary_enabled,
+            attack_stats_enabled,
             updated_at
        FROM codex_settings WHERE singleton`
   );
@@ -278,8 +287,9 @@ export async function saveCodexSettings(patch: CodexSettingsPatch): Promise<Code
     `INSERT INTO codex_settings(singleton,model,reasoning_effort,service_tier,
                                 narrative_enabled,digest_enabled,attacks_enabled,
                                 shadow_enabled,analytical_threats_enabled,analytical_enrichment_enabled,
-                                retrospective_gate_enabled,tactics_enabled,attack_research_enabled,movement_summary_enabled,updated_at)
-     VALUES (true,$1,$11,$12,$2,$3,$4,$5,$6,$7,$8,$9,$10,$13,now())
+                                retrospective_gate_enabled,tactics_enabled,attack_research_enabled,movement_summary_enabled,
+                                attack_stats_enabled,updated_at)
+     VALUES (true,$1,$11,$12,$2,$3,$4,$5,$6,$7,$8,$9,$10,$13,$14,now())
      ON CONFLICT (singleton) DO UPDATE SET
        model=EXCLUDED.model,
        reasoning_effort=EXCLUDED.reasoning_effort, service_tier=EXCLUDED.service_tier,
@@ -291,15 +301,17 @@ export async function saveCodexSettings(patch: CodexSettingsPatch): Promise<Code
        retrospective_gate_enabled=EXCLUDED.retrospective_gate_enabled,
        tactics_enabled=EXCLUDED.tactics_enabled,
        attack_research_enabled=EXCLUDED.attack_research_enabled,
-       movement_summary_enabled=EXCLUDED.movement_summary_enabled, updated_at=now()
+       movement_summary_enabled=EXCLUDED.movement_summary_enabled,
+       attack_stats_enabled=EXCLUDED.attack_stats_enabled, updated_at=now()
      RETURNING model,reasoning_effort,service_tier,
                narrative_enabled,digest_enabled,attacks_enabled,shadow_enabled,analytical_threats_enabled,
                analytical_enrichment_enabled,retrospective_gate_enabled,tactics_enabled,attack_research_enabled,movement_summary_enabled,
+               attack_stats_enabled,
                updated_at`,
     [next.model, next.features.narrative, next.features.digest, next.features.attacks,
       next.features.shadow, next.features.analytical_threats, next.features.analytical_enrichment,
       next.features.retrospective_gate, next.features.tactics, next.features.attack_research,
-      next.effort, next.serviceTier, next.features.movement_summary]
+      next.effort, next.serviceTier, next.features.movement_summary, next.features.attack_stats]
   );
   return fromRow(result.rows[0]!);
 }

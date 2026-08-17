@@ -77,7 +77,16 @@ const PUBLIC_ENTRY_POINTS = [
   // remember this list.
   'src/api/attack-analytics-routes.ts',
   'src/services/attack-tactics.ts',
-  'src/services/attack-tactics-commentary.ts'
+  'src/services/attack-tactics-commentary.ts',
+  // The attack statistics block on the same page (migration 048) and the digest that carries it. It
+  // is the first PUBLISHED calculation about the future, which is exactly why it must not be able to
+  // reach either of the two operator-only ones: a public module that could import the projection or
+  // the research memo is one refactor away from printing them. Its own ops plugin is listed too —
+  // it serves the same rows to the console and has no business near the other ops families.
+  'src/api/attack-stats-routes.ts',
+  'src/api/ops-attack-stats-routes.ts',
+  'src/services/attack-stats.ts',
+  'src/domain/attack-stats-report.ts'
 ];
 
 function read(relativePath: string): string {

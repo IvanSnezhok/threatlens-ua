@@ -1712,6 +1712,239 @@ body { overflow-x: hidden; }
   background: var(--rule-3);
 }
 
+/* --- Статистика ударів і ймовірності ----------------------------------------------------------- */
+
+/* Третя половина сторінки — і третій характер набору. Вгорі твердження (шпальта), посередині
+   довідка (фігури), а тут — розрахунок про майбутнє з чужих джерел. Він мусить читатися як інший
+   документ: власна рамка, дисклеймер бурштином ДО перших чисел, і жодного силуету тривоги. Бурштин
+   тут — той самий, що й у застереженнях вище: межа достовірності, а не небезпека. */
+.stats-band {
+  margin-top: clamp(56px, 7vw, 92px);
+  padding-top: 32px;
+  border-top: 1px solid var(--rule-2);
+}
+.stats-band > header p {
+  margin: 0;
+  color: var(--bone-4);
+  font: 400 10px/1.4 var(--mono);
+  letter-spacing: .14em;
+  text-transform: uppercase;
+}
+.stats-band > header h2 {
+  margin: 9px 0 0;
+  font: 700 clamp(22px, 2.8vw, 30px)/1.15 var(--display);
+  letter-spacing: -.035em;
+}
+.stats-disclaimer {
+  margin: 22px 0 0;
+  padding: 16px 20px;
+  max-width: 78ch;
+  border-left: 2px solid var(--risk);
+  background: rgba(233, 231, 224, .025);
+  color: var(--bone-2);
+  font-size: 13.5px;
+  line-height: 1.65;
+}
+.stats-disclaimer strong { color: var(--risk); font-weight: 600; }
+
+/* Вибір областей: чипи, а не список — двадцять п'ять коротких назв читаються як клавіатура, і
+   вибрана має вигляд натиснутої клавіші, тим самим інверсним кольором, що й перемикач періодів. */
+.region-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 26px 0 0;
+}
+.region-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 34px;
+  padding: 0 14px;
+  border: 1px solid var(--rule-2);
+  background: var(--surface);
+  color: var(--bone-3);
+  font: 500 10.5px/1 var(--mono);
+  letter-spacing: .08em;
+  text-transform: uppercase;
+  cursor: pointer;
+  transition: color .16s var(--ease), background-color .16s var(--ease), border-color .16s var(--ease);
+}
+.region-chip:hover { color: var(--bone); background: rgba(233, 231, 224, .04); }
+.region-chip.is-active { background: var(--bone); border-color: var(--bone); color: var(--ink); font-weight: 600; }
+.region-chip i { font-style: normal; font-size: 9px; opacity: .8; }
+
+.stats-wait {
+  margin: 26px 0 0;
+  max-width: 66ch;
+  color: var(--bone-3);
+  font-size: 13.5px;
+  line-height: 1.65;
+}
+
+/* Картка регіону: власна рамка, бо кілька карток стоять поспіль і читач мусить бачити, де кінчається
+   Київ і починається Полтавщина, не читаючи заголовків. */
+.stats-card {
+  margin: 30px 0 0;
+  padding: clamp(20px, 2.6vw, 34px) clamp(18px, 2.6vw, 34px) clamp(14px, 2vw, 24px);
+  border: 1px solid var(--rule-2);
+  background: linear-gradient(166deg, var(--surface-2) 0%, var(--surface) 60%);
+}
+.stats-card.is-empty { padding-bottom: clamp(20px, 2.6vw, 34px); }
+.stats-card.is-flagged { border-color: var(--rule-3); }
+.stats-card-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 14px 22px;
+}
+.stats-card-head p {
+  margin: 0;
+  color: var(--bone-4);
+  font: 400 10px/1.4 var(--mono);
+  letter-spacing: .14em;
+  text-transform: uppercase;
+}
+.stats-card-head h3 {
+  margin: 8px 0 0;
+  font: 600 clamp(20px, 2.4vw, 26px)/1.2 var(--body);
+  letter-spacing: -.025em;
+}
+.stats-flag {
+  margin: 18px 0 0;
+  padding: 12px 16px;
+  border-left: 2px solid var(--risk);
+  color: var(--bone-2);
+  font-size: 12.5px;
+  line-height: 1.6;
+}
+.stats-readout { grid-template-columns: repeat(6, 1fr); }
+.stats-readout .readout-cell strong.is-num { font-size: clamp(24px, 3vw, 38px); }
+.stats-readout .readout-cell strong.is-word { font-size: clamp(17px, 1.9vw, 22px); }
+.stats-section { margin: 30px 0 0; }
+.stats-section h4 {
+  margin: 0 0 14px;
+  color: var(--bone-4);
+  font: 400 10px/1.4 var(--mono);
+  letter-spacing: .14em;
+  text-transform: uppercase;
+}
+.stats-figures {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 26px 34px;
+}
+.stats-figures .hour-chart { height: 120px; }
+.stats-figures .bar-row { grid-template-columns: 110px 1fr 56px 0; }
+
+/* Календар прогнозу: одна колонка на день, висота стовпчика — ймовірність. Рівень кодує заливка в
+   тонах кістяного, найближчу ніч — обведення. Жодного бурштину: бурштин тут означав би «небезпека
+   зараз», а це базова частота. */
+/* На вузькому екрані стрічка прокручується, а не стискається: чотирнадцять підписів «34 %» в
+   375 px злилися б в один рядок цифр, і календар перестав би бути календарем. */
+.forecast-strip {
+  display: grid;
+  grid-auto-flow: column;
+  grid-auto-columns: minmax(44px, 1fr);
+  gap: 5px;
+  height: 150px;
+  padding-top: 8px;
+  border-bottom: 1px solid var(--rule-2);
+  overflow-x: auto;
+  scrollbar-width: thin;
+}
+.forecast-day {
+  display: grid;
+  grid-template-rows: auto 1fr auto;
+  align-items: end;
+  height: 100%;
+  min-width: 0;
+  padding: 0 2px;
+}
+.forecast-day b {
+  color: var(--bone-2);
+  font: 400 9.5px/1 var(--mono);
+  font-variant-numeric: tabular-nums;
+  text-align: center;
+  padding-bottom: 5px;
+}
+.forecast-day i {
+  display: block;
+  align-self: end;
+  min-height: 2px;
+  background: rgba(233, 231, 224, .22);
+}
+.forecast-day.is-medium i { background: var(--bone-3); }
+.forecast-day.is-high i { background: var(--bone); }
+.forecast-day.is-tonight i { outline: 1px solid var(--bone); outline-offset: 2px; }
+.forecast-day small {
+  padding-top: 6px;
+  color: var(--bone-4);
+  font: 400 8.5px/1.25 var(--mono);
+  text-align: center;
+}
+.forecast-day.is-tonight small { color: var(--bone-2); }
+
+.calendar-strip {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(12px, 1fr));
+  gap: 3px;
+}
+.calendar-day {
+  aspect-ratio: 1;
+  background: rgba(233, 231, 224, .07);
+}
+.calendar-day.is-attack { background: var(--bone); }
+
+.stats-fold { margin: 22px 0 0; border-top: 1px solid var(--rule); }
+.stats-fold summary {
+  padding: 13px 0;
+  color: var(--bone-3);
+  font: 400 10px/1 var(--mono);
+  letter-spacing: .15em;
+  text-transform: uppercase;
+  cursor: pointer;
+  list-style: none;
+}
+.stats-fold summary::-webkit-details-marker { display: none; }
+.stats-fold summary::after { content: ' ▸'; }
+.stats-fold[open] summary::after { content: ' ▾'; }
+.stats-plain { margin: 0 0 18px; color: var(--bone-2); font: 400 12.5px/1.7 var(--mono); }
+.stats-plain-list { margin: 0 0 18px; padding-left: 18px; max-width: 76ch; }
+.stats-plain-list li { margin-top: 8px; color: var(--bone-3); font-size: 12.5px; line-height: 1.65; }
+.stats-table-wrap { overflow-x: auto; margin: 0 0 18px; }
+.stats-table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+.stats-table th, .stats-table td {
+  padding: 9px 12px 9px 0;
+  border-bottom: 1px solid var(--rule);
+  color: var(--bone-2);
+  text-align: left;
+  vertical-align: top;
+  line-height: 1.5;
+}
+.stats-table th {
+  color: var(--bone-4);
+  font: 400 9px/1.4 var(--mono);
+  letter-spacing: .12em;
+  text-transform: uppercase;
+}
+.stats-table td small { display: block; color: var(--bone-4); font-size: 11px; }
+.stats-table a, .stats-report a { color: var(--bone); text-decoration: underline; text-decoration-color: var(--rule-3); }
+.stats-report { max-width: 80ch; margin: 0 0 18px; color: var(--bone-2); font-size: 13.5px; line-height: 1.7; }
+.stats-report h4 { margin: 22px 0 8px; font: 600 15px/1.3 var(--body); color: var(--bone); }
+.stats-report p { margin: 8px 0; }
+.stats-report ul, .stats-report ol { margin: 8px 0; padding-left: 20px; }
+.stats-report code { font: 400 12px/1 var(--mono); color: var(--bone); }
+.stats-meta {
+  margin: 24px 0 0;
+  padding-top: 14px;
+  border-top: 1px solid var(--rule);
+  color: var(--bone-4);
+  font-size: 11.5px;
+  line-height: 1.6;
+}
+
 /* --- Вузькі екрани та зменшений рух ------------------------------------------------------------ */
 
 @media (max-width: 860px) {
@@ -1731,6 +1964,10 @@ body { overflow-x: hidden; }
   .figure-head p { grid-column: 1; grid-row: 2; margin-top: 8px; }
   .figure-head h2 { grid-column: 1; grid-row: 3; }
   .tactics-meta > div { padding-right: 16px; margin-right: 16px; }
+  .stats-readout { grid-template-columns: repeat(2, 1fr); }
+  .stats-readout .readout-cell { border-right: 0; padding-right: 0; }
+  .stats-figures { grid-template-columns: 1fr; }
+  .forecast-day b { font-size: 8px; }
 }
 
 @media (prefers-reduced-motion: reduce) {

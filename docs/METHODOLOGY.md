@@ -150,7 +150,27 @@ Three words, and only the first two may ever reach a reader.
 - **derived** — we counted what already happened. The attacks page, and both tactical tables, which
   carry `data_nature = 'derived'` as a CHECK rather than as a convention.
 - **calculated** — an extrapolation forward. Operator-only by construction, stored behind its own
-  table prefix and its own isolation test, and absent from the tactical migration entirely.
+  table prefix and its own isolation test, and absent from the tactical migration entirely — with one
+  named, bounded exception below.
+
+### The exception: attack statistics and probabilities (ADR 0001)
+
+Since migration 048 one `calculated` family is published, by the owner's decision, and it is
+published as a base rate rather than as a warning. For a region a reader selects (an oblast or Kyiv),
+a model with hosted web search collects the strike episodes of the last `ATTACK_STATS_PERIOD_DAYS`
+days from open sources — two independent sources per episode, one official — and reports the days
+with attacks, the night share, the ballistic share, the hourly comb, the intervals between the last
+`ATTACK_STATS_LAST_EPISODES` episodes and a Poisson forecast: λ = 1 / mean interval, p = 1 − e^(−λ)
+per day, λ × horizon expected attacks, and low/base/high scenarios at the expectation ± its square
+root. Every one of those numbers is **recomputed here** from the intervals the model named
+(`src/domain/attack-stats-report.ts`); the model's own λ and p are kept beside them and a drift past
+tolerance labels the report `inconsistent` in the open. Levels are relabelled from p by the task's
+thresholds — high ≥ 60 %, medium 30–59 %, low < 30 % — never taken from the model.
+
+What it is not: not a target, not a route, not a time within the night, and not an alert. It is
+off by default, it lives in its own two tables no other surface reads, its disclaimer is part of the
+payload and the first line of the digest block, and it is not passed through the forecasting lexicon
+because it forecasts by definition — the lexicon keeps guarding every other public text unchanged.
 
 ### What the tactical block is not
 

@@ -18,7 +18,7 @@ const stored: CodexSettings = {
   model: null,
   features: {
     narrative: false, digest: false, attacks: false, shadow: false, analytical_threats: false,
-    analytical_enrichment: false, retrospective_gate: false, tactics: false, attack_research: false, movement_summary: false
+    analytical_enrichment: false, retrospective_gate: false, tactics: false, attack_research: false, movement_summary: false, attack_stats: false
   },
   updatedAt: '2026-08-08T00:00:00.000Z'
 };
@@ -72,14 +72,14 @@ describe('applying a patch', () => {
       model: 'o5',
       features: {
         narrative: true, digest: true, attacks: false, shadow: true, analytical_threats: true,
-        analytical_enrichment: false, retrospective_gate: true, tactics: true, attack_research: false, movement_summary: false
+        analytical_enrichment: false, retrospective_gate: true, tactics: true, attack_research: false, movement_summary: false, attack_stats: false
       }
     };
     const next = applySettingsPatch(current, { features: { digest: false } });
     expect(next.model).toBe('o5');
     expect(next.features).toEqual({
       narrative: true, digest: false, attacks: false, shadow: true, analytical_threats: true,
-      analytical_enrichment: false, retrospective_gate: true, tactics: true, attack_research: false, movement_summary: false
+      analytical_enrichment: false, retrospective_gate: true, tactics: true, attack_research: false, movement_summary: false, attack_stats: false
     });
   });
 
@@ -97,7 +97,7 @@ describe('applying a patch', () => {
     const next = applySettingsPatch(stored, { features: { attacks: true } });
     expect(next.features).toEqual({
       narrative: false, digest: false, attacks: true, shadow: false, analytical_threats: false,
-      analytical_enrichment: false, retrospective_gate: false, tactics: false, attack_research: false, movement_summary: false
+      analytical_enrichment: false, retrospective_gate: false, tactics: false, attack_research: false, movement_summary: false, attack_stats: false
     });
   });
 

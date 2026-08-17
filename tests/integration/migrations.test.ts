@@ -47,7 +47,7 @@ const MIGRATION_FILES = [
   '043_analytical_outcomes.sql',
   '044_publication_channels.sql',
   '045_model_enrichment.sql',
-  '046_origin_zone.sql', '047_codex_speed.sql'
+  '046_origin_zone.sql', '047_codex_speed.sql', '048_attack_stats.sql'
 ];
 
 /**
@@ -230,12 +230,14 @@ describe.skipIf(!integrationDatabaseAvailable)('migration runner against live Po
     const row = await sql<Record<string, boolean>>(
       `SELECT narrative_enabled,digest_enabled,attacks_enabled,shadow_enabled,
               analytical_threats_enabled,analytical_enrichment_enabled,retrospective_gate_enabled,
-              tactics_enabled,attack_research_enabled
+              tactics_enabled,attack_research_enabled,movement_summary_enabled,attack_stats_enabled
          FROM codex_settings WHERE singleton`
     );
     expect(row.rowCount).toBe(1);
+    // `attack_stats_enabled` (048) is the second switch whose text lands on the public attacks page,
+    // and the first that publishes a probability: an upgrade must find it off.
     expect(Object.values(row.rows[0]!))
-      .toEqual([false, false, false, false, false, false, false, false, false]);
+      .toEqual([false, false, false, false, false, false, false, false, false, false, false]);
   });
 
   it('keeps contextual/media evidence and analytical event provenance on the shadow table', async () => {

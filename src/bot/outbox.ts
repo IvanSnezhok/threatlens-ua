@@ -584,6 +584,38 @@ function details(...lines: (string | null)[]): string {
 }
 
 /**
+ * Статистика ударів і ймовірності по регіонах підписника — другий блок нічного зведення (міграція 048).
+ *
+ * Три речі тут навмисні, як і в каналі вище:
+ *
+ *  * дисклеймер стоїть ПЕРШИМ рядком блоку, курсивом, до жодного числа — це єдиний текст у боті, що
+ *    називає ймовірність, і те, що переживе пересилання чи скриншот, мусить нести «це не тривога»;
+ *  * маркер 📈 і підпис «порахувала мовна модель з відкритих джерел» — не силует оцінки ризику
+ *    (📊) і не силует тривоги (🔴): читач о 23:20 сортує повідомлення за формою;
+ *  * рядки приходять готовими з `attackStatsDigestLines` і тут лише екрануються: формулювання
+ *    належить тому модулю, що перерахував числа, а не форматувальнику.
+ *
+ * Payload старішого планувальника поля не має — `null`/не-масив дає порожній рядок, і зведення
+ * лишається таким, яким було завжди.
+ */
+function formatDigestAttackStats(entries: unknown): string {
+  if (!Array.isArray(entries) || !entries.length) return '';
+  const blocks: string[] = [];
+  let disclaimer: string | null = null;
+  for (const entry of entries as any[]) {
+    const lines = Array.isArray(entry?.lines) ? entry.lines.filter((line: unknown) => typeof line === 'string' && line.trim()) : [];
+    if (!lines.length) continue;
+    disclaimer ??= typeof entry.disclaimer === 'string' && entry.disclaimer.trim() ? entry.disclaimer : null;
+    const flagged = entry.verification === 'inconsistent' ? ' · числа моделі й перерахунок розходяться' : '';
+    blocks.push(`<b>${html(entry.regionName ?? '')}</b>${flagged ? html(flagged) : ''}\n${lines.map((line: string) => html(line)).join('\n')}`);
+  }
+  if (!blocks.length) return '';
+  return '\n\n📈 <b>Статистика ударів і ймовірності</b> · порахувала мовна модель з відкритих джерел'
+    + `\n<i>${html(disclaimer ?? 'Це ймовірнісна оцінка, не тривога: під час тривоги прямуйте в укриття незалежно від прогнозу.')}</i>`
+    + `\n\n${blocks.join('\n\n')}`;
+}
+
+/**
  * Every message follows the same three beats: what happened and where, what the reader should do,
  * then the details that let them judge it (evidence, validity, source). The order is the point — a
  * person reading one notification on a lock screen at 03:00 sees the action before the metadata.
@@ -693,10 +725,15 @@ export function formatMessage(row: any, now: Date = new Date()): string {
     // тихо, як `null`, а не надрукуватися як `[object Object]`.
     const modelDisclosure = typeof p.modelDisclosure === 'string' && p.modelDisclosure.trim()
       ? html(p.modelDisclosure) : null;
-    return `🌙 <b>Аналітика${generated ? ` станом на ${html(generated)}` : ''}</b>\n\n${lines.join('\n\n')}${omitted}${aiSummary}`
+    // Зведення без жодної оцінки — законний стан з міграції 048: чат отримав його заради статистики
+    // ударів нижче. Порожній перелік мусить СКАЗАТИ, що оцінок немає, а не лишити після заголовка
+    // порожній рядок, який читається як обірване повідомлення.
+    const body = lines.length ? lines.join('\n\n') : 'Чинних оцінок ризику по ваших підписках зараз немає.';
+    return `🌙 <b>Аналітика${generated ? ` станом на ${html(generated)}` : ''}</b>\n\n${body}${omitted}${aiSummary}`
+      + formatDigestAttackStats(p.attackStats)
       + details(
         horizon && `Горизонт оцінки — до ${html(horizon)}`,
-        'Рівень сформовано з публічних сигналів. Це не статистична ймовірність, не прогноз цілі та не офіційна тривога.',
+        lines.length ? 'Рівень сформовано з публічних сигналів. Це не статистична ймовірність, не прогноз цілі та не офіційна тривога.' : null,
         modelDisclosure,
         'У разі тривоги прямуйте до визначеного укриття.'
       );

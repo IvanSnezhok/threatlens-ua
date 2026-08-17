@@ -19,6 +19,7 @@ import { registerAnalyticalOutcomeMetrics } from '../services/analytical-outcome
 import { registerAppSettingsMetrics } from '../services/app-settings.js';
 import { registerAdminNoticeMetrics } from '../bot/admin-notice.js';
 import { registerAttackResearchMetrics } from '../services/attack-research.js';
+import { registerAttackStatsMetrics } from '../services/attack-stats.js';
 import { registerOutboxMetrics } from '../bot/outbox.js';
 import { telegramDeliveryGovernorStatus } from '../bot/delivery-governor.js';
 import { resolveRuntimeSettings } from '../services/runtime-settings.js';
@@ -27,10 +28,12 @@ import { registerTelegramCollectorMetrics, telegramCollectorStatus } from '../so
 import { hasValidOpsAuth, opsUnauthorized, safeEqual } from './ops-auth.js';
 import analyticsRoutes from './analytics-routes.js';
 import attackAnalyticsRoutes from './attack-analytics-routes.js';
+import attackStatsRoutes from './attack-stats-routes.js';
 import occupationRoutes from './occupation-routes.js';
 import opsAiRunsRoutes from './ops-ai-runs-routes.js';
 import opsCodexRoutes from './ops-codex-routes.js';
 import opsAttackResearchRoutes from './ops-attack-research-routes.js';
+import opsAttackStatsRoutes from './ops-attack-stats-routes.js';
 import opsBackfillRoutes from './ops-backfill-routes.js';
 import opsCoverageRoutes from './ops-coverage-routes.js';
 import opsDeployRoutes from './ops-deploy-routes.js';
@@ -322,6 +325,11 @@ export async function buildServer(options: BuildServerOptions = {}) {
   // working and are the only way to see that a console is pressing the button harder than the caps
   // allow, while `model_rejected` is the verifier turning down a memo the model wrote.
   registerAttackResearchMetrics(registry);
+  // `threatlens_attack_stats_runs_total{outcome}` and `threatlens_attack_stats_run_duration_seconds`:
+  // the open-source attack statistics surface — queued, fresh, refused, ok, inconsistent, rejected,
+  // failed — and how long one unbounded model run actually took, which is the only place that
+  // number exists once `ATTACK_STATS_TIMEOUT_MS` is zero.
+  registerAttackStatsMetrics(registry);
 
   const app = Fastify({ logger: { level: config.NODE_ENV === 'development' ? 'debug' : 'info' }, trustProxy: true });
   await app.register(rateLimit, { max: 300, timeWindow: '1 minute' });
@@ -425,9 +433,13 @@ export async function buildServer(options: BuildServerOptions = {}) {
   // Public, unlike `analyticsRoutes` above — see the header of the file for why the two cannot share
   // a plugin scope.
   await app.register(attackAnalyticsRoutes);
+  // Public as well: the attack statistics block on the same page, its own plugin for its own cache
+  // headers and its own per-route rate limit on the one POST.
+  await app.register(attackStatsRoutes);
   await app.register(vectorRoutes);
   await app.register(opsVectorRoutes);
   await app.register(opsAttackResearchRoutes);
+  await app.register(opsAttackStatsRoutes);
   await app.register(opsCodexRoutes);
   await app.register(opsAiRunsRoutes);
   await app.register(opsSourceTrustRoutes);

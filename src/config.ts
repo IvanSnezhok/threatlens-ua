@@ -506,6 +506,60 @@ export const envSchema = z.object({
   // usually a genuinely new question rather than an impatient repeat of the same one. 0 disables it.
   ATTACK_RESEARCH_COOLDOWN_SECONDS: z.coerce.number().int().min(0).max(3600).default(120),
 
+  // ---- Attack statistics and probabilities (public, model-written) --------------------------------
+  // The one surface this project lets a model spend an UNBOUNDED call on. The task — gather every
+  // strike episode on a region from open sources with web search, verify each against two sources,
+  // count, and fit a Poisson rate — is minutes of tool use, not seconds of prose, and the owner's
+  // instruction is explicit: no timeout. `0` therefore means «без обмеження» and is the default; a
+  // positive value is an operator's own ceiling, applied through the same `AbortSignal` as every
+  // other surface. What bounds the work instead is everything below: one run at a time, a daily cap
+  // counted from the reports table, a freshness window that turns a repeat request into a read, and
+  // a per-pass cap on how many regions the scheduler may queue.
+  ATTACK_STATS_TIMEOUT_MS: z.coerce.number().int().min(0).max(21_600_000).default(0),
+  // Kyiv wall-clock at which the daily pass queues the regions of interest, so their reports are
+  // ready BEFORE `NIGHTLY_DIGEST_TIME` reads them. Two hours fifty minutes ahead of the default digest:
+  // eight regions at a few minutes each finish comfortably, and a slow one still lands before 23:20.
+  ATTACK_STATS_RUN_TIME: z.string().regex(/^([01]\d|2[0-3]):[0-5]\d$/).default('20:30'),
+  // How far back the model is asked to collect episodes, in whole days ending yesterday. The owner's
+  // template used 47 days (01.07–16.08); 45 keeps a comparable base while leaving room for a
+  // month-versus-month sub-period comparison inside it.
+  ATTACK_STATS_PERIOD_DAYS: z.coerce.number().int().min(14).max(120).default(45),
+  // Forecast horizon in days, starting today. Two weeks: long enough for the calendar to be a
+  // calendar, short enough that a Poisson rate fitted on the last fifteen episodes still means
+  // something on its last day.
+  ATTACK_STATS_FORECAST_DAYS: z.coerce.number().int().min(3).max(31).default(14),
+  // How many of the newest episodes the intervals — and so λ — are taken from. Fifteen is the
+  // owner's template value; the CHECK in migration 048 mirrors these bounds.
+  ATTACK_STATS_LAST_EPISODES: z.coerce.number().int().min(3).max(60).default(15),
+  // Reports queued per Kyiv day, every requester counted, refused ones NOT counted (they write no
+  // row). Thirty covers the twenty-five regions once plus a handful of operator reruns; zero closes
+  // the surface — a second off-switch beside the Codex one, as with the research memo.
+  ATTACK_STATS_MAX_PER_DAY: z.coerce.number().int().min(0).max(200).default(30),
+  // A completed report younger than this is «свіжий»: a public selection reads it instead of
+  // queueing another run, and the daily pass skips the region. Twenty hours rather than twenty-four
+  // so that yesterday's 20:30 report counts as stale by today's 20:30 pass.
+  ATTACK_STATS_REFRESH_HOURS: z.coerce.number().int().min(1).max(168).default(20),
+  // How many regions one daily pass may queue, most-wanted first (bot subscribers, then page
+  // selections). Bounded work: with no per-call timeout, the pass is bounded by count instead.
+  ATTACK_STATS_MAX_REGIONS_PER_PASS: z.coerce.number().int().min(1).max(30).default(8),
+  // Whether a selection on the public page may queue a run at once (within the daily cap), or only
+  // register interest for the next scheduled pass. `true` is what «ймовірності для областей, котрі
+  // вибере користувач» asks for; `false` is the knob for an installation that would rather spend
+  // the model's time on a schedule only.
+  ATTACK_STATS_PUBLIC_REQUESTS: z.string().default('true').transform((value) => value === 'true'),
+  // Reasoning depth for THIS surface, overriding the `/ops` choice: `high` because this is analysis
+  // over sources the model has to find and reconcile, not a retelling of a ready table — the case the
+  // global `medium` was chosen for. Empty string defers to the stored setting.
+  ATTACK_STATS_REASONING_EFFORT: z.enum(['', 'low', 'medium', 'high', 'xhigh', 'max']).default('high'),
+  // The hosted search tool the Responses transport is asked for. `web_search` is what the Codex CLI
+  // sends today; `web_search_preview` is the older name some proxies still expect; empty disables the
+  // tool, in which case the prompt's «не відповідай з пам'яті» cannot be honoured and the report says
+  // so through `ai_runs`. Ignored on the chat/completions transport, which has no hosted tools.
+  ATTACK_STATS_WEB_SEARCH_TOOL: z.enum(['web_search', 'web_search_preview', '']).default('web_search'),
+  // Reports older than this are deleted by the worker's housekeeping tick. Sixty days keeps two
+  // months of forecasts against which a later calibration pass could score the model.
+  ATTACK_STATS_RETENTION_DAYS: z.coerce.number().int().min(7).max(365).default(60),
+
   // ---- Codex sign-in over OAuth ----------------------------------------------------------------
   // The operator presses a button in `/ops` instead of copying a token out of `~/.codex/auth.json`.
   // Everything here describes *where* the browser is sent and *where it comes back to*; whether a
@@ -1135,6 +1189,61 @@ export const APP_SETTINGS: Record<keyof AppConfig, SettingMeta> = {
     ui: { kind: 'number', min: 0, max: 3600, unit: 'с' },
     applyNote: 'Пауза рахується для пари «область + вікно» з часу останнього запиту в таблиці, '
       + 'тож зменшення ліміту одразу відкриває ті пари, які вже його вичекали.'
+  },
+  ATTACK_STATS_TIMEOUT_MS: {
+    scope: 'db_tunable', group: 'analytics', apply: 'hot',
+    ui: { kind: 'number', min: 0, max: 21_600_000, unit: 'мс' },
+    applyNote: 'Єдина поверхня без таймауту за замовчуванням: 0 означає «без обмеження», і саме так '
+      + 'просив власник — збір епізодів із вебпошуком триває хвилини. Додатне значення — власна стеля '
+      + 'оператора, застосовується до наступного запуску. Роботу обмежують не секунди, а один запуск '
+      + 'водночас, денний ліміт і вікно свіжості.'
+  },
+  ATTACK_STATS_RUN_TIME: {
+    scope: 'db_tunable', group: 'analytics', apply: 'hot', ui: { kind: 'text', placeholder: '20:30' },
+    applyNote: 'Київський час планового проходу, який ставить регіони в чергу. Має бути раніше за '
+      + 'NIGHTLY_DIGEST_TIME, інакше нічна аналітика бота піде зі вчорашніми звітами.'
+  },
+  ATTACK_STATS_PERIOD_DAYS: {
+    scope: 'db_tunable', group: 'analytics', apply: 'hot', ui: { kind: 'number', min: 14, max: 120, unit: 'діб' },
+    applyNote: 'Скільки діб назад (до вчора включно) модель збирає епізоди. Діє з наступного запуску.'
+  },
+  ATTACK_STATS_FORECAST_DAYS: {
+    scope: 'db_tunable', group: 'analytics', apply: 'hot', ui: { kind: 'number', min: 3, max: 31, unit: 'діб' }
+  },
+  ATTACK_STATS_LAST_EPISODES: {
+    scope: 'db_tunable', group: 'analytics', apply: 'hot', ui: { kind: 'number', min: 3, max: 60 },
+    applyNote: 'Скільки останніх епізодів дають інтервали для λ. Межі 3..60 продубльовано CHECK-ом у міграції 048.'
+  },
+  ATTACK_STATS_MAX_PER_DAY: {
+    scope: 'db_tunable', group: 'analytics', apply: 'hot', ui: { kind: 'number', min: 0, max: 200 },
+    applyNote: 'Рахується з таблиці звітів за київську добу, тож переживає перезапуск. 0 закриває поверхню.'
+  },
+  ATTACK_STATS_REFRESH_HOURS: {
+    scope: 'db_tunable', group: 'analytics', apply: 'hot', ui: { kind: 'number', min: 1, max: 168, unit: 'год' },
+    applyNote: 'Молодший за це готовий звіт вважається свіжим: вибір на сторінці читає його, а не ставить '
+      + 'новий запуск, і плановий прохід регіон пропускає.'
+  },
+  ATTACK_STATS_MAX_REGIONS_PER_PASS: {
+    scope: 'db_tunable', group: 'analytics', apply: 'hot', ui: { kind: 'number', min: 1, max: 30 }
+  },
+  ATTACK_STATS_PUBLIC_REQUESTS: {
+    scope: 'db_tunable', group: 'analytics', apply: 'hot', ui: { kind: 'boolean' },
+    applyNote: 'true — вибір області на публічній сторінці одразу ставить запуск у чергу (в межах денного '
+      + 'ліміту); false — лише записує інтерес до наступного планового проходу.'
+  },
+  ATTACK_STATS_REASONING_EFFORT: {
+    scope: 'db_tunable', group: 'analytics', apply: 'hot',
+    ui: { kind: 'select', options: ['', 'low', 'medium', 'high', 'xhigh', 'max'] },
+    applyNote: 'Глибина міркування саме для цієї поверхні; порожнє — як обрано в /ops для решти.'
+  },
+  ATTACK_STATS_WEB_SEARCH_TOOL: {
+    scope: 'db_tunable', group: 'analytics', apply: 'hot',
+    ui: { kind: 'select', options: ['web_search', 'web_search_preview', ''] },
+    applyNote: 'Який вбудований інструмент пошуку просити в Responses API. Порожнє вимикає пошук — тоді '
+      + 'модель відповідає з пам’яті всупереч промту, і це видно в ai_runs.'
+  },
+  ATTACK_STATS_RETENTION_DAYS: {
+    scope: 'db_tunable', group: 'analytics', apply: 'hot', ui: { kind: 'number', min: 7, max: 365, unit: 'діб' }
   },
   CODEX_OAUTH_ISSUER: { scope: 'db_tunable', group: 'analytics', apply: 'hot', ui: { kind: 'url' } },
   CODEX_OAUTH_CLIENT_ID: { scope: 'db_tunable', group: 'analytics', apply: 'hot', ui: { kind: 'text' } },

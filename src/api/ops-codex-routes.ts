@@ -139,7 +139,12 @@ const opsCodexRoutes: FastifyPluginAsync = async (app) => {
       tactics: z.boolean(),
       // The operator-only oblast research memo (migration 033), off by default. Never scheduled and
       // never published — it exists only while an operator is looking at it in this console.
-      attack_research: z.boolean()
+      attack_research: z.boolean(),
+      // Attack statistics and Poisson probabilities per region from open sources (migration 048),
+      // off by default. The only switch on this form that publishes a calculation about the future
+      // — the chance that a day is a day of attack — on the public attacks page and in the nightly
+      // analytics digest, always under a disclaimer and never anywhere near an alert.
+      attack_stats: z.boolean()
     }).partial().optional()
   });
 

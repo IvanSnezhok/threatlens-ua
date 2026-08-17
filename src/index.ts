@@ -16,6 +16,7 @@ import { startLocationCatalogScheduler } from './services/location-catalog.js';
 import { startOccupationScheduler } from './services/occupation.js';
 import { startSourceTrustScheduler } from './services/source-trust.js';
 import { startAnalyticalOutcomeScheduler } from './services/analytical-outcomes.js';
+import { startAttackStatsScheduler } from './services/attack-stats.js';
 import { eventHub } from './services/sse.js';
 import { startTelegramCollector } from './sources/telegram.js';
 
@@ -53,6 +54,10 @@ const stopSourceTrust = startSourceTrustScheduler(app.log);
 // точність за порогом упевненості. На інсталяції, де промоції ніколи не вмикали, прохід читає
 // порожній частковий індекс і завершується одразу.
 const stopAnalyticalOutcomes = startAnalyticalOutcomeScheduler(app.log);
+// Раз на хвилину: плановий прохід статистики ударів після ATTACK_STATS_RUN_TIME (регіони, які обрали
+// користувачі або на які підписані чати з аналітикою) і осушення черги — один запуск моделі водночас,
+// без таймауту на сам запуск. З вимкненим перемикачем у /ops тик читає одну таблицю й виходить.
+const stopAttackStats = startAttackStatsScheduler(app.log);
 const bot = createBot();
 // BEFORE the collector starts, because the collector's very first pass can land in `failed` or
 // `flood_wait` and that transition is one of the three this notifier exists for.
@@ -95,7 +100,7 @@ async function shutdown(signal: string) {
   // `stopAnalyticsRecompute()` runs BEFORE `eventHub.stop()`: it detaches the listener while the hub
   // is still the thing that would call it, and bumps the generation token so an in-flight floor
   // callback cannot re-arm itself against a pool this function is about to end.
-  stopIngestion(); stopRisk(); stopOperations(); stopNightlyDigests(); stopLocationCatalog(); stopOccupation(); stopSourceTrust(); stopAnalyticalOutcomes(); stopAnalytics(); stopAnalyticsRecompute(); stopNotifications(); eventHub.stop();
+  stopIngestion(); stopRisk(); stopOperations(); stopNightlyDigests(); stopLocationCatalog(); stopOccupation(); stopSourceTrust(); stopAnalyticalOutcomes(); stopAttackStats(); stopAnalytics(); stopAnalyticsRecompute(); stopNotifications(); eventHub.stop();
   bot?.stop();
   await stopCollector?.();
   await app.close();

@@ -226,3 +226,51 @@ describe('the speed knobs travel with every call', () => {
     expect(parsed.service_tier).toBe('flex');
   });
 });
+
+describe('the unbounded surface: hosted tools, its own effort, no signal', () => {
+  // Одна поверхня — статистика ударів з відкритих джерел — просить рівно три речі понад те, що
+  // просять решта: вбудований вебпошук бекенду, глибше міркування для себе й ЖОДНОГО AbortSignal.
+  // Кожна з трьох перевіряється окремо, бо кожна окремо й ламається: порожній `tools` означає
+  // відповідь з пам'яті всупереч промту, effort з налаштувань — переказ там, де треба аналіз, а
+  // `AbortSignal.timeout(0)` замість відсутнього сигналу — виклик, мертвий з першого тику.
+  it('offers the web search tool and overrides the stored reasoning effort for the call', async () => {
+    let body = '';
+    await codexChat({
+      ...request, surface: 'attack_stats', json: false, tools: [{ type: 'web_search' }], reasoningEffort: 'high'
+    }, {
+      credentials, settings, audit,
+      fetchImpl: async (_input, init) => { body = String(init?.body); return sse([completedEvent('звіт')]); }
+    });
+    const parsed = JSON.parse(body);
+    expect(parsed.tools).toEqual([{ type: 'web_search' }]);
+    expect(parsed.reasoning).toEqual({ effort: 'high' });
+    // Черга — і далі з налаштувань: перевизначається лише глибина.
+    expect(parsed.service_tier).toBe('priority');
+  });
+
+  it('keeps every other call on an empty tool list and the stored effort', async () => {
+    let body = '';
+    await codexChat(request, {
+      credentials, settings, audit,
+      fetchImpl: async (_input, init) => { body = String(init?.body); return sse([completedEvent('{}')]); }
+    });
+    expect(JSON.parse(body).tools).toEqual([]);
+    expect(JSON.parse(body).reasoning).toEqual({ effort: 'medium' });
+  });
+
+  it('sends no AbortSignal at all when timeoutMs is null, and a real one otherwise', async () => {
+    let signal: AbortSignal | null | undefined = null;
+    await codexChat({ ...request, timeoutMs: null }, {
+      credentials, settings, audit,
+      fetchImpl: async (_input, init) => { signal = init?.signal; return sse([completedEvent('{}')]); }
+    });
+    expect(signal).toBeUndefined();
+
+    await codexChat({ ...request, timeoutMs: 5_000 }, {
+      credentials, settings, audit,
+      fetchImpl: async (_input, init) => { signal = init?.signal; return sse([completedEvent('{}')]); }
+    });
+    expect(signal).toBeInstanceOf(AbortSignal);
+    expect((signal as unknown as AbortSignal).aborted).toBe(false);
+  });
+});

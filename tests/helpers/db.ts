@@ -78,7 +78,13 @@ const VOLATILE_TABLES = [
   // swept by the CASCADE anyway — it references three tables above — but `publication_channels`
   // references nothing volatile, so a file that enabled a channel would leave it enabled for every
   // file after it, and their model events would silently start queueing posts.
-  'channel_published_events', 'publication_channels'
+  'channel_published_events', 'publication_channels',
+  // Attack statistics (migration 048). The reports table is the one that matters: the daily cap is
+  // counted FROM it and the partial unique index makes one active row per region, so a file that left
+  // a `queued` row behind would make the next file's first request answer «already queued» — and the
+  // interest table would hand it a candidate list it never built. `worker_state` is truncated already
+  // (the daily-pass stamp lives there).
+  'attack_stats_reports', 'attack_stats_interest'
 ];
 
 /**
@@ -153,7 +159,8 @@ export async function resetDatabase(): Promise<void> {
   await sql(`UPDATE codex_settings SET model=NULL, narrative_enabled=false, digest_enabled=false,
              attacks_enabled=false, shadow_enabled=false, analytical_threats_enabled=false,
              retrospective_gate_enabled=false,
-             tactics_enabled=false, attack_research_enabled=false, updated_at=now()
+             tactics_enabled=false, attack_research_enabled=false, movement_summary_enabled=false,
+             attack_stats_enabled=false, updated_at=now()
              WHERE singleton`);
   await sql(`UPDATE telegram_delivery_governor SET tokens=25,last_refill_at=now(),blocked_until=NULL,updated_at=now()
              WHERE singleton`);

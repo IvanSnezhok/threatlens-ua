@@ -856,6 +856,9 @@ function connectStream() {
   // 'publication.changed' і 'analytics.updated' — нові імена: іменовані події EventSource НЕ
   // падають у загальний обробник message, тож без цього рядка клієнт мовчки б їх ігнорував.
   ['alert.started','alert.ended','threat.created','threat.updated','threat.corrected','threat.withdrawn','threat.expired','assessment.updated','source.stale','source.recovered','publication.changed','analytics.updated'].forEach((name) => source.addEventListener(name, () => scheduleRefresh(name)));
+  // Готовий звіт статистики ударів: наступне читання огляду має піти повз кеш браузера, а сторінка
+  // атак — перемалюватися тим самим шляхом, що й від будь-якого іншого кадру.
+  source.addEventListener('attack_stats.updated', () => { attackStatsDirty = true; scheduleRefresh('attack_stats.updated'); });
   source.onerror = () => {
     // Обробник живе довше за свій стрім: close() не скасовує вже поставленої в чергу події. Без
     // цієї перевірки помилка мертвого зʼєднання рахувала б спробу свіжому й псувала б йому розклад.
@@ -3883,12 +3886,404 @@ function attackConclusion(patterns) {
   </section>`;
 }
 
+// ---- Статистика ударів і ймовірності по регіонах ---------------------------------------------------
+//
+// Другий, окремий блок сторінки, і єдиний на всьому сайті, який називає ймовірність. Він живе під
+// агрегатами й виглядає інакше не з примхи: усе вище — опис минулого з нашого архіву, а це —
+// розрахунок про майбутнє з відкритих джерел, який модель зібрала вебпошуком і який ми перерахували
+// детерміновано (src/domain/attack-stats-report.ts). Дисклеймер стоїть ПЕРЕД числами і є частиною
+// даних, а не оформлення; бурштин у ньому — той самий колір, що й у застереженнях вище: межа
+// достовірності, не сигнал.
+//
+// Що робить читач: обирає області. Вибір живе в localStorage цієї вкладки і записується на сервер як
+// інтерес — з нього планувальник знає, що рахувати першим, а якщо публічні запити дозволені, вибір
+// одразу ставить запуск у чергу. Модель ніколи не викликається зі сторінки напряму: між клацанням і
+// нею — перемикач в /ops, денний ліміт, вікно свіжості й одна черга з одним активним рядком на регіон.
+// Про готовий звіт сторінка дізнається з того самого SSE-потоку, що й про все інше
+// (`attack_stats.updated`), а не опитуванням.
+
+const ATTACK_STATS_STORAGE_KEY = 'attack-stats-regions';
+const attackStatsLevelNames = { low: 'низька', medium: 'середня', high: 'висока' };
+const attackStatsWeaponNames = { ballistic: 'балістика', cruise: 'крилаті ракети', uav: 'БпЛА', unspecified: 'не уточнено' };
+const attackStatsVerificationNames = {
+  passed: 'перерахунок сходиться', inconsistent: 'числа моделі й перерахунок розходяться',
+  rejected: 'структуровані дані не розібрано', skipped: 'модель не відповіла'
+};
+// Позначка «свіже оновлення прийшло потоком»: наступне читання огляду йде повз кеш браузера, бо
+// сервер віддає його з max-age=60, а звіт, який щойно завершився, читач хоче побачити зараз.
+let attackStatsDirty = false;
+// Розгорнуті секції переживають перемалювання сторінки: кожен кадр потоку перебудовує весь #app.
+const attackStatsOpen = new Set();
+
+function attackStatsSelection() {
+  try {
+    const stored = JSON.parse(localStorage.getItem(ATTACK_STATS_STORAGE_KEY) ?? '[]');
+    return Array.isArray(stored) ? stored.filter((id) => /^ua-\d{2}$/.test(String(id))) : [];
+  } catch { return []; }
+}
+
+function saveAttackStatsSelection(ids) {
+  try { localStorage.setItem(ATTACK_STATS_STORAGE_KEY, JSON.stringify(ids)); } catch { /* приватний режим — вибір живе до перезавантаження */ }
+}
+
+function attackStatsPercent(value) {
+  return value === null || value === undefined ? '—' : `${Math.round(value * 100)} %`;
+}
+
+function attackStatsNumber(value, digits = 1) {
+  return value === null || value === undefined ? '—' : Number(value).toFixed(digits).replace('.', ',');
+}
+
+function attackStatsShortDate(iso) {
+  const [, month, day] = String(iso ?? '').split('-');
+  return day && month ? `${day}.${month}` : '—';
+}
+
+function attackStatsRange(from, to) {
+  return `${attackStatsShortDate(from)}–${attackStatsShortDate(to)}`;
+}
+
+function attackStatsWeekday(iso) {
+  const at = new Date(`${iso}T12:00:00Z`);
+  return Number.isNaN(at.getTime()) ? '' : at.toLocaleDateString('uk-UA', { weekday: 'short', timeZone: 'UTC' });
+}
+
+/**
+ * Markdown моделі → безпечний HTML. Спершу все екранується, і лише потім розмічається: заголовки,
+ * таблиці, списки, абзаци, жирний, код і посилання лише на http(s). Це не парсер markdown, а рівно
+ * ті конструкції, які просить промт; невпізнане лишається текстом.
+ */
+function attackStatsMarkdown(text) {
+  const escaped = escapeHtml(String(text ?? ''));
+  const inline = (line) => line
+    .replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>')
+    .replace(/`([^`]+)`/g, '<code>$1</code>')
+    .replace(/\[([^\]]+)\]\((https?:\/\/[^)\s]+)\)/g, '<a href="$2" target="_blank" rel="noopener noreferrer nofollow">$1</a>')
+    .replace(/(^|[\s(])(https?:\/\/[^\s<)]+)/g, '$1<a href="$2" target="_blank" rel="noopener noreferrer nofollow">$2</a>');
+  const out = [];
+  let paragraph = [];
+  let list = null;
+  let table = null;
+  const flushParagraph = () => { if (paragraph.length) { out.push(`<p>${inline(paragraph.join(' '))}</p>`); paragraph = []; } };
+  const flushList = () => { if (list) { out.push(`<${list.tag}>${list.items.map((item) => `<li>${inline(item)}</li>`).join('')}</${list.tag}>`); list = null; } };
+  const flushTable = () => {
+    if (!table) return;
+    const [head, ...rows] = table;
+    out.push(`<div class="stats-table-wrap"><table class="stats-table"><thead><tr>${head.map((cell) => `<th>${inline(cell)}</th>`).join('')}</tr></thead>`
+      + `<tbody>${rows.map((row) => `<tr>${row.map((cell) => `<td>${inline(cell)}</td>`).join('')}</tr>`).join('')}</tbody></table></div>`);
+    table = null;
+  };
+  for (const raw of escaped.split(/\r?\n/)) {
+    const line = raw.trimEnd();
+    if (line.startsWith('```')) { flushParagraph(); flushList(); flushTable(); continue; }
+    if (/^\|.*\|\s*$/.test(line)) {
+      flushParagraph(); flushList();
+      const cells = line.slice(1, -1).split('|').map((cell) => cell.trim());
+      if (cells.every((cell) => /^:?-{2,}:?$/.test(cell))) continue;
+      (table ??= []).push(cells);
+      continue;
+    }
+    flushTable();
+    const heading = /^(#{1,6})\s+(.*)$/.exec(line);
+    if (heading) { flushParagraph(); flushList(); out.push(`<h4>${inline(heading[2])}</h4>`); continue; }
+    const bullet = /^\s*[-*•]\s+(.*)$/.exec(line);
+    const numbered = /^\s*\d+[.)]\s+(.*)$/.exec(line);
+    if (bullet || numbered) {
+      flushParagraph();
+      const tag = bullet ? 'ul' : 'ol';
+      if (!list || list.tag !== tag) { flushList(); list = { tag, items: [] }; }
+      list.items.push((bullet ?? numbered)[1]);
+      continue;
+    }
+    if (!line.trim()) { flushParagraph(); flushList(); continue; }
+    flushList();
+    paragraph.push(line.trim());
+  }
+  flushParagraph(); flushList(); flushTable();
+  return out.join('');
+}
+
+function attackStatsStateLine(region) {
+  if (region.pending?.status === 'running') return 'рахується зараз';
+  if (region.pending?.status === 'queued') return 'у черзі';
+  if (!region.latest) return 'звіту ще немає';
+  const when = new Date(region.latest.finishedAt);
+  return `звіт ${when.toLocaleDateString('uk-UA', { day: '2-digit', month: '2-digit' })} ${shortTime(region.latest.finishedAt)}${region.latest.fresh ? '' : ' · застарів'}`;
+}
+
+function attackStatsChips(overview, selected) {
+  return `<div class="region-chips" role="group" aria-label="Області для статистики">${overview.regions.map((region) => {
+    const active = selected.includes(region.id);
+    const mark = region.pending ? '◌' : region.latest ? (region.latest.fresh ? '●' : '○') : '';
+    return `<button type="button" class="region-chip${active ? ' is-active' : ''}" data-stats-region="${escapeHtml(region.id)}"
+      aria-pressed="${active ? 'true' : 'false'}" title="${escapeHtml(attackStatsStateLine(region))}">
+      <span>${escapeHtml(region.name.replace(/ область$/u, ''))}</span>${mark ? `<i aria-hidden="true">${mark}</i>` : ''}</button>`;
+  }).join('')}</div>
+  <p class="chart-foot">● свіжий звіт · ○ звіт застарів · ◌ у черзі або рахується. Вибір зберігається в цьому браузері й записується як інтерес: саме з нього плановий прохід знає, що рахувати першим.</p>`;
+}
+
+function attackStatsForecastStrip(summary) {
+  if (!summary.forecast?.length) return '<p class="chart-foot">Прогнозу по днях модель не дала.</p>';
+  return `<div class="forecast-strip" role="img" aria-label="Ймовірність дня атаки по датах прогнозу">${summary.forecast.map((day) => {
+    const tonight = summary.tonight && day.date === summary.tonight.date;
+    return `<span class="forecast-day is-${escapeHtml(day.level)}${tonight ? ' is-tonight' : ''}"
+      title="${escapeHtml(day.date)} — ${escapeHtml(attackStatsPercent(day.p))}, ${escapeHtml(attackStatsLevelNames[day.level] ?? day.level)}">
+      <b>${escapeHtml(attackStatsPercent(day.p))}</b>
+      <i style="height:${Math.max(3, Math.round(day.p * 100))}%"></i>
+      <small>${escapeHtml(attackStatsShortDate(day.date))}<br>${escapeHtml(attackStatsWeekday(day.date))}</small></span>`;
+  }).join('')}</div>
+  <p class="chart-foot">Ймовірність, що доба буде добою атаки: висока ≥ 60 %, середня 30–59 %, низька < 30 %. Заливка — рівень; ${summary.tonight ? 'обведено найближчу ніч.' : ''} Не час і не ціль удару.</p>`;
+}
+
+function attackStatsCalendar(summary) {
+  if (!summary.calendar?.length) return '';
+  const days = summary.calendar;
+  return `<div class="calendar-strip" role="img" aria-label="Календар днів з атаками за період">${days.map((day) =>
+    `<span class="calendar-day${day.attack ? ' is-attack' : ''}" title="${escapeHtml(day.date)}${day.attack ? ' — атака' : ''}"></span>`).join('')}</div>
+  <p class="chart-foot">${attackStatsRange(summary.period.from, summary.period.to)}: заповнений квадрат — день з атакою за відкритими джерелами. ${summary.attackDays ?? '—'} з ${summary.period.days} діб.</p>`;
+}
+
+function attackStatsHourly(summary) {
+  const hours = (summary.hourly ?? []).map((count, hour) => ({ hour, count: Number(count) || 0 }));
+  if (!hours.some((row) => row.count > 0)) return '<p class="chart-foot">Годин початку ударів у даних немає.</p>';
+  // Той самий гребінець, що й вище на сторінці, — але тут стовпчик означає ЕПІЗОД, а не повідомлення.
+  const peak = hours.reduce((max, row) => Math.max(max, row.count), 0) || 1;
+  return `<div class="hour-chart" role="img" aria-label="Розподіл початку ударів за годинами доби">
+    ${hours.map((row) => `<span class="hour-col${row.hour >= 22 || row.hour < 6 ? ' is-night' : ''}"
+      title="${String(row.hour).padStart(2, '0')}:00 — ${row.count} ${attackPlural(row.count, 'епізод', 'епізоди', 'епізодів')}">
+      <i style="height:${row.count ? Math.max(2, (row.count / peak) * 100) : 0}%"></i>
+      <small>${row.hour % 3 === 0 ? String(row.hour).padStart(2, '0') : ''}</small></span>`).join('')}
+    </div><p class="chart-foot">Київський час, година початку удару. Світліші колонки — нічні години 22:00–06:00.</p>`;
+}
+
+function attackStatsWeapons(summary) {
+  const rows = ['ballistic', 'cruise', 'uav', 'unspecified']
+    .filter((key) => summary.weapons?.[key] !== null && summary.weapons?.[key] !== undefined)
+    .map((key) => ({ label: attackStatsWeaponNames[key], share: Number(summary.weapons[key]) }));
+  if (!rows.length) return '<p class="chart-foot">Розподілу засобів модель не дала.</p>';
+  const peak = rows.reduce((max, row) => Math.max(max, row.share), 0) || 1;
+  return `<div class="bar-rows">${rows.map((row) => `<div class="bar-row">
+    <span class="bar-label">${escapeHtml(row.label)}</span>
+    <span class="bar-track"><i style="width:${Math.max(1.5, (row.share / peak) * 100)}%"></i></span>
+    <b>${escapeHtml(attackStatsPercent(row.share))}</b><em class="trend"></em></div>`).join('')}</div>`;
+}
+
+function attackStatsMetricsTable(summary) {
+  if (!summary.metrics?.length) return '';
+  const cell = (value, format = (v) => v) => (value === null || value === undefined ? '—' : escapeHtml(String(format(value))));
+  return `<div class="stats-table-wrap"><table class="stats-table">
+    <thead><tr><th>Підперіод</th><th>Днів з атаками</th><th>Нічних</th><th>З балістикою</th><th>Інтервали, діб</th><th>Середній</th><th>Темп / 30 діб</th></tr></thead>
+    <tbody>${summary.metrics.map((row) => `<tr>
+      <td>${escapeHtml(row.label ?? '')}${row.from && row.to ? `<small>${escapeHtml(attackStatsRange(row.from, row.to))}</small>` : ''}</td>
+      <td>${cell(row.attack_days)}</td>
+      <td>${cell(row.night_share, attackStatsPercent)}</td>
+      <td>${cell(row.ballistic_share, attackStatsPercent)}</td>
+      <td>${row.intervals_days?.length ? escapeHtml(row.intervals_days.join(', ')) : '—'}</td>
+      <td>${cell(row.mean_interval_days, (v) => attackStatsNumber(v))}</td>
+      <td>${cell(row.tempo_per_30_days, (v) => attackStatsNumber(v))}</td>
+    </tr>`).join('')}</tbody></table></div>`;
+}
+
+function attackStatsEpisodes(summary) {
+  if (!summary.episodes?.length) return '<p class="chart-foot">Епізодів у структурованому вигляді модель не дала — дивіться повний текст нижче.</p>';
+  return `<div class="stats-table-wrap"><table class="stats-table">
+    <thead><tr><th>Дата</th><th>Час (Київ)</th><th>Засоби</th><th>Комбінована</th><th>Джерела</th><th>Примітки</th></tr></thead>
+    <tbody>${summary.episodes.map((episode) => `<tr>
+      <td>${escapeHtml(episode.date)}</td>
+      <td>${escapeHtml(episode.start ?? '—')}${episode.end ? `–${escapeHtml(episode.end)}` : ''}</td>
+      <td>${episode.weapons?.length ? episode.weapons.map((weapon) => escapeHtml(attackStatsWeaponNames[weapon] ?? weapon)).join(' + ') : 'не уточнено'}</td>
+      <td>${episode.combined === null ? '—' : episode.combined ? 'так' : 'ні'}</td>
+      <td>${(episode.sources ?? []).map((url, index) => `<a href="${escapeHtml(url)}" target="_blank" rel="noopener noreferrer nofollow">${index + 1}</a>`).join(' ') || '—'}</td>
+      <td>${escapeHtml(episode.note ?? '')}</td>
+    </tr>`).join('')}</tbody></table></div>`;
+}
+
+function attackStatsReadout(summary) {
+  const poisson = summary.poisson;
+  const cells = [
+    ['Днів з атаками', summary.attackDays ?? '—', 'num', `із ${summary.period.days} діб · ${attackStatsRange(summary.period.from, summary.period.to)}`],
+    ['Нічних', attackStatsPercent(summary.nightShare), 'num', 'початок у вікні 00:00–06:00'],
+    ['З балістикою', attackStatsPercent(summary.ballisticShare), 'num', 'частка епізодів'],
+    ['Середній інтервал', poisson ? `${attackStatsNumber(poisson.meanIntervalDays)} доби` : '—', 'word',
+      poisson ? `мін. ${poisson.minIntervalDays} · макс. ${poisson.maxIntervalDays} · за останніми ${poisson.intervalsDays.length + 1} епізодами` : 'інтервалів у даних немає'],
+    ['λ, атак на добу', poisson ? attackStatsNumber(poisson.lambdaPerDay, 2) : '—', 'num',
+      poisson ? `p = 1 − e^(−λ) ≈ ${attackStatsPercent(poisson.pDaily)}${summary.model.lambdaPerDay !== null ? ` · модель: λ ${attackStatsNumber(summary.model.lambdaPerDay, 2)}` : ''}` : 'перерахунок неможливий'],
+    ['Найближча ніч', summary.tonight ? attackStatsPercent(summary.tonight.p) : '—', 'num',
+      summary.tonight ? `${attackStatsShortDate(summary.tonight.date)} · ${attackStatsLevelNames[summary.tonight.level] ?? summary.tonight.level}` : 'прогнозу немає']
+  ];
+  return `<div class="readout stats-readout">${cells.map(([term, value, kind, foot]) => `<div class="readout-cell">
+      <span>${escapeHtml(term)}</span><strong class="is-${kind}">${escapeHtml(String(value))}</strong><small>${escapeHtml(foot)}</small>
+    </div>`).join('')}</div>`;
+}
+
+function attackStatsScenarios(summary) {
+  const poisson = summary.poisson;
+  if (!poisson) return '';
+  const days = summary.forecastPeriod.days;
+  return `<p class="chart-foot">Очікувано за ${days} діб (${attackStatsRange(summary.forecastPeriod.from, summary.forecastPeriod.to)}): базово ${attackStatsNumber(poisson.scenarios.base)} атак,
+    низька інтенсивність ${attackStatsNumber(poisson.scenarios.low)}, висока ${attackStatsNumber(poisson.scenarios.high)} — очікуване ± σ пуассонівської кількості.${
+    summary.model.expectedAttacks !== null ? ` Модель називала ${attackStatsNumber(summary.model.expectedAttacks)}.` : ''}</p>`;
+}
+
+function attackStatsFold(regionId, key, title, body, open = false) {
+  const isOpen = attackStatsOpen.has(`${regionId}:${key}`) || open;
+  return `<details class="stats-fold" data-stats-fold="${escapeHtml(`${regionId}:${key}`)}"${isOpen ? ' open' : ''}><summary>${escapeHtml(title)}</summary>${body}</details>`;
+}
+
+function attackStatsCard(region, report, outcomeNote) {
+  const state = attackStatsStateLine(region);
+  const head = `<header class="stats-card-head">
+      <div><p>${escapeHtml(state)}</p><h3>${escapeHtml(region.name)}</h3></div>
+      <span class="origin-chip">Відкриті джерела · мовна модель${report?.model ? ` · ${escapeHtml(report.model)}` : ''}</span>
+    </header>`;
+  if (!report) {
+    const failedLately = region.lastRun?.status === 'failed'
+      && (!region.latest || Date.parse(region.lastRun.finishedAt) > Date.parse(region.latest.finishedAt));
+    const waiting = region.pending
+      ? (region.pending.status === 'running'
+        ? 'Модель збирає епізоди з відкритих джерел і рахує — це триває хвилини, обмеження часу на цю задачу немає. Сторінка оновиться сама, коли звіт буде готовий.'
+        : 'Регіон у черзі: перед ним рахуються інші. Сторінка оновиться сама, коли дійде черга.')
+      : (outcomeNote ?? (failedLately
+        ? `Остання спроба (${shortDateTime(region.lastRun.finishedAt)}) не вдалася — модель не відповіла. Вибір записано; наступна спроба — у плановому проході або на вимогу оператора.`
+        : 'Звіту по цьому регіону ще немає. Вибір записано; його порахує плановий прохід або оператор.'));
+    return `<article class="stats-card is-empty" data-stats-card="${escapeHtml(region.id)}">${head}<p class="stats-wait">${escapeHtml(waiting)}</p></article>`;
+  }
+  const summary = report.summary;
+  if (!summary) {
+    return `<article class="stats-card is-empty" data-stats-card="${escapeHtml(region.id)}">${head}
+      <p class="stats-wait">Модель відповіла текстом, але структурованих даних для графіків у ньому не розібрано (${escapeHtml(report.rejectionReason ?? 'причину не названо')}). Нижче — її звіт як є; чисел із нього сторінка не бере.</p>
+      ${attackStatsFold(region.id, 'text', 'Повний текст звіту', `<div class="stats-report">${attackStatsMarkdown(report.reportText)}</div>`)}
+    </article>`;
+  }
+  const flagged = summary.verification !== 'passed';
+  return `<article class="stats-card${flagged ? ' is-flagged' : ''}" data-stats-card="${escapeHtml(region.id)}">
+    ${head}
+    ${flagged ? `<p class="stats-flag">${escapeHtml(attackStatsVerificationNames[summary.verification] ?? summary.verification)}${summary.poisson ? ` — перерахунок з інтервалів моделі дає λ ${attackStatsNumber(summary.poisson.lambdaPerDay, 2)} і p ≈ ${attackStatsPercent(summary.poisson.pDaily)} на добу.` : '.'}</p>` : ''}
+    ${attackStatsReadout(summary)}
+    <section class="stats-section">
+      <h4>Календар прогнозу · ${escapeHtml(attackStatsRange(summary.forecastPeriod.from, summary.forecastPeriod.to))}</h4>
+      ${attackStatsForecastStrip(summary)}
+      ${attackStatsScenarios(summary)}
+    </section>
+    ${summary.conclusions?.length ? `<section class="stats-section"><h4>Ключові висновки</h4>
+      <ul class="conclusion-list">${summary.conclusions.map((line) => `<li>${escapeHtml(line)}</li>`).join('')}</ul></section>` : ''}
+    <div class="stats-figures">
+      <section class="stats-section"><h4>Дні з атаками</h4>${attackStatsCalendar(summary)}</section>
+      <section class="stats-section"><h4>Година початку</h4>${attackStatsHourly(summary)}</section>
+      <section class="stats-section"><h4>Засоби ураження</h4>${attackStatsWeapons(summary)}
+        <p class="chart-foot">По епізодах із підтвердженим типом; комбінований епізод потрапляє в кілька рядків.</p></section>
+    </div>
+    ${summary.metrics?.length ? attackStatsFold(region.id, 'metrics', 'Метрики по підперіодах', attackStatsMetricsTable(summary)) : ''}
+    ${summary.poisson ? attackStatsFold(region.id, 'intervals', `Інтервали між останніми епізодами (${summary.poisson.intervalsDays.length})`,
+    `<p class="stats-plain">${escapeHtml(summary.poisson.intervalsDays.join(', '))} діб → середній ${escapeHtml(attackStatsNumber(summary.poisson.meanIntervalDays, 2))} → λ = ${escapeHtml(attackStatsNumber(summary.poisson.lambdaPerDay, 3))} → p = 1 − e^(−λ) = ${escapeHtml(attackStatsPercent(summary.poisson.pDaily))}.</p>`) : ''}
+    ${attackStatsFold(region.id, 'episodes', `Таблиця епізодів (${summary.episodes.length})`, attackStatsEpisodes(summary))}
+    ${summary.assumptions?.length ? attackStatsFold(region.id, 'assumptions', 'Припущення та обмеження моделі',
+    `<ul class="stats-plain-list">${summary.assumptions.map((line) => `<li>${escapeHtml(line)}</li>`).join('')}</ul>`) : ''}
+    ${attackStatsFold(region.id, 'text', 'Повний текст звіту', `<div class="stats-report">${attackStatsMarkdown(report.reportText)}</div>`)}
+    <p class="stats-meta">Порахувала мовна модель${report.model ? ` ${escapeHtml(report.model)}` : ''} з відкритих джерел ${escapeHtml(new Date(report.finishedAt ?? report.queuedAt).toLocaleString('uk-UA'))}${report.durationMs ? ` за ${report.durationMs >= 60000 ? `${Math.round(report.durationMs / 60000)} хв` : `${Math.max(1, Math.round(report.durationMs / 1000))} с`}` : ''} · λ, p і сценарії перераховано детерміновано з її інтервалів · ${escapeHtml(report.methodologyVersion ?? '')}</p>
+  </article>`;
+}
+
+async function fetchAttackStatsReport(region) {
+  if (!region.latest) return null;
+  // Ідентифікатор звіту в адресі — це ключ кешу: новий звіт має нову адресу, а той самий читається з
+  // кешу браузера ще пʼять хвилин, скільки б разів потік не перемальовував сторінку.
+  const response = await fetch(`/api/v1/analytics/attack-stats/${encodeURIComponent(region.id)}?r=${encodeURIComponent(region.latest.id)}`).catch(() => null);
+  return response?.ok ? response.json().catch(() => null) : null;
+}
+
+async function renderAttackStatsBlock(slot) {
+  const selected = attackStatsSelection();
+  slot.innerHTML = `<section class="stats-band" aria-labelledby="stats-title">
+    <header><p>Відкриті джерела · мовна модель · перерахунок Пуассона</p>
+      <h2 id="stats-title">Статистика ударів і ймовірності по регіонах</h2></header>
+    <div class="stats-disclaimer" role="note"><strong>Це не тривога і не прогноз цілі.</strong> <span data-stats-disclaimer>Дані засновані на відкритих джерелах та офіційних повідомленнях. Прогноз є ймовірнісним і не гарантує точного передбачення. Він не замінює офіційних сигналів повітряної тривоги — під час тривоги прямуйте в укриття незалежно від будь-яких прогнозів.</span></div>
+    <div data-stats-chips><p class="chart-foot">Завантаження…</p></div>
+    <div data-stats-cards></div>
+  </section>`;
+  const chipsSlot = $('[data-stats-chips]', slot);
+  const cardsSlot = $('[data-stats-cards]', slot);
+  let overview;
+  try {
+    const response = await fetch('/api/v1/analytics/attack-stats', attackStatsDirty ? { cache: 'reload' } : undefined);
+    if (!response.ok) throw new Error('attack stats unavailable');
+    overview = await response.json();
+    attackStatsDirty = false;
+  } catch {
+    chipsSlot.innerHTML = '<p class="chart-foot">Не вдалося отримати стан статистики. Спробуйте оновити сторінку.</p>';
+    return;
+  }
+  if (overview.disclaimer) $('[data-stats-disclaimer]', slot).textContent = overview.disclaimer;
+  const notes = new Map();
+
+  const draw = async () => {
+    const current = attackStatsSelection();
+    chipsSlot.innerHTML = attackStatsChips(overview, current)
+      + (overview.enabled ? '' : '<p class="chart-foot">Розрахунок зараз вимкнено оператором: вибір записується, звіти не рахуються.</p>');
+    if (!current.length) {
+      cardsSlot.innerHTML = '<p class="stats-wait">Оберіть одну або кілька областей — для кожної буде окрема картка: скільки днів з атаками було за період, коли починалися удари, чим били, і яка звідси пуассонівська ймовірність на найближчі ночі.</p>';
+      return;
+    }
+    const regions = current.map((id) => overview.regions.find((region) => region.id === id)).filter(Boolean);
+    const reports = await Promise.all(regions.map((region) => fetchAttackStatsReport(region)));
+    cardsSlot.innerHTML = regions.map((region, index) => attackStatsCard(region, reports[index], notes.get(region.id))).join('');
+  };
+
+  slot.addEventListener('toggle', (event) => {
+    const fold = event.target.closest?.('[data-stats-fold]');
+    if (!fold) return;
+    if (fold.open) attackStatsOpen.add(fold.dataset.statsFold); else attackStatsOpen.delete(fold.dataset.statsFold);
+  }, true);
+
+  chipsSlot.addEventListener('click', async (event) => {
+    const chip = event.target.closest('[data-stats-region]');
+    if (!chip) return;
+    const id = chip.dataset.statsRegion;
+    const current = attackStatsSelection();
+    if (current.includes(id)) {
+      saveAttackStatsSelection(current.filter((item) => item !== id));
+      await draw();
+      return;
+    }
+    saveAttackStatsSelection([...current, id]);
+    await draw();
+    // Реєструємо інтерес — і, якщо дозволено, запуск. Відповідь каже, що саме сталося, і картка це
+    // показує словами; свіжий звіт приходить у тій самій відповіді.
+    const response = await fetch(`/api/v1/analytics/attack-stats/${encodeURIComponent(id)}/requests`, { method: 'POST' }).catch(() => null);
+    const outcome = response ? await response.json().catch(() => null) : null;
+    if (!outcome) return;
+    const region = overview.regions.find((item) => item.id === id);
+    if (region) {
+      if (outcome.outcome === 'queued' || outcome.outcome === 'running') {
+        region.pending = { id: outcome.reportId, status: outcome.outcome, queuedAt: new Date().toISOString(), startedAt: null };
+        notes.delete(id);
+      } else if (outcome.outcome === 'fresh' && outcome.report) {
+        region.latest = {
+          id: outcome.report.id, finishedAt: outcome.report.finishedAt, verification: outcome.report.verification,
+          forecastFrom: outcome.report.forecastPeriod?.from, forecastTo: outcome.report.forecastPeriod?.to,
+          tonight: outcome.report.summary?.tonight ?? null, attackDays: outcome.report.summary?.attackDays ?? null,
+          model: outcome.report.model, fresh: true
+        };
+      } else if (typeof outcome.detail === 'string') {
+        notes.set(id, outcome.detail);
+        if (outcome.latest) region.latest = { ...region.latest, id: outcome.latest.id, finishedAt: outcome.latest.finishedAt, fresh: false, verification: outcome.latest.verification, model: outcome.latest.model, tonight: outcome.latest.summary?.tonight ?? null, attackDays: outcome.latest.summary?.attackDays ?? null, forecastFrom: outcome.latest.forecastPeriod?.from, forecastTo: outcome.latest.forecastPeriod?.to };
+      }
+      region.selections = (region.selections ?? 0) + 1;
+    }
+    await draw();
+  });
+
+  await draw();
+}
+
 async function renderAttacks() {
   const root = contentShell(
     'Відкриті джерела',
     'Аналіз атак',
     'Спершу — чим остання доба відрізняється від попередніх двох тижнів. Нижче — агрегати за добу, '
-    + 'тиждень і місяць: типи засобів, території, час доби та хвилі. Це опис минулого, а не прогноз.'
+    + 'тиждень і місяць: типи засобів, території, час доби та хвилі. Це опис минулого, а не прогноз. '
+    + 'Окремим блоком унизу — статистика ударів і ймовірності по обраних областях з відкритих джерел; '
+    + 'вона теж не є тривогою.'
   );
   const requested = new URLSearchParams(location.search).get('period');
   let period = ['day', 'week', 'month'].includes(requested) ? requested : 'day';
@@ -3902,10 +4297,14 @@ async function renderAttacks() {
     `<button type="button" data-period="${value}"${value === period ? ' class="is-active" aria-pressed="true"' : ' aria-pressed="false"'}>${label}</button>`).join('')}
       </div>
     </div>
-    <div id="attacks-body"><p class="chart-foot">Завантаження…</p></div>`;
+    <div id="attacks-body"><p class="chart-foot">Завантаження…</p></div>
+    <div id="attack-stats-slot"></div>`;
 
   const slot = $('#tactics-slot', root);
   const body = $('#attacks-body', root);
+  // Блок статистики не залежить від періоду й малюється паралельно з агрегатами: у нього власні
+  // запити, власний кеш і власний стан вибору. Перемикач періодів його не чіпає.
+  void renderAttackStatsBlock($('#attack-stats-slot', root));
   // Тактичний блок не залежить від вибраного періоду — він завжди про останні 24 години. Тому він
   // малюється один раз, першим завантаженням, і перемикач періодів під ним його не перемальовує:
   // блимання блоку, який не змінився, читалося б як зміна даних.
@@ -4218,6 +4617,144 @@ function wireResearchSection(root, reload) {
 }
 
 // ------------------------------------------------------------------------------------------------
+// Статистика ударів і ймовірності: черга, звіти, кнопки
+// ------------------------------------------------------------------------------------------------
+//
+// Та сама черга й ті самі звіти, що й на публічній сторінці атак, плюс те, чого публіка не бачить:
+// сирий JSON моделі, стан черги, кандидати планового проходу й дві кнопки. Оператор може поставити
+// регіон у чергу поза вікном свіжості й запустити плановий прохід зараз; перемикач і денний ліміт
+// діють на нього так само, як на всіх.
+
+const attackStatsStatusNames = { queued: 'у черзі', running: 'рахується', completed: 'готово', failed: 'збій' };
+const attackStatsRequesterNames = { scheduler: 'плановий прохід', operator: 'оператор', public: 'сторінка' };
+
+function opsAttackStatsReportHtml(report) {
+  if (!report) return '<p class="legend-note">Звіт не знайдено — можливо, його вже видалено за строком зберігання.</p>';
+  const summary = report.summary;
+  const technical = [
+    `${escapeHtml(attackStatsStatusNames[report.status] ?? report.status)}`,
+    report.verification ? escapeHtml(attackStatsVerificationNames[report.verification] ?? report.verification) : null,
+    report.model ? escapeHtml(report.model) : null,
+    report.durationMs != null ? `${Math.round(report.durationMs / 1000)} с` : null,
+    report.failureReason ? `збій: ${escapeHtml(report.failureReason)}` : null,
+    report.rejectionReason ? `відхилено: ${escapeHtml(report.rejectionReason)}` : null,
+    report.aiRunId ? `<a href="#ai-run-${escapeHtml(report.aiRunId)}">ai_runs</a>` : null
+  ].filter(Boolean).join(' · ');
+  return `<div class="ops-projection-card">
+    <p class="legend-note">${escapeHtml(report.region?.name ?? '')} · період ${escapeHtml(attackStatsRange(report.period?.from, report.period?.to))} · прогноз ${escapeHtml(attackStatsRange(report.forecastPeriod?.from, report.forecastPeriod?.to))} · ${technical}</p>
+    ${summary ? `<p class="legend-note">Днів з атаками ${escapeHtml(String(summary.attackDays ?? '—'))} із ${escapeHtml(String(summary.period?.days ?? '—'))}; ${
+      summary.poisson ? `λ ${escapeHtml(attackStatsNumber(summary.poisson.lambdaPerDay, 3))}, p ≈ ${escapeHtml(attackStatsPercent(summary.poisson.pDaily))}` : 'перерахунок неможливий'
+    }; найближча ніч ${summary.tonight ? `${escapeHtml(attackStatsShortDate(summary.tonight.date))} — ${escapeHtml(attackStatsPercent(summary.tonight.p))}` : '—'}.${
+      summary.issues?.length ? ` Зауваження звірки: ${escapeHtml(summary.issues.join(', '))}.` : ''}</p>` : ''}
+    ${report.reportText ? `<details class="stats-fold" open><summary>Текст звіту</summary><div class="stats-report">${attackStatsMarkdown(report.reportText)}</div></details>` : ''}
+    ${report.charts ? `<details class="stats-fold"><summary>JSON-блок моделі</summary><pre class="ops-json">${escapeHtml(JSON.stringify(report.charts, null, 2))}</pre></details>` : ''}
+    ${summary ? `<details class="stats-fold"><summary>Зведення (те, що читають сторінка й бот)</summary><pre class="ops-json">${escapeHtml(JSON.stringify(summary, null, 2))}</pre></details>` : ''}
+  </div>`;
+}
+
+function opsAttackStatsSection(payload) {
+  if (!payload) {
+    return `<section class="ops-section" id="attack-stats-section"><header class="ops-section-head"><div><p>Публічно, з дисклеймером</p><h2>Статистика ударів і ймовірності</h2></header>
+      <p class="legend-note">Поверхня недоступна.</p></section>`;
+  }
+  const settings = payload.settings ?? {};
+  const caps = payload.caps ?? {};
+  const regions = (payload.regions ?? []);
+  const options = regions.map((region) => `<option value="${escapeHtml(region.id)}">${escapeHtml(region.name)}</option>`).join('');
+  const pending = regions.filter((region) => region.pending);
+  const candidates = payload.candidates ?? [];
+  const recent = payload.recent ?? [];
+  return `<section class="ops-section" id="attack-stats-section">
+    <header class="ops-section-head">
+      <div><p>Публічно, з дисклеймером · ${escapeHtml(String(payload.methodologyVersion ?? ''))}</p>
+        <h2>Статистика ударів і ймовірності</h2></div>
+    </header>
+    <div class="safety-note">
+      <strong>Єдиний розрахунок про майбутнє, який публікується</strong>
+      <p>Модель із вебпошуком збирає епізоди з відкритих джерел і рахує пуассонівську ймовірність дня атаки по регіону. λ і p перераховуються з її інтервалів; розбіжність позначається, а не ховається. Дисклеймер їде першим рядком у бот і блоком на сторінці.</p>
+      <p>${escapeHtml(payload.disclaimer ?? '')}</p>
+    </div>
+    <p class="legend-note">Плановий прохід о ${escapeHtml(String(settings.runTime ?? '—'))} (Київ), нічна аналітика бота о ${escapeHtml(String(settings.digestTime ?? '—'))} ·
+      таймаут виклику: ${settings.timeoutMs ? `${escapeHtml(String(settings.timeoutMs))} мс` : 'без обмеження'} · до ${escapeHtml(String(settings.maxRegionsPerPass ?? '—'))} регіонів за прохід ·
+      період ${escapeHtml(String(payload.periodDays ?? '—'))} діб, прогноз ${escapeHtml(String(payload.forecastDays ?? '—'))} діб, останніх епізодів ${escapeHtml(String(payload.lastEpisodes ?? '—'))} ·
+      пошук: ${settings.webSearchTool ? escapeHtml(settings.webSearchTool) : 'вимкнено'} · глибина: ${settings.reasoningEffort ? escapeHtml(settings.reasoningEffort) : 'як у /ops'} ·
+      зберігання ${escapeHtml(String(settings.retentionDays ?? '—'))} діб · публічні запити ${payload.publicRequests ? 'дозволено' : 'вимкнено'}.</p>
+    ${payload.enabled ? '' : '<p class="legend-note">Перемикач «Статистика ударів і ймовірності» вимкнено в налаштуваннях Codex. Кнопки нижче повернуть відмову; вибір на сторінці лише записується.</p>'}
+    <div class="trust-controls">
+      <label class="trust-filter">Регіон<select data-attack-stats-region>${options}</select></label>
+      <button data-attack-stats-run>Порахувати зараз</button>
+      <button data-attack-stats-pass class="secondary">Плановий прохід зараз</button>
+      <output class="trust-count">${Number(caps.usedToday ?? 0)} з ${Number(caps.perDay ?? 0)} на сьогодні · свіжість ${Number(caps.refreshHours ?? 0)} год</output>
+    </div>
+    <div class="ops-projection" data-attack-stats-output></div>
+    <h3>Черга</h3>
+    ${pending.length ? `<ul class="stats-plain-list">${pending.map((region) => `<li>${escapeHtml(region.name)} — ${escapeHtml(attackStatsStatusNames[region.pending.status] ?? region.pending.status)} з ${escapeHtml(new Date(region.pending.queuedAt).toLocaleTimeString('uk-UA'))}</li>`).join('')}</ul>` : '<p class="legend-note">Порожня.</p>'}
+    <h3>Регіони зацікавленості</h3>
+    ${candidates.length ? `<ul class="stats-plain-list">${candidates.map((candidate) => `<li>${escapeHtml(candidate.name)} — підписників з аналітикою: ${Number(candidate.chats)}${candidate.lastSelectedAt ? `, на сторінці обирали ${escapeHtml(new Date(candidate.lastSelectedAt).toLocaleString('uk-UA'))}` : ''}</li>`).join('')}</ul>` : '<p class="legend-note">Ніхто ще не обирав регіонів і немає підписок з аналітикою.</p>'}
+    <h3>Останні звіти</h3>
+    ${recent.length ? `<div class="ops-channel-list">${recent.map((report) => {
+    const technical = [
+      new Date(report.queuedAt).toLocaleString('uk-UA'),
+      attackStatsRequesterNames[report.requestedBy] ?? report.requestedBy,
+      report.verification ? attackStatsVerificationNames[report.verification] ?? report.verification : null,
+      report.model, report.durationMs != null ? `${Math.round(report.durationMs / 1000)} с` : null,
+      report.failureReason
+    ].filter(Boolean).map((part) => escapeHtml(String(part))).join(' · ');
+    const bad = report.status === 'failed' || report.verification === 'rejected';
+    return `<article>
+        <div><span>${escapeHtml(attackStatsStatusNames[report.status] ?? report.status)}</span>
+          <h3>${escapeHtml(report.region?.name ?? '')}</h3>
+          <p>${technical}</p></div>
+        <div class="ops-channel-actions">
+          <span class="evidence ${bad ? 'unverified' : 'confirmed'}">${escapeHtml(report.summary?.tonight ? `${attackStatsShortDate(report.summary.tonight.date)} ${attackStatsPercent(report.summary.tonight.p)}` : '—')}</span>
+          <button data-attack-stats-open="${escapeHtml(report.id)}">Відкрити</button>
+        </div>
+      </article>`;
+  }).join('')}</div>` : '<p class="legend-note">Жодного запуску.</p>'}
+  </section>`;
+}
+
+function wireAttackStatsSection(root, reload) {
+  const section = $('#attack-stats-section', root);
+  if (!section) return;
+  const output = $('[data-attack-stats-output]', section);
+  if (!output) return;
+  section.addEventListener('click', async (event) => {
+    const open = event.target.closest('[data-attack-stats-open]');
+    if (open) {
+      output.innerHTML = '<p class="legend-note">Завантажуємо звіт…</p>';
+      const stored = await opsFetch(`/ops/attack-stats/${encodeURIComponent(open.dataset.attackStatsOpen)}`)
+        .then((result) => result.ok ? result.json() : null).catch(() => null);
+      output.innerHTML = opsAttackStatsReportHtml(stored);
+      return;
+    }
+    const run = event.target.closest('[data-attack-stats-run]');
+    const pass = event.target.closest('[data-attack-stats-pass]');
+    if (!run && !pass) return;
+    const button = run ?? pass;
+    button.disabled = true;
+    output.innerHTML = '<p class="legend-note">Ставимо в чергу…</p>';
+    const result = run
+      ? await opsFetch('/ops/attack-stats', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ regionId: $('[data-attack-stats-region]', section)?.value })
+      })
+      : await opsFetch('/ops/attack-stats/daily-pass', { method: 'POST' });
+    const payload = await result.json().catch(() => null);
+    button.disabled = false;
+    if (result.ok) {
+      output.innerHTML = run
+        ? `<p class="legend-note">${escapeHtml(payload?.outcome === 'fresh' ? 'Свіжий звіт уже є — його й показано.' : `Стан: ${payload?.outcome ?? '—'}${payload?.position ? `, місце в черзі ${payload.position}` : ''}. Воркер розбуджено; звіт зʼявиться в переліку нижче після завершення.`)}</p>`
+        : `<p class="legend-note">Плановий прохід: у чергу ${escapeHtml(String(payload?.queued?.length ?? 0))}, пропущено свіжих ${escapeHtml(String(payload?.skippedFresh?.length ?? 0))}, активних ${escapeHtml(String(payload?.skippedActive?.length ?? 0))}${payload?.refused ? `, відмова: ${escapeHtml(payload.refused)}` : ''}.</p>`;
+      if (typeof reload === 'function') setTimeout(() => reload(), 1500);
+      return;
+    }
+    output.innerHTML = `<p class="legend-note">Відмова: ${escapeHtml(payload?.detail ?? payload?.refused ?? payload?.error ?? 'причину не названо')}</p>`
+      + (result.status === 409 ? '<p class="legend-note">Увімкнути можна в блоці «Codex-аналітика» вище, перемикачем «Статистика ударів і ймовірності».</p>' : '');
+  });
+}
+
+// ------------------------------------------------------------------------------------------------
 // Журнал моделі: що саме її просили і що вона відповіла
 // ------------------------------------------------------------------------------------------------
 //
@@ -4231,7 +4768,8 @@ const promptVersionNames = {
   'shadow-classifier-v1': 'Тіньова класифікація',
   'retrospective-gate-v1': 'Ретроспективний гейт',
   'attack-tactics-commentary-v1': 'Коментар до тактики',
-  'attack-research-v1': 'Дослідження області'
+  'attack-research-v1': 'Дослідження області',
+  'attack-stats-v1': 'Статистика ударів і ймовірності'
 };
 
 function bytesLabel(value) {
@@ -4274,7 +4812,8 @@ const aiRunSurfaceNames = {
   retrospective_gate: 'Ретроспективний гейт',
   tactics: 'Тактика: коментар',
   movement_summary: 'Переказ руху загрози в сповіщеннях',
-  attack_research: 'Дослідження області'
+  attack_research: 'Дослідження області',
+  attack_stats: 'Статистика ударів і ймовірності'
 };
 const aiRunValidationNames = { passed: 'звірку пройдено', rejected: 'звірку не пройдено', skipped: 'звірка не застосовна' };
 
@@ -4856,6 +5395,14 @@ const codexFeatureLabels = {
   attack_research: {
     title: 'Дослідження області',
     note: 'Записка по одній області на запит оператора: що фіксували в цій годинній смузі раніше й що видно зараз. Тільки в цій консолі, ніколи не публікується й не потрапляє в Telegram. Без моделі кнопка працює так само — записку складають правила.'
+  },
+  // Восьмий — єдиний, що публікує розрахунок про майбутнє: ймовірність, що доба буде добою атаки, по
+  // обраних читачем областях. Числа збирає модель вебпошуком з відкритих джерел, λ і p перераховуються
+  // детерміновано з її інтервалів; дисклеймер — частина даних. Виклик без таймауту, один водночас,
+  // під денним лімітом. Вимкнений — блок на сторінці лише записує інтерес, у бот не йде нічого.
+  attack_stats: {
+    title: 'Статистика ударів і ймовірності',
+    note: 'Модель із вебпошуком збирає епізоди ударів по області з відкритих джерел за півтора місяця, рахує статистику й пуассонівську ймовірність на найближчі два тижні. Публічний блок на сторінці атак і нічна аналітика бота, завжди з дисклеймером. Один запуск водночас, без таймауту, під денним лімітом. Вимкнено — вибір областей лише записується.'
   }
 };
 
@@ -6196,11 +6743,13 @@ async function renderOps() {
   // Стан входу приходить у складі налаштувань, а не окремим запитом: перемикач «увімкнено» поруч
   // із мертвою сесією — найзаплутаніший стан цієї функції, і показати їх із двох різних моментів
   // означало б зробити його ще заплутанішим.
-  const [vectorOps, research, codexSettings, aiRuns, shadow, sourceTrust, runtime, deploy, backfill, coverage, opsSources] = await Promise.all([
+  const [vectorOps, research, attackStats, codexSettings, aiRuns, shadow, sourceTrust, runtime, deploy, backfill, coverage, opsSources] = await Promise.all([
     opsFetch('/ops/vectors').then((result) => result.ok ? result.json() : null).catch(() => null),
     // Тільки перелік і ліміти. Жодного меморандуму тут не рахується: він зʼявляється лише після
     // натискання, і саме тому відкриття консолі нічого не витрачає.
     opsFetch('/ops/attack-research').then((result) => result.ok ? result.json() : null).catch(() => null),
+    // Стан черги і останні звіти статистики ударів; так само нічого не рахує.
+    opsFetch('/ops/attack-stats').then((result) => result.ok ? result.json() : null).catch(() => null),
     opsFetch('/ops/codex/settings').then((result) => result.ok ? result.json() : null).catch(() => null),
     opsFetch(aiRunsUrl()).then((result) => result.ok ? result.json() : null).catch(() => null),
     opsFetch('/ops/shadow-classifier?hours=24').then((result) => result.ok ? result.json() : null).catch(() => null),
@@ -6267,6 +6816,7 @@ async function renderOps() {
     </div>
     ${opsVectorSection(vectorOps)}
     ${opsResearchSection(research)}
+    ${opsAttackStatsSection(attackStats)}
     <details class="ops-raw"><summary>Технічний стан і журнали</summary><pre class="ops-json">${escapeHtml(JSON.stringify({ sources: data.sources, outbox: data.outbox, aiRuns: data.aiRuns, database: data.database }, null, 2))}</pre></details>
     </div>
     </div>`;
@@ -6282,6 +6832,7 @@ async function renderOps() {
   wireSourcesSection(root, opsSources);
   wireCoverageSection(root);
   wireResearchSection(root, () => renderOps());
+  wireAttackStatsSection(root, () => renderOps());
   root.querySelectorAll('[data-project-vector]').forEach((button) => button.addEventListener('click', async () => {
     const output = $(`#projection-${button.dataset.projectVector}`, root);
     output.textContent = 'Рахуємо…';

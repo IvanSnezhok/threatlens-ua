@@ -653,13 +653,96 @@ curl -fsS -H "Authorization: Bearer $METRICS_TOKEN" localhost:3000/metrics |
 Rows are pruned after 90 days; the memos and their per-class rows go with the request row they hang
 off.
 
+## Attack statistics and probabilities (public, model-written)
+
+The one calculation about the future this product publishes, by the owner's explicit decision of
+2026-08-18, and the shape of the publication is the whole safety argument: **a separate block at the
+bottom of the public «Аналіз атак» page and a separate block of the nightly bot digest, behind an
+operator switch that ships off, always under a disclaimer that is part of the data**. It answers
+«як часто цю область атакували за півтора місяця і яка звідси базова ймовірність на найближчі ночі»
+— never where, never when in the night, never what will be hit.
+
+What the surface does per region (`src/domain/attack-stats-report.ts`, `src/services/attack-stats.ts`):
+
+- The model — with the backend's hosted **web search** — is given the owner's OSINT task verbatim
+  (`attack-stats-v1`): collect every strike episode on the region over `ATTACK_STATS_PERIOD_DAYS`
+  days ending yesterday, two independent sources per episode with one official, count the metrics,
+  fit a Poisson rate on the last `ATTACK_STATS_LAST_EPISODES` episodes and forecast
+  `ATTACK_STATS_FORECAST_DAYS` days. Its reply is Markdown with one JSON block for the charts.
+- **The arithmetic is recomputed here, not trusted.** From the intervals the model named, λ, p =
+  1 − e^(−λ), the expectation and the ±σ scenarios are recomputed deterministically and compared to
+  the model's numbers. A report whose λ or median p drifts past the tolerance is stored and shown as
+  `inconsistent` — with both numbers — never silently. A reply with no usable JSON block is stored
+  as `rejected`: the text can be read on the page, no chart is drawn from it, and the digest skips it.
+- **The call has no timeout by default.** `ATTACK_STATS_TIMEOUT_MS=0` means no `AbortSignal` at
+  all, and the surface goes to Codex through its own patient dispatcher (undici `Agent` without idle
+  timeouts) so a long reasoning stretch between searches cannot be cut off at five minutes by the
+  transport either. What bounds the work instead: one run at a time in the process, one active row
+  per region by unique index, `ATTACK_STATS_MAX_PER_DAY` runs queued per Kyiv day (counted from the
+  table), a freshness window (`ATTACK_STATS_REFRESH_HOURS`) that turns a repeat request into a read,
+  and `ATTACK_STATS_MAX_REGIONS_PER_PASS` on the scheduled pass.
+- **Who decides what gets computed.** Readers select regions on the page; a selection is recorded as
+  interest and — if `ATTACK_STATS_PUBLIC_REQUESTS` is on — queues one run within the caps. The daily
+  pass at `ATTACK_STATS_RUN_TIME` (Kyiv, before `NIGHTLY_DIGEST_TIME`) queues the regions of
+  interest: oblasts that analytics-subscribed chats live in (subscriptions on a raion or a city climb
+  to their oblast), then regions selected on the page, skipping fresh and active ones. The nightly
+  digest attaches the freshest passing report for each of a subscriber's regions — and a chat with a
+  report but no risk assessment now receives the digest too (`assessment_id` may be NULL for
+  `nightly_digest` rows since migration 048).
+
+```bash
+# Public: which regions have a report, which are queued, and the caps.
+curl -fsS http://localhost:3000/api/v1/analytics/attack-stats
+
+# Public: the newest report for one region — summary, forecast calendar, episodes, the model's text.
+curl -fsS http://localhost:3000/api/v1/analytics/attack-stats/ua-80
+
+# Public: «the reader selected this region». Records interest; queues a run when allowed.
+curl -fsS -X POST http://localhost:3000/api/v1/analytics/attack-stats/ua-53/requests
+
+# Operator: the same plus the queue, the candidates of the next pass, the last thirty runs.
+curl -fsS -u "$OPS_USER:$OPS_PASSWORD" http://localhost:3000/ops/attack-stats
+
+# Operator: queue one region now, ignoring the freshness window (switch and daily cap still apply).
+curl -fsS -u "$OPS_USER:$OPS_PASSWORD" -X POST -H 'Content-Type: application/json' \
+  -d '{"regionId":"ua-80"}' http://localhost:3000/ops/attack-stats
+
+# Operator: run the daily pass now, out of schedule.
+curl -fsS -u "$OPS_USER:$OPS_PASSWORD" -X POST http://localhost:3000/ops/attack-stats/daily-pass
+
+# Operator: one report whole — summary, text, the raw JSON block.
+curl -fsS -u "$OPS_USER:$OPS_PASSWORD" http://localhost:3000/ops/attack-stats/<report-id>
+```
+
+Reading it:
+
+- **`enabled: false` in the overview is the switch, and the page says so.** Selections are still
+  recorded (`attack_stats_interest`), so switching on later starts from what readers already asked
+  for. `refused_disabled`, `refused_public_closed` and `refused_daily_cap` come back as 200 with a
+  `detail` sentence — they are the governance working, not client errors — and write no row.
+- **`verification`** is `passed` (JSON parsed, recomputation agrees), `inconsistent` (parsed, the
+  numbers disagree — shown with a flag on the page and a line in the digest), `rejected` (no usable
+  JSON; text only) or `skipped` (the model never answered; the row is `failed` with the reason).
+- **The digest line for a region opens with the period and the counts, then «Найближча ніч (18.08):
+  ≈34 % — середня», then the next six days.** The disclaimer is the first line of the block, in
+  italics, before any number, and the block's marker is 📈 — never the silhouette of an alert.
+- **A run a restart interrupted is marked `failed` with `interrupted` on the next boot**, so no region
+  stays «рахується» forever. Reports older than `ATTACK_STATS_RETENTION_DAYS` are deleted by the
+  daily pass.
+
+```bash
+# Outcomes, refusals included; and how long an unbounded run actually took.
+curl -fsS -H "Authorization: Bearer $METRICS_TOKEN" localhost:3000/metrics |
+  grep -E 'threatlens_attack_stats_(runs_total|run_duration_seconds)'
+```
+
 ## Codex analytics (operator only)
 
 The whole lifecycle lives in one `/ops` group — «Codex-аналітика»: session status, the sign-in
-button, the model dropdown, the eight surface switches and the `ai_runs` audit viewer. Nothing about
+button, the model dropdown, the surface switches and the `ai_runs` audit viewer. Nothing about
 it requires editing `.env` or restarting, except `CODEX_BASE_URL` itself.
 
-The eight, in the order the console shows them and in ascending order of how much authority they
+The switches, in the order the console shows them and in ascending order of how much authority they
 grant:
 
 | switch | what it buys | where the text lands |
@@ -672,6 +755,8 @@ grant:
 | `retrospective_gate` | a verdict, not text | the pipeline |
 | `tactics` | commentary under the public tactical block | public attacks page |
 | `attack_research` | the oblast research memo | operator only |
+| `movement_summary` | a model retelling of a threat's movement, sources named | subscriber threat messages |
+| `attack_stats` | attack statistics and Poisson probabilities per region, from open sources | public attacks page + nightly digest |
 
 `attacks` is the one whose name has outlived its meaning, and the console label now says so. It has
 **never** gated the public attacks page: its single reader is `refineWithCodex()` in
