@@ -481,12 +481,23 @@ them was being warned about somewhere else.
 | distinct spellings | 4240 | **4240** |
 | classifier index build | 20.2 ms | 23.0 ms |
 | classifier, per message | 0.061 ms | **0.036 ms** |
-| `/api/v1/locations`, gzip | 13 KiB | 42 KiB |
+| `/api/v1/locations`, origin | 98 KiB | 456 KiB |
+| `/api/v1/locations`, on the wire | ~14 KiB | **48 KiB** (zstd, measured) |
+| Caddy CPU per cold catalogue request | ~0.6 ms | **2.2 ms** (measured over 100) |
 
 The spelling count is the number that matters: this is a **move, not an addition**. Those 1772 names
 were already in the catalogue as raion aliases, and classification got *faster* because a raion no
-longer carries up to 3532 of them. The public catalogue payload is the one real cost, and it is
-served from one cached Buffer with `max-age=900` and an ETag.
+longer carries up to 3532 of them.
+
+**The public catalogue payload is the one real cost.** The app serves it uncompressed from a single
+cached Buffer; `encode zstd gzip` in the Caddyfile is what the reader actually receives, and `encode`
+has no cache, so those 2.2 ms are paid per cold request. `max-age=900` plus the ETag keep it to once
+per reader per fifteen minutes — a revalidation is a 304 with an empty body and costs nothing. At
+that rate this is well inside budget, but it is the number to look at first if the catalogue ever
+grows again: caching a pre-compressed sibling Buffer beside the plain one on this route would take
+Caddy out of the loop entirely, exactly as `scripts/precompress-static.mjs` already does for
+`/data/*`. Not done here because it changes a public route's content negotiation and this change did
+not need it.
 
 **What changed in behaviour.**
 
