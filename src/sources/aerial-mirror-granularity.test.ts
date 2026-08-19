@@ -124,12 +124,17 @@ describe('the registry, and the guard that outlives it', () => {
     expect(() => toAlarmSnapshotBody(rollupWithOblast, 'declaration')).not.toThrow();
   });
 
-  it('passes a raion through unchanged, whichever feed it came from', () => {
+  it('passes a raion through unchanged, carrying the oblast it was nested under', () => {
     const body = toAlarmSnapshotBody(parseAerialMirrorSkogPayload(skogBody, NOW, STALE), 'rollup') as {
-      states: Array<{ regionName: string; active: boolean; startedAt: string }>;
+      states: Array<{ regionName: string; active: boolean; startedAt: string; parentName?: string }>;
     };
+    // `parentName` — не рівень і не твердження: область тут лишається згорткою й тривоги не
+    // піднімає. Це підказка резолверу, чию однойменну громаду мали на увазі (міграція 051).
     expect(body.states).toEqual(expect.arrayContaining([
-      { regionName: 'Ізюмський район', active: true, startedAt: '2026-08-19T11:30:20.000Z' }
+      {
+        regionName: 'Ізюмський район', active: true, startedAt: '2026-08-19T11:30:20.000Z',
+        parentName: 'Харківська область'
+      }
     ]));
   });
 });

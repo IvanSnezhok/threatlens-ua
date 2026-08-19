@@ -3,7 +3,7 @@ import { count, ensureMigrated, integrationDatabaseAvailable, resetDatabase, sql
 import type { CatalogImportSummary, KatottgEntry } from '../../src/services/location-catalog.js';
 
 /**
- * The raion tier against live PostgreSQL.
+ * The raion and hromada tiers against live PostgreSQL.
  *
  * The classifier is never downloaded here — the entries below are the shape `parseKatottgWorkbook`
  * produces, so the test exercises the writer and the resulting hierarchy without touching the
@@ -16,6 +16,7 @@ const RAION_CODE = 'UA23080000000090746';
 const HROMADA_CODE = 'UA23080070000048181';
 const CITY_CODE = 'UA23080070010092407';
 const RAION_ID = `katottg-${RAION_CODE.toLocaleLowerCase()}`;
+const HROMADA_ID = `katottg-${HROMADA_CODE.toLocaleLowerCase()}`;
 const SEEDED_CITY = 'test-city-melitopol';
 
 const ENTRIES: KatottgEntry[] = [
@@ -81,43 +82,63 @@ describe.skipIf(!integrationDatabaseAvailable)('KATOTTG raion import against liv
     });
   });
 
-  it('carries the raion and hromada spellings the alert channel uses', async () => {
+  it('carries the raion spellings the alert channel uses, and no hromada of its own', async () => {
     const aliases = await sql<{ aliases: string[] }>('SELECT aliases FROM locations WHERE id=$1', [RAION_ID]);
     expect(aliases.rows[0]!.aliases).toEqual(expect.arrayContaining([
-      'мелітопольський район', 'мелітопольського району', 'веселівська територіальна громада'
+      'мелітопольський район', 'мелітопольського району'
     ]));
+    // Міграція 051: назва громади належить рядкові громади. Аліас, залишений тут, змагався б із
+    // ним за той самий текст — і забирав би його, бо район у каталозі стоїть вище.
+    expect(aliases.rows[0]!.aliases).not.toContain('веселівська територіальна громада');
   });
 
-  it('re-points an oblast-parented city at its raion and stamps the official code', async () => {
+  it('inserts the hromada between the raion and the city, under both spellings', async () => {
+    const hromada = await sql<{ parent_id: string; type: string; name_uk: string; aliases: string[] }>(
+      'SELECT parent_id,type,name_uk,aliases FROM locations WHERE id=$1', [HROMADA_ID]
+    );
+    expect(hromada.rows[0]).toMatchObject({
+      parent_id: RAION_ID, type: 'hromada', name_uk: 'Веселівська територіальна громада'
+    });
+    expect(hromada.rows[0]!.aliases).toEqual([
+      'веселівська територіальна громада', 'веселівська громада'
+    ]);
+  });
+
+  it('re-points an oblast-parented city at its hromada and stamps the official code', async () => {
     const city = await sql<{ parent_id: string; official_code: string }>(
       'SELECT parent_id,official_code FROM locations WHERE id=$1', [SEEDED_CITY]
     );
-    expect(city.rows[0]).toEqual({ parent_id: RAION_ID, official_code: CITY_CODE });
+    // Не район: розсилка тривоги обходить предків СТВЕРДЖЕНОЇ локації, тож місто під районом
+    // не почуло б тривоги громади, у якій воно стоїть.
+    expect(city.rows[0]).toEqual({ parent_id: HROMADA_ID, official_code: CITY_CODE });
     expect(first.reparentedCities).toBe(1);
     // The row was reused rather than duplicated under a katottg- id.
     expect(await count('locations', `name_uk='Мелітополь'`)).toBe(1);
   });
 
-  it('resolves a three-level chain from city to oblast', async () => {
-    const chain = await sql<{ city: string; raion: string; oblast: string }>(
-      `SELECT c.name_uk AS city, r.name_uk AS raion, o.name_uk AS oblast
-         FROM locations c JOIN locations r ON r.id=c.parent_id JOIN locations o ON o.id=r.parent_id
+  it('resolves a four-level chain from city to oblast', async () => {
+    const chain = await sql<{ city: string; hromada: string; raion: string; oblast: string }>(
+      `SELECT c.name_uk AS city, h.name_uk AS hromada, r.name_uk AS raion, o.name_uk AS oblast
+         FROM locations c JOIN locations h ON h.id=c.parent_id
+                          JOIN locations r ON r.id=h.parent_id
+                          JOIN locations o ON o.id=r.parent_id
         WHERE c.id=$1`, [SEEDED_CITY]
     );
     expect(chain.rows[0]).toEqual({
-      city: 'Мелітополь', raion: 'Мелітопольський район', oblast: 'Запорізька область'
+      city: 'Мелітополь', hromada: 'Веселівська територіальна громада',
+      raion: 'Мелітопольський район', oblast: 'Запорізька область'
     });
   });
 
   it('is idempotent: the second import writes the same rows and moves nothing', async () => {
-    expect(first).toEqual({ raions: 1, cities: 1, reparentedCities: 1 });
-    expect(second).toEqual({ raions: 1, cities: 1, reparentedCities: 0 });
+    expect(first).toEqual({ raions: 1, hromadas: 1, cities: 1, reparentedCities: 1 });
+    expect(second).toEqual({ raions: 1, hromadas: 1, cities: 1, reparentedCities: 0 });
     // Лише рядок, який створив цей імпорт: у каталозі є й міграційно посіяні райони (026),
     // і рахувати їх тут означало б знову вимагати їх знесення перед прогоном.
     expect(await count('locations', `type='raion' AND id='${RAION_ID}'`)).toBe(1);
     const sync = await sql<{ imported_rows: number; status: string }>(
       `SELECT imported_rows,status FROM reference_dataset_syncs WHERE dataset_id='katottg'`
     );
-    expect(sync.rows[0]).toEqual({ imported_rows: 2, status: 'success' });
+    expect(sync.rows[0]).toEqual({ imported_rows: 3, status: 'success' });
   });
 });

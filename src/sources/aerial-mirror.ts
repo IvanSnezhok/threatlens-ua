@@ -105,6 +105,15 @@ export interface AerialMirrorRegion {
    * the `ual` feed files «м. Харків та Харківська територіальна громада» as a `State`.
    */
   level?: AerialMirrorLevel;
+  /**
+   * The oblast the upstream nested this region under, verbatim, where the payload has one.
+   *
+   * A tie-break and nothing more. 135 of the catalogue's hromadas share a name with a hromada in
+   * another raion, and the resolver refuses a tie rather than guessing; this is the answer the feed
+   * was already carrying and the adapter used to discard. It can only narrow a rejected tie — see
+   * `narrowByParent` in `src/services/ingestion.ts`.
+   */
+  parentName?: string;
 }
 
 export interface AerialMirrorSnapshot {
@@ -507,7 +516,7 @@ export function parseAerialMirrorSkogPayload(
   let droppedRollupOblasts = 0;
   let duplicateLabels = 0;
 
-  const take = (value: unknown, level: AerialMirrorLevel): void => {
+  const take = (value: unknown, level: AerialMirrorLevel, parentName?: string): void => {
     const entry = asObject(value);
     if (!entry) return;
     const name = typeof entry.name === 'string' ? entry.name.replace(/\s+/gu, ' ').trim() : '';
@@ -523,19 +532,25 @@ export function parseAerialMirrorSkogPayload(
       return;
     }
     byLevel[level] += 1;
-    byLabel.set(key, { name, active: true, changedAt: changed ?? cachedAt, level });
+    byLabel.set(key, {
+      name, active: true, changedAt: changed ?? cachedAt, level, ...(parentName ? { parentName } : {})
+    });
   };
 
   for (const value of entries) {
     const oblast = asObject(value);
     if (!oblast) continue;
-    // Область читається рівно настільки, щоб порахувати її як відкинуту: її стан тут — згортка.
-    if (typeof oblast.name === 'string' && typeof oblast.alert === 'boolean') {
+    // Область читається рівно настільки, щоб порахувати її як відкинуту (її стан тут — згортка) і
+    // щоб передати її назву вниз як підказку: сама вона тривоги не стверджує, але каже, ЯКА саме
+    // Миколаївська громада зараз світиться.
+    const oblastName = typeof oblast.name === 'string' ? oblast.name.replace(/\s+/gu, ' ').trim() : '';
+    if (oblastName && typeof oblast.alert === 'boolean') {
       readableCount += 1;
       if (oblast.alert) droppedRollupOblasts += 1;
     }
-    for (const district of Array.isArray(oblast.districts) ? oblast.districts : []) take(district, 'District');
-    for (const community of Array.isArray(oblast.community) ? oblast.community : []) take(community, 'Community');
+    const parent = oblastName || undefined;
+    for (const district of Array.isArray(oblast.districts) ? oblast.districts : []) take(district, 'District', parent);
+    for (const community of Array.isArray(oblast.community) ? oblast.community : []) take(community, 'Community', parent);
   }
 
   if (entries.length > 0 && readableCount === 0) {
@@ -578,7 +593,7 @@ export function parseAerialMirrorKlimenkoPayload(
   let readableCount = 0;
   let duplicateLabels = 0;
 
-  const take = (label: string, value: unknown, level: AerialMirrorLevel): void => {
+  const take = (label: string, value: unknown, level: AerialMirrorLevel, parentName?: string): void => {
     const entry = asObject(value);
     const name = label.replace(/\s+/gu, ' ').trim();
     if (!entry || !name || typeof entry.enabled !== 'boolean') return;
@@ -593,15 +608,18 @@ export function parseAerialMirrorKlimenkoPayload(
       return;
     }
     byLevel[level] += 1;
-    byLabel.set(key, { name, active: true, changedAt: changed ?? cachedAt, level });
+    byLabel.set(key, {
+      name, active: true, changedAt: changed ?? cachedAt, level, ...(parentName ? { parentName } : {})
+    });
   };
 
   for (const [label, value] of Object.entries(raw)) {
     take(label, value, 'State');
     const oblast = asObject(value);
     const districts = asObject(oblast?.districts);
+    const parent = label.replace(/\s+/gu, ' ').trim() || undefined;
     for (const [districtLabel, district] of Object.entries(districts ?? {})) {
-      take(districtLabel, district, 'District');
+      take(districtLabel, district, 'District', parent);
     }
   }
 
@@ -681,7 +699,8 @@ export function toAlarmSnapshotBody(
     states: snapshot.regions.map((region) => ({
       regionName: region.name,
       active: region.active,
-      startedAt: region.changedAt.toISOString()
+      startedAt: region.changedAt.toISOString(),
+      ...(region.parentName ? { parentName: region.parentName } : {})
     }))
   };
 }

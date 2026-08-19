@@ -212,31 +212,49 @@ function useConfig(overrides: Record<string, unknown>): void {
 }
 
 /**
- * The raion rows this file needs, built the way the KATOTTG importer builds them.
+ * The raion and hromada rows this file needs, built the way the KATOTTG importer builds them.
  *
- * `raionAliases` is imported rather than reproduced: the Community→raion fold under test is exactly
- * the aliases that function emits («Вовчанська територіальна громада» on Чугуївський район), and a
- * hand-written alias list here would be a test of itself. Покровська appears on TWO raions on
- * purpose — Донеччина and Дніпропетровщина both have one, which makes that hromada name genuinely
- * ambiguous, and ambiguity resolving to nothing is a property this file asserts.
+ * `raionAliases` and `hromadaAliases` are imported rather than reproduced: what this file tests is
+ * which row a published label lands on, and a hand-written alias list here would be a test of
+ * itself. Покровська appears in TWO raions on purpose — Донеччина and Дніпропетровщина both have
+ * one, which makes that hromada name genuinely ambiguous. Since migration 051 that ambiguity has
+ * two outcomes, and this file asserts both: nothing at all when the feed says only the name, and the
+ * right one of the two when the feed also says which oblast it nested the label under.
  */
+/** Seeded hromadas, by the label the feeds print for them. */
+const VOVCHANSK = 'test-hromada-vovchanska';
+const PECHENIHY = 'test-hromada-pechenizka';
+const LYPTSI = 'test-hromada-lypetska';
+const POKROVSK_HROMADA_DONETSK = 'test-hromada-pokrovska-ua-14';
+const POKROVSK_HROMADA_DNIPRO = 'test-hromada-pokrovska-ua-12';
+
+/** `[raion id, oblast id, raion name, raion stem, [[hromada id, hromada stem], …]]`. */
+const SEEDED: Array<[string, string, string, string, Array<[string, string]>]> = [
+  [SUMY_RAION, 'ua-59', 'Сумський район', 'Сумський',
+    [['test-hromada-sumska', 'Сумська'], ['test-hromada-krasnopilska', 'Краснопільська']]],
+  [KHARKIV_RAION, 'ua-63', 'Харківський район', 'Харківський',
+    [[LYPTSI, 'Липецька'], ['test-hromada-pisochynska', 'Пісочинська']]],
+  [CHUHUIV_RAION, 'ua-63', 'Чугуївський район', 'Чугуївський',
+    [[VOVCHANSK, 'Вовчанська'], [PECHENIHY, 'Печенізька']]],
+  [POKROVSK_RAION, 'ua-14', 'Покровський район', 'Покровський',
+    [[POKROVSK_HROMADA_DONETSK, 'Покровська'], ['test-hromada-hrodivska', 'Гродівська']]],
+  [SYNELNYKOVE_RAION, 'ua-12', 'Синельниківський район', 'Синельниківський',
+    [[POKROVSK_HROMADA_DNIPRO, 'Покровська']]]
+];
+
 async function seedRaions(): Promise<void> {
-  const { raionAliases } = await import('../../src/services/location-catalog.js');
-  const rows: Array<[string, string, string, string, string[]]> = [
-    [SUMY_RAION, 'ua-59', 'Сумський район', 'Сумський', ['Сумська', 'Краснопільська']],
-    [KHARKIV_RAION, 'ua-63', 'Харківський район', 'Харківський', ['Липецька', 'Пісочинська']],
-    [CHUHUIV_RAION, 'ua-63', 'Чугуївський район', 'Чугуївський', ['Вовчанська', 'Печенізька']],
-    [POKROVSK_RAION, 'ua-14', 'Покровський район', 'Покровський', ['Покровська', 'Гродівська']],
-    [SYNELNYKOVE_RAION, 'ua-12', 'Синельниківський район', 'Синельниківський', ['Покровська']]
-  ].map(([id, parent, nameUk, stem, hromadas]) => [
-    id as string, parent as string, nameUk as string, stem as string,
-    raionAliases(stem as string, hromadas as string[])
-  ]);
-  for (const [id, parent, nameUk, , aliases] of rows) {
+  const { hromadaAliases, hromadaName, raionAliases } = await import('../../src/services/location-catalog.js');
+  for (const [id, parent, nameUk, stem, hromadas] of SEEDED) {
     await sql(
       `INSERT INTO locations(id,parent_id,type,name_uk,aliases) VALUES ($1,$2,'raion',$3,$4)`,
-      [id, parent, nameUk, aliases]
+      [id, parent, nameUk, raionAliases(stem)]
     );
+    for (const [hromadaId, hromadaStem] of hromadas) {
+      await sql(
+        `INSERT INTO locations(id,parent_id,type,name_uk,aliases) VALUES ($1,$2,'hromada',$3,$4)`,
+        [hromadaId, id, hromadaName(hromadaStem), hromadaAliases(hromadaStem)]
+      );
+    }
   }
 }
 
@@ -580,10 +598,9 @@ describe.skipIf(!integrationDatabaseAvailable)('community aerial-alert mirror', 
    *
    * The aggregated feed can say «Харківська область» and nothing finer, so an alert over one raion
    * lit the whole oblast on the map. The `ual` passthrough publishes `State`, `District` and
-   * `Community` entries, and the catalogue already knows how to read all three: the resolver's
-   * literal-first lookup handles «X район», and `raionAliases` folds «X територіальна громада» into
-   * the raion that contains it. Nothing about resolution was changed for this — the labels simply
-   * started arriving.
+   * `Community` entries, and since migration 051 the catalogue has a row for each of the three: the
+   * resolver's literal-first lookup handles «X район», and «X територіальна громада» is a hromada
+   * row of its own rather than an alias of the raion around it.
    */
   describe('raion and hromada granularity', () => {
     it('runs against a catalogue with no KATOTTG import, which the counts below assume', async () => {
@@ -598,21 +615,22 @@ describe.skipIf(!integrationDatabaseAvailable)('community aerial-alert mirror', 
       expect(Number(rows.rows[0]!.n)).toBe(2);
     });
 
-    it('holds raions, hromadas-folded-to-raions and oblasts from one real capture', async () => {
+    it('holds raions, hromadas and oblasts from one real capture, each on its own row', async () => {
       await poll();
 
       // One request. The aggregated feed is consulted only when the raw one comes back empty or is
       // refused, so the steady state costs exactly what the old oblast-only poll cost.
       expect(fetchCalls).toEqual([RAW_URL]);
 
-      // Nine of the capture's thirty-one air-raid labels name a location this database carries; they
-      // fold to seven distinct rows (see the dedupe test below for the two that collide).
-      expect(await holdingLocations()).toEqual([
-        CHUHUIV_RAION, KHARKIV_RAION, POKROVSK_RAION, SUMY_RAION, CRIMEA, KHARKIV_CITY, LUHANSK
-      ].sort());
-      expect(await activePeriods()).toEqual([
-        CHUHUIV_RAION, KHARKIV_RAION, POKROVSK_RAION, SUMY_RAION, CRIMEA, KHARKIV_CITY, LUHANSK
-      ].sort());
+      // Nine of the capture's thirty-one air-raid labels name a location this database carries, and
+      // since migration 051 they are NINE distinct rows: the two Community labels used to fold into
+      // the raions above them and now stand for themselves.
+      const held = [
+        CHUHUIV_RAION, KHARKIV_RAION, POKROVSK_RAION, SUMY_RAION,
+        VOVCHANSK, LYPTSI, CRIMEA, KHARKIV_CITY, LUHANSK
+      ].sort();
+      expect(await holdingLocations()).toEqual(held);
+      expect(await activePeriods()).toEqual(held);
       expect((await sourceHealth()).health_status).toBe('current');
     });
 
@@ -624,9 +642,10 @@ describe.skipIf(!integrationDatabaseAvailable)('community aerial-alert mirror', 
           WHERE s.source_id=$1 GROUP BY l.type ORDER BY l.type`, [SOURCE]
       );
       // Before this change every row here was `oblast` or `special_city`, because those were the only
-      // labels the feed had. Four raions is the whole point.
+      // labels the feed had. Four raions and two hromadas are the whole point.
       expect(types.rows).toEqual([
-        { type: 'city', n: '1' }, { type: 'oblast', n: '2' }, { type: 'raion', n: '4' }
+        { type: 'city', n: '1' }, { type: 'hromada', n: '2' },
+        { type: 'oblast', n: '2' }, { type: 'raion', n: '4' }
       ]);
     });
 
@@ -636,15 +655,18 @@ describe.skipIf(!integrationDatabaseAvailable)('community aerial-alert mirror', 
       expect(Object.keys(FIXTURE.states)).not.toContain('Автономна Республіка Крим');
     });
 
-    it('resolves a hromada to its raion through the catalogue aliases', async () => {
-      // «Вовчанська територіальна громада» is not a catalogue row — the catalogue is deliberately
-      // three-tier — so it lands on Чугуївський район, which contains it. No District entry for that
-      // raion is present here: the hromada alone raises it.
+    it('raises the hromada itself, not the raion around it', async () => {
+      // Це і є міграція 051. До неї «Вовчанська територіальна громада» була аліасом Чугуївського
+      // району, і тривогу для однієї громади оголошували на весь район — тобто на людей, яких
+      // джерело не називало. Тепер вона піднімає рівно те, що назвав фід.
       rawResponse.body = freshRaw([rawEntry('Вовчанська територіальна громада', 'Community')]);
       await poll();
 
-      expect(await holdingLocations()).toEqual([CHUHUIV_RAION]);
-      expect(await activePeriods()).toEqual([CHUHUIV_RAION]);
+      expect(await holdingLocations()).toEqual([VOVCHANSK]);
+      expect(await activePeriods()).toEqual([VOVCHANSK]);
+      // Район сам по собі не стверджений: на карті він світиться як предок ствердженої громади
+      // (покриття `unmapped`), а не як власний період.
+      expect(await activePeriods()).not.toContain(CHUHUIV_RAION);
     });
 
     it('reports how old the data in the feed was, per feed', async () => {
@@ -672,10 +694,12 @@ describe.skipIf(!integrationDatabaseAvailable)('community aerial-alert mirror', 
       expect(Number(sample![1])).toBeLessThanOrEqual(91);
     });
 
-    it('resolves an ambiguous hromada name to nothing, and says so', async () => {
-      // Донеччина and Дніпропетровщина both have a Покровська hromada, so both raions carry the
-      // alias and `pickLocationMatch` refuses to guess. Silence is the safe outcome: raising the
-      // wrong raion is worse than raising none, and the unresolved report makes the gap visible.
+    it('resolves an ambiguous hromada name to nothing when the feed does not say which oblast', async () => {
+      // Донеччина and Дніпропетровщина both have a Покровська hromada, and this feed publishes the
+      // label with no enclosing region, so `pickLocationMatch` refuses to guess. Silence is the safe
+      // outcome: raising the wrong one is worse than raising none, and the unresolved report makes
+      // the gap visible. The feeds that DO nest their labels under an oblast resolve it — see the
+      // `skog`/`klimenko` block at the end of this file.
       rawResponse.body = freshRaw([
         rawEntry('Покровська територіальна громада', 'Community'),
         rawEntry('Сумський район', 'District')
@@ -703,9 +727,11 @@ describe.skipIf(!integrationDatabaseAvailable)('community aerial-alert mirror', 
   });
 
   describe('dedupe — one location, however many labels name it', () => {
-    it('folds a District and a Community of that District into one row', async () => {
+    it('keeps a District and a Community of that District apart, because they are two places', async () => {
       // Real, and present in the captured payload: Чугуївський район is alight as a District, and
-      // Вовчанська громада — inside it — is alight as a Community. Two labels, one catalogue row.
+      // Вовчанська громада — inside it — is alight as a Community. Until migration 051 the catalogue
+      // had one row for both and the fold collapsed them; now each label raises the row it names,
+      // and the raion's own start time is its own rather than the earlier of two unrelated ones.
       const earlier = new Date(Date.now() - 3_600_000).toISOString();
       const later = new Date(Date.now() - 600_000).toISOString();
       rawResponse.body = freshRaw([
@@ -715,27 +741,52 @@ describe.skipIf(!integrationDatabaseAvailable)('community aerial-alert mirror', 
       await poll();
 
       const rows = await sql<{ location_id: string; provider_started_at: Date }>(
+        `SELECT location_id,provider_started_at FROM alert_source_states WHERE source_id=$1
+          ORDER BY location_id`, [SOURCE]
+      );
+      expect(rows.rows.map((row) => row.location_id)).toEqual(
+        [CHUHUIV_RAION, VOVCHANSK].sort()
+      );
+      const byId = new Map(rows.rows.map((row) => [row.location_id, row.provider_started_at.toISOString()]));
+      expect(byId.get(CHUHUIV_RAION)).toBe(later);
+      expect(byId.get(VOVCHANSK)).toBe(earlier);
+    });
+
+    it('still folds two labels that name the SAME row', async () => {
+      // Фолд не прибрано — він лишається на випадок, коли апстрім друкує один рядок двічі. Тут це
+      // повна й коротка форма тієї самої громади, і найраніший старт має виграти, щоб час початку
+      // періоду не залежав від порядку, у якому фід перелічив мітки.
+      const earlier = new Date(Date.now() - 3_600_000).toISOString();
+      const later = new Date(Date.now() - 600_000).toISOString();
+      rawResponse.body = freshRaw([
+        { ...rawEntry('Вовчанська територіальна громада', 'Community'), activeAlerts: [{ type: 'AIR', lastUpdate: later }] },
+        { ...rawEntry('Вовчанська громада', 'Community'), activeAlerts: [{ type: 'AIR', lastUpdate: earlier }] }
+      ]);
+      await poll();
+
+      const rows = await sql<{ location_id: string; provider_started_at: Date }>(
         `SELECT location_id,provider_started_at FROM alert_source_states WHERE source_id=$1`, [SOURCE]
       );
       expect(rows.rows).toHaveLength(1);
-      expect(rows.rows[0]!.location_id).toBe(CHUHUIV_RAION);
-      // The earlier of the two starts wins, so the period's start does not depend on the order the
-      // upstream happened to list two labels in.
+      expect(rows.rows[0]!.location_id).toBe(VOVCHANSK);
       expect(rows.rows[0]!.provider_started_at.toISOString()).toBe(earlier);
     });
 
-    it('folds two Communities of the same raion', async () => {
+    it('raises two Communities of one raion as two rows', async () => {
       rawResponse.body = freshRaw([
         rawEntry('Вовчанська територіальна громада', 'Community'),
         rawEntry('Печенізька територіальна громада', 'Community')
       ]);
       await poll();
 
-      expect(await holdingLocations()).toEqual([CHUHUIV_RAION]);
+      expect(await holdingLocations()).toEqual(
+        [VOVCHANSK, PECHENIHY].sort()
+      );
+      // І жодного періоду на район: його цілком ніхто не оголошував.
       const periods = await sql<{ n: string }>(
         `SELECT count(*)::text AS n FROM alert_periods WHERE location_id=$1`, [CHUHUIV_RAION]
       );
-      expect(Number(periods.rows[0]!.n)).toBe(1);
+      expect(Number(periods.rows[0]!.n)).toBe(0);
     });
 
     it('keeps a location held when one of the labels naming it is alight', async () => {
@@ -932,7 +983,7 @@ describe.skipIf(!integrationDatabaseAvailable)('community aerial-alert mirror', 
     it('holds every alert when BOTH feeds are refused', async () => {
       await poll();
       const raised = await activePeriods();
-      expect(raised).toHaveLength(7);
+      expect(raised).toHaveLength(9);
 
       rawResponse.body = { ...(freshRaw() as object), cachedat: kyivNow(600) };
       response.body = allQuiet(kyivNow(900));
@@ -958,7 +1009,7 @@ describe.skipIf(!integrationDatabaseAvailable)('community aerial-alert mirror', 
       response = { ok: false, status: 429, body: null };
       await expect(poll()).rejects.toThrow(/Aerial alert mirror 429/);
 
-      expect(await activePeriods()).toHaveLength(7);
+      expect(await activePeriods()).toHaveLength(9);
       expect((await sourceHealth()).health_status).toBe('error');
     });
 
@@ -972,7 +1023,7 @@ describe.skipIf(!integrationDatabaseAvailable)('community aerial-alert mirror', 
       await ageAbsencesPastDebounce();
       await expect(poll()).rejects.toThrow(/stale|granular feed unusable/);
 
-      expect(await activePeriods()).toHaveLength(7);
+      expect(await activePeriods()).toHaveLength(9);
     });
 
     it('recovers at full granularity on the first good raw response', async () => {
@@ -1128,11 +1179,40 @@ describe.skipIf(!integrationDatabaseAvailable)('community aerial-alert mirror', 
       await syncAerialMirrorPair();
 
       expect(fetchCalls).toEqual([SKOG_URL, KLIMENKO_URL]);
-      // Харківський район — з обох фідів; Чугуївський — із громади, як і в `ual`; Сумський — зі skog.
-      expect(await activePeriods()).toEqual([CHUHUIV_RAION, KHARKIV_RAION, LUHANSK, SUMY_RAION].sort());
+      // Харківський і Сумський райони — з фідів; Вовчанська громада — сама собою, а не через
+      // Чугуївський район, який у цьому ж зрізі стоїть `alert: false`.
+      expect(await activePeriods()).toEqual([KHARKIV_RAION, LUHANSK, SUMY_RAION, VOVCHANSK].sort());
+      expect(await activePeriods()).not.toContain(CHUHUIV_RAION);
       // Ось воно: Харківщина й Сумщина стоять у skog `alert: true`, і жодна не стала тривогою.
       expect(await oblastPeriods()).toEqual([LUHANSK]);
       expect((await sourceHealth()).health_status).toBe('current');
+    });
+
+    it('tells two same-named hromadas apart by the oblast the feed nested them under', async () => {
+      // Покровська громада є і на Донеччині, і на Дніпропетровщині, і за назвою вона нерозрізненна —
+      // `ual` публікує мітку голою, і вона не резолвиться взагалі (див. блок вище). `skog` вкладає
+      // її в область, і саме цю відповідь адаптер раніше викидав.
+      rawResponse.body = {
+        source: 'skog', cachedat: kyivNow(1),
+        raw: {
+          1: {
+            name: 'Донецька область', alert: true, changed: kyivNow(300), districts: [],
+            community: [{ name: 'Покровська територіальна громада', alert: true, changed: kyivNow(200) }]
+          }
+        }
+      };
+      stateResponse = {
+        ok: true, status: 200,
+        body: { source: 'alerts.com.ua', cachedat: kyivNow(1), raw: {} }
+      };
+      const { syncAerialMirrorPair } = await import('../../src/services/ingestion.js');
+      await syncAerialMirrorPair();
+
+      expect(await activePeriods()).toEqual([POKROVSK_HROMADA_DONETSK]);
+      // Підказка ЗВУЖУЄ і ніколи не розширює: сусідня однойменна громада не піднята, і район над
+      // нею — теж ні.
+      expect(await activePeriods()).not.toContain(POKROVSK_HROMADA_DNIPRO);
+      expect(await oblastPeriods()).toEqual([]);
     });
 
     it('counts the oblast rollups it refused, so the rule is visible and not merely commented', async () => {

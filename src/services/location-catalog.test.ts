@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { strToU8, zipSync } from 'fflate';
-import { parseKatottgWorkbook, planCatalogImport, raionAliases } from './location-catalog.js';
+import { hromadaAliases, parseKatottgWorkbook, planCatalogImport, raionAliases } from './location-catalog.js';
 
 const DNIPRO_OBLAST = 'UA12000000000090473';
 const DNIPRO_RAION = 'UA12020000000059864';
@@ -88,13 +88,26 @@ describe('raion aliases', () => {
     ]);
   });
 
-  it('folds the hromadas of a raion in as full forms only', () => {
-    const aliases = raionAliases('Харківський', ['Харківська', 'Мереф’янська']);
-    expect(aliases).toContain('харківська територіальна громада');
-    expect(aliases).toContain('мереф’янська громада');
-    // A bare feminine adjective would outrank the "Харківська область" prefix match and steal
-    // oblast-level alerts, so hromadas contribute qualified forms only.
-    expect(aliases).not.toContain('харківська');
+  it('no longer answers for the hromadas inside it', () => {
+    // Until migration 051 these were folded in here. They are rows of their own now, and an alias
+    // left behind on the raion would compete with the hromada's own name for the same text.
+    expect(raionAliases('Харківський')).not.toContain('харківська територіальна громада');
+  });
+});
+
+describe('hromada aliases', () => {
+  it('spells both forms the alert mirrors publish', () => {
+    expect(hromadaAliases('Мереф’янська')).toEqual([
+      'мереф’янська територіальна громада', 'мереф’янська громада'
+    ]);
+  });
+
+  it('never emits the bare adjective, which would shadow the oblast', () => {
+    // `normalizeForCatalogue` strips the «область» affix before matching, so «Харківська область»
+    // reaches the query as exactly `харківська`. A hromada alias spelt that way would be an exact
+    // rank-1 hit against the oblast's rank-2 prefix hit and would take every oblast declaration.
+    expect(hromadaAliases('Харківська').every((alias) => alias.endsWith('громада'))).toBe(true);
+    expect(hromadaAliases('Харківська')).not.toContain('харківська');
   });
 });
 
@@ -109,23 +122,32 @@ describe('catalogue import plan', () => {
       nameUk: 'Мелітопольський район',
       parentCodes: [ZAPORIZHZHIA_OBLAST]
     });
-    expect(melitopol?.aliases).toEqual(expect.arrayContaining([
-      'мелітопольський район', 'мелітопольського району',
-      'мелітопольська територіальна громада', 'веселівська територіальна громада'
-    ]));
-    // Hromadas belong to exactly one raion; the neighbouring oblast must not pick them up.
-    expect(plan.raions.find((raion) => raion.officialCode === DNIPRO_RAION)?.aliases)
-      .not.toContain('веселівська територіальна громада');
+    expect(melitopol?.aliases).toEqual([
+      'мелітопольський', 'мелітопольський район', 'мелітопольського району', 'мелітопольському районі'
+    ]);
   });
 
-  it('prefers the raion as a city parent and keeps the oblast as a fallback', () => {
+  it('gives every hromada a row of its own, under its raion', () => {
+    expect(plan.hromadas).toHaveLength(3);
+    expect(plan.hromadas.find((hromada) => hromada.officialCode === VESELE_HROMADA)).toEqual({
+      id: `katottg-${VESELE_HROMADA.toLocaleLowerCase()}`,
+      nameUk: 'Веселівська територіальна громада',
+      officialCode: VESELE_HROMADA,
+      aliases: ['веселівська територіальна громада', 'веселівська громада'],
+      parentCodes: [MELITOPOL_RAION, ZAPORIZHZHIA_OBLAST]
+    });
+  });
+
+  it('parents a city on its hromada, keeping raion and oblast as fallbacks', () => {
     expect(plan.cities).toHaveLength(2);
+    // The order matters and is not cosmetic: the alert fan-out walks the ancestors of the ALERTED
+    // row, so a city parented on the raion would never hear the alert of the hromada it sits in.
     expect(plan.cities.find((city) => city.officialCode === MELITOPOL_CITY)).toEqual({
       id: `katottg-${MELITOPOL_CITY.toLocaleLowerCase()}`,
       nameUk: 'Мелітополь',
       officialCode: MELITOPOL_CITY,
       aliases: ['мелітополь'],
-      parentCodes: [MELITOPOL_RAION, ZAPORIZHZHIA_OBLAST]
+      parentCodes: [MELITOPOL_HROMADA, MELITOPOL_RAION, ZAPORIZHZHIA_OBLAST]
     });
   });
 
@@ -140,7 +162,7 @@ describe('catalogue import plan', () => {
 
   it('is deterministic, so a re-import addresses the rows the previous run wrote', () => {
     expect(planCatalogImport(parsed)).toEqual(plan);
-    const rows = [...plan.raions, ...plan.cities];
+    const rows = [...plan.raions, ...plan.hromadas, ...plan.cities];
     expect(rows.map((row) => row.id))
       .toEqual(rows.map((row) => `katottg-${row.officialCode.toLocaleLowerCase()}`));
     expect(new Set(rows.map((row) => row.id)).size).toBe(rows.length);

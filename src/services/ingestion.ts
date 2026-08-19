@@ -6,8 +6,8 @@ import { pool } from '../db/pool.js';
 import { parseAlertChannelMessage } from '../domain/alert-parser.js';
 import { classifyMessage, CLASSIFIER_VERSION, isDeEscalation, significanceRejection } from '../domain/classifier.js';
 import {
-  applyDeEscalation, cachedLocationLexemes, ingestThreat, recordClassification,
-  type ClassificationDecision, type ClassificationLogEntry
+  applyDeEscalation, cachedLocationLexemes, ingestThreat, LOCATION_HIERARCHY_MAX_DEPTH,
+  recordClassification, type ClassificationDecision, type ClassificationLogEntry
 } from '../repositories/events.js';
 import {
   AERIAL_MIRROR_SOURCE_ID, AERIAL_MIRROR_STATE_SOURCE_ID, AERIAL_MIRROR_USER_AGENT,
@@ -37,6 +37,12 @@ interface AlarmRecord {
   externalId: string;
   locationKey: string;
   locationName: string;
+  /**
+   * The region the feed filed this row under, when it says so — «Дніпропетровська область» for a
+   * hromada nested beneath it. Used ONLY to break a tie between catalogue rows that spell the same
+   * (see {@link resolveLocationId}); it never widens a match and never invents one.
+   */
+  parentName?: string;
   alertType: string;
   active: boolean;
   startedAt: Date;
@@ -79,6 +85,8 @@ export function normalizeAlarmResponse(body: unknown): { records: AlarmRecord[];
       const locationName = String(alert.locationName ?? alert.regionName ?? alert.region_name
         ?? region.locationName ?? region.regionName ?? region.region_name ?? region.name ?? '');
       if (!locationKey && !locationName) return;
+      const parentNameRaw = alert.parentName ?? alert.parent_name ?? region.parentName ?? region.parent_name;
+      const parentName = typeof parentNameRaw === 'string' && parentNameRaw.trim() ? parentNameRaw.trim() : undefined;
       const rawType = String(alert.alertType ?? alert.type ?? alert.alert_type ?? 'AIR').toUpperCase();
       const status = String(alert.status ?? region.status ?? '').toLowerCase();
       const activeValue = alert.active ?? alert.isActive ?? alert.is_active ?? region.active ?? region.isActive;
@@ -89,6 +97,7 @@ export function normalizeAlarmResponse(body: unknown): { records: AlarmRecord[];
         externalId: String(alert.id ?? `${locationKey || locationName}-${rawType}-${startedAt.toISOString()}-${regionIndex}-${alertIndex}`),
         locationKey,
         locationName,
+        ...(parentName ? { parentName } : {}),
         alertType: alarmTypeMap[rawType] ?? rawType.toLocaleLowerCase(),
         active,
         startedAt
@@ -146,10 +155,18 @@ const LOCATION_MATCH_SQL = `SELECT id,type,
  * Progressively narrower spellings to try for one published location name.
  *
  * The alert channel publishes a city and the hromada around it as a single label —
- * "м. Харків та Харківська територіальна громада" — which matches nothing in the catalogue. The
- * full label is still tried first: if the catalogue ever gains that exact hromada row it wins, and
- * only then does the query fall back to the city inside it. This is a narrowing, not a guess; the
- * refusal-on-ambiguity rule still applies to every candidate individually.
+ * "м. Харків та Харківська територіальна громада" — which matches nothing in the catalogue as
+ * written. The full label is still tried first, in case a feed ever spells a row exactly.
+ *
+ * What follows it is the HROMADA half, then the city half. That order is the whole point of
+ * migration 051: both halves name a real row now, and the hromada is the one the label actually
+ * claims. Resolving to the city would be narrower than what the source said — the alert covers the
+ * hromada, of which the city is one part — and narrowing an official alert is the one direction
+ * this project never takes. The city stays as the fallback for a catalogue that has not imported
+ * the hromada yet, which is exactly what it was before.
+ *
+ * This is a narrowing, not a guess; the refusal-on-ambiguity rule still applies to every candidate
+ * individually.
  */
 export function locationNameCandidates(raw: string): string[] {
   const base = raw.replace(/\s+/gu, ' ').trim().replace(/[.,;:!?]+$/u, '').trim();
@@ -159,8 +176,8 @@ export function locationNameCandidates(raw: string): string[] {
     if (trimmed && !candidates.includes(trimmed)) candidates.push(trimmed);
   };
   push(base);
-  const compound = /^(.+?)\s+та\s+.+територіальн[а-яіїєґ]*\s+громад[а-яіїєґ]*$/iu.exec(base);
-  if (compound) push(compound[1]!);
+  const compound = /^(.+?)\s+та\s+(.+територіальн[а-яіїєґ]*\s+громад[а-яіїєґ]*)$/iu.exec(base);
+  if (compound) { push(compound[2]!); push(compound[1]!); }
   return candidates;
 }
 
@@ -195,6 +212,54 @@ function catalogueLookupForms(candidate: string): string[] {
 export interface LocationQuery {
   locationKey?: string;
   locationName: string;
+  /**
+   * The enclosing region the feed filed this name under, when it says so. Optional, and consulted
+   * only where the name alone is ambiguous — see {@link narrowByParent}.
+   */
+  parentName?: string;
+}
+
+/**
+ * The candidates that lie under `parentName`, when that is the only thing telling them apart.
+ *
+ * ## Why this exists
+ *
+ * Hromada names repeat. Of the 1772 hromadas the catalogue gained in migration 051, 135 share a
+ * name with a hromada in another raion — Калинівська, Миколаївська, Степанівська and so on — and
+ * `pickLocationMatch` refuses a tie rather than guessing, which is the right default and which
+ * would have left those 135 unresolvable forever.
+ *
+ * They are not actually ambiguous in the data, though. `skog` nests communities under the oblast
+ * that holds them and `klimenko` keys its object by oblast name, so every row arrives already
+ * carrying the answer; only 31 of the 135 still collide once the oblast is known. The parser was
+ * throwing that away because `AerialMirrorRegion` had nowhere to put it.
+ *
+ * ## Why it narrows and never widens
+ *
+ * This runs only on a tier `pickLocationMatch` was about to reject, and it can only ever REMOVE
+ * candidates. If the parent does not resolve, or resolves to something that holds none of them, or
+ * still holds more than one, the answer stays "no match" — exactly what it was without the hint. A
+ * hint can therefore turn a refusal into a resolution, and can never turn one row into a different
+ * one.
+ */
+async function narrowByParent(
+  candidates: LocationCandidate[], parentName: string
+): Promise<string | null> {
+  const parentId = await resolveLocationId({ locationName: parentName });
+  if (!parentId) return null;
+  const under = await pool.query<{ id: string }>(
+    `WITH RECURSIVE climb(id, ancestor_id, depth, path) AS (
+         SELECT id, id, 0, ARRAY[id] FROM locations WHERE id = ANY($1::text[])
+       UNION ALL
+         SELECT c.id, parent.id, c.depth+1, c.path||parent.id
+           FROM climb c JOIN locations self ON self.id = c.ancestor_id
+                        JOIN locations parent ON parent.id = self.parent_id
+          WHERE c.depth < ${LOCATION_HIERARCHY_MAX_DEPTH} AND NOT (parent.id = ANY(c.path))
+     )
+     SELECT DISTINCT id FROM climb WHERE ancestor_id = $2`,
+    [candidates.map((candidate) => candidate.id), parentId]
+  );
+  return under.rowCount === 1 ? under.rows[0]!.id : null;
 }
 
 async function resolveLocationId(query: LocationQuery): Promise<string | null> {
@@ -212,6 +277,16 @@ async function resolveLocationId(query: LocationQuery): Promise<string | null> {
       );
       const matched = pickLocationMatch(rows.rows);
       if (matched) return matched;
+      // Only the tier that was rejected is worth narrowing, and only the exact tiers: a prefix hit
+      // is a guess about the text and does not become a better guess for having a parent.
+      if (!query.parentName) continue;
+      for (const rank of [0, 1]) {
+        const tier = rows.rows.filter((row) => Number(row.match_rank) === rank);
+        if (tier.length < 2) continue;
+        const narrowed = await narrowByParent(tier, query.parentName);
+        if (narrowed) return narrowed;
+        break;
+      }
     }
   }
   return null;
@@ -546,9 +621,11 @@ async function persistOfficialAlertSnapshot(sourceId: string, body: unknown): Pr
   const resolved: Array<AlarmRecord & { locationId: string }> = [];
   const unresolved: string[] = [];
   for (const record of normalized.records) {
-    const locationId = await resolveLocationId(
-      { locationKey: record.locationKey, locationName: record.locationName }
-    );
+    const locationId = await resolveLocationId({
+      locationKey: record.locationKey,
+      locationName: record.locationName,
+      ...(record.parentName ? { parentName: record.parentName } : {})
+    });
     if (locationId) resolved.push({ ...record, locationId });
     else unresolved.push(record.locationName || record.locationKey);
   }

@@ -464,6 +464,65 @@ messages arrive only through the reconnect backfill (median ~2 h). Subscribing t
 next-largest latency win available and needs no code. A token for `ALERTS_IN_UA_TOKEN` (7 s floor,
 no cache) is the other.
 
+## The hromada tier (migration 051)
+
+Migration 050 made the granular feed the default; this one gives what it publishes somewhere to
+land. `skog` announces communities — «Марганецька територіальна громада», «Харківська
+територіальна громада» — and until now the catalogue held those names as *aliases of the raion
+around them*. The feed said "hromada" and the system heard "raion": a reader inside Харківська
+громада and a reader in a village forty kilometres out both got «Харківський район», and one of
+them was being warned about somewhere else.
+
+**Measured before the change**, on the live catalogue and the real KATOTTG workbook (07.07.2026):
+
+| | before | after |
+|---|---|---|
+| catalogue rows | 651 | 2423 (+1772 hromadas) |
+| distinct spellings | 4240 | **4240** |
+| classifier index build | 20.2 ms | 23.0 ms |
+| classifier, per message | 0.061 ms | **0.036 ms** |
+| `/api/v1/locations`, gzip | 13 KiB | 42 KiB |
+
+The spelling count is the number that matters: this is a **move, not an addition**. Those 1772 names
+were already in the catalogue as raion aliases, and classification got *faster* because a raion no
+longer carries up to 3532 of them. The public catalogue payload is the one real cost, and it is
+served from one cached Buffer with `max-age=900` and an ETag.
+
+**What changed in behaviour.**
+
+- A Community label raises the hromada, not the raion. The raion gets no period of its own.
+- The map is unchanged in appearance: a hromada has no polygon, so `reachOf()` gives the nearest
+  polygon ancestor coverage `unmapped` — which renders lit, exactly as `direct` does, because there
+  is no finer layer to replace it. Only `partial` (an ancestor *above* an anchored one) renders
+  muted, and a hromada never produces that.
+- Cities are re-parented onto their hromada. This is load-bearing rather than tidy: the alert
+  fan-out walks the ancestors of the *alerted* row, so a city left under the raion would go silent
+  for the alert of the hromada it sits in — the readers standing closest to it.
+- Same-named hromadas are told apart by the oblast the feed nested the label under. 135 of the 1772
+  names repeat; the hint settles 104 of them, and the remaining 31 resolve to nothing, which is the
+  same refusal they got before.
+- Two spellings that used to resolve now do not: «калінінська (територіальна) громада». Джанкойський
+  район holds two hromadas of that name, so neither the name nor the oblast separates them. Both are
+  in occupied Crimea, which the feeds publish as a whole oblast and never by hromada.
+
+**The one-time transition artefact.** A raion that was lit ONLY through a hromada label stops being
+asserted in its own right the moment the re-import lands, so its period closes on the ordinary
+debounce. A subscriber hears the more precise hromada alert first and, about a minute later, an
+«відбій» for the raion. That is a true statement about the raion — nobody declared the whole of it —
+not an early all-clear, but it is worth knowing before the phone rings.
+
+**How the rows get there.** The migration writes no rows. It deletes the `katottg` row from
+`reference_dataset_syncs`, and the scheduler re-imports on the next boot, in ONE transaction that
+inserts the hromadas and strips their aliases off the raions together — so no spelling ever belongs
+to two rows, not even for an instant. If the download fails, the catalogue keeps its previous shape
+and keeps working; the import simply retries.
+
+```bash
+# Did the re-import land, and how many rows of each tier does the catalogue hold?
+psql -c "SELECT status,imported_rows,synced_at FROM reference_dataset_syncs WHERE dataset_id='katottg'"
+psql -c "SELECT type,count(*) FROM locations GROUP BY 1 ORDER BY 1"
+```
+
 ## Publication mode (operator only)
 
 The public presentation can be held back by `PUBLICATION_DELAY_SECONDS` (default 15). The mode lives

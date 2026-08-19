@@ -4,7 +4,7 @@ import { config } from '../config.js';
 import {
   AERIAL_MIRROR_MIN_POLL_SECONDS, ALERTS_IN_UA_MIN_POLL_SECONDS, SLOW_LEG_INTERVAL_SECONDS,
   UKRAINE_ALARM_MIN_POLL_SECONDS, alertLegIntervalMs, escapeLikePattern, ingestionLegs,
-  normalizeAlarmResponse, pickLocationMatch, registerAlertChannelMetrics
+  locationNameCandidates, normalizeAlarmResponse, pickLocationMatch, registerAlertChannelMetrics
 } from './ingestion.js';
 
 describe('official alert normalization', () => {
@@ -23,6 +23,24 @@ describe('official alert normalization', () => {
       region_id: 'ua-53', region_name: 'Полтавська область', alert_type: 'ARTILLERY', status: 'inactive'
     }] });
     expect(result.records[0]).toMatchObject({ locationKey: 'ua-53', alertType: 'artillery', active: false });
+  });
+});
+
+describe('the spellings tried for one published label', () => {
+  it('leaves an ordinary label alone', () => {
+    expect(locationNameCandidates('Харківський район')).toEqual(['Харківський район']);
+    expect(locationNameCandidates('  Полтавська  область.  ')).toEqual(['Полтавська область']);
+  });
+
+  it('reads a compound city-and-hromada label as the hromada first', () => {
+    // Обидві половини тепер називають справжній рядок каталогу. Ширша з них — громада: тривога
+    // накриває її цілком, і звузити офіційну тривогу до міста всередині означало б сказати менше,
+    // ніж сказало джерело. Місто лишається запасним варіантом.
+    expect(locationNameCandidates('м. Харків та Харківська територіальна громада')).toEqual([
+      'м. Харків та Харківська територіальна громада',
+      'Харківська територіальна громада',
+      'м. Харків'
+    ]);
   });
 });
 
@@ -96,6 +114,24 @@ describe('location match resolution', () => {
  * along on the same call — reaches a registry, and that calling the registration twice is safe,
  * because `src/api/server.ts` is not the only place that may ever want a registry.
  */
+describe('the parent hint a feed nests a label under', () => {
+  it('carries the enclosing region from a snapshot body', () => {
+    const result = normalizeAlarmResponse({ states: [
+      { regionName: 'Нікопольська територіальна громада', active: true, parentName: 'Дніпропетровська область' }
+    ] });
+    expect(result.records[0]).toMatchObject({
+      locationName: 'Нікопольська територіальна громада', parentName: 'Дніпропетровська область'
+    });
+  });
+
+  it('omits it rather than carrying an empty string, so the resolver cannot narrow on nothing', () => {
+    const result = normalizeAlarmResponse({ states: [
+      { regionName: 'Полтавський район', active: true, parentName: '   ' }
+    ] });
+    expect(result.records[0]).not.toHaveProperty('parentName');
+  });
+});
+
 describe('metric registration', () => {
   const expected = [
     'threatlens_aerial_mirror_polls_total',
