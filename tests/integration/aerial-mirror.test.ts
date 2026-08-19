@@ -111,14 +111,32 @@ function rawEntry(
 
 interface StubResponse { ok: boolean; status: number; body: unknown }
 
+/**
+ * Поточні значення двох налаштувань, прочитані на кожен запит.
+ *
+ * `useConfig` міняє їх поблочно, а заглушка `fetch` ставиться один раз на всі тести, тож зчитувати
+ * їх наперед означало б маршрутизувати запити за конфігурацією іншого блоку.
+ */
+let readConfig: () => Record<string, unknown>;
+const configuredStateSource = (): string => String(readConfig().AERIAL_MIRROR_STATE_SOURCE ?? '').trim();
+const configuredBaseUrl = (): string => String(readConfig().AERIAL_MIRROR_URL ?? MIRROR_URL);
+
 /** The bare URL's answer — the aggregated oblast feed. */
 let response: StubResponse;
-/** The `?source=ual&raw` answer. */
+/** The `?source=<granular>&raw` answer. */
 let rawResponse: StubResponse;
+/** The `?source=<declaration>&raw` answer — the second mirror source (migration 050). */
+let stateResponse: StubResponse;
 
 async function poll(): Promise<void> {
   const { syncAerialMirror } = await import('../../src/services/ingestion.js');
   await syncAerialMirror();
+}
+
+/** URL фіда оголошень за поточним налаштуванням, або порожній рядок, коли він вимкнений. */
+function stateFeedUrl(): string {
+  const state = configuredStateSource();
+  return state ? `${configuredBaseUrl()}?source=${state}&raw=` : '';
 }
 
 async function activePeriods(): Promise<string[]> {
@@ -149,6 +167,15 @@ async function ageAbsencesPastDebounce(): Promise<void> {
     `UPDATE alert_source_states SET missing_since=now()-interval '1 hour'
      WHERE missing_since IS NOT NULL AND source_id=$1`, [SOURCE]
   );
+}
+
+/** Активні періоди рівня області — те, що ця зміна має тримати незмінним. */
+async function oblastPeriods(): Promise<string[]> {
+  const rows = await sql<{ location_id: string }>(
+    `SELECT p.location_id FROM alert_periods p JOIN locations l ON l.id=p.location_id
+      WHERE p.status='active' AND l.type IN ('oblast','special_city') ORDER BY p.location_id`
+  );
+  return rows.rows.map((row) => row.location_id);
 }
 
 async function withConfig<T>(overrides: Record<string, unknown>, body: () => Promise<T>): Promise<T> {
@@ -220,18 +247,32 @@ describe.skipIf(!integrationDatabaseAvailable)('community aerial-alert mirror', 
 
   // Zero gap between the two requests: the sequencing is asserted by one test that sets a real
   // value, and every other test would only be paying for it.
-  useConfig({ AERIAL_MIRROR_REQUEST_GAP_MS: 0 });
+  //
+  // `ual` і порожній фід оголошень — не типова конфігурація, а та, для якої цей файл написаний.
+  // Типовою з міграції 050 є пара `skog` + `klimenko`, і в неї свій блок наприкінці файлу; усе, що
+  // тут, описує поведінку ОДНОГО фіда деталізації, і вона не залежить від того, який саме це фід.
+  useConfig({
+    AERIAL_MIRROR_REQUEST_GAP_MS: 0,
+    AERIAL_MIRROR_RAW_SOURCE: 'ual',
+    AERIAL_MIRROR_STATE_SOURCE: ''
+  });
 
   beforeEach(async () => {
     await resetDatabase();
     await seedRaions();
+    const { config } = await import('../../src/config.js');
+    readConfig = () => config as unknown as Record<string, unknown>;
     fetchCalls = [];
     response = { ok: true, status: 200, body: fresh() };
     rawResponse = { ok: true, status: 200, body: freshRaw() };
+    stateResponse = { ok: true, status: 200, body: { source: 'alerts.com.ua', cachedat: kyivNow(1), raw: {} } };
     vi.stubGlobal('fetch', async (input: unknown) => {
       const url = String(input);
       fetchCalls.push(url);
-      const chosen = url.includes('raw') ? rawResponse : response;
+      // Маршрут за НАЛАШТУВАННЯМ, а не за підрядком: той самий апстрім може бути і фідом деталізації,
+      // і фідом оголошень, і тест, який плутає їх за назвою в URL, перевіряв би не те, що думає.
+      const chosen = stateFeedUrl() && url === stateFeedUrl() ? stateResponse
+        : url.includes('raw') ? rawResponse : response;
       return { ok: chosen.ok, status: chosen.status, json: async () => chosen.body };
     });
   });
@@ -255,14 +296,18 @@ describe.skipIf(!integrationDatabaseAvailable)('community aerial-alert mirror', 
       });
     });
 
-    it('shares its independence group with no other source', async () => {
+    it('shares its independence group with the second mirror feed and with nothing else', async () => {
       // The point of the group. `?source=default` may be serving Alerts.in.ua or Ukraine Alarm on
       // any given poll, so pooling it with `official-civil-alerts` would let one upstream
       // corroborate itself.
+      //
+      // Міграція 050 додала другий рядок того самого дзеркала — фід оголошень рівня області — і він
+      // НАВМИСНО в тій самій групі: це той самий хост і той самий республікатор, тож два фіди не є
+      // двома незалежними підтвердженнями й не мають ними прикидатися ніде, де рахується незалежність.
       const rows = await sql<{ id: string }>(
-        `SELECT id FROM sources WHERE independence_group='community-alert-mirror'`
+        `SELECT id FROM sources WHERE independence_group='community-alert-mirror' ORDER BY id`
       );
-      expect(rows.rows.map((row) => row.id)).toEqual([SOURCE]);
+      expect(rows.rows.map((row) => row.id)).toEqual([SOURCE, 'aerial-alerts-mirror-state']);
     });
   });
 
@@ -616,7 +661,7 @@ describe.skipIf(!integrationDatabaseAvailable)('community aerial-alert mirror', 
       registerPublicationMetrics(registry);
       const text = await registry.metrics();
       const sample = new RegExp(
-        `threatlens_source_cache_age_seconds\\{source="${SOURCE}",feed="raw"\\} (\\d+)`
+        `threatlens_source_cache_age_seconds\\{source="${SOURCE}",feed="granular"\\} (\\d+)`
       ).exec(text);
       expect(sample).not.toBeNull();
       // Не рівність: `cachedat` друкується з точністю до секунди, тож між ним і `now` завжди є
@@ -775,53 +820,68 @@ describe.skipIf(!integrationDatabaseAvailable)('community aerial-alert mirror', 
       expect(await activePeriods()).toEqual([]);
     });
 
-    it('falls back to the aggregated feed when the raw list is empty but the country is not', async () => {
-      // The dangerous case. `cachedat` is fresh, the envelope is intact, `raw` is `[]` — and seven
-      // oblasts are alight according to the other upstream. Believing the empty list would publish
-      // «Офіційний відбій» for every raion this source holds.
+    it('holds, and asserts nothing, when the granular list is empty but the country is not', async () => {
+      // The dangerous case. `cachedat` is fresh, the envelope is intact, the granular list is empty —
+      // and seven oblasts are alight according to the other upstream. Believing the empty list would
+      // publish «Офіційний відбій» for every raion this source holds.
+      //
+      // Що змінилося з міграцією 050. Раніше тут відбувався відкат на агрегований фід — і саме він
+      // оголошував області, яких влада не оголошувала: агрегований фід світить область, коли
+      // світиться будь-яка її частина. Виміряно на бойових даних: 10 % опитувань падали сюди, і за
+      // тиждень із цього вийшло 212 обласних періодів, зокрема 32 по Харківщині. Тепер знімок не
+      // пишеться зовсім: те, що джерело тримало, лишається на місці, і жодна область не зʼявляється.
+      await poll();
+      const held = await holdingLocations();
+      expect(held).toContain(CHUHUIV_RAION);
+
       rawResponse.body = freshRaw([]);
       response.body = fresh();
+      fetchCalls = [];
       const warnings: Array<Record<string, unknown>> = [];
       const { syncAerialMirror } = await import('../../src/services/ingestion.js');
-      await syncAerialMirror({ warn: (fields: Record<string, unknown>) => warnings.push(fields) });
+      await expect(syncAerialMirror({ warn: (fields: Record<string, unknown>) => warnings.push(fields) }))
+        .rejects.toThrow(/granular feed unusable/);
 
+      // Свідка все одно питали — саме він відрізняє «тиха країна» від «фід зламався».
       expect(fetchCalls).toEqual([RAW_URL, MIRROR_URL]);
-      // Oblast granularity for this poll — degraded, and far better than a wrong all-clear.
-      expect(await holdingLocations()).toEqual(
-        ['ua-12', DONETSK, 'ua-23', LUHANSK, SUMY, 'ua-63', 'ua-74'].sort()
-      );
-      // Falling back is the adapter working, not failing: the source stays healthy and the operator
-      // is told through the log and `threatlens_aerial_mirror_polls_total{mode="unified_fallback"}`.
-      expect((await sourceHealth()).health_status).toBe('current');
+      // Нічого не оголошено, нічого не знято: стан рівно той, що був.
+      expect(await holdingLocations()).toEqual(held);
+      expect(await activePeriods()).toEqual(held);
+      expect((await sourceHealth()).health_status).toBe('error');
       expect(warnings).toHaveLength(1);
-      expect(warnings[0]).toMatchObject({ sourceId: SOURCE, upstream: 'ual', unifiedActive: 7 });
-      expect(String(warnings[0]!.reason)).toMatch(/no air-raid region while the aggregated feed reports 7/);
+      expect(warnings[0]).toMatchObject({ sourceId: SOURCE, upstream: 'ual', witnessActive: 7 });
+      expect(String(warnings[0]!.reason)).toMatch(/no air-raid region while the aggregated witness reports 7/);
+      // Жодної НОВОЇ області. Дві, що є, — Луганщина й Крим — оголошені самим фідом як цілі області
+      // (State), і саме тому лишаються; сім, які показує агрегований свідок, не зʼявляються ніде.
+      expect(await oblastPeriods()).toEqual([CRIMEA, LUHANSK].sort());
     });
 
-    it('treats a raw list of only non-air declarations exactly like an empty one', async () => {
+    it('treats a granular list of only non-air declarations exactly like an empty one', async () => {
       // Also "nothing alight" as far as this source is concerned, and it gets the same cross-check
       // rather than being believed on its own.
       rawResponse.body = freshRaw([rawEntry('Вовчанська територіальна громада', 'Community', ['ARTILLERY'])]);
       response.body = fresh();
-      await poll();
+      await expect(poll()).rejects.toThrow(/granular feed unusable/);
 
       expect(fetchCalls).toEqual([RAW_URL, MIRROR_URL]);
-      expect(await holdingLocations()).toContain(SUMY);
+      expect(await holdingLocations()).toEqual([]);
     });
 
-    it('never treats an unreadable raw body as quiet, cross-check or not', async () => {
-      // A reshaped upstream is not an empty one. This goes down the fallback path because the raw
-      // feed is unusable, not because it reported peace — and if the aggregated feed says the country
-      // is quiet, the fallback still applies THAT, from a feed that was actually read.
+    it('never treats an unreadable granular body as quiet, cross-check or not', async () => {
+      // A reshaped upstream is not an empty one, and it is not a reason to fall to oblast rows
+      // either: the poll ends with the state this source already held.
       await poll();
+      const held = await holdingLocations();
       rawResponse.body = { source: 'ukrainealarm.com API', cachedat: kyivNow(1), raw: [{ nope: 1 }] };
       response.body = fresh();
       fetchCalls = [];
-      await poll();
+      await expect(poll()).rejects.toThrow(/granular feed unusable/);
 
+      // Свідка питають і тут: «нечитабельне тіло» і «порожній список» відрізняються лише причиною,
+      // а рішення в обох випадках одне — не писати нічого.
       expect(fetchCalls).toEqual([RAW_URL, MIRROR_URL]);
-      expect(await holdingLocations()).toContain(SUMY);
-      expect((await sourceHealth()).health_status).toBe('current');
+      expect(await holdingLocations()).toEqual(held);
+      expect((await sourceHealth()).health_status).toBe('error');
     });
   });
 
@@ -831,27 +891,34 @@ describe.skipIf(!integrationDatabaseAvailable)('community aerial-alert mirror', 
       ['a body that is not the passthrough shape', () => fresh()],
       ['a raw list that is not an array', () => ({ source: 'x', cachedat: kyivNow(1), raw: 'nope' })],
       ['null', () => null]
-    ])('falls back to the aggregated feed when the raw feed answers with %s', async (_label, body) => {
+    ])('holds what it had when the granular feed answers with %s', async (_label, body) => {
+      // Кожен із цих чотирьох випадків раніше закінчувався обласним знімком з агрегованого фіда.
+      // Тепер — нічим: джерело йде в `error`, а те, що воно тримало, лишається на місці. Це та сама
+      // асиметрія, що й у решті цього файлу: краще тримати зайве, ніж оголосити те, чого не було.
+      await poll();
+      const held = await holdingLocations();
       rawResponse.body = body();
       response.body = fresh();
-      await poll();
+      fetchCalls = [];
+      await expect(poll()).rejects.toThrow(/granular feed unusable/);
 
-      expect(fetchCalls).toEqual([RAW_URL, MIRROR_URL]);
-      expect(await holdingLocations()).toContain(SUMY);
-      expect((await sourceHealth()).health_status).toBe('current');
+      expect(await holdingLocations()).toEqual(held);
+      expect((await sourceHealth()).health_status).toBe('error');
+      // Жодної НОВОЇ області: сім, що світить агрегований свідок, не стають тривогами.
+      expect(await oblastPeriods()).toEqual([CRIMEA, LUHANSK].sort());
     });
 
-    it('falls back when the raw feed is rate limited', async () => {
-      // 429 on the passthrough only. Two requests per second per host is the published limit and the
-      // scheduler polls every fifteen, so this means the egress IP is shared — the aggregated feed is
-      // usually still answering, and one oblast-granularity poll beats a source error.
+    it('holds when the granular feed is rate limited', async () => {
+      // 429 on the passthrough only. Полита секунда чужого IP — це не привід оголосити область:
+      // інші джерела (фід оголошень, канали ОВА) не зачеплені, а це джерело просто мовчить.
+      await poll();
+      const held = await holdingLocations();
       rawResponse = { ok: false, status: 429, body: null };
       response.body = fresh();
-      await poll();
+      await expect(poll()).rejects.toThrow(/granular feed unusable: Aerial alert mirror 429/);
 
-      expect(fetchCalls).toEqual([RAW_URL, MIRROR_URL]);
-      expect(await holdingLocations()).toContain(SUMY);
-      expect((await sourceHealth()).health_status).toBe('current');
+      expect(await holdingLocations()).toEqual(held);
+      expect((await sourceHealth()).health_status).toBe('error');
     });
 
     /**
@@ -869,7 +936,7 @@ describe.skipIf(!integrationDatabaseAvailable)('community aerial-alert mirror', 
 
       rawResponse.body = { ...(freshRaw() as object), cachedat: kyivNow(600) };
       response.body = allQuiet(kyivNow(900));
-      await expect(poll()).rejects.toThrow(/stale/);
+      await expect(poll()).rejects.toThrow(/stale|granular feed unusable/);
 
       expect(await activePeriods()).toEqual(raised);
       expect(await holdingLocations()).toEqual(raised);
@@ -900,10 +967,10 @@ describe.skipIf(!integrationDatabaseAvailable)('community aerial-alert mirror', 
       rawResponse.body = { ...(freshRaw() as object), cachedat: kyivNow(3600) };
       response.body = allQuiet(kyivNow(3600));
       for (let attempt = 0; attempt < 5; attempt += 1) {
-        await expect(poll()).rejects.toThrow(/stale/);
+        await expect(poll()).rejects.toThrow(/stale|granular feed unusable/);
       }
       await ageAbsencesPastDebounce();
-      await expect(poll()).rejects.toThrow(/stale/);
+      await expect(poll()).rejects.toThrow(/stale|granular feed unusable/);
 
       expect(await activePeriods()).toHaveLength(7);
     });
@@ -911,7 +978,7 @@ describe.skipIf(!integrationDatabaseAvailable)('community aerial-alert mirror', 
     it('recovers at full granularity on the first good raw response', async () => {
       rawResponse.body = { ...(freshRaw() as object), cachedat: kyivNow(900) };
       response.body = allQuiet(kyivNow(900));
-      await expect(poll()).rejects.toThrow(/stale/);
+      await expect(poll()).rejects.toThrow(/stale|granular feed unusable/);
       expect((await sourceHealth()).health_status).toBe('error');
 
       rawResponse.body = freshRaw();
@@ -946,7 +1013,8 @@ describe.skipIf(!integrationDatabaseAvailable)('community aerial-alert mirror', 
 
       rawResponse.body = freshRaw([]);
       response.body = fresh();
-      await withConfig({ AERIAL_MIRROR_REQUEST_GAP_MS: 120 }, poll);
+      await withConfig({ AERIAL_MIRROR_REQUEST_GAP_MS: 120 },
+        () => poll().catch(() => undefined));
 
       expect(fetchCalls).toEqual([RAW_URL, MIRROR_URL]);
       expect(concurrent).toBe(1);
@@ -967,8 +1035,22 @@ describe.skipIf(!integrationDatabaseAvailable)('community aerial-alert mirror', 
       ]);
     });
 
-    it('honours a configured upstream', async () => {
+    it('honours a configured upstream, and reads it with THAT feed’s parser', async () => {
+      // Раніше апстрім був лише рядком у URL, а тіло розбирали одним парсером. Тепер у кожного фіда
+      // свій, тож конфігурація «читай klimenko» означає й «розбирай як klimenko»: тіло `ual` тут
+      // відхиляється, і це правильно — воно іншої форми.
       rawResponse.body = freshRaw([rawEntry('Сумський район', 'District')]);
+      await withConfig({ AERIAL_MIRROR_RAW_SOURCE: 'klimenko' },
+        () => expect(poll()).rejects.toThrow(/klimenko response carries no .raw. object/));
+      expect(fetchCalls).toEqual([`${MIRROR_URL}?source=klimenko&raw=`, MIRROR_URL]);
+
+      fetchCalls = [];
+      rawResponse.body = {
+        source: 'alerts.com.ua', cachedat: kyivNow(1),
+        raw: { 'Сумська область': { enabled: false, 'type:': 'state', districts: {
+          'Сумський район': { enabled: true, type: 'district', enabled_at: '2026-08-19T11:30:20+00:00' }
+        } } }
+      };
       await withConfig({ AERIAL_MIRROR_RAW_SOURCE: 'klimenko' }, poll);
       expect(fetchCalls).toEqual([`${MIRROR_URL}?source=klimenko&raw=`]);
       expect(await holdingLocations()).toEqual([SUMY_RAION]);
@@ -978,6 +1060,152 @@ describe.skipIf(!integrationDatabaseAvailable)('community aerial-alert mirror', 
       await withConfig({ AERIAL_MIRROR_ENABLED: false }, poll);
       expect(fetchCalls).toEqual([]);
       expect(await activePeriods()).toEqual([]);
+    });
+  });
+
+  // ============================================================================================
+  // Типова конфігурація з міграції 050: два фіди, і жодної обласної згортки
+  // ============================================================================================
+
+  /**
+   * Що саме тут пінять, і чому це два фіди, а не один.
+   *
+   * `skog` свіжий (кеш ~11 с проти 121 с у `ual`) і має райони з громадами — але його прапорець
+   * рівня області є ЗГОРТКОЮ: він світить область, якщо світиться будь-яка її частина. `klimenko`
+   * так само свіжий і вмикає область лише тоді, коли її оголосили цілою, але не має громад. Тому
+   * деталізація береться з першого, оголошення області — з другого, і кожен пише СВОЄ джерело:
+   * знімок гасить усе, чого в ньому немає, тож збій одного не має гасити те, що тримає другий.
+   */
+  describe('the default pair: skog for granularity, klimenko for oblast declarations', () => {
+    useConfig({ AERIAL_MIRROR_RAW_SOURCE: 'skog', AERIAL_MIRROR_STATE_SOURCE: 'klimenko' });
+
+    const SKOG_URL = `${MIRROR_URL}?source=skog&raw=`;
+    const KLIMENKO_URL = `${MIRROR_URL}?source=klimenko&raw=`;
+    const STATE_SOURCE = 'aerial-alerts-mirror-state';
+
+    /** Харківщина: область світиться згорткою, під нею — два райони й громада. */
+    function skogBody(): unknown {
+      return {
+        source: 'skog', cachedat: kyivNow(1),
+        raw: {
+          1: {
+            name: 'Харківська область', alert: true, changed: kyivNow(300),
+            districts: [
+              { name: 'Харківський район', alert: true, changed: kyivNow(300) },
+              { name: 'Чугуївський район', alert: false, changed: kyivNow(3600) }
+            ],
+            community: [{ name: 'Вовчанська територіальна громада', alert: true, changed: kyivNow(200) }]
+          },
+          2: {
+            name: 'Сумська область', alert: true, changed: kyivNow(120),
+            districts: [{ name: 'Сумський район', alert: true, changed: kyivNow(120) }],
+            community: []
+          }
+        }
+      };
+    }
+
+    /** Луганщина оголошена цілою; Харківщина — ні, попри ввімкнений район. */
+    function klimenkoBody(): unknown {
+      return {
+        source: 'alerts.com.ua', cachedat: kyivNow(1),
+        raw: {
+          'Луганська область': { enabled: true, 'type:': 'state', enabled_at: '2022-04-04T16:45:39+00:00', districts: [] },
+          'Харківська область': { enabled: false, 'type:': 'state', districts: {
+            'Харківський район': { enabled: true, type: 'district', enabled_at: '2026-08-19T11:28:16+00:00' }
+          } }
+        }
+      };
+    }
+
+    beforeEach(() => {
+      rawResponse.body = skogBody();
+      stateResponse = { ok: true, status: 200, body: klimenkoBody() };
+    });
+
+    it('raises the raions and hromadas, and never the oblast the rollup feed lit', async () => {
+      const { syncAerialMirrorPair } = await import('../../src/services/ingestion.js');
+      await syncAerialMirrorPair();
+
+      expect(fetchCalls).toEqual([SKOG_URL, KLIMENKO_URL]);
+      // Харківський район — з обох фідів; Чугуївський — із громади, як і в `ual`; Сумський — зі skog.
+      expect(await activePeriods()).toEqual([CHUHUIV_RAION, KHARKIV_RAION, LUHANSK, SUMY_RAION].sort());
+      // Ось воно: Харківщина й Сумщина стоять у skog `alert: true`, і жодна не стала тривогою.
+      expect(await oblastPeriods()).toEqual([LUHANSK]);
+      expect((await sourceHealth()).health_status).toBe('current');
+    });
+
+    it('counts the oblast rollups it refused, so the rule is visible and not merely commented', async () => {
+      const { syncAerialMirrorPair } = await import('../../src/services/ingestion.js');
+      const { registerAlertChannelMetrics } = await import('../../src/services/ingestion.js');
+      await syncAerialMirrorPair();
+
+      const registry = new Registry();
+      registerAlertChannelMetrics(registry);
+      const text = await registry.metrics();
+      expect(text).toMatch(/threatlens_aerial_mirror_dropped_rollup_oblasts 2/);
+    });
+
+    it('keeps the two feeds in two sources, so one failing cannot clear the other', async () => {
+      const { syncAerialMirrorPair } = await import('../../src/services/ingestion.js');
+      await syncAerialMirrorPair();
+      const before = await activePeriods();
+
+      // Фід деталізації ламається; фід оголошень відповідає як завжди.
+      rawResponse.body = { source: 'skog', cachedat: kyivNow(1), raw: 'nope' };
+      response.body = fresh();
+      await expect(syncAerialMirrorPair()).rejects.toThrow(/granular feed unusable/);
+
+      expect(await activePeriods()).toEqual(before);
+      const health = await sql<{ id: string; health_status: string }>(
+        `SELECT id,health_status FROM sources WHERE id = ANY($1::text[]) ORDER BY id`,
+        [[SOURCE, STATE_SOURCE]]
+      );
+      expect(health.rows).toEqual([
+        { id: SOURCE, health_status: 'error' },
+        { id: STATE_SOURCE, health_status: 'current' }
+      ]);
+    });
+
+    it('lets the declaration feed raise a whole oblast, which is the half the rollup feed cannot say', async () => {
+      const { syncAerialMirrorPair } = await import('../../src/services/ingestion.js');
+      await syncAerialMirrorPair();
+      expect(await oblastPeriods()).toEqual([LUHANSK]);
+
+      // Харківщину оголосили цілою — і ось тепер вона тривога, бо так сказав фід оголошень.
+      stateResponse.body = {
+        source: 'alerts.com.ua', cachedat: kyivNow(1),
+        raw: {
+          'Луганська область': { enabled: true, 'type:': 'state', enabled_at: '2022-04-04T16:45:39+00:00', districts: [] },
+          'Харківська область': { enabled: true, 'type:': 'state', enabled_at: '2026-08-19T12:00:00+00:00', districts: {} }
+        }
+      };
+      await syncAerialMirrorPair();
+      expect(await oblastPeriods()).toEqual([LUHANSK, 'ua-63'].sort());
+    });
+
+    it('spaces the two feeds instead of firing them together', async () => {
+      let inFlight = 0;
+      let concurrent = 0;
+      const startedAt: number[] = [];
+      vi.stubGlobal('fetch', async (input: unknown) => {
+        const url = String(input);
+        fetchCalls.push(url);
+        startedAt.push(Date.now());
+        inFlight += 1;
+        concurrent = Math.max(concurrent, inFlight);
+        await new Promise((resolve) => setTimeout(resolve, 5));
+        inFlight -= 1;
+        const chosen = url.includes('klimenko') ? stateResponse : url.includes('raw') ? rawResponse : response;
+        return { ok: chosen.ok, status: chosen.status, json: async () => chosen.body };
+      });
+
+      const { syncAerialMirrorPair } = await import('../../src/services/ingestion.js');
+      await withConfig({ AERIAL_MIRROR_REQUEST_GAP_MS: 120 }, () => syncAerialMirrorPair());
+
+      expect(fetchCalls).toEqual([SKOG_URL, KLIMENKO_URL]);
+      expect(concurrent).toBe(1);
+      expect(startedAt[1]! - startedAt[0]!).toBeGreaterThanOrEqual(120);
     });
   });
 });

@@ -403,6 +403,67 @@ histogram_quantile(0.95, sum by (le, source) (rate(threatlens_alert_propagation_
 threatlens_ingestion_leg_interval_seconds >= 120
 ```
 
+## Alert granularity and speed (migration 050)
+
+Two things changed on 19.08.2026, and they share one root: the mirror feed that carried raion and
+hromada detail was also the slowest one, and every time it failed the adapter fell back to a feed
+that only knows oblasts.
+
+**Measured before the change.** 22 reads of each mirror feed, 10 s apart, against the live endpoint:
+
+| feed | own cache refresh | granularity |
+|---|---|---|
+| `?source=ual&raw` | **exactly 121 s** (17:09:08 → 17:11:09 → 17:13:09) | State + District + Community |
+| `?source=skog&raw` | ~11 s | State (**rollup**) + District + Community |
+| `?source=klimenko&raw` | ~11 s | State (declaration) + District |
+| aggregated (`states`) | ~11 s | 25 oblast rows, `alertnow` is a **rollup** |
+
+and on the production database: 212 oblast alert periods in seven days — 32 Kharkiv, 27 Mykolaiv,
+23 Kherson — while no feed ever showed those oblasts declared whole. They came from the automatic
+fallback, which fired on **10 % of polls** (94 of 917 in 75 minutes) because the `ual` body kept
+arriving truncated.
+
+**What runs now.** One leg, two sequenced requests, two sources:
+
+- `aerial-alerts-mirror` reads `AERIAL_MIRROR_RAW_SOURCE` (default `skog`) for **raions and
+  hromadas**. Its oblast layer is a rollup and is dropped by the parser; `toAlarmSnapshotBody`
+  refuses to build a body that carries one, so the rule survives a future edit.
+- `aerial-alerts-mirror-state` reads `AERIAL_MIRROR_STATE_SOURCE` (default `klimenko`) for
+  **whole-oblast declarations** — the three that are genuinely declared (Луганщина, Крим,
+  Севастополь) rather than the ten a rollup lights up.
+- The aggregated feed is now only the witness in the quiet-versus-broken rule. It asserts nothing.
+
+**When the detailed feed cannot be read, this source now asserts nothing at all** — no oblast
+fallback. The previous state stands until the debounce or another source moves it, the source goes
+`error`, and the poll is counted as `granular_unusable_held` / `granular_disputed_held`. Holding an
+alert too long is the safe direction; announcing an oblast the authority never declared is not.
+
+```bash
+# Which feed supplied the last snapshots, and how much the detail costs in staleness.
+curl -fsS -H "Authorization: Bearer $METRICS_TOKEN" localhost:3000/metrics |
+  grep -E 'threatlens_aerial_mirror_(polls_total|raw_regions|dropped_rollup_oblasts)|threatlens_source_cache_age_seconds'
+```
+
+Reading it:
+
+- **`threatlens_aerial_mirror_dropped_rollup_oblasts` is not an error and must not be zero on a busy
+  night.** It counts the oblasts the granular feed lit as a rollup and this adapter refused — i.e.
+  exactly the «тривога в X області» messages that are no longer sent.
+- **`granular_*_held` above zero means the mirror is flaky, not that alerts were lost.** The
+  measured truncation rate of that endpoint is 9–18 % on every feed, independent of our poll rate.
+- **An oblast period still appears** when the declaration feed says the oblast itself is declared.
+  That is the authority speaking, and it is the only path left to an oblast-wide announcement.
+- **`AERIAL_MIRROR_RAW_SOURCE=''` is still the documented retreat** — aggregated, oblast-only, one
+  request per poll — and in that mode the operator has explicitly accepted rollups. It is off by
+  default and should stay that way while any granular feed answers.
+
+**What is still slow, and is not code.** The alert Telegram channels reach us with p50 2.5 s versus
+~10 s for the mirror, but the collector account is not subscribed to them, so 92–99 % of their
+messages arrive only through the reconnect backfill (median ~2 h). Subscribing the account to
+`@air_alert_ua`, `@khersonskaODA`, `@kherson_miskrada`, `@VinnytsiaODA`, `@oda_rv`, `@slv_vca` is the
+next-largest latency win available and needs no code. A token for `ALERTS_IN_UA_TOKEN` (7 s floor,
+no cache) is the other.
+
 ## Publication mode (operator only)
 
 The public presentation can be held back by `PUBLICATION_DELAY_SECONDS` (default 15). The mode lives

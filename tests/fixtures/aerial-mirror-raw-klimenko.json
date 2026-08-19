@@ -1,0 +1,128 @@
+{
+ "source": "Vadym Klymenko API",
+ "cachedat": "2026-08-19 17:08:53",
+ "raw": {
+  "АР Крим": {
+   "enabled": true,
+   "type:": "state",
+   "districts": [],
+   "enabled_at": "2022-12-10T22:22:00+00:00",
+   "disabled_at": null
+  },
+  "Севастополь'": {
+   "enabled": true,
+   "type:": "state",
+   "districts": [],
+   "enabled_at": "2022-12-10T22:22:00+00:00",
+   "disabled_at": null
+  },
+  "Луганська область": {
+   "enabled": true,
+   "type:": "state",
+   "districts": {
+    "Старобільський район": {
+     "enabled": false,
+     "type": "district",
+     "enabled_at": null,
+     "disabled_at": null
+    },
+    "Сватівський район": {
+     "enabled": false,
+     "type": "district",
+     "enabled_at": null,
+     "disabled_at": null
+    },
+    "Сєвєродонецький район": {
+     "enabled": false,
+     "type": "district",
+     "enabled_at": null,
+     "disabled_at": null
+    },
+    "Щастинський район": {
+     "enabled": false,
+     "type": "district",
+     "enabled_at": null,
+     "disabled_at": null
+    }
+   },
+   "enabled_at": "2022-04-04T16:45:39+00:00",
+   "disabled_at": null
+  },
+  "Тернопільська область": {
+   "enabled": false,
+   "type:": "state",
+   "districts": {
+    "Тернопільський район": {
+     "enabled": false,
+     "type": "district",
+     "enabled_at": null,
+     "disabled_at": null
+    },
+    "Чортківський район": {
+     "enabled": false,
+     "type": "district",
+     "enabled_at": null,
+     "disabled_at": null
+    },
+    "Кременецький район": {
+     "enabled": false,
+     "type": "district",
+     "enabled_at": null,
+     "disabled_at": null
+    }
+   },
+   "enabled_at": null,
+   "disabled_at": null
+  },
+  "Харківська область": {
+   "enabled": false,
+   "type:": "state",
+   "districts": {
+    "Ізюмський район": {
+     "enabled": true,
+     "type": "district",
+     "enabled_at": "2026-08-19T11:30:20+00:00",
+     "disabled_at": null
+    },
+    "Харківський район": {
+     "enabled": true,
+     "type": "district",
+     "enabled_at": "2026-08-19T11:28:16+00:00",
+     "disabled_at": null
+    },
+    "Лозівський район": {
+     "enabled": false,
+     "type": "district",
+     "enabled_at": null,
+     "disabled_at": null
+    },
+    "Богодухівський район": {
+     "enabled": true,
+     "type": "district",
+     "enabled_at": "2026-08-19T14:08:29+00:00",
+     "disabled_at": null
+    },
+    "Куп'янський район": {
+     "enabled": true,
+     "type": "district",
+     "enabled_at": "2026-08-19T11:09:01+00:00",
+     "disabled_at": null
+    },
+    "Чугуївський район": {
+     "enabled": true,
+     "type": "district",
+     "enabled_at": "2026-08-19T13:00:05.999Z",
+     "disabled_at": null
+    },
+    "Берестинський район": {
+     "enabled": false,
+     "type": "district",
+     "enabled_at": null,
+     "disabled_at": null
+    }
+   },
+   "enabled_at": null,
+   "disabled_at": null
+  }
+ }
+}

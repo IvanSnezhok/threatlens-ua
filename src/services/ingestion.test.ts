@@ -117,7 +117,10 @@ describe('metric registration', () => {
     'threatlens_ingestion_leg_runs_total',
     'threatlens_ingestion_leg_interval_seconds',
     'threatlens_ingestion_leg_duration_seconds',
-    'threatlens_alert_pokes_total'
+    'threatlens_alert_pokes_total',
+    // Скільки обласних «тривог», яких влада не оголошувала, адаптер відкинув на останньому опитуванні
+    // (міграція 050). Нуль тут — не мета: на ніч із районними тривогами це кілька одиниць.
+    'threatlens_aerial_mirror_dropped_rollup_oblasts'
   ];
 
   it('attaches every counter this module owns, model-layer ones included', () => {

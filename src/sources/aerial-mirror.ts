@@ -38,6 +38,16 @@
 
 /** Registry id of the mirror. Matches the row inserted by `027_aerial_alert_mirror.sql`. */
 export const AERIAL_MIRROR_SOURCE_ID = 'aerial-alerts-mirror';
+/**
+ * Друге джерело того самого дзеркала: фід, чий рівень області є ОГОЛОШЕННЯМ.
+ *
+ * Окремий рядок у `sources`, а не другий фід усередині одного джерела, тому що знімок — це повне
+ * твердження одного джерела про країну: `persistOfficialAlertSnapshot` гасить усе, чого в ньому
+ * немає. Два фіди в одному знімку означали б, що збій одного гасить те, що тримав другий; два
+ * джерела означають, що кожен відповідає лише за себе, а зведення їх обʼєднує тим самим `bool_or`
+ * із дебаунсом і перевіркою живості, які для цього й написані.
+ */
+export const AERIAL_MIRROR_STATE_SOURCE_ID = 'aerial-alerts-mirror-state';
 
 /** The mirror publishes air-raid state and nothing else. */
 export const AERIAL_MIRROR_ALERT_TYPE = 'air_raid';
@@ -118,6 +128,13 @@ export interface AerialMirrorRawSnapshot extends AerialMirrorSnapshot {
   nonAirRegions: number;
   /** Duplicate labels folded away before resolution. */
   duplicateLabels: number;
+  /**
+   * Обласні записи, які фід оголосив увімкненими, а парсер відкинув як згортку з районів.
+   *
+   * Нуль для фідів, чий рівень області є оголошенням (`ual`, `klimenko`). Для `skog` це число —
+   * рівно ті «тривоги в області», яких влада не оголошувала і яких ця система більше не повторює.
+   */
+  droppedRollupOblasts: number;
 }
 
 /**
@@ -407,8 +424,220 @@ export function parseAerialMirrorRawPayload(
     readableCount,
     byLevel,
     nonAirRegions,
-    duplicateLabels
+    duplicateLabels,
+    // Рівень області в `ual` — оголошення влади, тож відкидати тут нема чого.
+    droppedRollupOblasts: 0
   };
+}
+
+/**
+ * Дві свіжі витяжки того самого дзеркала: `skog` і `klimenko`.
+ *
+ * ================================================================================================
+ * Навіщо вони, якщо вже є `ual`
+ * ================================================================================================
+ *
+ * Виміряно на живому ендпоінті 19.08.2026, 22 зчитування кожного фіда з інтервалом 10 с:
+ *
+ *   ual       — `cachedat` рухається РІВНО раз на 121 с (17:09:08 → 17:11:09 → 17:13:09);
+ *   skog      — раз на ~11 с;
+ *   klimenko  — раз на ~11 с.
+ *
+ * Тобто найдетальніший фід був водночас найстарішим: у середньому він віддавав стан хвилинної
+ * давності, і саме ця хвилина була найбільшим доданком у затримці сповіщення (p50 74 с від часу,
+ * який назвав провайдер, до рядка в журналі). Обидва швидкі фіди дають ту саму районну деталізацію:
+ * у тому ж зрізі в обох рівно 29 однакових районів під тривогою, і в жодного немає району, якого не
+ * було б в іншого.
+ *
+ * ================================================================================================
+ * Чому область із них читається по-різному
+ * ================================================================================================
+ *
+ * `klimenko` позначає область увімкненою лише тоді, коли її оголосили цілою: у тому самому зрізі
+ * увімкнені рівно «АР Крим», «Севастополь» і «Луганська область» — три постійні, — а Харківщина
+ * стоїть `false` з пʼятьма ввімкненими районами. Це ОГОЛОШЕННЯ.
+ *
+ * `skog` позначає область увімкненою, якщо світиться будь-яка її частина: у тому ж зрізі це десять
+ * областей, серед них Харківська, Одеська, Сумська. Це ЗГОРТКА, а не оголошення — рівно те, що
+ * робить і агрегований фід (`states.alertnow`).
+ *
+ * Різниця не косметична. Оголосити «повітряна тривога — Харківська область», коли влада оголосила
+ * Ізюмський і Куп'янський райони, означає сказати людям у Лозівському районі, що в них тривога,
+ * якої немає. Тому рівень області з фіда-згортки НЕ ЧИТАЄТЬСЯ ВЗАГАЛІ: парсер таких записів не
+ * повертає, а {@link toAlarmSnapshotBody} відмовляється сформувати тіло, у якому вони опинилися б.
+ */
+export type AerialMirrorOblastLayer = 'declaration' | 'rollup';
+
+export interface AerialMirrorUpstream {
+  /** Читає тіло цього апстріму в той самий знімок, що й `ual`. */
+  parse: (body: unknown, now: Date, staleSeconds: number) => AerialMirrorRawSnapshot;
+  /**
+   * Чим є прапорець рівня області в цьому фіді: оголошенням влади (`declaration`) чи згорткою з
+   * районів (`rollup`). Фід-згортка не має права підняти обласну тривогу.
+   */
+  oblastLayer: AerialMirrorOblastLayer;
+  /** Скільки секунд між оновленнями власного кешу — виміряно, не з документації. */
+  observedRefreshSeconds: number;
+}
+
+function emptyLevels(): Record<AerialMirrorLevel, number> {
+  return { State: 0, District: 0, Community: 0, other: 0 };
+}
+
+/**
+ * `?source=skog&raw`: обʼєкт із записами `{name, alert, changed, districts[], community[]}`.
+ *
+ * Беруться райони й громади; область — ні, вона тут згортка (див. блок вище). Пропущені обласні
+ * записи рахуються в `droppedRollupOblasts`, щоб «ми свідомо це викинули» було видно в метриці, а не
+ * лише в коментарі.
+ */
+export function parseAerialMirrorSkogPayload(
+  body: unknown, now: Date, staleSeconds: number
+): AerialMirrorRawSnapshot {
+  const root = asObject(body);
+  if (!root) throw new Error('aerial mirror skog response is not a JSON object');
+  const raw = root.raw;
+  const entries = Array.isArray(raw) ? raw : raw && typeof raw === 'object' ? Object.values(raw) : null;
+  if (!entries) throw new Error('aerial mirror skog response carries no `raw` collection');
+
+  const { cachedAt, ageSeconds } = readCachedAt(root, now, staleSeconds);
+  const byLabel = new Map<string, AerialMirrorRegion>();
+  const byLevel = emptyLevels();
+  let readableCount = 0;
+  let droppedRollupOblasts = 0;
+  let duplicateLabels = 0;
+
+  const take = (value: unknown, level: AerialMirrorLevel): void => {
+    const entry = asObject(value);
+    if (!entry) return;
+    const name = typeof entry.name === 'string' ? entry.name.replace(/\s+/gu, ' ').trim() : '';
+    if (!name || typeof entry.alert !== 'boolean') return;
+    readableCount += 1;
+    if (!entry.alert) return;
+    const changed = typeof entry.changed === 'string' ? kyivWallClockToUtc(entry.changed) : null;
+    const key = name.toLocaleLowerCase('uk-UA');
+    const existing = byLabel.get(key);
+    if (existing) {
+      duplicateLabels += 1;
+      if ((changed ?? cachedAt) < existing.changedAt) existing.changedAt = changed ?? cachedAt;
+      return;
+    }
+    byLevel[level] += 1;
+    byLabel.set(key, { name, active: true, changedAt: changed ?? cachedAt, level });
+  };
+
+  for (const value of entries) {
+    const oblast = asObject(value);
+    if (!oblast) continue;
+    // Область читається рівно настільки, щоб порахувати її як відкинуту: її стан тут — згортка.
+    if (typeof oblast.name === 'string' && typeof oblast.alert === 'boolean') {
+      readableCount += 1;
+      if (oblast.alert) droppedRollupOblasts += 1;
+    }
+    for (const district of Array.isArray(oblast.districts) ? oblast.districts : []) take(district, 'District');
+    for (const community of Array.isArray(oblast.community) ? oblast.community : []) take(community, 'Community');
+  }
+
+  if (entries.length > 0 && readableCount === 0) {
+    throw new Error('aerial mirror skog response carries no readable entries');
+  }
+
+  return {
+    upstream: typeof root.source === 'string' ? root.source : 'skog',
+    cachedAt,
+    ageSeconds,
+    regions: [...byLabel.values()],
+    entryCount: entries.length,
+    readableCount,
+    byLevel,
+    nonAirRegions: 0,
+    duplicateLabels,
+    droppedRollupOblasts
+  };
+}
+
+/**
+ * `?source=klimenko&raw`: обʼєкт, ключі якого — назви областей, значення —
+ * `{enabled, "type:", districts: {назва: {enabled, enabled_at}}}`.
+ *
+ * Тут рівень області — оголошення, тож він читається; райони — теж. Громад цей фід не має, і саме
+ * тому він не може бути єдиним: у зрізі 19.08.2026 він не знав про повітряну тривогу для
+ * Нікопольської та Марганецької громад, яку `skog` і `ual` показували.
+ */
+export function parseAerialMirrorKlimenkoPayload(
+  body: unknown, now: Date, staleSeconds: number
+): AerialMirrorRawSnapshot {
+  const root = asObject(body);
+  if (!root) throw new Error('aerial mirror klimenko response is not a JSON object');
+  const raw = asObject(root.raw);
+  if (!raw) throw new Error('aerial mirror klimenko response carries no `raw` object');
+
+  const { cachedAt, ageSeconds } = readCachedAt(root, now, staleSeconds);
+  const byLabel = new Map<string, AerialMirrorRegion>();
+  const byLevel = emptyLevels();
+  let readableCount = 0;
+  let duplicateLabels = 0;
+
+  const take = (label: string, value: unknown, level: AerialMirrorLevel): void => {
+    const entry = asObject(value);
+    const name = label.replace(/\s+/gu, ' ').trim();
+    if (!entry || !name || typeof entry.enabled !== 'boolean') return;
+    readableCount += 1;
+    if (!entry.enabled) return;
+    const changed = isoInstant(entry.enabled_at);
+    const key = name.toLocaleLowerCase('uk-UA');
+    const existing = byLabel.get(key);
+    if (existing) {
+      duplicateLabels += 1;
+      if ((changed ?? cachedAt) < existing.changedAt) existing.changedAt = changed ?? cachedAt;
+      return;
+    }
+    byLevel[level] += 1;
+    byLabel.set(key, { name, active: true, changedAt: changed ?? cachedAt, level });
+  };
+
+  for (const [label, value] of Object.entries(raw)) {
+    take(label, value, 'State');
+    const oblast = asObject(value);
+    const districts = asObject(oblast?.districts);
+    for (const [districtLabel, district] of Object.entries(districts ?? {})) {
+      take(districtLabel, district, 'District');
+    }
+  }
+
+  const entryCount = Object.keys(raw).length;
+  if (entryCount > 0 && readableCount === 0) {
+    throw new Error('aerial mirror klimenko response carries no readable entries');
+  }
+
+  return {
+    upstream: typeof root.source === 'string' ? root.source : 'klimenko',
+    cachedAt,
+    ageSeconds,
+    regions: [...byLabel.values()],
+    entryCount,
+    readableCount,
+    byLevel,
+    nonAirRegions: 0,
+    duplicateLabels,
+    droppedRollupOblasts: 0
+  };
+}
+
+/**
+ * Кожен апстрім, який цей адаптер уміє читати, і те, чим є в ньому рівень області.
+ *
+ * `ual` лишається — це власне тіло Ukraine Alarm і єдиний фід, у якого і громади, і оголошення
+ * області, — але він на дві хвилини старіший за решту, тож типовим уже не є.
+ */
+export const AERIAL_MIRROR_UPSTREAMS: Readonly<Record<string, AerialMirrorUpstream>> = {
+  ual: { parse: parseAerialMirrorRawPayload, oblastLayer: 'declaration', observedRefreshSeconds: 121 },
+  skog: { parse: parseAerialMirrorSkogPayload, oblastLayer: 'rollup', observedRefreshSeconds: 11 },
+  klimenko: { parse: parseAerialMirrorKlimenkoPayload, oblastLayer: 'declaration', observedRefreshSeconds: 11 }
+};
+
+export function aerialMirrorUpstream(name: string): AerialMirrorUpstream | null {
+  return AERIAL_MIRROR_UPSTREAMS[name.trim()] ?? null;
 }
 
 /**
@@ -436,7 +665,18 @@ export function parseAerialMirrorRawPayload(
  * That debounce is wanted here and not merely tolerated: `?source=default` switches upstream between
  * polls, and a switch that lands mid-transition must not be able to publish «Офіційний відбій».
  */
-export function toAlarmSnapshotBody(snapshot: AerialMirrorSnapshot): unknown {
+export function toAlarmSnapshotBody(
+  snapshot: AerialMirrorSnapshot, oblastLayer: AerialMirrorOblastLayer = 'declaration'
+): unknown {
+  // Структурна межа, а не домовленість: тіло знімка фіда-згортки не може містити обласного запису.
+  // Парсер таких записів не повертає; ця перевірка ловить майбутню зміну, яка почала б їх повертати,
+  // тут — до того, як «тривога в області, якої не оголошували» стане рядком у `alert_periods`.
+  if (oblastLayer === 'rollup') {
+    const oblast = snapshot.regions.find((region) => region.level === 'State');
+    if (oblast) {
+      throw new Error(`aerial mirror rollup feed may not assert an oblast: ${oblast.name}`);
+    }
+  }
   return {
     states: snapshot.regions.map((region) => ({
       regionName: region.name,

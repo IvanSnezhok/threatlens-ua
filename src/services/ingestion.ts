@@ -10,9 +10,9 @@ import {
   type ClassificationDecision, type ClassificationLogEntry
 } from '../repositories/events.js';
 import {
-  AERIAL_MIRROR_SOURCE_ID, AERIAL_MIRROR_USER_AGENT, aerialMirrorRawUrl, parseAerialMirrorPayload,
-  parseAerialMirrorRawPayload, toAlarmSnapshotBody,
-  type AerialMirrorRawSnapshot, type AerialMirrorSnapshot
+  AERIAL_MIRROR_SOURCE_ID, AERIAL_MIRROR_STATE_SOURCE_ID, AERIAL_MIRROR_USER_AGENT,
+  aerialMirrorRawUrl, aerialMirrorUpstream, parseAerialMirrorPayload, toAlarmSnapshotBody,
+  type AerialMirrorRawSnapshot, type AerialMirrorUpstream
 } from '../sources/aerial-mirror.js';
 import type { NormalizedMessage } from '../types.js';
 import { alertPokeMetrics, pokeAlertStarted } from './alert-poke.js';
@@ -686,10 +686,32 @@ export async function syncAlertsInUa(log?: { warn: Function }): Promise<void> {
 export async function syncAerialMirror(log?: { warn: Function }): Promise<void> {
   if (!config.AERIAL_MIRROR_ENABLED) return;
   if (!await sourceCollectionEnabled(AERIAL_MIRROR_SOURCE_ID)) return;
+  const name = config.AERIAL_MIRROR_RAW_SOURCE.trim();
   try {
-    const snapshot = await collectAerialMirrorSnapshot(new Date(), log);
+    if (!name) {
+      // Задокументований відступ оператора: жодної деталізації, самі області з агрегованого фіда.
+      // Він лишається, бо саме сюди відходять, коли апстрім переробить своє тіло, — але типовим уже
+      // не є, і в ньому оператор СВІДОМО приймає обласні згортки. Прапорця рівня в цих записах немає,
+      // тож перевірка `toAlarmSnapshotBody` їх і не стосується: вона про фіди, у яких поруч із
+      // областю є райони, які їй суперечать.
+      aerialMirrorPolls.inc({ mode: 'unified_only' });
+      const snapshot = parseAerialMirrorPayload(
+        await fetchAerialMirror(config.AERIAL_MIRROR_URL), new Date(), config.AERIAL_MIRROR_STALE_SECONDS
+      );
+      observeSourceCacheAge(AERIAL_MIRROR_SOURCE_ID, 'aggregated', snapshot.ageSeconds);
+      const persistedOblasts = await persistOfficialAlertSnapshot(
+        AERIAL_MIRROR_SOURCE_ID, toAlarmSnapshotBody(snapshot)
+      );
+      await markSourceSuccess(AERIAL_MIRROR_SOURCE_ID);
+      recordUnresolvedLocations(AERIAL_MIRROR_SOURCE_ID, persistedOblasts.unresolved, log);
+      return;
+    }
+    const upstream = aerialMirrorUpstream(name);
+    if (!upstream) throw new Error(`unknown aerial mirror upstream: ${name}`);
+    const snapshot = await collectAerialMirrorSnapshot(upstream, new Date(), log);
+    aerialMirrorDroppedOblasts.set(snapshot.droppedRollupOblasts);
     const persisted = await persistOfficialAlertSnapshot(
-      AERIAL_MIRROR_SOURCE_ID, toAlarmSnapshotBody(snapshot)
+      AERIAL_MIRROR_SOURCE_ID, toAlarmSnapshotBody(snapshot, upstream.oblastLayer)
     );
     await markSourceSuccess(AERIAL_MIRROR_SOURCE_ID);
     recordUnresolvedLocations(AERIAL_MIRROR_SOURCE_ID, persisted.unresolved, log);
@@ -698,6 +720,63 @@ export async function syncAerialMirror(log?: { warn: Function }): Promise<void> 
     countChannelError(AERIAL_MIRROR_SOURCE_ID, 'collect');
     throw error;
   }
+}
+
+/**
+ * Друге джерело того самого дзеркала: фід, чий рівень області є оголошенням влади.
+ *
+ * Окремим джерелом, а не другим фідом у знімку вище, з причини, написаної біля
+ * {@link AERIAL_MIRROR_STATE_SOURCE_ID}: знімок гасить усе, чого в ньому немає, тож два фіди в
+ * одному знімку означали б, що збій одного гасить те, що тримає другий. Тут кожен відповідає лише
+ * за себе, а зведення обʼєднує їх тим самим `bool_or` із дебаунсом і перевіркою живості.
+ *
+ * Цей фід не має громад — і саме тому він не заміняє фід деталізації, а доповнює його: у зрізі
+ * 19.08.2026 він не знав про повітряну тривогу для Нікопольської та Марганецької громад.
+ */
+export async function syncAerialMirrorState(log?: { warn: Function }): Promise<void> {
+  if (!config.AERIAL_MIRROR_ENABLED) return;
+  const upstream = aerialMirrorUpstream(config.AERIAL_MIRROR_STATE_SOURCE);
+  if (!upstream) return;
+  if (!await sourceCollectionEnabled(AERIAL_MIRROR_STATE_SOURCE_ID)) return;
+  try {
+    const now = new Date();
+    const snapshot = upstream.parse(
+      await fetchAerialMirror(aerialMirrorRawUrl(config.AERIAL_MIRROR_URL, config.AERIAL_MIRROR_STATE_SOURCE)),
+      now, config.AERIAL_MIRROR_STALE_SECONDS
+    );
+    observeSourceCacheAge(AERIAL_MIRROR_STATE_SOURCE_ID, 'state', snapshot.ageSeconds);
+    aerialMirrorPolls.inc({ mode: 'state' });
+    // Порожній знімок цього фіда — це «жодна область не оголошена цілою», і це нормальний стан
+    // країни: постійні Луганщина й Крим є завжди, тож нуль записів тут означав би, що фід зламався.
+    // `persistOfficialAlertSnapshot` сам відмовиться від тіла, у якому нічого не розпізналося.
+    const persisted = await persistOfficialAlertSnapshot(
+      AERIAL_MIRROR_STATE_SOURCE_ID, toAlarmSnapshotBody(snapshot, upstream.oblastLayer)
+    );
+    await markSourceSuccess(AERIAL_MIRROR_STATE_SOURCE_ID);
+    recordUnresolvedLocations(AERIAL_MIRROR_STATE_SOURCE_ID, persisted.unresolved, log);
+  } catch (error) {
+    aerialMirrorPolls.inc({ mode: 'state_unusable' });
+    await markSourceError(AERIAL_MIRROR_STATE_SOURCE_ID, error);
+    countChannelError(AERIAL_MIRROR_STATE_SOURCE_ID, 'collect');
+    throw error;
+  }
+}
+
+/**
+ * Одна нога — два джерела дзеркала, послідовно й без взаємного скасування.
+ *
+ * `allSettled`, а не `all`: фід деталізації і фід оголошень незалежні, і збій одного не має
+ * скасовувати роботу другого. Помилка все одно піднімається наверх — планувальник рахує невдачу ноги
+ * й розводить наступний прохід, — але лише після того, як обидва отримали свій шанс.
+ */
+export async function syncAerialMirrorPair(log?: { warn: Function }): Promise<void> {
+  const granular = await syncAerialMirror(log).then(() => null, (error: unknown) => error);
+  if (config.AERIAL_MIRROR_STATE_SOURCE.trim() && config.AERIAL_MIRROR_REQUEST_GAP_MS > 0) {
+    await new Promise((resolve) => setTimeout(resolve, config.AERIAL_MIRROR_REQUEST_GAP_MS));
+  }
+  const state = await syncAerialMirrorState(log).then(() => null, (error: unknown) => error);
+  const failure = granular ?? state;
+  if (failure) throw failure;
 }
 
 /** The database switch is checked immediately before a polled adapter touches its provider. */
@@ -766,74 +845,71 @@ async function fetchAerialMirror(url: string): Promise<unknown> {
  * oblast-only behaviour, one request per poll.
  */
 async function collectAerialMirrorSnapshot(
-  now: Date, log?: { warn: Function }
-): Promise<AerialMirrorSnapshot> {
+  upstream: AerialMirrorUpstream, now: Date, log?: { warn: Function }
+): Promise<AerialMirrorRawSnapshot> {
   const stale = config.AERIAL_MIRROR_STALE_SECONDS;
-  const upstream = config.AERIAL_MIRROR_RAW_SOURCE.trim();
-  // Вік того, що фід щойно віддав, — за його власним `cachedat`. Записується на КОЖНОМУ читанні, і
-  // саме тому обидва тіла мають свою мітку: різниця між ними і є ціною деталізації. Виміряно на
-  // ubilling.net.ua 15.08.2026: агрегований фід оновлюється за ~3 с, `?source=ual&raw` — рівно раз
-  // на 121 с, тобто в середньому віддає стан хвилинної давності. Ця хвилина була найбільшим
-  // доданком у затримці сповіщення й ніде не була видна.
-  const record = <T extends AerialMirrorSnapshot>(feed: string, snapshot: T): T => {
+  const name = config.AERIAL_MIRROR_RAW_SOURCE.trim();
+  // Вік того, що фід щойно віддав, — за його власним `cachedat`. Записується на КОЖНОМУ читанні:
+  // різниця між фідами і є ціною деталізації, і саме вона привела до зміни типового апстріму.
+  const record = <T extends AerialMirrorRawSnapshot>(feed: string, snapshot: T): T => {
     observeSourceCacheAge(AERIAL_MIRROR_SOURCE_ID, feed, snapshot.ageSeconds);
     return snapshot;
   };
-  if (!upstream) {
-    aerialMirrorPolls.inc({ mode: 'unified_only' });
-    return record(
-      'aggregated', parseAerialMirrorPayload(await fetchAerialMirror(config.AERIAL_MIRROR_URL), now, stale)
-    );
-  }
 
-  let raw: AerialMirrorRawSnapshot | null = null;
+  let granular: AerialMirrorRawSnapshot | null = null;
   let reason = '';
   try {
-    raw = record('raw', parseAerialMirrorRawPayload(
-      await fetchAerialMirror(aerialMirrorRawUrl(config.AERIAL_MIRROR_URL, upstream)), now, stale
+    granular = record('granular', upstream.parse(
+      await fetchAerialMirror(aerialMirrorRawUrl(config.AERIAL_MIRROR_URL, name)), now, stale
     ));
   } catch (error) {
     reason = error instanceof Error ? error.message : String(error);
   }
-  if (raw && raw.regions.length) {
-    aerialMirrorPolls.inc({ mode: 'raw' });
-    aerialMirrorRawRegions.set({ level: 'State' }, raw.byLevel.State);
-    aerialMirrorRawRegions.set({ level: 'District' }, raw.byLevel.District);
-    aerialMirrorRawRegions.set({ level: 'Community' }, raw.byLevel.Community);
-    aerialMirrorRawRegions.set({ level: 'other' }, raw.byLevel.other);
-    return raw;
+  if (granular && granular.regions.length) {
+    aerialMirrorPolls.inc({ mode: 'granular' });
+    for (const level of ['State', 'District', 'Community', 'other'] as const) {
+      aerialMirrorRawRegions.set({ level }, granular.byLevel[level]);
+    }
+    return granular;
   }
 
-  // Second request, spaced. Anything it throws escapes this function on purpose: with the raw feed
-  // already unusable, an unreadable aggregated feed leaves nothing that could justify writing.
+  // Другий запит, рознесений у часі. Він тут СВІДОК, а не заміна: агрегований фід знає лише області
+  // й світить їх, коли світиться будь-яка частина, тож підняти з нього тривогу означало б оголосити
+  // те, чого влада не оголошувала. Єдине питання, на яке він відповідає, — «країна тиха чи фід
+  // зламався»; будь-яка інша його відповідь закінчується тим, що ми не пишемо нічого.
   if (config.AERIAL_MIRROR_REQUEST_GAP_MS > 0) {
     await new Promise((resolve) => setTimeout(resolve, config.AERIAL_MIRROR_REQUEST_GAP_MS));
   }
-  const unified = record('aggregated', parseAerialMirrorPayload(
+  const witness = parseAerialMirrorPayload(
     await fetchAerialMirror(config.AERIAL_MIRROR_URL), now, stale
-  ));
-  const unifiedActive = unified.regions.filter((region) => region.active).length;
+  );
+  observeSourceCacheAge(AERIAL_MIRROR_SOURCE_ID, 'witness', witness.ageSeconds);
+  const witnessActive = witness.regions.filter((region) => region.active).length;
 
-  if (raw && !unifiedActive) {
-    // Quiet, corroborated. The empty raw snapshot is the honest one to persist: it is what the
-    // primary feed said, and the aggregated feed was consulted only as a witness.
-    aerialMirrorPolls.inc({ mode: 'raw_quiet' });
+  if (granular && !witnessActive) {
+    // Тиша, підтверджена свідком. Порожній знімок — чесний: це те, що сказав основний фід.
+    aerialMirrorPolls.inc({ mode: 'granular_quiet' });
     for (const level of ['State', 'District', 'Community', 'other'] as const) {
       aerialMirrorRawRegions.set({ level }, 0);
     }
-    return raw;
+    return granular;
   }
 
-  if (raw) {
-    reason = `raw feed reported no air-raid region while the aggregated feed reports ${unifiedActive}`
-      + ` (${raw.entryCount} raw entries, ${raw.readableCount} readable, ${raw.nonAirRegions} non-air)`;
-  }
-  aerialMirrorPolls.inc({ mode: 'unified_fallback' });
+  // Основний фід не читається (або каже «тихо», а свідок каже інакше). Раніше тут відбувався відкат
+  // на агрегований фід — і саме він створював обласні тривоги, яких ніхто не оголошував: за добу
+  // 10 % опитувань падали сюди, а за тиждень із цього виходило 212 обласних періодів, зокрема 32 по
+  // Харківщині. Тепер ми не пишемо НІЧОГО: стан цього джерела лишається таким, яким був, зведення
+  // тримає його через дебаунс і живість, а решта джерел (фід оголошень, канали ОВА) не зачеплені.
+  aerialMirrorPolls.inc({ mode: granular ? 'granular_disputed_held' : 'granular_unusable_held' });
+  const detail = granular
+    ? `granular feed reported no air-raid region while the aggregated witness reports ${witnessActive}`
+      + ` (${granular.entryCount} entries, ${granular.readableCount} readable)`
+    : reason;
   log?.warn(
-    { sourceId: AERIAL_MIRROR_SOURCE_ID, upstream, reason, unifiedActive },
-    'aerial mirror raw feed unusable, falling back to the aggregated oblast feed for this poll'
+    { sourceId: AERIAL_MIRROR_SOURCE_ID, upstream: name, reason: detail, witnessActive },
+    'aerial mirror granular feed unusable; holding alert state instead of asserting oblast rollups'
   );
-  return unified;
+  throw new Error(`aerial mirror granular feed unusable: ${detail}`);
 }
 
 // ------------------------------------------------------------------------------------------------
@@ -887,11 +963,14 @@ export const ALERT_CHANNEL_SOURCE_ID = 'air-alert-ua';
 /**
  * Which feed actually moved the mirror's alert state, per poll.
  *
- * The series an operator watches to know whether the granularity upgrade is live. `raw` is the
- * healthy steady state; a `unified_fallback` rate that stops being ~zero means the `ual` passthrough
- * is failing and the map has quietly gone back to oblast-only, which is a degradation nothing else
- * makes visible — the source stays `current` throughout, because falling back is the adapter working
- * as designed. `raw_quiet` separates "the country is calm and both feeds agree" from that.
+ * `granular` is the healthy steady state. `granular_quiet` is «країна тиха, і свідок це підтверджує».
+ * The two `_held` series are the ones to watch: they mean the detailed feed could not be read (or
+ * disagreed with the witness) and this source therefore asserted NOTHING — the previous state stands
+ * until the debounce or another source moves it. Before migration 050 that case fell back to the
+ * aggregated oblast feed instead, which is how «тривога в Харківській області» reached subscribers
+ * on nights when only two of its raions were declared: 10 % of polls landed there, and a week of
+ * them produced 212 oblast periods. `state` and `state_unusable` are the second source, the one that
+ * carries a genuine whole-oblast declaration.
  */
 const aerialMirrorPolls = new Counter({
   name: 'threatlens_aerial_mirror_polls_total',
@@ -912,6 +991,19 @@ const aerialMirrorRawRegions = new Gauge({
   name: 'threatlens_aerial_mirror_raw_regions',
   help: 'Air-raid regions in the last usable raw aerial-mirror poll, by upstream region type',
   labelNames: ['level'],
+  registers: []
+});
+
+/**
+ * Обласні записи, які фід деталізації оголосив увімкненими, а парсер відкинув як згортку з районів.
+ *
+ * Це число — рівно ті «тривоги в області», яких влада не оголошувала і яких ця система більше не
+ * повторює. Воно НЕ є помилкою й не має падати до нуля: на звичайну ніч із районними тривогами воно
+ * дорівнює кільком одиницям, і саме так виглядає правило, що працює.
+ */
+const aerialMirrorDroppedOblasts = new Gauge({
+  name: 'threatlens_aerial_mirror_dropped_rollup_oblasts',
+  help: 'Oblast rows the granular feed marked alight and this adapter refused as a rollup, last poll',
   registers: []
 });
 
@@ -1032,6 +1124,7 @@ export function registerAlertChannelMetrics(registry: Registry): void {
   const metrics: ReadonlyArray<[string, Counter<string> | Gauge<string> | Histogram<string>]> = [
     ['threatlens_aerial_mirror_polls_total', aerialMirrorPolls],
     ['threatlens_aerial_mirror_raw_regions', aerialMirrorRawRegions],
+    ['threatlens_aerial_mirror_dropped_rollup_oblasts', aerialMirrorDroppedOblasts],
     ['threatlens_alert_channel_messages_total', alertChannelMessages],
     ['threatlens_alert_channel_stuck_alerts_total', alertChannelStuckAlerts],
     ['threatlens_alert_stale_sources_ignored_total', alertStaleSourcesIgnored],
@@ -1940,8 +2033,12 @@ export function ingestionLegs(log: { info: Function; warn: Function; error: Func
   return [
     // ---- alert state, fast --------------------------------------------------------------------
     {
+      // Обидва фіди дзеркала — в ОДНІЙ нозі, послідовно. Не двома ногами з двома розкладами: вони
+      // б'ють в один хост, а планувальник не координує ноги між собою, тож дві ноги рано чи пізно
+      // збіглися б в одну мілісекунду — рівно та пара запитів усередині секунди, на якій дзеркало
+      // віддає обрізане тіло. Пауза між ними — той самий `AERIAL_MIRROR_REQUEST_GAP_MS`.
       name: 'aerial-mirror',
-      run: () => syncAerialMirror(log),
+      run: () => syncAerialMirrorPair(log),
       intervalMs: () => alertLegIntervalMs(AERIAL_MIRROR_MIN_POLL_SECONDS)
     },
     {

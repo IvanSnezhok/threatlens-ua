@@ -47,7 +47,7 @@ const MIGRATION_FILES = [
   '043_analytical_outcomes.sql',
   '044_publication_channels.sql',
   '045_model_enrichment.sql',
-  '046_origin_zone.sql', '047_codex_speed.sql', '048_attack_stats.sql', '049_codex_primary.sql'
+  '046_origin_zone.sql', '047_codex_speed.sql', '048_attack_stats.sql', '049_codex_primary.sql', '050_alert_granularity.sql'
 ];
 
 /**
@@ -219,6 +219,16 @@ describe.skipIf(!integrationDatabaseAvailable)('migration runner against live Po
     // other settlement that happens to sit in the same oblast.
     expect(SEEDED_SETTLEMENT_OBLASTS.map(([code]) => byCode.get(code)?.name_uk))
       .toEqual(SEEDED_SETTLEMENT_OBLASTS.map(([, name]) => name));
+  });
+
+  it('teaches the catalogue the spelling of Crimea the declaration feed uses', async () => {
+    // Фід оголошень рівня області (`klimenko`) пише «АР Крим». Без цього псевдоніма кожне опитування
+    // писало б оператору нерозпізнану назву — щохвилини, назавжди, про територію, де ця система
+    // нічого не оголошує. Перевіряється значення, а не сам факт UPDATE: міграція ідемпотентна.
+    const row = await sql<{ has_alias: boolean; name_uk: string }>(
+      `SELECT name_uk, 'ар крим' = ANY(aliases) AS has_alias FROM locations WHERE id='ua-43'`
+    );
+    expect(row.rows[0]).toEqual({ name_uk: 'Автономна Республіка Крим', has_alias: true });
   });
 
   it('gives the codex switch row every switch, all of them off', async () => {

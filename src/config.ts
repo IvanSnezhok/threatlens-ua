@@ -57,42 +57,48 @@ export const envSchema = z.object({
   // Which upstream to read through the mirror's documented `?source=<x>&raw` passthrough, which
   // returns that upstream's NATIVE body instead of the aggregated oblast-only `states` object.
   //
-  // `ual` — Ukraine Alarm — is the default because it is the only probed upstream that publishes all
-  // three administrative levels: `State`, `District` (raion) and `Community` (hromada, folded into
-  // its raion by the catalogue). Measured on one live poll: 3 State + 26 District + 5 Community
-  // entries where the aggregated feed had nine oblasts and nothing finer, and a Crimea row the
-  // aggregated feed does not carry at all. `klimenko` serves the envelope but its district list was
-  // empty when probed, `jaam` returned `[]`, and `aiu` 429s readily — none is a drop-in.
+  // Який апстрім дзеркала читати заради ДЕТАЛІЗАЦІЇ — районів і громад.
   //
-  // ЩО ЦЕЙ ВИБІР КОШТУЄ. Дзеркало кешує кожне тіло окремо, і кеші дуже різні. Виміряно 15.08.2026,
-  // опитуванням `cachedat` кожні 8–15 с протягом кількох хвилин:
+  // ЩО ЗМІНИЛОСЯ Й ЧОМУ. Типовим був `ual` — власне тіло Ukraine Alarm, єдине, у якому є всі три
+  // рівні. Ціною була затримка: виміряно 19.08.2026, 22 зчитування кожного фіда з кроком 10 с,
   //
-  //   агрегований (`states`) — оновлення раз на ~3 с, вік відповіді 0.5–3.1 с;
-  //   `?source=skog&raw`     — ~3 с, вік 0.5–2.9 с;
-  //   `?source=klimenko&raw` — ~3 с, вік 0.2–3.6 с;
-  //   `?source=aiu&raw`      — ~20 с, вік 19.7–23.7 с, і один 429 із пʼяти запитів;
-  //   `?source=ual&raw`      — оновлення рівно раз на **121 с** (19:09:37 → 19:11:38 → 19:13:38),
-  //                            вік відповіді 21.8–110.3 с, тобто в середньому ~60 с.
+  //   `?source=ual&raw`      — `cachedat` рухається РІВНО раз на 121 с (17:09:08 → 17:11:09 → 17:13:09),
+  //                            тобто в середньому віддає стан хвилинної давності;
+  //   `?source=skog&raw`     — раз на ~11 с;
+  //   `?source=klimenko&raw` — раз на ~11 с;
+  //   агрегований (`states`) — раз на ~11 с.
   //
-  // Тобто громадна деталізація коштує близько хвилини затримки попередження, і на бойових даних це
-  // й був найбільший доданок: від часу, який провайдер сам назвав початком тривоги, до нашого рядка
-  // журналу минало p50 74 с через дзеркало — і 2.5 с через канал ОВА, який нічого не кешує.
+  // На бойових даних ця хвилина й була найбільшим доданком затримки: p50 74 с від часу, який
+  // провайдер назвав початком тривоги, до нашого рядка журналу (через канал ОВА — 2.5 с).
   //
-  // ЧОМУ ЦЕ НЕ ЛІКУЄТЬСЯ ОБʼЄДНАННЯМ ДВОХ ФІДІВ. Свіжий агрегований фід позначає область як alertnow
-  // тоді, коли світиться БУДЬ-ЯКА її частина (перевірено на тому ж зрізі: `ual` мав State лише для
-  // Луганщини й Криму, агрегований — сім областей). Підняти з нього обласну тривогу означало б
-  // оголосити те, чого влада не оголошувала; а обласний передплатник і без того чує районну тривогу,
-  // бо `related_locations` включає нащадків. Тож обʼєднання не додає нічого, крім неправди про
-  // офіційний стан. Справжній обхід — прямий доступ до API (`ALERTS_IN_UA_TOKEN`, поріг 7 с) або
-  // офіційні канали ОВА, і обидва лежать поза цим файлом.
+  // Попередній коментар тут стверджував, що `klimenko` віддає порожній список районів, а `skog`
+  // деталізації не має. На 19.08.2026 це вже неправда, і це перевірено на тому самому зрізі: в
+  // `skog` і `klimenko` рівно по 29 районів під тривогою, множини збігаються повністю, і `skog`
+  // додатково несе громади (Запорізька, Марганецька, Харківська ТГ) — ті самі, що й `ual`.
   //
-  // Вік кожної відповіді тепер видно в `threatlens_source_cache_age_seconds{source,feed}`.
+  // Тому типовим став `skog`: та сама деталізація, що в `ual`, і на дві хвилини свіжіша.
   //
-  // **Empty string turns the passthrough off** and restores oblast-only behaviour: one request per
-  // poll against the aggregated feed, exactly as this source shipped. That is the setting to reach
-  // for if the upstream reshapes its body — it is a full retreat to a known-good path, not a
-  // degradation — and it is why this is a string rather than a boolean.
-  AERIAL_MIRROR_RAW_SOURCE: z.string().default('ual'),
+  // ЧОГО З ЦЬОГО ФІДА НЕ ЧИТАЮТЬ. Рівень області в `skog` — ЗГОРТКА: він світить область, якщо
+  // світиться будь-яка її частина (у тому ж зрізі — десять областей, серед них Харківська, тоді як
+  // `klimenko` і `ual` показували її не оголошеною при пʼятьох ввімкнених районах). Обласні записи
+  // такого фіда парсер не повертає взагалі, а `toAlarmSnapshotBody` відмовляється зібрати тіло, у
+  // якому вони опинилися б: оголосити «тривога в Харківській області», коли влада оголосила два
+  // райони, означає сказати людям у Лозівському районі про тривогу, якої немає. Обласний передплатник
+  // і без того чує районну тривогу — `related_locations` включає нащадків.
+  //
+  // Порожній рядок вимикає деталізацію: дзеркало тоді несе лише те, що скаже фід оголошень нижче.
+  AERIAL_MIRROR_RAW_SOURCE: z.string().default('skog'),
+  // Який апстрім дзеркала читати заради ОГОЛОШЕНЬ РІВНЯ ОБЛАСТІ, окремим джерелом
+  // (`aerial-alerts-mirror-state`).
+  //
+  // `klimenko` вмикає область лише тоді, коли її оголосили цілою: у зрізі 19.08.2026 це рівно «АР
+  // Крим», «Севастополь» і «Луганська область» — три постійні, — тоді як Харківщина стоїть вимкненою
+  // з пʼятьма ввімкненими районами. Це те, чого фід деталізації вище свідомо не дає, і без цього
+  // джерела оголошена ціла область зникла б із карти.
+  //
+  // Окреме ДЖЕРЕЛО, а не другий фід одного джерела: знімок — це повне твердження джерела про країну,
+  // і збій одного фіда не має гасити те, що тримає інший. Порожній рядок вимикає це джерело.
+  AERIAL_MIRROR_STATE_SOURCE: z.string().default('klimenko'),
   // Pause between the raw poll and the aggregated cross-check, when a cross-check is needed at all.
   //
   // The endpoint publishes two requests per second per host, and during research a probe loop that
@@ -1030,7 +1036,16 @@ export const APP_SETTINGS: Record<keyof AppConfig, SettingMeta> = {
   },
   AERIAL_MIRROR_RAW_SOURCE: {
     scope: 'db_tunable', group: 'official', apply: 'hot', impact: 'alerts',
-    ui: { kind: 'text', placeholder: 'ual' }
+    ui: { kind: 'select', options: ['skog', 'ual', 'klimenko', ''] },
+    applyNote: 'Фід деталізації (райони й громади). Типово skog — та сама деталізація, що в ual, і на '
+      + 'дві хвилини свіжіша (виміряно 19.08.2026: ual оновлюється раз на 121 с, skog — раз на ~11 с). '
+      + 'Рівень області з skog не читається взагалі: там це згортка з районів, а не оголошення влади.'
+  },
+  AERIAL_MIRROR_STATE_SOURCE: {
+    scope: 'db_tunable', group: 'official', apply: 'hot', impact: 'alerts',
+    ui: { kind: 'select', options: ['klimenko', 'ual', ''] },
+    applyNote: 'Фід оголошень рівня області, окремим джерелом. Порожнє — і оголошена ціла область '
+      + '(Луганщина, Крим) зникне з карти, бо фід деталізації її свідомо не несе.'
   },
   AERIAL_MIRROR_REQUEST_GAP_MS: {
     scope: 'db_tunable', group: 'official', apply: 'hot', ui: { kind: 'number', min: 0, unit: 'мс' }
