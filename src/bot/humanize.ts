@@ -171,6 +171,49 @@ export function validUntilLine(value: unknown, now: Date = new Date()): string |
 }
 
 // ------------------------------------------------------------------------------------------------
+// Actuality and probability (migration 049)
+// ------------------------------------------------------------------------------------------------
+//
+// Очікувана загроза — те, що джерело сказало про найближчі години, а не про зараз. Вона йде іншим
+// маркером, іншим заголовком і без заклику в укриття; ймовірність — оцінка моделі, і підписана як
+// оцінка, не як факт. Для події правил (`timing: 'now'`, `probability: null`) усі три функції
+// нижче мовчать, і повідомлення лишається точно таким, яким було завжди.
+
+const TIMING_BADGES: Record<string, string> = {
+  within_hour: 'очікується протягом години',
+  evening: 'очікується увечері',
+  within_day: 'очікується протягом доби',
+  within_two_days: 'очікується протягом двох діб'
+};
+
+export function isExpectedTiming(value: unknown): value is keyof typeof TIMING_BADGES {
+  return typeof value === 'string' && value in TIMING_BADGES;
+}
+
+export function timingBadge(value: unknown): string {
+  return isExpectedTiming(value) ? TIMING_BADGES[value]! : '';
+}
+
+/** «Оцінка ймовірності моделлю: ≈60 %» — або нічого, коли ймовірності немає (подія правил). */
+export function probabilityLine(value: unknown): string | null {
+  const number = typeof value === 'number' ? value : typeof value === 'string' ? Number(value) : Number.NaN;
+  if (!Number.isFinite(number) || number < 0 || number > 1) return null;
+  return `Оцінка ймовірності моделлю: ≈${Math.round(number * 100)} %`;
+}
+
+/** «Вікно: з 18:00 до 23:59» / «Вікно: до 06:40 (ще ~5 год)». */
+export function expectedWindowLine(from: unknown, until: unknown, now: Date = new Date()): string | null {
+  const untilMoment = humanMoment(until, now);
+  if (!untilMoment) return null;
+  const fromDate = toDate(from);
+  const fromMoment = fromDate && fromDate.getTime() > now.getTime() ? humanMoment(from, now) : null;
+  const countdown = humanCountdown(until, now);
+  return fromMoment
+    ? `Вікно: з ${fromMoment} до ${untilMoment}`
+    : `Вікно: до ${untilMoment}${countdown ? ` (${countdown})` : ''}`;
+}
+
+// ------------------------------------------------------------------------------------------------
 // Update lines
 // ------------------------------------------------------------------------------------------------
 

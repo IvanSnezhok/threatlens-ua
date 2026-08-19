@@ -792,6 +792,22 @@ body { overflow-x: hidden; }
    самої причини: рядок і картка описують одну подію й мусять помилятися однаково. */
 .territory-state-row.model-origin { border-left-style: dashed; }
 
+/* Очікувана загроза (міграція 049: timing ≠ now) — третя вісь тієї самої смуги: КОНТУР замість
+   заливки. Не «зараз», а «може бути»: картка не має права виглядати як жива загроза, і кольору їй
+   теж не додається — контур кажe «форма загрози є, наповнення ще немає». Той самий словник у рядку
+   панелі: подвійна лінія ліворуч. */
+.event-card.expected::before {
+  background: transparent;
+  border-left: 1px solid var(--threat);
+  border-right: 1px solid var(--threat);
+  opacity: .6;
+}
+.event-card.expected .event-meta span { color: var(--bone-3); }
+.event-card.expected h2 { color: var(--bone-2); }
+.territory-state-row.expected { border-left-style: double; }
+.territory-threats-expected .territory-state-row small { color: var(--bone-4); }
+.expected-note { border-left-style: double; }
+
 .event-meta, .event-foot {
   display: flex;
   justify-content: space-between;

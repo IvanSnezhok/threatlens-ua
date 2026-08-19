@@ -4,9 +4,11 @@ import { hasValidOpsAuth, opsUnauthorized } from './ops-auth.js';
 import { beginCodexLogin, cancelPendingLogin, codexStatus, disconnectCodex } from '../services/codex-auth.js';
 import { listCodexModels } from '../services/codex-client.js';
 import {
-  CODEX_EFFORTS, CODEX_SERVICE_TIERS, readCodexSettings, resolveSettings, saveCodexSettings
+  CLASSIFIER_MODES, CODEX_EFFORTS, CODEX_SERVICE_TIERS, readCodexSettings, resolveSettings, saveCodexSettings
 } from '../services/codex-settings.js';
 import { shadowAgreement } from '../services/shadow-classifier.js';
+import { modelContextOverview } from '../services/model-context.js';
+import { config } from '../config.js';
 import { enrichmentReport } from '../services/analytical-enrichment.js';
 import { withdrawAnalyticalEvent } from '../repositories/events.js';
 import {
@@ -107,6 +109,8 @@ const opsCodexRoutes: FastifyPluginAsync = async (app) => {
     // не дізнатися про хибний вибір із поведінки моделі під час події.
     effort: z.enum(CODEX_EFFORTS).nullish(),
     serviceTier: z.enum(CODEX_SERVICE_TIERS).nullish(),
+    // Хто класифікує (міграція 049): `rules` або `codex`. Режим, а не перемикач — див. codex-settings.
+    classifierMode: z.enum(CLASSIFIER_MODES).nullish(),
     features: z.object({
       narrative: z.boolean(),
       digest: z.boolean(),
@@ -144,8 +148,37 @@ const opsCodexRoutes: FastifyPluginAsync = async (app) => {
       // off by default. The only switch on this form that publishes a calculation about the future
       // — the chance that a day is a day of attack — on the public attacks page and in the nightly
       // analytics digest, always under a disclaimer and never anywhere near an alert.
-      attack_stats: z.boolean()
+      attack_stats: z.boolean(),
+      // Risk assessment through Codex instead of the AI_* endpoint (migration 049): same index, same
+      // clamp, one more reader of the per-location context. Off by default.
+      risk: z.boolean()
     }).partial().optional()
+  });
+
+  /**
+   * Контексти по локаціях (міграція 049): скільки їх, скільки важать, які найбільші й коли їх востаннє
+   * стискали. Читання, нічого не рахує; самі тексти сюди не віддаються — їх читає лише модель.
+   */
+  app.get('/ops/model-contexts', async (request, reply) => {
+    if (!authorised(request)) return opsUnauthorized(request, reply);
+    const overview = await modelContextOverview(15);
+    return {
+      ...overview,
+      settings: {
+        enabled: config.MODEL_CONTEXT_ENABLED,
+        maxTokens: config.MODEL_CONTEXT_MAX_TOKENS,
+        compactToTokens: config.MODEL_CONTEXT_COMPACT_TO_TOKENS,
+        requestTokens: config.MODEL_CONTEXT_REQUEST_TOKENS,
+        retentionDays: config.MODEL_CONTEXT_RETENTION_DAYS,
+        compactionTimeoutMs: config.MODEL_CONTEXT_COMPACTION_TIMEOUT_MS
+      },
+      classifier: {
+        timeoutMs: config.CODEX_PRIMARY_TIMEOUT_MS,
+        maxPerMinute: config.CODEX_PRIMARY_MAX_PER_MINUTE,
+        maxConcurrent: config.CODEX_PRIMARY_MAX_CONCURRENT,
+        minConfidence: config.CODEX_PRIMARY_MIN_CONFIDENCE
+      }
+    };
   });
 
   app.put('/ops/codex/settings', async (request, reply) => {

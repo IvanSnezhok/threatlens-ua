@@ -40,6 +40,12 @@ export type DeliveryClass = 'protected' | 'standard' | 'soft' | 'analytics' | 'c
 export function deliveryClass(row: any): DeliveryClass {
   const payload = row?.payload ?? {};
   if (row?.notification_type === 'channel_publication') return 'channel';
+  // Очікувана загроза (міграція 049: timing ≠ now) — ніколи не `protected`, хоч би яким було джерело:
+  // «увечері може бути» не має права стояти в черзі попереду «тривога зараз». Перевіряється ПЕРЕД
+  // гілкою protected саме тому.
+  const expected = row?.notification_type === 'threat_update'
+    && typeof payload.timing === 'string' && payload.timing !== 'now';
+  if (expected) return 'soft';
   if (row?.notification_type === 'alert_start' || row?.notification_type === 'alert_end'
     || (row?.notification_type === 'threat_update'
       && (payload.evidenceLevel === 'official' || payload.updateKind === 'escalation'))) return 'protected';
@@ -53,6 +59,7 @@ export function deliveryClass(row: any): DeliveryClass {
 /** The same decision in SQL, in the same order and for the same reason. */
 const classSql = `CASE
   WHEN notification_type='channel_publication' THEN 'channel'
+  WHEN notification_type='threat_update' AND payload->>'timing' IS NOT NULL AND payload->>'timing'<>'now' THEN 'soft'
   WHEN notification_type IN ('alert_start','alert_end')
     OR (notification_type='threat_update'
       AND (payload->>'evidenceLevel'='official' OR payload->>'updateKind'='escalation')) THEN 'protected'

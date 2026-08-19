@@ -47,7 +47,7 @@ const MIGRATION_FILES = [
   '043_analytical_outcomes.sql',
   '044_publication_channels.sql',
   '045_model_enrichment.sql',
-  '046_origin_zone.sql', '047_codex_speed.sql', '048_attack_stats.sql'
+  '046_origin_zone.sql', '047_codex_speed.sql', '048_attack_stats.sql', '049_codex_primary.sql'
 ];
 
 /**
@@ -230,14 +230,20 @@ describe.skipIf(!integrationDatabaseAvailable)('migration runner against live Po
     const row = await sql<Record<string, boolean>>(
       `SELECT narrative_enabled,digest_enabled,attacks_enabled,shadow_enabled,
               analytical_threats_enabled,analytical_enrichment_enabled,retrospective_gate_enabled,
-              tactics_enabled,attack_research_enabled,movement_summary_enabled,attack_stats_enabled
+              tactics_enabled,attack_research_enabled,movement_summary_enabled,attack_stats_enabled,
+              risk_enabled
          FROM codex_settings WHERE singleton`
     );
     expect(row.rowCount).toBe(1);
     // `attack_stats_enabled` (048) is the second switch whose text lands on the public attacks page,
-    // and the first that publishes a probability: an upgrade must find it off.
+    // and the first that publishes a probability: an upgrade must find it off. `risk_enabled` (049)
+    // hands the six-hour index to the model: off too.
     expect(Object.values(row.rows[0]!))
-      .toEqual([false, false, false, false, false, false, false, false, false, false, false]);
+      .toEqual([false, false, false, false, false, false, false, false, false, false, false, false]);
+    // And the classifier MODE (049) is the rules: an upgrade must not wake up with a model writing
+    // events. Checked as a value, not as a column existing.
+    const mode = await sql<{ classifier_mode: string }>(`SELECT classifier_mode FROM codex_settings WHERE singleton`);
+    expect(mode.rows[0]!.classifier_mode).toBe('rules');
   });
 
   it('keeps contextual/media evidence and analytical event provenance on the shadow table', async () => {

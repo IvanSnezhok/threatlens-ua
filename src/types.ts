@@ -26,6 +26,15 @@ export type OriginZoneId = 'black_sea' | 'azov_sea';
  * either wrote this or it did not; see `migrations/041_threat_event_origin.sql`.
  */
 export type ThreatOrigin = 'deterministic' | 'model';
+/**
+ * Коли загроза актуальна за словами джерела (міграція 049). `now` — звичайна жива загроза, як кожна
+ * подія правил; решта — очікувані, з вікном `expectedFrom..expectedUntil`. Словник живе тут, бо його
+ * читають і подія, і API, і бот; правила відмінювання й вікна — у `src/domain/threat-timing.ts`.
+ */
+export const THREAT_TIMINGS = ['now', 'within_hour', 'evening', 'within_day', 'within_two_days'] as const;
+export type ThreatTiming = (typeof THREAT_TIMINGS)[number];
+/** Хто збудував класифікацію події: правила чи модель у режимі `classifier_mode=codex`. */
+export type ClassifiedBy = 'rules' | 'codex';
 export type RelationType = 'explicit_threat' | 'mentioned' | 'reported_direction' | 'official_alert' | 'aftermath';
 
 /**
@@ -136,6 +145,17 @@ export interface LiveEvent {
    * different claims and the map used to make them look identical.
    */
   origin: ThreatOrigin;
+  /**
+   * Актуальність, ймовірність і вікно очікування (міграція 049). `now` з `probability: null` — подія
+   * правил, точно така, як була. Очікувана подія (`timing` ≠ now) — не жива загроза зараз: карта
+   * не заливає нею територію, картка й бот підписують її «очікується …», і саме за цими полями.
+   */
+  timing: ThreatTiming;
+  probability: number | null;
+  expectedFrom: string | null;
+  expectedUntil: string | null;
+  classifiedBy: ClassifiedBy;
+  assessmentNote: string | null;
   title: string;
   summary: string;
   startedAt: string;

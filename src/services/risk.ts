@@ -2,6 +2,9 @@ import { z } from 'zod';
 import { config } from '../config.js';
 import { pool } from '../db/pool.js';
 import { CLASSIFIER_VERSION, riskLevel } from '../domain/classifier.js';
+import { codexChat } from './codex-client.js';
+import { codexFeatureEnabled } from './codex-settings.js';
+import { loadLocationContexts, renderContextsForPrompt } from './model-context.js';
 import { trustModifier } from './source-trust.js';
 
 const modelAssessmentSchema = z.object({
@@ -233,13 +236,50 @@ async function recordFailedRun(input: unknown, error: unknown): Promise<void> {
  * the contract: {@link fallbackAssessment} is the deployed default wherever `AI_*` is unset and
  * already produces a complete, clamped, Ukrainian assessment.
  */
+/**
+ * Той самий системний промт для обох модельних шляхів — Codex і AI_*. Текст із відповіді потрапляє
+ * людині в очі без редагування, тому вимога до повних українських речень стоїть у самому промті.
+ */
+const RISK_SYSTEM_PROMPT = 'Return only JSON. Assess the relative risk that an official warning of the specified type will appear for this location within six hours. This is an index, not a statistical probability. Never infer an impact, target, exact route, or safety. Required fields: locationId, threatType, horizonHours=6, score 0-10, confidence low|medium|high, supportingSignalIds, raisingFactors, limitingFactors, summary. Write summary, raisingFactors and limitingFactors in Ukrainian, as complete calm sentences a civilian can read aloud; never emit raw field names, signal type identifiers, English terms or numeric weights in them.';
+
+/** Скільки токенів контексту локації їде в один запит оцінки ризику — груп за прохід десятки, тож менше, ніж у класифікатора. */
+const RISK_CONTEXT_TOKENS = 20_000;
+
+/**
+ * Оцінка ризику моделлю Codex (міграція 049, перемикач `risk`), з контекстом локації в запиті.
+ *
+ * Той самий контракт, що й у AI_*-шляху нижче: та сама схема, той самий `clampAssessment` після, той
+ * самий запасний шлях правил на будь-який збій. Що інше — транспорт (`codexChat`, який сам пише
+ * `ai_runs`) і те, що модель бачить: не лише сигнали, а й те, що система знає про це місце.
+ */
+async function callCodex(
+  location: { id: string; name_uk: string }, threatType: string, input: unknown
+): Promise<ModelAssessment | null> {
+  const contexts = await loadLocationContexts([location.id], Math.min(RISK_CONTEXT_TOKENS, config.MODEL_CONTEXT_REQUEST_TOKENS))
+    .catch(() => []);
+  const contextBlock = renderContextsForPrompt(contexts);
+  const result = await codexChat({
+    promptVersion: 'risk-v2',
+    surface: 'risk',
+    classifierVersion: CLASSIFIER_VERSION,
+    system: RISK_SYSTEM_PROMPT,
+    user: (contextBlock ? `## Контекст локації\n${contextBlock}\n\n` : '') + `## Сигнали\n${JSON.stringify(input)}`,
+    json: true,
+    auditInput: { ...(input as object), contextTokens: contexts.reduce((sum, context) => sum + context.tokens, 0) }
+  }).catch(() => null);
+  if (!result || !result.ok) return null;
+  try {
+    return modelAssessmentSchema.parse(JSON.parse(result.content));
+  } catch {
+    return null;
+  }
+}
+
 async function callModel(
   location: { id: string; name_uk: string }, threatType: string, signals: RiskSignalRow[],
   allowModel: boolean
 ): Promise<ModelAssessment> {
-  if (!allowModel || !config.AI_BASE_URL || !config.AI_API_KEY || !config.AI_MODEL) {
-    return fallbackAssessment(location, threatType, signals);
-  }
+  if (!allowModel) return fallbackAssessment(location, threatType, signals);
   const input = {
     location: { id: location.id, name: location.name_uk },
     threatType,
@@ -257,6 +297,15 @@ async function callModel(
       observedAt: signal.observed_at
     }))
   };
+  // Codex спершу, коли оператор увімкнув перемикач `risk`: це і є «Codex — основна аналітична модель».
+  // Не відповіла — AI_*-шлях, якщо налаштований; інакше правила. Жоден із трьох не кидає.
+  if (await codexFeatureEnabled('risk')) {
+    const fromCodex = await callCodex(location, threatType, input);
+    if (fromCodex) return fromCodex;
+  }
+  if (!config.AI_BASE_URL || !config.AI_API_KEY || !config.AI_MODEL) {
+    return fallbackAssessment(location, threatType, signals);
+  }
   const started = Date.now();
   try {
     const response = await fetch(`${config.AI_BASE_URL.replace(/\/$/, '')}/chat/completions`, {
@@ -271,7 +320,7 @@ async function callModel(
           // Telegram. Тому від моделі вимагається не перелік полів, а завершені українські речення:
           // «reported_direction» у списку чинників було б таким самим витоком технічної назви, як і
           // раніше в інтерфейсі.
-          { role: 'system', content: 'Return only JSON. Assess the relative risk that an official warning of the specified type will appear for this location within six hours. This is an index, not a statistical probability. Never infer an impact, target, exact route, or safety. Required fields: locationId, threatType, horizonHours=6, score 0-10, confidence low|medium|high, supportingSignalIds, raisingFactors, limitingFactors, summary. Write summary, raisingFactors and limitingFactors in Ukrainian, as complete calm sentences a civilian can read aloud; never emit raw field names, signal type identifiers, English terms or numeric weights in them.' },
+          { role: 'system', content: RISK_SYSTEM_PROMPT },
           { role: 'user', content: JSON.stringify(input) }
         ]
       }),

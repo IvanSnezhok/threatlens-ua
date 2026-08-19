@@ -123,6 +123,27 @@ const originNames = { model: 'оцінка моделі' };
 // саме сталося, і чого НЕ сталося, бо друге тут важливіше за перше.
 const ORIGIN_MODEL_NOTE = 'Припущення моделі за текстом повідомлення. Джерело не заявляло про цю загрозу прямо.';
 const isModelOrigin = (origin) => origin === 'model';
+// Актуальність загрози (міграція 049). `now` — звичайна жива загроза, без підпису; решта — очікувана:
+// окремий бейдж у картці, окремий рядок у діалозі й панелі, без заливки полігона. Ймовірність — оцінка
+// моделі, і підписується як оцінка.
+const timingBadges = {
+  within_hour: 'очікується протягом години', evening: 'очікується увечері',
+  within_day: 'очікується протягом доби', within_two_days: 'очікується протягом двох діб'
+};
+const isExpectedTiming = (timing) => typeof timing === 'string' && timing in timingBadges;
+function probabilityText(value) {
+  const number = Number(value);
+  return Number.isFinite(number) && value !== null && value !== undefined ? `≈${Math.round(number * 100)} %` : '';
+}
+function expectedWindowText(from, until) {
+  if (!until) return '';
+  const fromAt = from ? new Date(from) : null;
+  const untilAt = new Date(until);
+  if (Number.isNaN(untilAt.getTime())) return '';
+  const sameDay = (a, b) => a.toDateString() === b.toDateString();
+  const fmt = (at) => sameDay(at, new Date()) ? shortTime(at.toISOString()) : shortDateTime(at.toISOString());
+  return fromAt && !Number.isNaN(fromAt.getTime()) && fromAt.getTime() > Date.now() ? `з ${fmt(fromAt)} до ${fmt(untilAt)}` : `до ${fmt(untilAt)}`;
+}
 const confidenceNames = { low: 'низька', medium: 'середня', high: 'висока' };
 // Рівень джерела людині нічого не каже літерою. Назва каже все, а літера лишається в дужках для тих,
 // хто читав методологію.
@@ -522,6 +543,9 @@ function territoryCoverage() {
   for (const alert of snapshot?.alerts ?? []) claim(coverage.alert, alert.location_id);
 
   for (const event of snapshot?.threats ?? []) {
+    // Очікувана загроза (міграція 049) не заливає полігон: це сказане джерелом про найближчі години,
+    // а не стан зараз. Сервер робить те саме в composeTerritoryStates(); цей запасний шлях — теж.
+    if (isExpectedTiming(event.timing)) continue;
     // liveThreats() агрегує locations[] через jsonb_agg(DISTINCT …), тож одна локація під двома
     // relation_type приходить двома записами. Згортаємо їх за id, інакше «наслідки» загубилися б
     // на другому записі, а перший порахувався б двічі.
@@ -985,11 +1009,17 @@ function eventCard(item, type) {
   // `model-origin` навішується на всю картку, бо CSS уточнює саме семантичну смугу ліворуч
   // (.event-card::before), а не текст всередині.
   const model = isModelOrigin(item.origin);
-  return `<article class="event-card ${escapeHtml(item.evidenceLevel)}${model ? ' model-origin' : ''}" data-event="${escapeHtml(item.id)}">
-    <div class="event-meta"><span>${escapeHtml(evidenceNames[item.evidenceLevel] ?? item.evidenceLevel)}${model ? ` · ${escapeHtml(originNames.model)}` : ''}</span><time>${shortTime(item.lastObservedAt)}</time></div>
+  // Очікувана загроза (timing ≠ now) — інший силует: бейдж «очікується …» у шапці замість часу останньої
+  // згадки, ймовірність моделі поруч, і клас `expected` для CSS — блідіша смуга, бо це не «зараз».
+  const expected = isExpectedTiming(item.timing);
+  const probability = probabilityText(item.probability);
+  return `<article class="event-card ${escapeHtml(item.evidenceLevel)}${model ? ' model-origin' : ''}${expected ? ' expected' : ''}" data-event="${escapeHtml(item.id)}">
+    <div class="event-meta"><span>${escapeHtml(evidenceNames[item.evidenceLevel] ?? item.evidenceLevel)}${model ? ` · ${escapeHtml(originNames.model)}` : ''}${expected ? ` · ${escapeHtml(timingBadges[item.timing])}` : ''}</span><time>${shortTime(item.lastObservedAt)}</time></div>
     <h2>${escapeHtml(item.title)}</h2><p>${escapeHtml(item.summary)}</p>
     <div class="location-tags">${item.locations.map((loc) => `<span>${escapeHtml(loc.name)}</span>`).join('')}</div>
-    <div class="event-foot"><b>${escapeHtml(threatNames[item.threatType] ?? item.threatType)}</b><span>${timeAgo(item.lastObservedAt)}</span></div></article>`;
+    <div class="event-foot"><b>${escapeHtml(threatNames[item.threatType] ?? item.threatType)}</b><span>${expected
+    ? `${probability ? `ймовірність ${escapeHtml(probability)} · ` : ''}${escapeHtml(expectedWindowText(item.expectedFrom, item.expectedUntil))}`
+    : `${probability ? `${escapeHtml(probability)} · ` : ''}${timeAgo(item.lastObservedAt)}`}</span></div></article>`;
 }
 
 // `origin` їде властивістю фічі, а джерело лишається одне на обидва шари напрямку. Розводить їх
@@ -2958,9 +2988,21 @@ async function showThreatDetails(id) {
   const originNote = model
     ? `<div class="origin-note"><strong>${escapeHtml(originNames.model)}</strong><p>${escapeHtml(ORIGIN_MODEL_NOTE)}</p></div>`
     : '';
+  // Актуальність і ймовірність (міграція 049): речення на очікувану загрозу — ДО характеристик, бо це
+  // змінює, як читати все нижче; для звичайної події — лише рядок ймовірності, якщо модель її дала.
+  const expectedNote = isExpectedTiming(item.timing)
+    ? `<div class="origin-note expected-note"><strong>${escapeHtml(sentence(timingBadges[item.timing]))}</strong><p>${
+      escapeHtml(`Джерело повідомило про можливу загрозу, а не про загрозу зараз${item.probability != null ? `; оцінка ймовірності моделлю — ${probabilityText(item.probability)}` : ''}${
+        item.expected_until ? `. Вікно: ${expectedWindowText(item.expected_from, item.expected_until)}` : ''}. Це не сигнал тривоги: під час тривоги — в укриття незалежно від цієї оцінки.`)}</p>${
+      item.assessment_note ? `<p><small>🤖 ${escapeHtml(item.assessment_note)}</small></p>` : ''}</div>`
+    : '';
+  const probabilityRow = item.probability != null
+    ? `<div><dt>Ймовірність (модель)</dt><dd>${escapeHtml(probabilityText(item.probability))}</dd></div>` : '';
+  const classifierRow = item.classified_by === 'codex'
+    ? `<div><dt>Класифікувала</dt><dd>модель Codex</dd></div>` : '';
   openDetail(item.title,
     `${evidenceNames[item.evidence_level] ?? item.evidence_level}${model ? ` · ${originNames.model}` : ''}`,
-    `<p class="detail-summary">${escapeHtml(item.summary)}</p>${originNote}<dl><div><dt>Тип</dt><dd>${escapeHtml(threatNames[item.threat_type] ?? item.threat_type ?? 'не визначено')}</dd></div><div><dt>Остання згадка</dt><dd>${escapeHtml(agoOrUnknown(new Date(item.last_observed_at).getTime()))}</dd></div><div><dt>Дійсна до</dt><dd>${item.valid_until ? escapeHtml(shortTime(item.valid_until)) : 'не визначено'}</dd></div><div><dt>Напрямок</dt><dd>${escapeHtml(item.direction_text || 'не повідомлявся')}</dd></div></dl>${vectorChainHtml(vector)}<h3>Джерела</h3>${sources}${updates ? `<h3>Історія змін</h3><ol class="update-list">${updates}</ol>` : ''}<div class="safety-note"><strong>Геометрія не є прогнозом</strong><p>Система показує лише дослівно повідомлену територію або напрямок і не екстраполює маршрут.</p></div>`);
+    `<p class="detail-summary">${escapeHtml(item.summary)}</p>${originNote}${expectedNote}<dl><div><dt>Тип</dt><dd>${escapeHtml(threatNames[item.threat_type] ?? item.threat_type ?? 'не визначено')}</dd></div><div><dt>Остання згадка</dt><dd>${escapeHtml(agoOrUnknown(new Date(item.last_observed_at).getTime()))}</dd></div><div><dt>Дійсна до</dt><dd>${item.valid_until ? escapeHtml(shortTime(item.valid_until)) : 'не визначено'}</dd></div><div><dt>Напрямок</dt><dd>${escapeHtml(item.direction_text || 'не повідомлявся')}</dd></div>${probabilityRow}${classifierRow}</dl>${vectorChainHtml(vector)}<h3>Джерела</h3>${sources}${updates ? `<h3>Історія змін</h3><ol class="update-list">${updates}</ol>` : ''}<div class="safety-note"><strong>Геометрія не є прогнозом</strong><p>Система показує лише дослівно повідомлену територію або напрямок і не екстраполює маршрут.</p></div>`);
 }
 
 async function showAssessmentDetails(id) {
@@ -3097,6 +3139,7 @@ function territoryLegacyHtml(locationId) {
   // приховує від неї.
   const threats = [];
   for (const event of snapshot?.threats ?? []) {
+    if (isExpectedTiming(event.timing)) continue;
     let asserted = null, mentioned = null, aftermath = false;
     for (const loc of event.locations ?? []) {
       const relation = territoryRelation(locationId, loc.id);
@@ -3265,12 +3308,27 @@ function territoryLiveHtml(territory, locationId) {
     ${alertBlock}
     ${asserted.length ? `<h3>Загрози</h3><ul class="territory-threats">${asserted.map(territoryThreatRow).join('')}</ul>` : ''}
     ${mentioned.length ? `<h3>Згадано джерелом</h3><ul class="territory-threats territory-threats-mentioned">${mentioned.map(territoryThreatRow).join('')}</ul>` : ''}
+    ${territoryExpectedBlock(territory.expected)}
     ${territory.consequences ? '<p class="territory-consequence">Повідомлено про наслідки на території.</p>' : ''}
     ${territoryAssessmentBlock(territory.assessment)}
     ${empty}
     ${held}
     <div class="safety-note"><strong>Це не прогноз траєкторії</strong>
       <p>Система показує лише дослівно повідомлену територію або напрямок і не екстраполює маршрут.</p></div>`;
+}
+
+// Очікувані загрози (міграція 049): окремий розділ панелі, після загроз і згадок, без полігона й іконки.
+// Рядок каже коли, з якою оцінкою ймовірності й у якому вікні — і нічого про укриття: це не «зараз».
+function territoryExpectedBlock(expected) {
+  if (!Array.isArray(expected) || !expected.length) return '';
+  return `<h3>Очікується</h3><ul class="territory-threats territory-threats-expected">${expected.map((row) => `
+    <li class="territory-state-row expected" data-event="${escapeHtml(row.eventId)}">
+      <b>${escapeHtml(threatNames[row.threatType] ?? row.threatType)}</b>
+      <span>${escapeHtml(timingBadges[row.timing] ?? row.timing)}${row.probability != null ? ` · ймовірність ${escapeHtml(probabilityText(row.probability))}` : ''}${
+      row.expectedUntil ? ` · ${escapeHtml(expectedWindowText(row.expectedFrom, row.expectedUntil))}` : ''} · ${escapeHtml(evidenceNames[row.evidenceLevel] ?? row.evidenceLevel)}</span>
+      ${row.note ? `<small>🤖 ${escapeHtml(row.note)}</small>` : ''}
+      <small>Повідомлення про можливу загрозу, не сигнал тривоги.</small>
+    </li>`).join('')}</ul>`;
 }
 
 function territoryPanelBody(territory, locationId) {
@@ -4769,7 +4827,10 @@ const promptVersionNames = {
   'retrospective-gate-v1': 'Ретроспективний гейт',
   'attack-tactics-commentary-v1': 'Коментар до тактики',
   'attack-research-v1': 'Дослідження області',
-  'attack-stats-v1': 'Статистика ударів і ймовірності'
+  'attack-stats-v1': 'Статистика ударів і ймовірності',
+  'codex-classifier-v1': 'Класифікатор (основний режим)',
+  'context-compaction-v1': 'Стискання контексту локації',
+  'risk-v2': 'Оцінка ризику'
 };
 
 function bytesLabel(value) {
@@ -4813,7 +4874,9 @@ const aiRunSurfaceNames = {
   tactics: 'Тактика: коментар',
   movement_summary: 'Переказ руху загрози в сповіщеннях',
   attack_research: 'Дослідження області',
-  attack_stats: 'Статистика ударів і ймовірності'
+  attack_stats: 'Статистика ударів і ймовірності',
+  classifier: 'Класифікатор (основний режим)',
+  context_compaction: 'Стискання контексту локації'
 };
 const aiRunValidationNames = { passed: 'звірку пройдено', rejected: 'звірку не пройдено', skipped: 'звірка не застосовна' };
 
@@ -5403,8 +5466,47 @@ const codexFeatureLabels = {
   attack_stats: {
     title: 'Статистика ударів і ймовірності',
     note: 'Модель із вебпошуком збирає епізоди ударів по області з відкритих джерел за півтора місяця, рахує статистику й пуассонівську ймовірність на найближчі два тижні. Публічний блок на сторінці атак і нічна аналітика бота, завжди з дисклеймером. Один запуск водночас, без таймауту, під денним лімітом. Вимкнено — вибір областей лише записується.'
+  },
+  // Оцінка ризику по локаціях моделлю Codex замість AI_*-ендпоінта або правил, з контекстом локації
+  // в запиті. Той самий індекс, той самий затискач; змінюється лише те, хто пише число й текст.
+  risk: {
+    title: 'Оцінка ризику: модель Codex',
+    note: 'Шестигодинний індекс ризику по локації рахує Codex — з сигналами й контекстом локації в запиті — замість окремого AI_*-ендпоінта або правил. Межі ті самі: індекс, не ймовірність; стелі за рівнем джерел затискає код. Не відповіла — AI_* (якщо налаштовано), інакше правила.'
   }
 };
+
+// ------------------------------------------------------------------------------------------------
+// Контексти по локаціях: памʼять моделі про кожне місце (міграція 049)
+// ------------------------------------------------------------------------------------------------
+//
+// Не налаштування, а стан: скільки контекстів, скільки вони важать, які найбільші й коли їх
+// стискала модель. Самі тексти сюди не приходять — їх читає лише модель, і це навмисно: контекст —
+// це робоча памʼять запиту, а не документ для людини.
+function opsModelContextSection(payload, settings) {
+  if (!payload) {
+    return '<section class="ops-section" id="model-context-section"><header class="ops-section-head"><div><p>Памʼять моделі</p><h2>Контексти по локаціях</h2></div></header><p class="legend-note">Стан недоступний.</p></section>';
+  }
+  const mode = settings?.classifierMode ?? 'rules';
+  const cfg = payload.settings ?? {};
+  const cls = payload.classifier ?? {};
+  const rows = (payload.largest ?? []).map((row) => `<tr>
+      <td>${escapeHtml(row.name)}<small>${escapeHtml(row.locationId)}</small></td>
+      <td>${escapeHtml(String(row.tokens))}</td>
+      <td>${escapeHtml(String(row.entries))}</td>
+      <td>${escapeHtml(String(row.compactions))}${row.compactedAt ? `<small>${escapeHtml(new Date(row.compactedAt).toLocaleString('uk-UA'))}</small>` : ''}</td>
+      <td>${escapeHtml(new Date(row.updatedAt).toLocaleString('uk-UA'))}</td>
+    </tr>`).join('');
+  return `<section class="ops-section" id="model-context-section">
+    <header class="ops-section-head"><div><p>Памʼять моделі · режим класифікатора: ${escapeHtml(mode === 'codex' ? 'Codex' : 'правила')}</p><h2>Контексти по локаціях</h2></div></header>
+    <p class="legend-note">${cfg.enabled === false ? 'Вимкнено (MODEL_CONTEXT_ENABLED=false): контексти не пишуться й не додаються до запитів. ' : ''}
+      Рядків: ${escapeHtml(String(payload.rows ?? 0))}, разом ≈ ${escapeHtml(String(payload.totalTokens ?? 0))} токенів (оцінка). Стеля ${escapeHtml(String(cfg.maxTokens ?? '—'))} токенів на локацію,
+      після стискання ≈ ${escapeHtml(String(cfg.compactToTokens ?? '—'))}; у запит — до ${escapeHtml(String(cfg.requestTokens ?? '—'))}; зберігання ${escapeHtml(String(cfg.retentionDays ?? '—'))} діб;
+      стискання ${cfg.compactionTimeoutMs ? `до ${escapeHtml(String(cfg.compactionTimeoutMs))} мс` : 'без обмеження часу'}.
+      Класифікатор у режимі Codex: таймаут ${escapeHtml(String(cls.timeoutMs ?? '—'))} мс, до ${escapeHtml(String(cls.maxPerMinute ?? '—'))}/хв, одночасно ${escapeHtml(String(cls.maxConcurrent ?? '—'))}, мін. впевненість ${escapeHtml(String(cls.minConfidence ?? '—'))}.</p>
+    ${rows ? `<div class="stats-table-wrap"><table class="stats-table"><thead><tr><th>Локація</th><th>Токенів</th><th>Записів</th><th>Стискань</th><th>Оновлено</th></tr></thead><tbody>${rows}</tbody></table></div>`
+    : '<p class="legend-note">Жодного контексту ще не записано: вони зʼявляються з першим класифікованим повідомленням або тривогою.</p>'}
+  </section>`;
+}
 
 function codexFeatureField(key, enabled) {
   const label = codexFeatureLabels[key];
@@ -5450,6 +5552,15 @@ function opsCodexSettingsSection(payload) {
       <p class="legend-note">Глибина керує тим, скільки модель думає, черга — скільки чекає.
         Для узагальнення руху загроз черга важить більше: текст, що прийшов після того, як загроза
         минула, не вартий нічого, хоч би як добре був написаний.</p>
+      <label class="codex-model">Хто класифікує повідомлення<select data-codex-classifier-mode>${
+        [['rules', 'правила — модель лише тіньова й промоційна'], ['codex', 'Codex — основний класифікатор, правила запасні']]
+          .map(([value, label]) => `<option value="${value}"${(settings.classifierMode ?? 'rules') === value ? ' selected' : ''}>${escapeHtml(label)}</option>`).join('')
+      }</select></label>
+      <p class="legend-note">Режим, а не перемикач. У режимі Codex модель читає кожне повідомлення з контекстом
+        локації й відповідає, який це клас, де, КОЛИ актуально (зараз / за годину / увечері / за добу / за
+        дві доби) і з якою ймовірністю; з цього робиться подія з доказовістю джерела. Правила лишаються
+        запасним шляхом (модель недоступна, повільна, поза бюджетом, невпевнена) і єдиним джерелом відбоїв.
+        Вимкнений Codex-сеанс у цьому режимі означає «класифікують правила», а не тишу.</p>
       <div class="codex-features">
         ${Object.keys(codexFeatureLabels).map((key) => codexFeatureField(key, settings.features[key])).join('')}
       </div>
@@ -5478,6 +5589,7 @@ function wireCodexSettingsSection(root, onSaved) {
         model: $('[data-codex-model]', root)?.value || null,
         effort: $('[data-codex-effort]', root)?.value || null,
         serviceTier: $('[data-codex-tier]', root)?.value || null,
+        classifierMode: $('[data-codex-classifier-mode]', root)?.value || null,
         features
       })
     }).catch(() => null);
@@ -6743,13 +6855,15 @@ async function renderOps() {
   // Стан входу приходить у складі налаштувань, а не окремим запитом: перемикач «увімкнено» поруч
   // із мертвою сесією — найзаплутаніший стан цієї функції, і показати їх із двох різних моментів
   // означало б зробити його ще заплутанішим.
-  const [vectorOps, research, attackStats, codexSettings, aiRuns, shadow, sourceTrust, runtime, deploy, backfill, coverage, opsSources] = await Promise.all([
+  const [vectorOps, research, attackStats, modelContexts, codexSettings, aiRuns, shadow, sourceTrust, runtime, deploy, backfill, coverage, opsSources] = await Promise.all([
     opsFetch('/ops/vectors').then((result) => result.ok ? result.json() : null).catch(() => null),
     // Тільки перелік і ліміти. Жодного меморандуму тут не рахується: він зʼявляється лише після
     // натискання, і саме тому відкриття консолі нічого не витрачає.
     opsFetch('/ops/attack-research').then((result) => result.ok ? result.json() : null).catch(() => null),
     // Стан черги і останні звіти статистики ударів; так само нічого не рахує.
     opsFetch('/ops/attack-stats').then((result) => result.ok ? result.json() : null).catch(() => null),
+    // Контексти по локаціях для запитів моделі: розміри й стискання (міграція 049).
+    opsFetch('/ops/model-contexts').then((result) => result.ok ? result.json() : null).catch(() => null),
     opsFetch('/ops/codex/settings').then((result) => result.ok ? result.json() : null).catch(() => null),
     opsFetch(aiRunsUrl()).then((result) => result.ok ? result.json() : null).catch(() => null),
     opsFetch('/ops/shadow-classifier?hours=24').then((result) => result.ok ? result.json() : null).catch(() => null),
@@ -6813,6 +6927,7 @@ async function renderOps() {
       ${opsCodexSettingsSection(codexSettings)}
       ${opsShadowSection(shadow, codexSettings?.settings ?? null)}
       ${opsAiRunsSection(aiRuns, codex, codexSettings?.settings ?? null)}
+      ${opsModelContextSection(modelContexts, codexSettings?.settings ?? null)}
     </div>
     ${opsVectorSection(vectorOps)}
     ${opsResearchSection(research)}

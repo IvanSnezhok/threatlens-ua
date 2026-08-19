@@ -75,10 +75,13 @@ export const CODEX_FEATURES = [
   // замовчуванням, як і решта: модельний текст біля попередження вмикають свідомо.
   'movement_summary',
   // Статистика ударів і пуассонівський прогноз по регіонах з відкритих джерел (міграція 048).
-  // Останній у списку не за авторитетом над конвеєром — його немає взагалі, — а за тим, що це
-  // єдиний перемикач, який публікує РОЗРАХУНОК ПРО МАЙБУТНЄ: ймовірність дня атаки, з дисклеймером,
+  // Єдиний перемикач, який публікує РОЗРАХУНОК ПРО МАЙБУТНЄ: ймовірність дня атаки, з дисклеймером,
   // на публічній сторінці атак і в нічній аналітиці бота. Вимкнено за замовчуванням.
-  'attack_stats'
+  'attack_stats',
+  // Оцінка ризику по локаціях моделлю Codex (міграція 049) — замість окремого AI_*-ендпоінта або
+  // правил, з контекстом локації в запиті. Та сама межа, що й у AI_*: індекс, не ймовірність; числа
+  // затискає `clampAssessment`. Вимкнено за замовчуванням.
+  'risk'
 ] as const;
 export type CodexFeature = (typeof CODEX_FEATURES)[number];
 
@@ -104,11 +107,24 @@ export type CodexEffort = (typeof CODEX_EFFORTS)[number];
 export const CODEX_SERVICE_TIERS = ['priority', 'default', 'flex'] as const;
 export type CodexServiceTier = (typeof CODEX_SERVICE_TIERS)[number];
 
+/**
+ * Хто класифікує повідомлення (міграція 049).
+ *
+ * `rules` — детерміновані правила, модель лише тіньова й промоційна, як було завжди. `codex` — модель
+ * класифікує кожне повідомлення: клас, локації, актуальність (зараз / за годину / увечері / за добу /
+ * за дві доби), ймовірність; правила — запасний шлях, коли модель недоступна, повільна, поза
+ * бюджетом чи невпевнена, і єдине джерело відбоїв. Не булевий перемикач, а режим: «хто основний» —
+ * це не «чи є ще один текст», і консоль мусить показати його як вибір, а не як галочку.
+ */
+export const CLASSIFIER_MODES = ['rules', 'codex'] as const;
+export type ClassifierMode = (typeof CLASSIFIER_MODES)[number];
+
 export interface CodexSettings {
   /** The operator's explicit choice, or null when they have deferred to `CODEX_MODEL`. */
   model: string | null;
   effort: CodexEffort;
   serviceTier: CodexServiceTier;
+  classifierMode: ClassifierMode;
   features: CodexFeatureFlags;
   updatedAt: string | null;
 }
@@ -144,6 +160,8 @@ interface SettingsRow {
   attack_research_enabled: boolean;
   movement_summary_enabled: boolean;
   attack_stats_enabled: boolean;
+  classifier_mode: string;
+  risk_enabled: boolean;
   updated_at: Date;
 }
 
@@ -151,10 +169,11 @@ const DEFAULTS: CodexSettings = {
   model: null,
   effort: 'medium',
   serviceTier: 'priority',
+  classifierMode: 'rules',
   features: {
     narrative: false, digest: false, attacks: false, shadow: false, analytical_threats: false,
     analytical_enrichment: false, retrospective_gate: false, tactics: false, attack_research: false,
-    movement_summary: false, attack_stats: false
+    movement_summary: false, attack_stats: false, risk: false
   },
   updatedAt: null
 };
@@ -168,6 +187,9 @@ function fromRow(row: SettingsRow): CodexSettings {
       ? row.reasoning_effort as CodexEffort : 'medium',
     serviceTier: (CODEX_SERVICE_TIERS as readonly string[]).includes(row.service_tier)
       ? row.service_tier as CodexServiceTier : 'priority',
+    // Невідоме значення читається як `rules`: безпечний бік — правила, як було завжди.
+    classifierMode: (CLASSIFIER_MODES as readonly string[]).includes(row.classifier_mode)
+      ? row.classifier_mode as ClassifierMode : 'rules',
     features: {
       narrative: row.narrative_enabled,
       digest: row.digest_enabled,
@@ -179,7 +201,8 @@ function fromRow(row: SettingsRow): CodexSettings {
       tactics: row.tactics_enabled,
       attack_research: row.attack_research_enabled,
       movement_summary: row.movement_summary_enabled,
-      attack_stats: row.attack_stats_enabled
+      attack_stats: row.attack_stats_enabled,
+      risk: row.risk_enabled
     },
     updatedAt: row.updated_at.toISOString()
   };
@@ -224,6 +247,7 @@ export interface CodexSettingsPatch {
   model?: string | null;
   effort?: string | null;
   serviceTier?: string | null;
+  classifierMode?: string | null;
   features?: Partial<CodexFeatureFlags>;
 }
 
@@ -245,6 +269,7 @@ export function applySettingsPatch(current: CodexSettings, patch: CodexSettingsP
     model,
     effort: pick(patch.effort, CODEX_EFFORTS, current.effort),
     serviceTier: pick(patch.serviceTier, CODEX_SERVICE_TIERS, current.serviceTier),
+    classifierMode: pick(patch.classifierMode, CLASSIFIER_MODES, current.classifierMode),
     features: {
       narrative: patch.features?.narrative ?? current.features.narrative,
       digest: patch.features?.digest ?? current.features.digest,
@@ -256,7 +281,8 @@ export function applySettingsPatch(current: CodexSettings, patch: CodexSettingsP
       tactics: patch.features?.tactics ?? current.features.tactics,
       attack_research: patch.features?.attack_research ?? current.features.attack_research,
       movement_summary: patch.features?.movement_summary ?? current.features.movement_summary,
-      attack_stats: patch.features?.attack_stats ?? current.features.attack_stats
+      attack_stats: patch.features?.attack_stats ?? current.features.attack_stats,
+      risk: patch.features?.risk ?? current.features.risk
     },
     updatedAt: current.updatedAt
   };
@@ -267,7 +293,7 @@ export async function readCodexSettings(): Promise<CodexSettings> {
     `SELECT model,reasoning_effort,service_tier,
             narrative_enabled,digest_enabled,attacks_enabled,shadow_enabled,analytical_threats_enabled,
             analytical_enrichment_enabled,retrospective_gate_enabled,tactics_enabled,attack_research_enabled,movement_summary_enabled,
-            attack_stats_enabled,
+            attack_stats_enabled,classifier_mode,risk_enabled,
             updated_at
        FROM codex_settings WHERE singleton`
   );
@@ -288,8 +314,8 @@ export async function saveCodexSettings(patch: CodexSettingsPatch): Promise<Code
                                 narrative_enabled,digest_enabled,attacks_enabled,
                                 shadow_enabled,analytical_threats_enabled,analytical_enrichment_enabled,
                                 retrospective_gate_enabled,tactics_enabled,attack_research_enabled,movement_summary_enabled,
-                                attack_stats_enabled,updated_at)
-     VALUES (true,$1,$11,$12,$2,$3,$4,$5,$6,$7,$8,$9,$10,$13,$14,now())
+                                attack_stats_enabled,classifier_mode,risk_enabled,updated_at)
+     VALUES (true,$1,$11,$12,$2,$3,$4,$5,$6,$7,$8,$9,$10,$13,$14,$15,$16,now())
      ON CONFLICT (singleton) DO UPDATE SET
        model=EXCLUDED.model,
        reasoning_effort=EXCLUDED.reasoning_effort, service_tier=EXCLUDED.service_tier,
@@ -302,16 +328,18 @@ export async function saveCodexSettings(patch: CodexSettingsPatch): Promise<Code
        tactics_enabled=EXCLUDED.tactics_enabled,
        attack_research_enabled=EXCLUDED.attack_research_enabled,
        movement_summary_enabled=EXCLUDED.movement_summary_enabled,
-       attack_stats_enabled=EXCLUDED.attack_stats_enabled, updated_at=now()
+       attack_stats_enabled=EXCLUDED.attack_stats_enabled,
+       classifier_mode=EXCLUDED.classifier_mode, risk_enabled=EXCLUDED.risk_enabled, updated_at=now()
      RETURNING model,reasoning_effort,service_tier,
                narrative_enabled,digest_enabled,attacks_enabled,shadow_enabled,analytical_threats_enabled,
                analytical_enrichment_enabled,retrospective_gate_enabled,tactics_enabled,attack_research_enabled,movement_summary_enabled,
-               attack_stats_enabled,
+               attack_stats_enabled,classifier_mode,risk_enabled,
                updated_at`,
     [next.model, next.features.narrative, next.features.digest, next.features.attacks,
       next.features.shadow, next.features.analytical_threats, next.features.analytical_enrichment,
       next.features.retrospective_gate, next.features.tactics, next.features.attack_research,
-      next.effort, next.serviceTier, next.features.movement_summary, next.features.attack_stats]
+      next.effort, next.serviceTier, next.features.movement_summary, next.features.attack_stats,
+      next.classifierMode, next.features.risk]
   );
   return fromRow(result.rows[0]!);
 }
@@ -330,5 +358,17 @@ export async function codexFeatureEnabled(feature: CodexFeature): Promise<boolea
     return settings.features[feature];
   } catch {
     return false;
+  }
+}
+
+/**
+ * Хто класифікує зараз. Будь-яка помилка читання — `rules`: конвеєр, який не може прочитати свій
+ * режим, має класифікувати правилами, а не зупинятися й не вгадувати, що оператор хотів модель.
+ */
+export async function codexClassifierMode(): Promise<ClassifierMode> {
+  try {
+    return (await readCodexSettings()).classifierMode;
+  } catch {
+    return 'rules';
   }
 }

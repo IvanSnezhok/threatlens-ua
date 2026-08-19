@@ -84,7 +84,10 @@ const VOLATILE_TABLES = [
   // a `queued` row behind would make the next file's first request answer «already queued» — and the
   // interest table would hand it a candidate list it never built. `worker_state` is truncated already
   // (the daily-pass stamp lives there).
-  'attack_stats_reports', 'attack_stats_interest'
+  'attack_stats_reports', 'attack_stats_interest',
+  // Контексти по локаціях (міграція 049): рядок, що лишився від попереднього файлу, поїхав би в промт
+  // наступного й міняв би те, що модель-заглушка «бачить», непомітно для тесту.
+  'model_location_contexts'
 ];
 
 /**
@@ -160,7 +163,7 @@ export async function resetDatabase(): Promise<void> {
              attacks_enabled=false, shadow_enabled=false, analytical_threats_enabled=false,
              retrospective_gate_enabled=false,
              tactics_enabled=false, attack_research_enabled=false, movement_summary_enabled=false,
-             attack_stats_enabled=false, updated_at=now()
+             attack_stats_enabled=false, classifier_mode='rules', risk_enabled=false, updated_at=now()
              WHERE singleton`);
   await sql(`UPDATE telegram_delivery_governor SET tokens=25,last_refill_at=now(),blocked_until=NULL,updated_at=now()
              WHERE singleton`);

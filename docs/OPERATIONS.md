@@ -736,6 +736,75 @@ curl -fsS -H "Authorization: Bearer $METRICS_TOKEN" localhost:3000/metrics |
   grep -E 'threatlens_attack_stats_(runs_total|run_duration_seconds)'
 ```
 
+## Codex as the primary classifier (operator only)
+
+Since migration 049 the console's «Codex-аналітика» group has a MODE beside the switches: «Хто
+класифікує повідомлення» — `rules` (the deterministic classifier, the model shadow-only, as always) or
+`codex` (the model classifies every message; the rules are the fallback and the only source of
+all-clears). Ships as `rules`. ADR 0002 records the decision and its boundaries.
+
+What `codex` changes, message by message (`src/services/codex-classifier.ts`, `src/services/ingestion.ts`):
+
+- The model is asked AFTER the rules have handled any all-clear and BEFORE the significance check,
+  with the channel's previous messages, the per-location contexts and the rules' own reading as a
+  hint. It answers class, places (names — resolved through the catalogue, never ids), state,
+  **timing** (`now | within_hour | evening | within_day | within_two_days`) and **probability**.
+- The event is written with the SOURCE's evidence level (`monitoring` for a tier-B channel, never
+  `unverified` by fiat) and `classified_by='codex'`; `origin` stays `deterministic` — the claim is the
+  source's, the model read it. The archive row carries `classifier_version='codex-primary-v1'`,
+  `model`, `model_confidence`, `timing`, `probability`; `shadow_classifications` gets the
+  rules-versus-model comparison from the same verdict, so `/ops` agreement keeps working without a
+  second call.
+- Every failure falls back to the rules and is counted:
+  `threatlens_codex_classifier_outcomes_total{outcome=fallback_timeout|fallback_model_failed|
+  fallback_unparsable|fallback_rate_limited|fallback_busy|fallback_low_confidence|fallback_no_locations|
+  fallback_disabled}`. `suppressed` is the model confidently (≥ 0.7) saying «not a threat» where the
+  rules saw one; the archive row then reads `ignored_reason='model_not_significant'`.
+- Bounds, all hot in `/ops` → settings: `CODEX_PRIMARY_TIMEOUT_MS` (20 s), `CODEX_PRIMARY_MAX_PER_MINUTE`
+  (60; 0 = rules with the mode on paper), `CODEX_PRIMARY_MAX_CONCURRENT` (6), `CODEX_PRIMARY_MIN_CONFIDENCE`
+  (0.5). Nothing queues: over budget means the rules, now.
+
+**Expected threats.** A verdict with `timing ≠ now` becomes an event that lives to the end of its
+window (evening = Kyiv 18:00–23:59; within_day = 24 h; within_two_days = 48 h), does NOT fill the
+territory polygon or become an icon, is listed in the territory panel under «Очікується», on the
+event card with a badge, and reaches subscribers as a quiet 🕒 message («очікується увечері ·
+ймовірність ≈60 %») in the `soft` delivery class with no shelter instruction. A later «now» message
+for the same class and place merges into it and makes it current.
+
+```bash
+# Switch the mode (and, separately, the Codex risk assessment).
+curl -fsS -u "$OPS_USER:$OPS_PASSWORD" -X PUT -H 'Content-Type: application/json' \
+  -d '{"classifierMode":"codex","features":{"risk":true}}' http://localhost:3000/ops/codex/settings
+
+# What the model was asked and answered, per message.
+curl -fsS -u "$OPS_USER:$OPS_PASSWORD" 'http://localhost:3000/ops/ai-runs?surface=classifier&limit=20'
+
+# Outcomes.
+curl -fsS -H "Authorization: Bearer $METRICS_TOKEN" localhost:3000/metrics |
+  grep threatlens_codex_classifier_outcomes_total
+```
+
+### Per-location model context
+
+Every classified message, every rules/model verdict and every official alert start and end is
+appended as one timestamped line to `model_location_contexts` for the places involved (the named
+location, its oblast; `ua` when no place was named). The context rides in every model request about
+that place — the classifier, the Codex risk assessment — most specific place first, newest lines
+first, within `MODEL_CONTEXT_REQUEST_TOKENS`. When a location's estimated size passes
+`MODEL_CONTEXT_MAX_TOKENS` (100 000) the model is asked to compact it to
+`MODEL_CONTEXT_COMPACT_TO_TOKENS` («стисни, неактуальне відкинь», surface `context_compaction`, no
+timeout by default); if the model does not answer, the oldest lines are cut deterministically. Rows
+untouched for `MODEL_CONTEXT_RETENTION_DAYS` are deleted. Contexts are written in BOTH modes so the
+day the mode is switched the model has history to read; `MODEL_CONTEXT_ENABLED=false` stops both
+writing and reading.
+
+```bash
+# Sizes, the largest contexts, compactions — never the text itself.
+curl -fsS -u "$OPS_USER:$OPS_PASSWORD" http://localhost:3000/ops/model-contexts
+curl -fsS -H "Authorization: Bearer $METRICS_TOKEN" localhost:3000/metrics |
+  grep threatlens_model_context_operations_total
+```
+
 ## Codex analytics (operator only)
 
 The whole lifecycle lives in one `/ops` group — «Codex-аналітика»: session status, the sign-in
@@ -757,6 +826,7 @@ grant:
 | `attack_research` | the oblast research memo | operator only |
 | `movement_summary` | a model retelling of a threat's movement, sources named | subscriber threat messages |
 | `attack_stats` | attack statistics and Poisson probabilities per region, from open sources | public attacks page + nightly digest |
+| `risk` | the six-hour risk index written by Codex, with the location context, instead of `AI_*` | map assessments + Telegram |
 
 `attacks` is the one whose name has outlived its meaning, and the console label now says so. It has
 **never** gated the public attacks page: its single reader is `refineWithCodex()` in

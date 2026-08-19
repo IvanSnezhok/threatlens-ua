@@ -21,7 +21,7 @@
  * `territories[]`. The two implementations are pinned to each other by CONTRACT.md §3.3 and by
  * STAGE1 §12.1's key-by-key table; changing one without the other changes the map's appearance.
  */
-import { type EvidenceLevel, type LiveEvent, type RelationType, type ThreatType } from '../types.js';
+import { type EvidenceLevel, type LiveEvent, type RelationType, type ThreatTiming, type ThreatType } from '../types.js';
 import {
   compareThreatIcons, rankThreatIcons, EVIDENCE_RANK, RELATION_RANK,
   type IconCandidate, type IconTone, type TerritoryIcon
@@ -90,6 +90,23 @@ export interface TerritoryThreat {
   eventIds: string[];             // up to 8, newest first — the panel's click-through targets
 }
 
+/**
+ * Очікувана загроза на території (міграція 049): подія з `timing` ≠ now. Вона НЕ заливає полігон і
+ * не стає іконкою — це не «загроза зараз», а сказане джерелом про найближчі години чи доби. Панель
+ * показує її окремим рядком «очікується …», з ймовірністю моделі і вікном.
+ */
+export interface TerritoryExpectedThreat {
+  eventId: string;
+  threatType: ThreatType;
+  timing: ThreatTiming;
+  probability: number | null;
+  expectedFrom: string | null;
+  expectedUntil: string | null;
+  evidenceLevel: EvidenceLevel;
+  lastObservedAt: string;
+  note: string | null;
+}
+
 export interface TerritoryAssessment {
   assessmentId: string;
   threatType: ThreatType;
@@ -111,6 +128,7 @@ export interface TerritoryState {
   alertSince: string | null;      // ISO — earliest active alert start
   alerts: TerritoryAlert[];
   threats: TerritoryThreat[];     // ordered by the icon priority, strongest first
+  expected: TerritoryExpectedThreat[];  // очікувані (timing ≠ now), найближчі першими; без полігона й іконки
   threatActive: boolean;          // any threat with `asserted === true` — drives the orange polygon
   consequences: boolean;          // any `TerritoryThreat.consequence` — «підтверджена атака / наслідки»
   assessment: TerritoryAssessment | null;   // strongest live assessment (highest riskScore)
@@ -126,6 +144,10 @@ export interface TerritoryState {
  * Константа переоголошена, а не імпортована: імпорт із репозиторію затягнув би сюди `pg`.
  */
 export const LOCATION_HIERARCHY_MAX_DEPTH = 8;
+/** Скільки очікуваних загроз несе одна територія в панель. */
+export const MAX_TERRITORY_EXPECTED = 6;
+/** Порядок актуальності: дзеркало `TIMING_RANK` із `src/domain/threat-timing.ts`. */
+const TIMING_RANK: Record<ThreatTiming, number> = { now: 0, within_hour: 1, evening: 2, within_day: 3, within_two_days: 4 };
 
 /** Тільки ці три рівні мають контур на карті; усе інше (місто, громада, країна) не є територією. */
 export const POLYGON_TIERS = new Set<string>(['oblast', 'special_city', 'raion']);
@@ -320,6 +342,7 @@ interface TerritoryDraft {
   coverage: TerritoryCoverage;
   alerts: TerritoryAlert[];
   threats: Map<ThreatType, ThreatDraft>;
+  expected: Map<string, TerritoryExpectedThreat>;
   assessment: TerritoryAssessment | null;
   assessmentCoverage: TerritoryCoverage | null;
 }
@@ -395,7 +418,7 @@ export function composeTerritoryStates(input: {
       return existing;
     }
     const draft: TerritoryDraft = {
-      node, coverage, alerts: [], threats: new Map(), assessment: null, assessmentCoverage: null
+      node, coverage, alerts: [], threats: new Map(), expected: new Map(), assessment: null, assessmentCoverage: null
     };
     drafts.set(node.id, draft);
     return draft;
@@ -415,6 +438,25 @@ export function composeTerritoryStates(input: {
   }
 
   for (const event of input.threats) {
+    // Очікувана подія (міграція 049) — в окремий список території, а не в полігон і не в іконку:
+    // «увечері очікується балістика» не є загрозою зараз, і заливати нею область означало б показати
+    // читачеві те саме, що й «балістика в повітрі».
+    if (event.timing && event.timing !== 'now') {
+      for (const location of event.locations ?? []) {
+        for (const { node, coverage } of reachOf(location.id)) {
+          const draft = draftFor(node, coverage);
+          if (!draft.expected.has(event.id)) {
+            draft.expected.set(event.id, {
+              eventId: event.id, threatType: event.threatType, timing: event.timing,
+              probability: event.probability ?? null, expectedFrom: event.expectedFrom ?? null,
+              expectedUntil: event.expectedUntil ?? null, evidenceLevel: event.evidenceLevel,
+              lastObservedAt: toIso(event.lastObservedAt), note: event.assessmentNote ?? null
+            });
+          }
+        }
+      }
+      continue;
+    }
     // liveThreats() агрегує locations[] через jsonb_agg(DISTINCT …), тож одна локація під двома
     // relation_type приходить двома записами. Згортаємо їх за id, лишаючи найсильніший звʼязок,
     // інакше перший запис порахувався б двічі. `aftermath` тримаємо окремим прапорцем: він мусить
@@ -516,6 +558,11 @@ export function composeTerritoryStates(input: {
     const alertSince = draft.alerts.reduce<string | null>(
       (earliest, alert) => earliest == null || alert.startedAt < earliest ? alert.startedAt : earliest, null
     );
+    // Найближчі першими, за рівної актуальності — ймовірніші; не більше шести: це рядки панелі.
+    const expected = [...draft.expected.values()]
+      .sort((left, right) => (TIMING_RANK[left.timing] - TIMING_RANK[right.timing])
+        || ((right.probability ?? 0) - (left.probability ?? 0)))
+      .slice(0, MAX_TERRITORY_EXPECTED);
     const assessment = draft.assessment;
     const state: TerritoryState = {
       locationId: draft.node.id,
@@ -527,6 +574,7 @@ export function composeTerritoryStates(input: {
       alertSince,
       alerts: draft.alerts,
       threats,
+      expected,
       threatActive: threats.some((threat) => threat.asserted),
       consequences: threats.some((threat) => threat.consequence),
       assessment,

@@ -20,6 +20,8 @@ import { registerAppSettingsMetrics } from '../services/app-settings.js';
 import { registerAdminNoticeMetrics } from '../bot/admin-notice.js';
 import { registerAttackResearchMetrics } from '../services/attack-research.js';
 import { registerAttackStatsMetrics } from '../services/attack-stats.js';
+import { registerCodexClassifierMetrics } from '../services/codex-classifier.js';
+import { registerModelContextMetrics } from '../services/model-context.js';
 import { registerOutboxMetrics } from '../bot/outbox.js';
 import { telegramDeliveryGovernorStatus } from '../bot/delivery-governor.js';
 import { resolveRuntimeSettings } from '../services/runtime-settings.js';
@@ -330,6 +332,11 @@ export async function buildServer(options: BuildServerOptions = {}) {
   // failed — and how long one unbounded model run actually took, which is the only place that
   // number exists once `ATTACK_STATS_TIMEOUT_MS` is zero.
   registerAttackStatsMetrics(registry);
+  // `threatlens_codex_classifier_outcomes_total{outcome}` — which messages the model classified, which
+  // it suppressed, and which fell back to the rules and why; `threatlens_model_context_operations_total`
+  // — appends, compactions and trims of the per-location contexts (migration 049).
+  registerCodexClassifierMetrics(registry);
+  registerModelContextMetrics(registry);
 
   const app = Fastify({ logger: { level: config.NODE_ENV === 'development' ? 'debug' : 'info' }, trustProxy: true });
   await app.register(rateLimit, { max: 300, timeWindow: '1 minute' });
@@ -681,6 +688,9 @@ export async function buildServer(options: BuildServerOptions = {}) {
               -- says only «не перевірено» hides that a model wrote it. threatDetails() gets the
               -- column for free through its e.* expansion; this list is explicit and has to name it.
               e.evidence_level,e.origin,e.title,e.summary,e.started_at,e.last_observed_at,
+              -- Актуальність і ймовірність (міграція 049) — з тієї самої причини, що й origin: архів
+              -- має казати, що «увечері очікується» було очікуванням, а не загрозою на ту мить.
+              e.timing,e.probability,e.expected_from,e.expected_until,e.classified_by,
               CASE WHEN e.ended_at > $8 THEN NULL ELSE e.ended_at END AS ended_at
        FROM threat_events e LEFT JOIN threat_event_locations el ON el.event_id=e.id
        WHERE ($1::text IS NULL OR EXISTS (SELECT 1 FROM related_locations r WHERE r.id=el.location_id))

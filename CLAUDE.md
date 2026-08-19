@@ -1,6 +1,6 @@
 # ThreatLens UA
 
-Read `CONTEXT.md` before changing domain behavior. Preserve the civil-threat safety boundaries: official alerts outrank analysis; AI or shadow classification must never mutate official alerts, live events, map state, risk, or notifications.
+Read `CONTEXT.md` before changing domain behavior. Preserve the civil-threat safety boundaries: official alerts outrank analysis; a model never touches official alerts and never issues an all-clear. In the default `rules` mode, AI or shadow classification must never mutate live events, map state, risk, or notifications; in the owner-chosen `classifier_mode=codex` (ADR 0002) the model is the primary classifier and its verdict creates events with the source's evidence — every model failure, timeout, budget refusal or low confidence falls back to the rules, so a warning is never lost.
 
 ## Agent skills
 

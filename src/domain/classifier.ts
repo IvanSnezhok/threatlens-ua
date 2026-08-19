@@ -868,7 +868,12 @@ export function assessRetrospective(text: string): RetrospectiveAssessment {
   return { verdict: 'suspect', markers, nowMarkers };
 }
 
-const labels: Record<ThreatType, string> = {
+/**
+ * Заголовок події за класом. Експортовано для модельного класифікатора
+ * (`src/services/codex-classifier.ts`): подія, збудована з вердикту моделі, має читатися на карті
+ * тими самими словами, що й подія правил, — заголовок не є місцем, де читач має вгадувати автора.
+ */
+export const THREAT_EVENT_TITLES: Record<ThreatType, string> = {
   uav: 'Загроза ударних БпЛА',
   ballistic_missile: 'Балістична загроза',
   cruise_missile: 'Загроза крилатих ракет',
@@ -880,6 +885,7 @@ const labels: Record<ThreatType, string> = {
   combined: 'Комбінована загроза',
   unknown: 'Повідомлення про загрозу'
 };
+const labels = THREAT_EVENT_TITLES;
 
 function relationFor(text: string, alias: string): RelationType {
   const escaped = alias.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');

@@ -10,9 +10,9 @@ import { summariseMovement } from '../services/movement-summary.js';
 import { deliverableRun } from '../services/event-log-cursor.js';
 import {
   MODEL_CHANNEL_ACTION, MODEL_CHANNEL_DISCLAIMER, MODEL_CHANNEL_STANDING,
-  cleanSummary, confidenceLabel, evidenceRaisedLine, evidenceStatement, extensionLine,
-  geographyChangedLine, humanMoment, levelLabel, modelAnalysisHeading, riskLevelChangedLine,
-  threatLabel, threatTypeChangedLine, validUntilLine
+  cleanSummary, confidenceLabel, evidenceRaisedLine, evidenceStatement, expectedWindowLine, extensionLine,
+  geographyChangedLine, humanMoment, isExpectedTiming, levelLabel, modelAnalysisHeading, probabilityLine,
+  riskLevelChangedLine, threatLabel, threatTypeChangedLine, timingBadge, validUntilLine
 } from './humanize.js';
 import {
   decideAssessmentNotification, decideThreatNotification, geographyKey, mergePublishedState,
@@ -421,7 +421,10 @@ async function enqueueForEvent(event: any) {
       const names = locationLabel(scopedIds.map((id) => catalogue.labels.get(id) ?? nameById.get(id) ?? id));
       // A soft update is a courtesy, not a warning: it rides at the quiet priority even when the
       // threat itself is official, because the only thing it says is "still standing, until later".
-      const priority = decision.kind === 'soft' ? 4 : (snapshot.evidenceLevel === 'official' ? 1 : 3);
+      // Очікувана загроза (міграція 049, timing ≠ now) — теж не попередження «зараз»: вона їде тихим
+      // пріоритетом, без звуку, бо каже «увечері може бути», а не «в укриття».
+      const expected = typeof threat.timing === 'string' && threat.timing !== 'now';
+      const priority = decision.kind === 'soft' || expected ? 4 : (snapshot.evidenceLevel === 'official' ? 1 : 3);
       const inserted = await pool.query(
         `INSERT INTO notification_outbox(event_id,chat_id,notification_type,idempotency_key,priority,payload)
          VALUES ($1::uuid,$2,'threat_update',$3,$4,$5::jsonb)
@@ -433,6 +436,14 @@ async function enqueueForEvent(event: any) {
             modelSummary: movement?.summary ?? null, modelSources: movement?.sources ?? null,
             evidenceLevel: snapshot.evidenceLevel, lastObservedAt: threat.last_observed_at,
             validUntil: threat.valid_until, ...threatSource,
+            // Актуальність і ймовірність (міграція 049). Для події правил — `now` і null, і
+            // форматувальник мовчить про них, як мовчав завжди.
+            timing: threat.timing ?? 'now',
+            probability: threat.probability == null ? null : Number(threat.probability),
+            expectedFrom: threat.expected_from ?? null,
+            expectedUntil: threat.expected_until ?? null,
+            assessmentNote: threat.assessment_note ?? null,
+            classifiedBy: threat.classified_by ?? 'rules',
             updateKind: decision.kind, changes: decision.changes,
             previousThreatType: published?.threatType ?? null,
             previousEvidenceLevel: published?.evidenceLevel ?? null,
@@ -755,6 +766,24 @@ export function formatMessage(row: any, now: Date = new Date()): string {
   const attribution = modelSummary
     ? `\n\n🤖 <i>Переказ моделі за повідомленнями: ${html(modelSources.join(', '))}</i>`
     : '';
+  // Очікувана загроза (міграція 049): «увечері очікується», «протягом години» — те, що джерело сказало
+  // про найближчі години, а не про зараз. Інший маркер (🕒, не ⚠️), у заголовку — коли, без заклику в
+  // укриття: укриття — на офіційний сигнал, і саме це має прочитати людина, якій пишуть удень про
+  // вечір. Ймовірність — оцінка моделі, і так і підписана.
+  if (isExpectedTiming(p.timing)) {
+    return `🕒 <b>${html(p.locationName)} — ${html(threatLabel(p.threatType))}: ${html(timingBadge(p.timing))}</b>`
+      + (summary ? `\n\n${html(summary)}` : '')
+      + attribution
+      + '\n\nЦе попередження про можливу загрозу, а не сигнал тривоги. Стежте за офіційними '
+      + 'сповіщеннями; під час тривоги — в укриття незалежно від цієї оцінки.'
+      + details(
+        probabilityLine(p.probability),
+        expectedWindowLine(p.expectedFrom, p.expectedUntil, now),
+        typeof p.assessmentNote === 'string' && p.assessmentNote.trim() ? `🤖 ${html(p.assessmentNote.trim())}` : null,
+        evidenceStatement(p.evidenceLevel),
+        sourceLine(p)
+      );
+  }
   return `⚠️ <b>${html(p.locationName)} — ${html(threatLabel(p.threatType))}</b>`
     + (summary ? `\n\n${html(summary)}` : '')
     + attribution
@@ -762,6 +791,7 @@ export function formatMessage(row: any, now: Date = new Date()): string {
     + 'і дочекайтеся офіційного сповіщення.'
     + details(
       evidenceStatement(p.evidenceLevel),
+      probabilityLine(p.probability),
       validUntilLine(p.validUntil, now),
       sourceLine(p)
     );

@@ -108,7 +108,9 @@ export interface CodexChatRequest {
    * the same commit or the build does not pass.
    */
   surface: 'narrative' | 'digest' | 'attacks' | 'shadow' | 'risk' | 'retrospective_gate'
-    | 'tactics' | 'attack_research' | 'movement_summary' | 'attack_stats';
+    | 'tactics' | 'attack_research' | 'movement_summary' | 'attack_stats'
+    // Міграція 049: модель як основний класифікатор повідомлень і стискання контексту локації.
+    | 'classifier' | 'context_compaction';
   /** Recorded as `ai_runs.classifier_version` when the caller knows which rules produced its input. */
   classifierVersion?: string;
   system: string;

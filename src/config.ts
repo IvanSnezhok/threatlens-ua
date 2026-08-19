@@ -560,6 +560,50 @@ export const envSchema = z.object({
   // months of forecasts against which a later calibration pass could score the model.
   ATTACK_STATS_RETENTION_DAYS: z.coerce.number().int().min(7).max(365).default(60),
 
+  // ---- Codex as the primary classifier ------------------------------------------------------------
+  // `codex_settings.classifier_mode` (migration 049) decides WHO classifies; these decide how the
+  // model call on the ingestion path is bounded when it does. Every bound here resolves to the same
+  // thing — the deterministic rules classify this message instead — so none of them can lose a
+  // warning; what they cost is a model verdict on one message. Unlike the open-source statistics
+  // surface the call IS bounded in time: a message that waits on a model is a message that is not on
+  // the map yet, and a hung call would hold a warning hostage. Twenty seconds is the shared default;
+  // two minutes is the ceiling because past it the fallback verdict would be older than the thirty
+  // minute validity window it would create.
+  CODEX_PRIMARY_TIMEOUT_MS: z.coerce.number().int().min(1000).max(120_000).default(20_000),
+  // Calls per rolling minute across every source. Over budget the rules classify; nothing queues,
+  // for the same reason the shadow classifier queues nothing — a queue hands back the spend a
+  // minute late and labels the wrong hour. Sixty covers a heavy night on a dozen channels; zero turns
+  // the mode into «rules with the switch on», a deliberate second off-switch.
+  CODEX_PRIMARY_MAX_PER_MINUTE: z.coerce.number().int().min(0).max(600).default(60),
+  // How many messages may be waiting on the model at once. The collector dispatches updates
+  // concurrently, so a burst is a burst of concurrent calls; beyond this number the rules take over
+  // immediately rather than the burst serialising behind the model.
+  CODEX_PRIMARY_MAX_CONCURRENT: z.coerce.number().int().min(1).max(32).default(6),
+  // Below this confidence the model's verdict is recorded (for the agreement table) but the rules'
+  // classification is the one that publishes. 0.5 means «the model must at least lean»; raising it
+  // hands more messages back to the rules, lowering it trusts the model's guesses.
+  CODEX_PRIMARY_MIN_CONFIDENCE: z.coerce.number().min(0).max(1).default(0.5),
+
+  // ---- Per-location model context --------------------------------------------------------------------
+  // One rolling text per oblast, raion, city or «ua»: what was reported about it, what was decided,
+  // when alerts started and ended. It rides in every model request about that place and is compacted
+  // BY THE MODEL once its estimated size passes the ceiling — «стиснути, неактуальне відкинути» — down
+  // to the target. The estimate is deliberately generous (src/domain/token-estimate.ts), so the
+  // ceiling is crossed early rather than late.
+  MODEL_CONTEXT_ENABLED: z.string().default('true').transform((value) => value === 'true'),
+  MODEL_CONTEXT_MAX_TOKENS: z.coerce.number().int().min(10_000).max(400_000).default(100_000),
+  MODEL_CONTEXT_COMPACT_TO_TOKENS: z.coerce.number().int().min(2_000).max(200_000).default(40_000),
+  // Token budget for the contexts carried in ONE request — the most specific place first, then its
+  // oblast, then the national context, newest lines first within each.
+  MODEL_CONTEXT_REQUEST_TOKENS: z.coerce.number().int().min(1_000).max(300_000).default(100_000),
+  // The compaction call: 0 = no AbortSignal (it summarises up to the ceiling in one go and nobody is
+  // waiting on it); a positive value is the operator's ceiling in ms.
+  MODEL_CONTEXT_COMPACTION_TIMEOUT_MS: z.coerce.number().int().min(0).max(3_600_000).default(0),
+  // Characters of a source message kept per context entry.
+  MODEL_CONTEXT_ENTRY_CHARS: z.coerce.number().int().min(80).max(2000).default(400),
+  // A location nobody has mentioned for this long loses its context row.
+  MODEL_CONTEXT_RETENTION_DAYS: z.coerce.number().int().min(1).max(365).default(45),
+
   // ---- Codex sign-in over OAuth ----------------------------------------------------------------
   // The operator presses a button in `/ops` instead of copying a token out of `~/.codex/auth.json`.
   // Everything here describes *where* the browser is sent and *where it comes back to*; whether a
@@ -1244,6 +1288,47 @@ export const APP_SETTINGS: Record<keyof AppConfig, SettingMeta> = {
   },
   ATTACK_STATS_RETENTION_DAYS: {
     scope: 'db_tunable', group: 'analytics', apply: 'hot', ui: { kind: 'number', min: 7, max: 365, unit: 'діб' }
+  },
+  CODEX_PRIMARY_TIMEOUT_MS: {
+    scope: 'db_tunable', group: 'analytics', apply: 'hot', ui: { kind: 'number', min: 1000, max: 120_000, unit: 'мс' },
+    applyNote: 'Скільки повідомлення чекає на модель у режимі classifier_mode=codex. Вичерпано — класифікують '
+      + 'правила, повідомлення не губиться. Діє з наступного повідомлення.'
+  },
+  CODEX_PRIMARY_MAX_PER_MINUTE: {
+    scope: 'db_tunable', group: 'analytics', apply: 'hot', ui: { kind: 'number', min: 0, max: 600, unit: 'на хвилину' },
+    applyNote: 'Понад бюджет — правила, без черги. 0 лишає режим увімкненим на папері, а класифікують правила.'
+  },
+  CODEX_PRIMARY_MAX_CONCURRENT: {
+    scope: 'db_tunable', group: 'analytics', apply: 'hot', ui: { kind: 'number', min: 1, max: 32 }
+  },
+  CODEX_PRIMARY_MIN_CONFIDENCE: {
+    scope: 'db_tunable', group: 'analytics', apply: 'hot', ui: { kind: 'number', min: 0, max: 1 },
+    applyNote: 'Нижче — вердикт моделі записується для звірки, а публікує класифікація правил.'
+  },
+  MODEL_CONTEXT_ENABLED: {
+    scope: 'db_tunable', group: 'analytics', apply: 'hot', ui: { kind: 'boolean' },
+    applyNote: 'Вимкнене — контексти по локаціях не пишуться й не додаються до запитів; наявні рядки лишаються.'
+  },
+  MODEL_CONTEXT_MAX_TOKENS: {
+    scope: 'db_tunable', group: 'analytics', apply: 'hot', ui: { kind: 'number', min: 10_000, max: 400_000, unit: 'токенів' },
+    applyNote: 'Стеля, за якою контекст локації просять стиснути. Оцінка завищена навмисно, тож стискання настає раніше.'
+  },
+  MODEL_CONTEXT_COMPACT_TO_TOKENS: {
+    scope: 'db_tunable', group: 'analytics', apply: 'hot', ui: { kind: 'number', min: 2_000, max: 200_000, unit: 'токенів' }
+  },
+  MODEL_CONTEXT_REQUEST_TOKENS: {
+    scope: 'db_tunable', group: 'analytics', apply: 'hot', ui: { kind: 'number', min: 1_000, max: 300_000, unit: 'токенів' },
+    applyNote: 'Бюджет контекстів в одному запиті: найконкретніше місце, потім область, потім країна; найсвіжіше першим.'
+  },
+  MODEL_CONTEXT_COMPACTION_TIMEOUT_MS: {
+    scope: 'db_tunable', group: 'analytics', apply: 'hot', ui: { kind: 'number', min: 0, max: 3_600_000, unit: 'мс' },
+    applyNote: '0 — без обмеження: стискання нікого не тримає, а стиснути сто тисяч токенів за секунди не можна.'
+  },
+  MODEL_CONTEXT_ENTRY_CHARS: {
+    scope: 'db_tunable', group: 'analytics', apply: 'hot', ui: { kind: 'number', min: 80, max: 2000, unit: 'символів' }
+  },
+  MODEL_CONTEXT_RETENTION_DAYS: {
+    scope: 'db_tunable', group: 'analytics', apply: 'hot', ui: { kind: 'number', min: 1, max: 365, unit: 'діб' }
   },
   CODEX_OAUTH_ISSUER: { scope: 'db_tunable', group: 'analytics', apply: 'hot', ui: { kind: 'url' } },
   CODEX_OAUTH_CLIENT_ID: { scope: 'db_tunable', group: 'analytics', apply: 'hot', ui: { kind: 'text' } },

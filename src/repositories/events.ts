@@ -1,5 +1,6 @@
 import { createHash } from 'node:crypto';
 import type { PoolClient } from 'pg';
+import { nearerTiming, type ThreatTiming } from '../domain/threat-timing.js';
 import { config } from '../config.js';
 import { CLASSIFIER_VERSION } from '../domain/classifier.js';
 import type { TerritoryNode } from '../domain/territory-state.js';
@@ -478,6 +479,16 @@ export interface ClassificationLogEntry {
   message?: NormalizedMessage;
   /** Backfill provenance keeps an old promoted event archive-only. */
   historical?: boolean;
+  /**
+   * Хто збудував класифікацію. Типово — `CLASSIFIER_VERSION` правил; у режимі `classifier_mode=codex`
+   * — `codex-primary-v1`, і тоді `assessment` несе те, чого правила не дають: актуальність,
+   * ймовірність, модель і її впевненість. Одна колонка `classifier_version` у архіві — і рішення
+   * моделі міряються тими самими запитами, що й рішення правил.
+   */
+  classifierVersion?: string;
+  assessment?: {
+    model: string; confidence: number; timing: ThreatTiming; probability: number | null; note: string | null;
+  } | null;
 }
 
 /**
@@ -501,19 +512,23 @@ export async function recordClassification(entry: ClassificationLogEntry): Promi
       `INSERT INTO message_classifications(source_message_id,source_id,classifier_version,published_at,
          decision,intent,created_event,ignored_reason,threat_type,candidate_threat_types,indicators,
          national_scope,direction_text,event_id,retraction_coverage,retracted_threat_types,
-         withdrawn_assertions,withdrawn_event_ids,last_assertion_at,decayed_risk_signals,origin_zone)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18::uuid[],$19,$20,$21)
+         withdrawn_assertions,withdrawn_event_ids,last_assertion_at,decayed_risk_signals,origin_zone,
+         timing,probability,model,model_confidence,model_note)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18::uuid[],$19,$20,$21,
+         $22,$23,$24,$25,$26)
        ON CONFLICT (source_message_id,classifier_version) DO NOTHING
        RETURNING id`,
       [
-        entry.sourceMessageId, entry.sourceId, CLASSIFIER_VERSION, entry.publishedAt,
+        entry.sourceMessageId, entry.sourceId, entry.classifierVersion ?? CLASSIFIER_VERSION, entry.publishedAt,
         entry.decision, classified.intent, entry.createdEvent ?? false, entry.ignoredReason ?? null,
         classified.threatType, classified.signalThreatTypes, classified.indicators,
         classified.nationalScope, classified.directionText ?? null, entry.eventId ?? null,
         retraction?.coverage ?? null, retraction ? retraction.threatTypes : null,
         withdrawal?.withdrawnAssertions ?? null, withdrawal?.touchedEventIds ?? null,
         withdrawal?.lastAssertionAt ?? null, withdrawal?.decayedSignals ?? null,
-        classified.originZone ?? null
+        classified.originZone ?? null,
+        entry.assessment?.timing ?? null, entry.assessment?.probability ?? null,
+        entry.assessment?.model ?? null, entry.assessment?.confidence ?? null, entry.assessment?.note ?? null
       ]
     );
     const classificationId = inserted.rows[0]?.id;
@@ -578,6 +593,22 @@ export interface IngestThreatOptions {
   historical?: boolean;
   /** Model provenance. Forces `unverified` evidence and disables every retraction branch. */
   modelPromotion?: { model: string; confidence: number };
+  /**
+   * Модель як ОСНОВНИЙ класифікатор (міграція 049, `classifier_mode='codex'`): актуальність,
+   * ймовірність і вікно очікування з її вердикту. На відміну від `modelPromotion` це НЕ знижує
+   * доказовості й не вимикає злиття: твердження лишається твердженням джерела, модель лише прочитала
+   * його. Подія позначається `classified_by='codex'`, а `origin` лишається `deterministic` — див.
+   * коментар до колонки в міграції 049.
+   */
+  assessment?: {
+    model: string;
+    classifierVersion: string;
+    timing: ThreatTiming;
+    probability: number | null;
+    expectedFrom: Date;
+    expectedUntil: Date;
+    note: string | null;
+  };
 }
 
 export async function ingestThreat(
@@ -699,12 +730,16 @@ export async function ingestThreat(
     }
     const locationIds = eventLocations.map((location) => location.id);
 
-    const existing = locationIds.length ? await client.query<{ id: string; evidence_level: EvidenceLevel; status: string }>(
-      `SELECT e.id,e.evidence_level,e.status FROM threat_events e
+    // Очікувана подія (timing <> now) приймає нові повідомлення впродовж усього свого вікна, а не лише
+    // тридцять хвилин від останньої згадки: «увечері очікується» о 15:00 і «все ще очікується» о 17:00 —
+    // одна подія, а не дві.
+    const existing = locationIds.length ? await client.query<{ id: string; evidence_level: EvidenceLevel; status: string; timing: ThreatTiming }>(
+      `SELECT e.id,e.evidence_level,e.status,e.timing FROM threat_events e
        JOIN threat_event_locations el ON el.event_id=e.id
        WHERE e.threat_type=$1 AND el.location_id=ANY($2::text[])
          AND e.status IN ('observed','confirmed','active')
-         AND e.last_observed_at > now() - interval '30 minutes'
+         AND (e.last_observed_at > now() - interval '30 minutes'
+              OR (e.timing <> 'now' AND e.expected_until > now()))
        ORDER BY e.last_observed_at DESC LIMIT 1`,
       [classified.threatType, locationIds]
     ) : { rows: [], rowCount: 0 } as never;
@@ -748,6 +783,14 @@ export async function ingestThreat(
       // that report changes is corroboration, and corroboration is `evidence_level`, which this
       // statement does raise. Clearing the flag here would erase the disclosure at the exact moment
       // the event grows — the reader would watch a model guess quietly become an ordinary report.
+      // Актуальність після злиття — БЛИЖЧА з двох: «увечері очікується» + «вже летить» = зараз.
+      // Ймовірність — більша; вікно — ширше; `valid_until` — далі. Нова оцінка без `assessment`
+      // (повідомлення, яке класифікували правила) лишає існуючу актуальність, але рахується як «зараз»
+      // для вікна чинності, як і завжди.
+      const existingTiming: ThreatTiming = existing.rows[0].timing ?? 'now';
+      const mergedTiming: ThreatTiming = options.assessment
+        ? nearerTiming(options.assessment.timing, existingTiming)
+        : 'now';
       await client.query(
         `UPDATE threat_events SET
            summary=CASE WHEN $6::boolean THEN summary
@@ -757,10 +800,20 @@ export async function ingestThreat(
            direction_text=CASE WHEN $6::boolean THEN COALESCE(direction_text,$5)
              WHEN $3::timestamptz >= last_observed_at
              THEN COALESCE($5,direction_text) ELSE direction_text END,
-           valid_until=GREATEST(valid_until,$3::timestamptz + interval '30 minutes')
+           valid_until=GREATEST(valid_until,$3::timestamptz + interval '30 minutes',$8::timestamptz),
+           timing=$7,
+           probability=CASE WHEN $9::numeric IS NULL THEN probability ELSE GREATEST(COALESCE(probability,0),$9::numeric) END,
+           expected_from=CASE WHEN $10::timestamptz IS NULL THEN expected_from ELSE LEAST(COALESCE(expected_from,$10::timestamptz),$10::timestamptz) END,
+           expected_until=CASE WHEN $8::timestamptz IS NULL THEN expected_until ELSE GREATEST(COALESCE(expected_until,$8::timestamptz),$8::timestamptz) END,
+           assessment_note=COALESCE($11,assessment_note)
          WHERE id=$1`,
         [eventId, classified.summary, message.publishedAt, nextEvidence,
-          classified.directionText ?? null, Boolean(options.modelPromotion)]
+          classified.directionText ?? null, Boolean(options.modelPromotion),
+          mergedTiming,
+          options.assessment && options.assessment.timing !== 'now' ? options.assessment.expectedUntil : null,
+          options.assessment?.probability ?? null,
+          options.assessment ? options.assessment.expectedFrom : null,
+          options.assessment?.note ?? null]
       );
       if (existing.rows[0].evidence_level !== nextEvidence) {
         await client.query(
@@ -782,14 +835,26 @@ export async function ingestThreat(
       // live mode. `/api/v1/history` filters on nothing but `created_at <= cutoff`, so the event is
       // still in the archive an operator and a reader can page through — which is the whole point of
       // replaying the window at all.
+      // Очікувана подія живе до кінця свого вікна, а не тридцять хвилин: `valid_until` — це те, що
+      // читає сповіщувач і прибиральник, тож «увечері очікується» без цього зникло б з карти о 15:30.
+      const expectedUntil = options.assessment && options.assessment.timing !== 'now' ? options.assessment.expectedUntil : null;
       const result = await client.query<{ id: string }>(
-        `INSERT INTO threat_events(threat_type,status,evidence_level,origin,title,summary,started_at,last_observed_at,direction_text,valid_until,ended_at)
-         VALUES ($1,$2,$3,$9,$4,$5,$6::timestamptz,$6::timestamptz,$7,$6::timestamptz + interval '30 minutes',
-           CASE WHEN $8 THEN $6::timestamptz + interval '30 minutes' ELSE NULL END) RETURNING id`,
+        `INSERT INTO threat_events(threat_type,status,evidence_level,origin,title,summary,started_at,last_observed_at,direction_text,valid_until,ended_at,
+                                   timing,probability,expected_from,expected_until,classified_by,assessment_note)
+         VALUES ($1,$2,$3,$9,$4,$5,$6::timestamptz,$6::timestamptz,$7,
+           GREATEST($6::timestamptz + interval '30 minutes', COALESCE($13::timestamptz, $6::timestamptz)),
+           CASE WHEN $8 THEN $6::timestamptz + interval '30 minutes' ELSE NULL END,
+           $10,$11,$12::timestamptz,$13::timestamptz,$14,$15) RETURNING id`,
         [classified.threatType,
           outsideWindow ? 'expired' : evidenceLevel === 'official' ? 'active' : 'observed', evidenceLevel,
           classified.title, classified.summary, message.publishedAt, classified.directionText ?? null,
-          outsideWindow, origin]
+          outsideWindow, origin,
+          options.assessment?.timing ?? 'now',
+          options.assessment?.probability ?? null,
+          options.assessment?.expectedFrom ?? message.publishedAt,
+          expectedUntil ?? new Date(message.publishedAt.getTime() + THREAT_VALIDITY_MS),
+          options.assessment ? 'codex' : 'rules',
+          options.assessment?.note ?? null]
       );
       eventId = result.rows[0]!.id;
     }
@@ -823,8 +888,12 @@ export async function ingestThreat(
     // two-hour half-life and gates on `expires_at > now()` alone, so a three-hour-old signal still
     // contributes about a third of its weight — a backfill would quietly raise the analytic index of
     // every oblast in the replayed window hours after the reports it is built from stopped applying.
-    const baseContribution = options.modelPromotion ? 0.3
-      : sourceRow.official ? 2.5 : sourceRow.tier === 'B' ? 1.5 : 0.6;
+    // Очікувана загроза (не «зараз») важить у шестигодинному індексі ризику менше: масштабовано на
+    // ймовірність моделі та вдвічі — це сигнал про можливе, а не про наявне, і так він читається.
+    const timingWeight = options.assessment && options.assessment.timing !== 'now'
+      ? 0.5 * (options.assessment.probability ?? 0.5) : 1;
+    const baseContribution = (options.modelPromotion ? 0.3
+      : sourceRow.official ? 2.5 : sourceRow.tier === 'B' ? 1.5 : 0.6) * timingWeight;
     for (const target of outsideWindow ? [] : signalTargets) {
       for (const signalThreatType of classified.signalThreatTypes) {
         await client.query(
@@ -985,7 +1054,10 @@ export async function liveThreats(cutoff: Date): Promise<LiveEvent[]> {
      LEFT JOIN event_evidence ee ON ee.event_id=e.id
      LEFT JOIN source_messages sm ON sm.id=ee.source_message_id
      LEFT JOIN sources s ON s.id=sm.source_id
-     WHERE e.last_observed_at > now() - interval '12 hours'
+     WHERE ( e.last_observed_at > now() - interval '12 hours'
+             -- Очікувана подія (міграція 049) читається за своїм вікном, а не за останньою згадкою:
+             -- «протягом двох діб» без нової згадки не має зникнути з карти за дванадцять годин.
+             OR (e.timing <> 'now' AND e.expected_until > now()) )
        AND e.created_at <= $1
        AND ( e.status IN ('observed','confirmed','active')
           OR ( e.status IN ('expired','withdrawn','corrected')
@@ -998,6 +1070,13 @@ export async function liveThreats(cutoff: Date): Promise<LiveEvent[]> {
     threatType: row.threat_type,
     status: row.status,
     evidenceLevel: row.evidence_level,
+    // Міграція 049. COALESCE з тієї самої причини, що й `origin` нижче: бінарник може випередити базу.
+    timing: row.timing ?? 'now',
+    probability: row.probability == null ? null : Number(row.probability),
+    expectedFrom: row.expected_from?.toISOString() ?? null,
+    expectedUntil: row.expected_until?.toISOString() ?? null,
+    classifiedBy: row.classified_by ?? 'rules',
+    assessmentNote: row.assessment_note ?? null,
     // `e.*` above already carries the column; it is mapped explicitly because everything else on
     // this object is, and because a reader of `LiveEvent` must not have to know that a model event
     // is the `unverified` one whose indicators happened to say so. COALESCE guards the one window

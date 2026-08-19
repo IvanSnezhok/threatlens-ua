@@ -26,6 +26,12 @@ import {
 } from './publication.js';
 import { retrospectiveGate, retrospectiveGateMetrics } from './retrospective-gate.js';
 import { scheduleShadowClassification, shadowClassifierMetrics } from './shadow-classifier.js';
+import {
+  CODEX_CLASSIFIER_VERSION, classifyWithCodex, contextLineForVerdict, contextLocationIdsFor,
+  recordPrimaryComparison, type CodexClassifyInput, type ModelAssessment
+} from './codex-classifier.js';
+import { codexClassifierMode } from './codex-settings.js';
+import { appendLocationContext, contextExcerpt, contextLine } from './model-context.js';
 
 interface AlarmRecord {
   externalId: string;
@@ -1519,50 +1525,111 @@ const PUBLISHING_DECISIONS: ReadonlySet<ClassificationDecision> =
  * worth a dropped threat event. What is lost when this fails is one row of history, and the counter
  * says so.
  */
-async function archiveClassification(entry: ClassificationLogEntry): Promise<void> {
+/**
+ * Що знає архівний шлях понад {@link ClassificationLogEntry}, коли класифікувала модель (міграція 049):
+ * сам вхід моделі — для рядка звірки «правила проти моделі», який пишеться, щойно в повідомлення є
+ * id, — і локації контексту, куди дописати цей вердикт для наступного повідомлення.
+ */
+interface ArchiveEntry extends ClassificationLogEntry {
+  /** Вердикт моделі став класифікацією (або придушив її): тіньовий виклик не потрібен — він уже був. */
+  modelClassified?: boolean;
+  primaryInput?: CodexClassifyInput;
+  modelAssessment?: ModelAssessment | null;
+  contextLocationIds?: string[];
+  /** Що про джерело знає конвеєр: для рядка контексту. */
+  sourceName?: string | null;
+}
+
+/** Назва, рівень і офіційність джерела — один запит на джерело, памʼять процесу на десять хвилин. */
+const sourceDescriptors = new Map<string, { at: number; value: { name: string; tier: string; official: boolean } | null }>();
+const SOURCE_DESCRIPTOR_TTL_MS = 10 * 60_000;
+
+export async function sourceDescriptor(sourceId: string): Promise<{ name: string; tier: string; official: boolean } | null> {
+  const cached = sourceDescriptors.get(sourceId);
+  if (cached && Date.now() - cached.at < SOURCE_DESCRIPTOR_TTL_MS) return cached.value;
+  const row = await pool.query<{ name: string; tier: string; official: boolean }>(
+    `SELECT name,tier,official FROM sources WHERE id=$1`, [sourceId]
+  ).catch(() => ({ rows: [] as Array<{ name: string; tier: string; official: boolean }> }));
+  const value = row.rows[0] ?? null;
+  sourceDescriptors.set(sourceId, { at: Date.now(), value });
+  return value;
+}
+
+/** Тестовий шов. */
+export function resetSourceDescriptors(): void {
+  sourceDescriptors.clear();
+}
+
+/**
+ * Запис у контекст локацій (міграція 049) — для кожного повідомлення, у будь-якому режимі: контекст
+ * має бути готовий до дня, коли модель стане основною, а не починатися з нуля того дня. Локації —
+ * названі в класифікації, їхні області, і «ua», коли місця немає зовсім.
+ */
+async function noteInLocationContexts(entry: ArchiveEntry): Promise<void> {
+  if (!config.MODEL_CONTEXT_ENABLED) return;
+  const ids = entry.contextLocationIds?.length
+    ? entry.contextLocationIds
+    : await contextLocationIdsFor(entry.classified).catch(() => ['ua']);
+  const located = entry.classified.locations.length > 0;
+  const targets = located ? ids.filter((id) => id !== 'ua') : ids;
+  const text = entry.message?.text ?? entry.classified.summary;
+  const line = contextLine(entry.publishedAt, contextLineForVerdict(
+    entry.sourceName ? { name: entry.sourceName } : null, entry.sourceId, text,
+    entry.modelAssessment ?? null, entry.primaryInput?.rules ?? entry.classified, entry.decision, contextExcerpt
+  ));
+  await appendLocationContext(targets, line);
+}
+
+async function archiveClassification(entry: ArchiveEntry): Promise<void> {
   // The shadow classifier hangs off this one function rather than off the four branches that call
   // it, because "the deterministic decision is final and written down" is exactly the moment a second
   // opinion becomes meaningful and cannot influence anything. It is started before the archive write
   // is awaited on purpose — the two are independent, neither waits for the other, and the model call
   // is fire-and-forget in both directions.
   //
+  // У режимі `classifier_mode=codex` модель уже відповіла на це повідомлення ДО рішення, і її
+  // відповідь уже є класифікацією (або придушенням): другий виклик нічого не додав би, крім витрати,
+  // а рядок звірки «правила проти моделі» пишеться нижче з того самого вердикту.
+  //
   // The original text and envelope are passed because an image/audio-only post can have no useful
   // deterministic summary, and because an analytical promotion must preserve its source identity.
-  scheduleShadowClassification({
-    sourceMessageId: entry.sourceMessageId,
-    sourceId: entry.sourceId,
-    publishedAt: entry.publishedAt,
-    text: entry.message?.text ?? entry.classified.summary,
-    classified: entry.classified,
-    media: entry.media,
-    message: entry.message,
-    allowAnalyticalPromotion: entry.decision === 'ignored' || entry.decision === 'unrecognized',
-    // The complement of the flag above, and the reason both live on this one line: a message either
-    // was refused by the rules — in which case the model may fill the gap — or it was published, in
-    // which case the model may only annotate what was published, into a table nothing public reads
-    // (`./analytical-enrichment.ts`, migration 045). Deriving both from `entry.decision` here is what
-    // makes them exclusive by construction rather than by a rule two call sites have to remember.
-    //
-    // `entry.eventId` is set only on the branch that ran `ingestThreat`, and the decision is checked
-    // anyway: a future branch that starts carrying an event id for some other reason must not
-    // silently acquire the right to have the model write remarks against it.
-    ...(PUBLISHING_DECISIONS.has(entry.decision) && entry.eventId
-      ? {
-          publishedClaim: {
-            eventId: entry.eventId,
-            threatType: entry.classified.threatType,
-            // What the rules took out of THIS message, not what the event holds after every merge:
-            // the enrichment write re-checks each proposed place against the event as it stands, so
-            // this list only has to be the honest baseline of the current reading.
-            locationIds: entry.classified.locations.map((location) => location.id),
-            directionText: entry.classified.directionText ?? null,
-            nationalScope: entry.classified.nationalScope
+  if (!entry.modelClassified) {
+    scheduleShadowClassification({
+      sourceMessageId: entry.sourceMessageId,
+      sourceId: entry.sourceId,
+      publishedAt: entry.publishedAt,
+      text: entry.message?.text ?? entry.classified.summary,
+      classified: entry.classified,
+      media: entry.media,
+      message: entry.message,
+      allowAnalyticalPromotion: entry.decision === 'ignored' || entry.decision === 'unrecognized',
+      // The complement of the flag above, and the reason both live on this one line: a message either
+      // was refused by the rules — in which case the model may fill the gap — or it was published, in
+      // which case the model may only annotate what was published, into a table nothing public reads
+      // (`./analytical-enrichment.ts`, migration 045). Deriving both from `entry.decision` here is what
+      // makes them exclusive by construction rather than by a rule two call sites have to remember.
+      //
+      // `entry.eventId` is set only on the branch that ran `ingestThreat`, and the decision is checked
+      // anyway: a future branch that starts carrying an event id for some other reason must not
+      // silently acquire the right to have the model write remarks against it.
+      ...(PUBLISHING_DECISIONS.has(entry.decision) && entry.eventId
+        ? {
+            publishedClaim: {
+              eventId: entry.eventId,
+              threatType: entry.classified.threatType,
+              // What the rules took out of THIS message, not what the event holds after every merge:
+              // the enrichment write re-checks each proposed place against the event as it stands, so
+              // this list only has to be the honest baseline of the current reading.
+              locationIds: entry.classified.locations.map((location) => location.id),
+              directionText: entry.classified.directionText ?? null,
+              nationalScope: entry.classified.nationalScope
+            }
           }
-        }
-      : {}),
-    historical: entry.historical
-  });
-  classificationDecisions.inc({ version: CLASSIFIER_VERSION, decision: entry.decision });
+        : {}),
+      historical: entry.historical
+    });
+  }
+  classificationDecisions.inc({ version: entry.classifierVersion ?? CLASSIFIER_VERSION, decision: entry.decision });
   try {
     await recordClassification(entry);
   } catch (error) {
@@ -1573,6 +1640,12 @@ async function archiveClassification(entry: ClassificationLogEntry): Promise<voi
       decision: entry.decision, error: error instanceof Error ? error.message : String(error)
     }));
   }
+  // Звірка й контекст — після архіву, поза транзакцією, і ніколи не коштують повідомленню нічого.
+  if (entry.modelAssessment && entry.primaryInput) {
+    await recordPrimaryComparison(entry.primaryInput, entry.sourceMessageId, entry.modelAssessment, entry.contextLocationIds ?? [])
+      .catch(() => undefined);
+  }
+  await noteInLocationContexts(entry).catch(() => undefined);
 }
 
 export interface ProcessMessageOptions {
@@ -1619,10 +1692,29 @@ async function classifyAndIngest(message: NormalizedMessage, options: ProcessMes
   // за ідентичністю масиву, тож свіжий масив на кожен виклик означав повну переіндексацію каталогу
   // (~300k записів) на кожне повідомлення — саме це роздувало контейнер до гігабайтів під час атак.
   const locations = await cachedLocationLexemes();
-  const classified = classifyMessage(message.text, locations);
+  const rules = classifyMessage(message.text, locations);
   const count = (outcome: string) => {
     if (options.monitor) monitorMessages.inc({ source: message.sourceId, outcome });
   };
+  const sourceInfo = await sourceDescriptor(message.sourceId);
+  // Спільні для кожної гілки нижче поля архівного запису про модель (міграція 049). Порожні в режимі
+  // `rules`; у режимі `codex` — наповнюються після виклику моделі, який стоїть ПІСЛЯ відбою правил:
+  // відбій — єдине рішення, яке модель не ухвалює.
+  let classified = rules;
+  let primaryInput: CodexClassifyInput | undefined;
+  let modelAssessment: ModelAssessment | null = null;
+  let modelClassified = false;
+  let modelSuppressed = false;
+  let contextLocationIds: string[] | undefined;
+  const modelFields = () => ({
+    primaryInput, modelAssessment, modelClassified, contextLocationIds,
+    sourceName: sourceInfo?.name ?? null,
+    ...(modelClassified ? { classifierVersion: CODEX_CLASSIFIER_VERSION } : {}),
+    assessment: modelAssessment ? {
+      model: modelAssessment.model, confidence: modelAssessment.confidence, timing: modelAssessment.timing,
+      probability: modelAssessment.probability, note: modelAssessment.note
+    } : null
+  });
   // A source withdrawing its own earlier claim — "ТУшки неактивні", "ціль знищена", "не відмічаємо
   // ознак застосування стратегічної авіації". This is the only evidence a publisher ever gives that
   // a threat is over; before it moved state, a threat could fade only on the 30-minute timer.
@@ -1648,9 +1740,23 @@ async function classifyAndIngest(message: NormalizedMessage, options: ProcessMes
       sourceId: message.sourceId, sourceMessageId: outcome.sourceMessageId,
       publishedAt: message.publishedAt, classified, decision: 'de_escalation', media: message.media,
       message, historical: options.historical,
-      withdrawal: outcome.withdrawal
+      withdrawal: outcome.withdrawal, ...modelFields()
     });
     return { deEscalation: true as const, classified, withdrawal: outcome.withdrawal };
+  }
+  // Модель як основний класифікатор (міграція 049). Стоїть ПІСЛЯ відбою правил — модель не має права
+  // оголосити, що загрози немає, — і ПЕРЕД перевіркою значущості, бо саме значущість вона й вирішує.
+  // Кожен запасний вихід (`fallback`) лишає класифікацію правил недоторканою: повідомлення не губиться.
+  if ((await codexClassifierMode()) === 'codex') {
+    primaryInput = { message, rules, lexemes: locations, source: sourceInfo };
+    const primary = await classifyWithCodex(primaryInput);
+    contextLocationIds = primary.contextLocationIds;
+    if (primary.status !== 'fallback') {
+      classified = primary.classified;
+      modelAssessment = primary.assessment;
+      modelClassified = true;
+      modelSuppressed = primary.status === 'suppressed';
+    }
   }
   const rejection = significanceRejection(classified);
   if (rejection) {
@@ -1671,7 +1777,9 @@ async function classifyAndIngest(message: NormalizedMessage, options: ProcessMes
       // in which a threat *and* a place were both recognised.
       decision: rejection === 'retrospective' ? 'ignored_retrospective'
         : rejection === 'no_location' ? 'ignored' : 'unrecognized',
-      ignoredReason: rejection
+      // «Модель упевнено не побачила загрози» — своя причина, бо відтворюється не правилами, а
+      // моделлю в той момент, і саме це має прочитати той, хто розбирає, чому повідомлення змовчали.
+      ignoredReason: modelSuppressed ? 'model_not_significant' : rejection, ...modelFields()
     });
     return { ignored: true as const };
   }
@@ -1683,7 +1791,7 @@ async function classifyAndIngest(message: NormalizedMessage, options: ProcessMes
     await archiveClassification({
       sourceId: message.sourceId, sourceMessageId, publishedAt: message.publishedAt, classified,
       decision: 'coalesced', ignoredReason: 'restated_within_coalesce_window', media: message.media,
-      message, historical: options.historical
+      message, historical: options.historical, ...modelFields()
     });
     return { coalesced: true as const };
   }
@@ -1716,13 +1824,21 @@ async function classifyAndIngest(message: NormalizedMessage, options: ProcessMes
       await archiveClassification({
         sourceId: message.sourceId, sourceMessageId, publishedAt: message.publishedAt, classified,
         decision: 'ignored_retrospective_model', ignoredReason: 'retrospective_model', media: message.media,
-        message, historical: options.historical
+        message, historical: options.historical, ...modelFields()
       });
       return { ignored: true as const };
     }
   }
   count('classified');
-  const result = await ingestThreat(message, classified, { historical: options.historical });
+  const result = await ingestThreat(message, classified, {
+    historical: options.historical,
+    ...(modelAssessment ? { assessment: {
+      model: modelAssessment.model, classifierVersion: modelAssessment.classifierVersion,
+      timing: modelAssessment.timing, probability: modelAssessment.probability,
+      expectedFrom: modelAssessment.expectedFrom, expectedUntil: modelAssessment.expectedUntil,
+      note: modelAssessment.note
+    } } : {})
+  });
   if (result.withdrawal.withdrawnAssertions || result.withdrawal.endedEventIds.length) {
     threatWithdrawals.inc({
       source: message.sourceId,
@@ -1736,7 +1852,7 @@ async function classifyAndIngest(message: NormalizedMessage, options: ProcessMes
     // `redirect` keeps its own decision because it is the only message class that asserts and
     // withdraws at once; `createdEvent` still records whether the event it asserted was new.
     decision: classified.intent === 'redirect' ? 'redirect' : result.created ? 'event_created' : 'event_merged',
-    eventId: result.id, createdEvent: result.created, withdrawal: result.withdrawal
+    eventId: result.id, createdEvent: result.created, withdrawal: result.withdrawal, ...modelFields()
   });
   return result;
 }
