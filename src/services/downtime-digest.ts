@@ -94,10 +94,29 @@ export interface DowntimeMessage {
  * той самий набір, а перезапуск процесу нічого не змінює. Порівняння з тією ж стелею, яку читає
  * `ingestThreat`, — і не з власною копією числа: інакше «застаріле» означало б тут одне, а там інше.
  *
- * `classified_at > $1` — курсор: беремо лише те, що зʼявилося в архіві після попереднього зведення.
- * Саме він, а не вікно публікацій, робить прохід неповторним, бо вікна двох сусідніх дозборів
- * перекриваються, а рядки архіву — ні.
+ * Три межі, і кожна відповідає на власне питання:
+ *
+ *  * `classified_at > $1` — **курсор**: що зʼявилося в архіві після попереднього зведення. Саме він,
+ *    а не вікно публікацій, робить прохід неповторним, бо вікна двох сусідніх дозборів
+ *    перекриваються, а рядки архіву — ні;
+ *  * `classified_at <= $2` — верхня межа того самого курсора;
+ *  * `published_at >= $5` — **підлога простою**, і без неї зведення бреше. Перший бойовий прохід
+ *    (20.08.2026) заявив вікно «з 12 травня»: у добу, з якої курсор почав, потрапили рядки архіву,
+ *    чиї повідомлення опубліковано три місяці тому, і читач отримав би «поки звʼязок був відсутній,
+ *    12.05–20.08». Простій не може бути довшим, ніж дозбір узагалі має право сягати назад
+ *    (`CLASSIFIER_BACKFILL_MAX_AGE_SECONDS`), тож саме це число і є підлогою: те, що старше, не є
+ *    пропущеним за час мовчання — воно є архівом.
  */
+/**
+ * Найдавніше, що ще має право називатися простоєм.
+ *
+ * Те саме число, яким обмежений сам дозбір: далі назад він не читає, тож нічого старшого в
+ * «пропущене за час мовчання» потрапити не може. Читається щоразу — межа дозбору гаряча.
+ */
+export function downtimeFloor(now: Date): Date {
+  return new Date(now.getTime() - config.CLASSIFIER_BACKFILL_MAX_AGE_SECONDS * 1000);
+}
+
 export async function downtimeMessages(since: Date, until: Date): Promise<DowntimeMessage[]> {
   const ceiling = deliveryAgeCeilingMs();
   if (ceiling === null) return [];
@@ -117,8 +136,9 @@ export async function downtimeMessages(since: Date, until: Date): Promise<Downti
       WHERE mc.classified_at > $1 AND mc.classified_at <= $2
         AND mc.decision = ANY($3::text[])
         AND mc.classified_at - mc.published_at >= make_interval(secs => $4::double precision)
+        AND mc.published_at >= $5
       ORDER BY mc.published_at, mc.source_id, el.location_id`,
-    [since, until, ASSERTING_DECISIONS, ceiling / 1000]
+    [since, until, ASSERTING_DECISIONS, ceiling / 1000, downtimeFloor(until)]
   );
   return result.rows.map((row) => ({
     publishedAt: row.published_at,

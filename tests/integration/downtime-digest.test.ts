@@ -132,6 +132,22 @@ describe.skipIf(!integrationDatabaseAvailable)('зведення після пр
     expect(content).toMatch(/повідомлення 2 : час \d{2}:\d{2}, /);
   });
 
+  it('не називає простоєм те, що дозбір і не читав би — місячної давнини архів', async () => {
+    // Перший бойовий прохід 20.08.2026 заявив вікно «з 12 травня»: у добу, з якої почав курсор,
+    // потрапили рядки архіву з тримісячної давнини публікаціями. Простій не може бути довшим, ніж
+    // дозбір узагалі сягає назад, і саме це тут і перевіряється.
+    await seedUser(7304);
+    await seedSubscription({ chatId: 7304, locationId: POLTAVA_OBLAST });
+    const { config } = await import('../../src/config.js');
+    // Дозбір читає назад шість годин; повідомлення тижневої давнини — архів, а не пропущене.
+    expect(config.CLASSIFIER_BACKFILL_MAX_AGE_SECONDS).toBe(21_600);
+    await ingest(ERADAR, 'Шахед курсом на Полтавщину.', 7 * 24 * 60, 'ancient-1');
+
+    const result = await digest();
+    expect(result.chats).toBe(0);
+    expect(await outboxRows()).toHaveLength(0);
+  });
+
   it('другий прохід над тим самим простоєм не шле другої копії', async () => {
     await seedUser(7305);
     await seedSubscription({ chatId: 7305, locationId: POLTAVA_OBLAST });
