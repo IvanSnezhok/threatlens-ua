@@ -1,5 +1,7 @@
 import { describe, expect, it } from 'vitest';
-import { expectedWindow, isThreatTiming, nearerTiming, TIMING_LABELS, TIMING_BADGES } from './threat-timing.js';
+import {
+  describeAge, expectedWindow, isThreatTiming, momentIn, nearerTiming, TIMING_LABELS, TIMING_BADGES
+} from './threat-timing.js';
 
 /**
  * Актуальність загрози в часі: вікно рахується з київського календаря, «увечері» — київський вечір,
@@ -72,5 +74,38 @@ describe('the vocabulary', () => {
     expect(Object.keys(TIMING_LABELS)).toHaveLength(5);
     expect(TIMING_BADGES.evening).toBe('очікується увечері');
     expect('now' in TIMING_BADGES).toBe(false);
+  });
+});
+
+/**
+ * Час, яким його бачить модель (рішення власника 20.08.2026). Обидві функції існують заради одного
+ * рішення — «зараз» це чи вже ні, — і обидві мають давати той самий рядок обом класифікаторам,
+ * основному й тіньовому, бо їхні вердикти порівнюють між собою.
+ */
+describe('час у запиті до моделі', () => {
+  const publishedAt = new Date('2026-08-20T20:41:00.000Z');
+
+  it('називає київський момент словами, а не ISO-рядком', () => {
+    const moment = momentIn(publishedAt, 'Europe/Kyiv');
+    // 20:41 UTC — це 23:41 за Києвом улітку, і саме цю годину бачить джерело у своєму пості.
+    expect(moment).toContain('23:41');
+    expect(moment).not.toMatch(/\d{4}-\d{2}-\d{2}T/);
+  });
+
+  it('дає вік повідомлення готовим рядком — щоб модель його читала, а не рахувала', () => {
+    const at = (minutes: number) => describeAge(publishedAt, new Date(publishedAt.getTime() + minutes * 60_000));
+    expect(at(0)).toBe('менше хвилини тому');
+    expect(at(3)).toBe('3 хв тому');
+    expect(at(59)).toBe('59 хв тому');
+    expect(at(60)).toBe('1 год тому');
+    expect(at(130)).toBe('2 год 10 хв тому');
+  });
+
+  it('не падає й не бреше, коли годинник джерела попереду нашого', () => {
+    // Канали ставлять час своїм годинником. Секунди розходження — щоденна норма й читаються як
+    // «щойно»; помітний розбіг має бути названий, а не показаний як відʼємний вік.
+    expect(describeAge(publishedAt, new Date(publishedAt.getTime() - 30_000))).toBe('менше хвилини тому');
+    expect(describeAge(publishedAt, new Date(publishedAt.getTime() - 5 * 60_000)))
+      .toBe('щойно (мітка часу джерела попереду нашого годинника)');
   });
 });

@@ -3,6 +3,7 @@ import { Counter, Gauge, Histogram, type Registry } from 'prom-client';
 import { config } from '../config.js';
 import { pool } from '../db/pool.js';
 import { THREAT_VALIDITY_MS } from '../repositories/events.js';
+import { publishDowntimeDigest } from './downtime-digest.js';
 import { ALERT_CHANNEL_ADAPTER_TYPE, MONITOR_ADAPTER_TYPE, processMessage } from './ingestion.js';
 
 /**
@@ -772,6 +773,15 @@ export function startClassifierBackfill(
     running = true;
     try {
       await runBackfillSweep(port, log, limits);
+      // Зведення — ПІСЛЯ дозбору й окремо від нього. Дозбір лишається тим, чим був: він читає
+      // історію й archives її. Що з прочитаного варто сказати людині — інше питання, з іншими
+      // межами (підписки, тихий пріоритет, минулий час), і воно ставиться над архівом, а не всередині
+      // циклу по повідомленнях. Виклик стоїть тут, а не в `runBackfillSweep`, щоб прямий виклик
+      // проходу в тесті лишався тим, що на ньому написано, і не розсилав нікому нічого.
+      const digest = await publishDowntimeDigest();
+      if (digest.chats) {
+        log.info?.({ ...digest }, 'downtime digest queued');
+      }
     } catch (error) {
       // Nothing here may reach the collector. A sweep that throws is a sweep that will be tried
       // again on the next tick; a sweep that throws INTO the collector is a dead live stream.

@@ -3836,6 +3836,40 @@ function shortDateTime(iso) {
   return `${at.toLocaleDateString('uk-UA', { day: '2-digit', month: '2-digit' })} ${shortTime(iso)}`;
 }
 
+/**
+ * Розбір останньої завершеної тривоги.
+ *
+ * Малюється власним запитом і власним слотом, бо відповідає на інше питання, ніж агрегати навколо:
+ * ті описують добу, тиждень і місяць, а це — одну конкретну тривогу, яка щойно скінчилася. Тому
+ * перемикач періодів його не чіпає, і 404 з ендпоінта не є помилкою: він означає «жодної тривоги,
+ * вартої розбору, за добу не було», і блок просто не показується.
+ *
+ * Застереження стоїть під заголовком, ДО першого числа: саме числа звідси переказують далі, і
+ * скриншот, який їх переживе, мусить нести «це повідомлення каналів, а не офіційні дані».
+ */
+async function renderAttackDebriefBlock(slot) {
+  if (!slot) return;
+  let data;
+  try {
+    const response = await fetch('/api/v1/analytics/attacks/debrief');
+    if (!response.ok) return;
+    data = await response.json();
+  } catch {
+    return;
+  }
+  const lines = Array.isArray(data.lines) ? data.lines : [];
+  if (!lines.length) return;
+  slot.innerHTML = `<section class="tactics-band" aria-labelledby="debrief-title">
+      <header class="tactics-head">
+        <p class="tactics-kicker">Остання завершена тривога</p>
+        <h2 class="tactics-title" id="debrief-title">${escapeHtml(data.locationName ?? '')}</h2>
+        <p class="tactics-empty">${escapeHtml(data.disclaimer ?? '')}</p>
+      </header>
+      <div class="bar-rows">${lines.map((line) =>
+    `<div class="bar-row"><span class="bar-label bar-label-wide">${escapeHtml(line)}</span></div>`).join('')}</div>
+    </section>`;
+}
+
 function tacticsBand(tactics) {
   const unavailable = !tactics || !tactics.available;
   return `<section class="tactics-band${unavailable ? ' is-empty' : ''}" aria-labelledby="tactics-title">
@@ -4341,12 +4375,14 @@ async function renderAttacks() {
     'Спершу — чим остання доба відрізняється від попередніх двох тижнів. Нижче — агрегати за добу, '
     + 'тиждень і місяць: типи засобів, території, час доби та хвилі. Це опис минулого, а не прогноз. '
     + 'Окремим блоком унизу — статистика ударів і ймовірності по обраних областях з відкритих джерел; '
-    + 'вона теж не є тривогою.'
+    + 'вона теж не є тривогою. Якщо за добу була тривога, про яку писали канали, зверху стоїть її '
+    + 'розбір: скільки повідомлень, які засоби називали джерела, де повідомляли про вибухи чи роботу ППО.'
   );
   const requested = new URLSearchParams(location.search).get('period');
   let period = ['day', 'week', 'month'].includes(requested) ? requested : 'day';
 
   root.innerHTML = `<div id="tactics-slot"></div>
+    <div id="debrief-slot"></div>
     <div class="period-bar">
       <div class="period-bar-label"><p>Агрегати за період</p>
         <span>Вікно рухоме: відлік ведеться від цієї хвилини назад, а не від початку доби.</span></div>
@@ -4363,6 +4399,9 @@ async function renderAttacks() {
   // Блок статистики не залежить від періоду й малюється паралельно з агрегатами: у нього власні
   // запити, власний кеш і власний стан вибору. Перемикач періодів його не чіпає.
   void renderAttackStatsBlock($('#attack-stats-slot', root));
+  // Розбір останньої тривоги теж не залежить від періоду й вантажиться паралельно. Порожній слот —
+  // нормальний і найчастіший стан: за добу могло не бути тривоги, вартої розбору.
+  void renderAttackDebriefBlock($('#debrief-slot', root));
   // Тактичний блок не залежить від вибраного періоду — він завжди про останні 24 години. Тому він
   // малюється один раз, першим завантаженням, і перемикач періодів під ним його не перемальовує:
   // блимання блоку, який не змінився, читалося б як зміна даних.

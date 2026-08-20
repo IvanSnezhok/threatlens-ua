@@ -229,7 +229,7 @@ describe('shadowClassify', () => {
     const outcome = await shadowClassify(input('Ударні БпЛА у напрямку Києва'), { chat: chat as never });
     expect(outcome).toMatchObject({ status: 'recorded', agrees: true, fields: [] });
     expect(chat).toHaveBeenCalledOnce();
-    expect(chat.mock.calls[0]![0]).toMatchObject({ promptVersion: 'shadow-classifier-v1', json: true });
+    expect(chat.mock.calls[0]![0]).toMatchObject({ promptVersion: 'shadow-classifier-v2', json: true });
   });
 
   it('audits the digest rather than the rendered prompt', async () => {

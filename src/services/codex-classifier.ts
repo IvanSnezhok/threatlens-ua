@@ -6,7 +6,9 @@ import {
   CLASSIFIER_VERSION, THREAT_EVENT_TITLES, significanceRejection, type LocationLexeme
 } from '../domain/classifier.js';
 import { THREAT_LABELS, resolveModelPlace } from '../domain/model-place.js';
-import { THREAT_TIMINGS, expectedWindow, type ThreatTiming } from '../domain/threat-timing.js';
+import {
+  THREAT_TIMINGS, describeAge, expectedWindow, momentIn, type ThreatTiming
+} from '../domain/threat-timing.js';
 import { THREAT_TYPES, type ClassifiedMessage, type NormalizedMessage, type ThreatType } from '../types.js';
 import { codexChat, type CodexChatRequest, type CodexChatResult } from './codex-client.js';
 import { imageDataUrl, transcribeAudio } from './media-enrichment.js';
@@ -68,7 +70,15 @@ import {
  */
 
 export const CODEX_CLASSIFIER_VERSION = 'codex-primary-v1';
-export const CODEX_CLASSIFIER_PROMPT_VERSION = 'codex-classifier-v1';
+/**
+ * `v2` — повідомленню додано час публікації і його вік (рішення власника 20.08.2026).
+ *
+ * Версія промпта рухається, а `CODEX_CLASSIFIER_VERSION` — ні, і це навмисно: змінилося те, ЩО
+ * модель бачить, а не те, як її вердикт стає класифікацією. Архів `codex_runs` пише версію промпта
+ * окремим полем, тож вердикти до цієї зміни й після неї лишаються порівнюваними — і видно, з якого
+ * моменту `timing` рахувався від часу публікації, а не від часу обробки.
+ */
+export const CODEX_CLASSIFIER_PROMPT_VERSION = 'codex-classifier-v2';
 
 /** Придушення тверджень правил вимагає більше впевненості, ніж власне твердження. */
 export const SUPPRESSION_MIN_CONFIDENCE = 0.7;
@@ -159,6 +169,8 @@ const SYSTEM_PROMPT = [
   'significant=true лише коли повідомлення СТВЕРДЖУЄ загрозу (зараз або очікувану) для конкретного місця в Україні або всієї країни. Відбій, «нічого не летить», жарт, реклама, збір коштів, подія на території РФ, переказ минулої ночі — significant=false.',
   'threatState: asserted — загроза наявна або очікується; redirected — рухається/змінила напрямок (тоді destinationLocations — куди); withdrawn — прямо сказано, що загрози більше немає; uncertain — стан не встановити.',
   'timing — КОЛИ загроза стосується названих місць: now — просто зараз (пуски, у повітрі, вибухи, курс на); within_hour — очікується протягом години (зліт носіїв, «на підході», групи в сусідній області); evening — увечері цієї доби; within_day — протягом доби; within_two_days — протягом двох діб. Якщо про час не сказано — now.',
+  'Поля now, publishedAt і messageAge — це поточний київський час, київський час публікації повідомлення і скільки воно пролежало до обробки. Читай timing ВІДНОСНО publishedAt: «зараз» у тексті означає момент публікації, а не момент, коли ми це читаємо.',
+  'Якщо messageAge велика (повідомлення старе), це НЕ робить загрозу неактуальною саму по собі — але знижуй confidence і probability для «зараз», бо ситуація могла змінитися, і скажи про це в note. Не перекваліфіковуй старе повідомлення в очікувану загрозу: воно описує момент своєї публікації.',
   'probability — твоя оцінка від 0 до 1, що загроза реалізується для названих місць у цьому вікні (для now — що вона справді є там). Спирайся на категоричність джерела, його рівень, підтвердження іншими повідомленнями в контексті й типові патерни з контексту. null лише коли significant=false.',
   'expectedFrom/expectedUntil — ISO-8601 з часовим поясом лише коли джерело назвало час явно («з 20:00», «до ранку»); інакше null.',
   'note — одне речення українською, чому саме так (до 300 символів), без прогнозів цілей.',
@@ -248,11 +260,9 @@ export async function contextLocationIdsFor(rules: ClassifiedMessage): Promise<s
   return ordered;
 }
 
+/** Київський момент — той самий формат, що його бачить тінь і що його читає людина. */
 function kyivNow(at: Date): string {
-  return new Intl.DateTimeFormat('uk-UA', {
-    timeZone: config.APP_TIMEZONE, weekday: 'long', year: 'numeric', month: '2-digit', day: '2-digit',
-    hour: '2-digit', minute: '2-digit', hourCycle: 'h23'
-  }).format(at);
+  return momentIn(at, config.APP_TIMEZONE);
 }
 
 function parseIso(value: string | null): Date | null {
@@ -397,8 +407,18 @@ export async function classifyWithCodex(
       nationalScope: input.rules.nationalScope,
       directionText: input.rules.directionText ?? null
     };
+    // Три часові поля, а не одне (рішення власника 20.08.2026). `now` тут був завжди, і сам по собі
+    // він не давав моделі нічого: не знаючи, КОЛИ канал це написав, вона не могла відрізнити пуски,
+    // про які повідомили хвилину тому, від тих самих слів, які ми читаємо через дві години після
+    // реконекту. Тепер вона бачить обидва моменти і вік між ними — а `timing` і `probability` це
+    // рівно ті два поля, які від цієї різниці й залежать.
+    //
+    // Київський час, а не UTC, і в тих самих словах, що й `now`: джерела пишуть «о 23:40» за Києвом,
+    // і модель, яка порівнює київську мітку в тексті з UTC у полі, порівнює два різні годинники.
     const facts = {
       now: kyivNow(startedAt),
+      publishedAt: kyivNow(input.message.publishedAt),
+      messageAge: describeAge(input.message.publishedAt, startedAt),
       source: input.source ?? { name: input.message.sourceId, tier: 'C', official: false },
       previousMessages: previous.map((item) => ({ at: item.publishedAt.toISOString(), text: item.text })),
       currentMessage: text.slice(0, TEXT_LIMIT),

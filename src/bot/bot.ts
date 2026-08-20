@@ -1,7 +1,10 @@
 import { Bot, InlineKeyboard } from 'grammy';
 import { config } from '../config.js';
 import { pool } from '../db/pool.js';
-import { LOCATION_HIERARCHY_MAX_DEPTH } from '../repositories/events.js';
+import { LOCATION_HIERARCHY_MAX_DEPTH, relatedLocationsByRootCte } from '../repositories/events.js';
+import {
+  ATTACK_DEBRIEF_DISCLAIMER, attackDebriefLines, buildAttackDebrief, debriefWorthShowing
+} from '../services/attack-debrief.js';
 import { listRecommendedChannels } from '../services/recommended-channels.js';
 
 import {
@@ -201,6 +204,48 @@ export function createBot() {
     await ctx.reply(`🌙 <b>Аналітика станом на ${html(humanMoment(new Date()))}</b>\n\n${lines.join('\n\n')}\n\nЦе індекс публічних сигналів, не статистична ймовірність і не офіційна тривога.`, { parse_mode: 'HTML' });
   });
 
+  /**
+   * Розбір останньої тривоги на вимогу — для того, хто прочитав відбій уночі й повернувся вранці.
+   *
+   * Той самий розбір, що приходить сам (`src/services/attack-debrief.ts`), і ті самі його межі:
+   * підсумок повідомлень каналів за вікно тривоги, у минулому часі, із застереженням першим рядком.
+   * Команда потрібна тому, що розсилку розбору оператор може вимкнути, а читач — не підписатися на
+   * відбої; на вимогу він доступний завжди.
+   *
+   * Береться остання ЗАКРИТА тривога по підписках чату, а не найгучніша: питання, на яке відповідає
+   * команда, — «що це щойно було», і відповідь на нього одна.
+   */
+  bot.command('debrief', async (ctx) => {
+    // Якір обходу ієрархії — підписки цього чату, підзапитом. `chat_id` лишається звʼязаним
+    // параметром; у вираз якоря не потрапляє нічого, що ввів користувач.
+    const last = await pool.query<{ id: string }>(
+      `${relatedLocationsByRootCte(
+        '(SELECT coalesce(array_agg(DISTINCT location_id), \'{}\') FROM subscriptions'
+        + ' WHERE chat_id=$1 AND enabled=true)'
+      )}
+       SELECT ap.id
+         FROM alert_periods ap
+        WHERE ap.status='ended' AND ap.ended_at IS NOT NULL
+          AND ap.ended_at > now() - interval '24 hours'
+          AND EXISTS (SELECT 1 FROM related_locations_by_root r WHERE r.id=ap.location_id)
+        ORDER BY ap.ended_at DESC LIMIT 1`,
+      [ctx.chat.id]
+    );
+    const alertPeriodId = last.rows[0]?.id;
+    if (!alertPeriodId) {
+      return ctx.reply('За добу по ваших підписках не було завершених тривог. Додати територію — /city.');
+    }
+    const debrief = await buildAttackDebrief(alertPeriodId).catch(() => null);
+    if (!debriefWorthShowing(debrief)) {
+      return ctx.reply('За час тієї тривоги моніторингові канали майже нічого не повідомляли — розбирати нема чого.');
+    }
+    const lines = attackDebriefLines(debrief).map((line) => `• ${html(line)}`);
+    await ctx.reply(
+      `📋 <b>Розбір атаки — ${html(debrief.locationName)}</b>\n<i>${html(ATTACK_DEBRIEF_DISCLAIMER)}</i>\n\n${lines.join('\n')}`,
+      { parse_mode: 'HTML' }
+    );
+  });
+
   const showSettings = async (ctx: any, edit = false) => {
     const text = await settingsText(ctx.chat.id); const reply_markup = await settingsKeyboard(ctx.chat.id);
     if (edit) return ctx.editMessageText(text, { parse_mode: 'HTML', reply_markup });
@@ -246,7 +291,7 @@ export function createBot() {
     await ctx.reply('Telegram-ідентифікатор, підписки, черга повідомлень і журнал нічних зведень видалені.');
   });
   bot.command('help', async (ctx) => ctx.reply(
-    '/status — поточний стан\n/city — додати територію\n/city Назва — пошук міста\n/analytics — оцінка на 6 годин\n/channels — рекомендовані Telegram-канали\n/settings — фільтри й видалення підписок\n/stop — вимкнути повідомлення\n/delete_me — видалити дані\n\nУ разі офіційної тривоги прямуйте до визначеного укриття.'
+    '/status — поточний стан\n/city — додати територію\n/city Назва — пошук міста\n/analytics — оцінка на 6 годин\n/debrief — розбір останньої тривоги\n/channels — рекомендовані Telegram-канали\n/settings — фільтри й видалення підписок\n/stop — вимкнути повідомлення\n/delete_me — видалити дані\n\nУ разі офіційної тривоги прямуйте до визначеного укриття.'
   ));
   bot.catch((error) => console.error('Telegram bot error', error.error));
   return bot;

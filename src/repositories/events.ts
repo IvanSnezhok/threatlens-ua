@@ -83,6 +83,40 @@ export function relatedLocationsCte(anchor = '$1'): string {
 }
 
 /**
+ * Той самий обхід ієрархії, але для БАГАТЬОХ місць одразу і зі збереженням того, від якого саме
+ * місця дійшли: `related_locations_by_root(root, id)`.
+ *
+ * {@link relatedLocationsCte} відповідає на питання «чи стосується цього читача ось це одне місце»
+ * і зливає результат у пласку множину — саме те, що треба фан-ауту тривог. Зведення після простою
+ * ставить обернене питання: «які з десятка місць, де вночі щось було, стосуються цього читача», і
+ * пласка множина на нього відповісти не може — у ній уже не видно, який рядок від якого місця.
+ *
+ * Правила обходу тут ті самі й навмисно повторені з попередньої функції, а не переписані: угору й
+ * униз по `parent_id` на будь-яку глибину, захист від циклів через `path` і безумовна стеля
+ * {@link LOCATION_HIERARCHY_MAX_DEPTH}. `parent_id` приходить із KATOTTG, тобто ззовні процесу, і
+ * ацикличності від нього ніхто не гарантував.
+ *
+ * `anchor` — вираз-плейсхолдер з масивом ідентифікаторів (`$1::text[]`), ніколи не дані користувача.
+ */
+export function relatedLocationsByRootCte(anchor = '$1::text[]'): string {
+  return `WITH RECURSIVE root_ancestors(root,id,parent_id,depth,path) AS (
+      SELECT seed.id,seed.id,seed.parent_id,0,ARRAY[seed.id] FROM locations seed WHERE seed.id=ANY(${anchor})
+    UNION ALL
+      SELECT child.root,parent.id,parent.parent_id,child.depth+1,child.path||parent.id
+      FROM root_ancestors child JOIN locations parent ON parent.id=child.parent_id
+      WHERE child.depth<${LOCATION_HIERARCHY_MAX_DEPTH} AND NOT (parent.id=ANY(child.path))
+  ), root_descendants(root,id,depth,path) AS (
+      SELECT seed.id,seed.id,0,ARRAY[seed.id] FROM locations seed WHERE seed.id=ANY(${anchor})
+    UNION ALL
+      SELECT parent.root,child.id,parent.depth+1,parent.path||child.id
+      FROM root_descendants parent JOIN locations child ON child.parent_id=parent.id
+      WHERE parent.depth<${LOCATION_HIERARCHY_MAX_DEPTH} AND NOT (child.id=ANY(parent.path))
+  ), related_locations_by_root(root,id) AS (
+      SELECT root,id FROM root_ancestors UNION SELECT root,id FROM root_descendants
+  )`;
+}
+
+/**
  * Materialises {@link relatedLocationsCte} for callers that fan one location out over several
  * statements, so the walk is paid for once instead of once per statement.
  */
@@ -178,6 +212,32 @@ async function appendSystemEvent(client: PoolClient, eventType: string, payload:
  * message may publish at all. Two copies of that constant is two definitions of "expired".
  */
 export const THREAT_VALIDITY_MS = 30 * 60_000;
+
+/**
+ * Стеля віку повідомлення для доставки, у мілісекундах, або `null`, коли її вимкнено.
+ *
+ * Читається щоразу, а не запамʼятовується в константі: `SOURCE_MESSAGE_MAX_DELIVERY_AGE_MINUTES` —
+ * гаряче налаштування (`apply: 'hot'`), і оператор, який змінив його в `/ops`, має отримати нову
+ * межу на наступному повідомленні, а не на наступному перезапуску.
+ */
+export function deliveryAgeCeilingMs(): number | null {
+  const minutes = config.SOURCE_MESSAGE_MAX_DELIVERY_AGE_MINUTES;
+  return minutes > 0 ? minutes * 60_000 : null;
+}
+
+/**
+ * Чи це повідомлення ще має право дійти до людини — за одним лише його віком.
+ *
+ * Один предикат на дві поверхні: `ingestThreat` вирішує ним, чи писати рядок у `system_event_log`
+ * (тобто чи буде подія на карті й сповіщення в боті), а `src/services/ingestion.ts` — чи називати
+ * рішення придушеним за віком у архіві й у контексті локацій. Два окремі порівняння з тією самою
+ * межею — це два визначення слова «застаріле».
+ */
+export function withinDeliveryAge(publishedAt: Date, now: Date = new Date()): boolean {
+  const ceiling = deliveryAgeCeilingMs();
+  if (ceiling === null) return true;
+  return now.getTime() - publishedAt.getTime() < ceiling;
+}
 
 const evidenceRank: Record<EvidenceLevel, number> = { unverified: 0, monitoring: 1, confirmed: 2, official: 3 };
 function strongestEvidence(left: EvidenceLevel, right: EvidenceLevel): EvidenceLevel {
@@ -589,6 +649,11 @@ export interface IngestThreatOptions {
    * the live path must keep its current behaviour exactly: a live message that arrives forty minutes
    * late through a Telegram outage is still the collector observing the channel, and silently
    * demoting it would be a behaviour change nobody asked for.
+   *
+   * The age ceiling below ({@link deliveryAgeCeilingMs}) is the OTHER half of the same question, and
+   * it is deliberately not this flag: it looks at how old the message is, not at who is replaying
+   * it, so a live path that starts delivering hour-old posts is covered without anybody having to
+   * remember to pass a flag.
    */
   historical?: boolean;
   /** Model provenance. Forces `unverified` evidence and disables every retraction branch. */
@@ -627,9 +692,34 @@ export async function ingestThreat(
    * A retraction is deliberately NOT switched off. A publisher's own all-clear is the safety-positive
    * direction, and with the `asserted_at <= $2` bound in {@link applyRetraction} it can only ever
    * reach what was standing when it was published.
+   *
+   * Дві межі, і жодна не послаблює іншої:
+   *
+   *  * **вікно валідності повідомлення дозбору** (30 хв) — те, що було тут завжди. Воно суворіше й
+   *    вмикається прапорцем `historical`;
+   *  * **стеля віку** (`SOURCE_MESSAGE_MAX_DELIVERY_AGE_MINUTES`, типово година) — рішення власника
+   *    20.08.2026. Вона дивиться лише на вік і тому накриває ЖИВИЙ шлях теж: після реконекту
+   *    MTProto віддає пачку пропущених апдейтів з їхніми справжніми датами й без жодного прапорця,
+   *    і саме вони йшли в бот як щойно опубліковані. Повідомлення старше за стелю доходить до
+   *    архіву й до контексту локацій — до людини не доходить нічого.
    */
-  const outsideWindow = Boolean(options.historical)
-    && message.publishedAt.getTime() + THREAT_VALIDITY_MS <= Date.now();
+  //
+  // Очікувана загроза рахується не за віком, а за власним вікном. «Увечері очікується удар»,
+  // опубліковане о 14:00 і прочитане о 15:10, стосується вечора, а не тих сімдесяти хвилин, що
+  // минули: стеля віку є проксі для питання «те, про що це повідомлення, вже скінчилося?», і для
+  // події «зараз» вона на нього відповідає, а для очікуваної — ні. Тому там питається саме те, що
+  // мається на увазі: чи закрилося вікно очікування. Придушити попередження про сьогоднішній вечір
+  // через те, що ми прочитали його на годину пізніше, означало б втратити справжнє попередження
+  // заради правила, написаного проти хибних.
+  const expectedUntil = options.assessment && options.assessment.timing !== 'now'
+    ? options.assessment.expectedUntil
+    : null;
+  const staleForDelivery = expectedUntil
+    ? expectedUntil.getTime() <= Date.now()
+    : !withinDeliveryAge(message.publishedAt);
+  const outsideWindow = (Boolean(options.historical)
+    && message.publishedAt.getTime() + THREAT_VALIDITY_MS <= Date.now())
+    || staleForDelivery;
   const client = await pool.connect();
   try {
     await client.query('BEGIN');

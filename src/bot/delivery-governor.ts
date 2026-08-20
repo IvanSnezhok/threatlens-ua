@@ -40,6 +40,13 @@ export type DeliveryClass = 'protected' | 'standard' | 'soft' | 'analytics' | 'c
 export function deliveryClass(row: any): DeliveryClass {
   const payload = row?.payload ?? {};
   if (row?.notification_type === 'channel_publication') return 'channel';
+  // Зведення після простою і розбір атаки після відбою — погляди НАЗАД, і обидва їдуть у черзі
+  // аналітики. Перевіряються тут, поруч з каналом і до всього, що ключується на payload, з тієї
+  // самої причини, що описана вище: жодна форма payload не сміє відкрити їм гілку `protected`, з
+  // голови якої черга під час масованої атаки віддає «Повітряна тривога».
+  if (row?.notification_type === 'attack_debrief' || row?.notification_type === 'downtime_digest') {
+    return 'analytics';
+  }
   // Очікувана загроза (міграція 049: timing ≠ now) — ніколи не `protected`, хоч би яким було джерело:
   // «увечері може бути» не має права стояти в черзі попереду «тривога зараз». Перевіряється ПЕРЕД
   // гілкою protected саме тому.
@@ -59,6 +66,7 @@ export function deliveryClass(row: any): DeliveryClass {
 /** The same decision in SQL, in the same order and for the same reason. */
 const classSql = `CASE
   WHEN notification_type='channel_publication' THEN 'channel'
+  WHEN notification_type IN ('attack_debrief','downtime_digest') THEN 'analytics'
   WHEN notification_type='threat_update' AND payload->>'timing' IS NOT NULL AND payload->>'timing'<>'now' THEN 'soft'
   WHEN notification_type IN ('alert_start','alert_end')
     OR (notification_type='threat_update'

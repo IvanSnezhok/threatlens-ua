@@ -91,6 +91,7 @@ if (bot) {
       { command: 'status', description: 'Поточний стан підписок' },
       { command: 'city', description: 'Додати область або місто' },
       { command: 'analytics', description: 'Оцінка ризику на 6 годин' },
+      { command: 'debrief', description: 'Розбір останньої тривоги' },
       { command: 'channels', description: 'Рекомендовані Telegram-канали' },
       { command: 'settings', description: 'Налаштувати підписки' },
       { command: 'help', description: 'Довідка та правила безпеки' }

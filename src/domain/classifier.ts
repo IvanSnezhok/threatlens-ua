@@ -1268,6 +1268,23 @@ function resolveSpanCollisions(candidates: Candidate[]): Candidate[] {
  * outside every longer match: "Київщина та місто Київ" resolves both, "Київська область" alone
  * resolves only the oblast.
  */
+/**
+ * Місця, які текст НАЗИВАЄ, — для читачів, що не класифікують.
+ *
+ * Тонка обгортка над {@link resolveLocations}, і саме обгортка, а не другий алгоритм. Розбір атаки
+ * (`src/services/attack-debrief.ts`) має прочитати місця з повідомлення, яке правила відкинули як
+ * «не твердження»: «Вибухи в Полтаві» не створює загрози й не має події, тож жодного звʼязку з
+ * місцем в архіві не лишає — а це рівно те повідомлення, заради якого розбір і читають.
+ *
+ * Повертається лише пара «ідентифікатор і назва»: тип звʼязку, покритий проміжок тексту й усе, що
+ * потрібно класифікації, лишається всередині. Читач, якому досить назви, не має отримувати від цієї
+ * функції важелів, якими можна щось ствердити — назвати місце й ствердити для нього загрозу мусять
+ * лишатися різними діями.
+ */
+export function namedLocations(text: string, locations: LocationLexeme[]): Array<{ id: string; name: string }> {
+  return resolveLocations(text, locations).map(({ id, name }) => ({ id, name }));
+}
+
 function resolveLocations(text: string, locations: LocationLexeme[]): ResolvedLocation[] {
   const normalized = text.toLocaleLowerCase('uk-UA');
   const tokens = tokenize(normalized);

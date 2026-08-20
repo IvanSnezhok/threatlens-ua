@@ -140,6 +140,7 @@ describe('metric registration', () => {
     'threatlens_alert_channel_stuck_alerts_total',
     'threatlens_alert_stale_sources_ignored_total',
     'threatlens_monitor_messages_total',
+    'threatlens_messages_stale_for_delivery_total',
     'threatlens_classification_log_failures_total',
     'threatlens_threat_withdrawals_total',
     'threatlens_classifications_total',

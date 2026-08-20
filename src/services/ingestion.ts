@@ -7,7 +7,8 @@ import { parseAlertChannelMessage } from '../domain/alert-parser.js';
 import { classifyMessage, CLASSIFIER_VERSION, isDeEscalation, significanceRejection } from '../domain/classifier.js';
 import {
   applyDeEscalation, cachedLocationLexemes, ingestThreat, LOCATION_HIERARCHY_MAX_DEPTH,
-  recordClassification, type ClassificationDecision, type ClassificationLogEntry
+  recordClassification, withinDeliveryAge,
+  type ClassificationDecision, type ClassificationLogEntry
 } from '../repositories/events.js';
 import {
   AERIAL_MIRROR_SOURCE_ID, AERIAL_MIRROR_STATE_SOURCE_ID, AERIAL_MIRROR_USER_AGENT,
@@ -1126,6 +1127,24 @@ const monitorMessages = new Counter({
   registers: []
 });
 /**
+ * Повідомлення, старші за стелю доставки (`SOURCE_MESSAGE_MAX_DELIVERY_AGE_MINUTES`).
+ *
+ * Кожне з них класифіковано, заархівовано й дописано в контекст локацій — і жодне не дійшло до
+ * людини. Мітка `path` розділяє два різні діагнози, які без неї виглядали б однаково:
+ *
+ *  * `backfill` — дозбір читає стару історію. Це нормальна робота; число дорівнює тому, скільки
+ *    вікна простою вже нікого не стосується;
+ *  * `live` — живий колектор віддав годинної давнини пост. Стала ненульова величина тут означає, що
+ *    MTProto систематично довозить пропущені апдейти після реконекту, і саме ці повідомлення до цієї
+ *    стелі йшли в бот як щойно опубліковані.
+ */
+const staleForDelivery = new Counter({
+  name: 'threatlens_messages_stale_for_delivery_total',
+  help: 'Source messages archived without delivery because they were older than the delivery age ceiling',
+  labelNames: ['source', 'path'],
+  registers: []
+});
+/**
  * Archive writes that were dropped so the pipeline could carry on.
  *
  * A non-zero value means the classification archive has holes and any count taken from it is a
@@ -1206,6 +1225,7 @@ export function registerAlertChannelMetrics(registry: Registry): void {
     ['threatlens_alert_channel_stuck_alerts_total', alertChannelStuckAlerts],
     ['threatlens_alert_stale_sources_ignored_total', alertStaleSourcesIgnored],
     ['threatlens_monitor_messages_total', monitorMessages],
+    ['threatlens_messages_stale_for_delivery_total', staleForDelivery],
     ['threatlens_classification_log_failures_total', classificationLogFailures],
     ['threatlens_threat_withdrawals_total', threatWithdrawals],
     ['threatlens_classifications_total', classificationDecisions],
@@ -1743,10 +1763,16 @@ async function noteInLocationContexts(entry: ArchiveEntry): Promise<void> {
   const located = entry.classified.locations.length > 0;
   const targets = located ? ids.filter((id) => id !== 'ua') : ids;
   const text = entry.message?.text ?? entry.classified.summary;
-  const line = contextLine(entry.publishedAt, contextLineForVerdict(
+  // Повідомлення старше за стелю доставки в контекст ІДЕ — власне заради цього воно й обробляється, —
+  // але позначене. Модель, яка читає цей контекст, має бачити різницю між «джерело сказало це, і
+  // людей попередили» і «джерело сказало це, а ми дізналися запізно»: без позначки годинної давнини
+  // пост із дозбору читається як подія, що сталася й на яку відреагували.
+  const verdict = contextLineForVerdict(
     entry.sourceName ? { name: entry.sourceName } : null, entry.sourceId, text,
     entry.modelAssessment ?? null, entry.primaryInput?.rules ?? entry.classified, entry.decision, contextExcerpt
-  ));
+  );
+  const stale = !withinDeliveryAge(entry.publishedAt);
+  const line = contextLine(entry.publishedAt, stale ? `${verdict} · дізналися запізно, не доставлялося` : verdict);
   await appendLocationContext(targets, line);
 }
 
@@ -1849,6 +1875,12 @@ export async function processMessage(message: NormalizedMessage, options: Proces
   // Ingestion lag is measured from the source's own timestamp, not from ours: the number an operator
   // needs is "how old was this when we accepted it", and our clock cannot answer that.
   observeIngestionLag(message.sourceId, (Date.now() - message.publishedAt.getTime()) / 1000);
+  // Рахується ТУТ, а не в `ingestThreat`: там лічильник побачив би лише ті повідомлення, що дійшли
+  // до події, і мовчав би про застарілі, які правила відкинули раніше. Оператор питає «скільки
+  // старого нам довозять», а не «скільки старого стало б подією».
+  if (!withinDeliveryAge(message.publishedAt)) {
+    staleForDelivery.inc({ source: message.sourceId, path: options.historical ? 'backfill' : 'live' });
+  }
   const startedAt = Date.now();
   try {
     return await classifyAndIngest(message, options);

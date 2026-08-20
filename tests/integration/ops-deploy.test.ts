@@ -172,7 +172,7 @@ describe.skipIf(!integrationDatabaseAvailable)('ops deployment API', () => {
       // The seeded singleton, never "no row, therefore unknown".
       expect(body.repo).toMatchObject({ branch: 'main', remoteCommit: null, workingTreeDirty: false });
       expect(body.commitState).toBe('unknown');
-      expect(body.app.migrations.newest).toBe('051_hromada_rows.sql');
+      expect(body.app.migrations.newest).toBe('052_downtime_digest.sql');
       // The boundary is stated on the payload, so an operator can read it off the page.
       expect(body.limits).toEqual({
         ref: 'refs/heads/main', services: ['app', 'caddy'],
@@ -363,7 +363,7 @@ describe.skipIf(!integrationDatabaseAvailable)('ops deployment API', () => {
         const ready = await app.inject({ method: 'GET', url: '/health/ready' });
         expect(ready.statusCode).toBe(200);
         expect(ready.json()).toMatchObject({
-          status: 'ready', commit: config.APP_COMMIT, migration: '051_hromada_rows.sql'
+          status: 'ready', commit: config.APP_COMMIT, migration: '052_downtime_digest.sql'
         });
       } finally {
         await app.close();

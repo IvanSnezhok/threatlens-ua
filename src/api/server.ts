@@ -22,6 +22,8 @@ import { registerAttackResearchMetrics } from '../services/attack-research.js';
 import { registerAttackStatsMetrics } from '../services/attack-stats.js';
 import { registerCodexClassifierMetrics } from '../services/codex-classifier.js';
 import { registerModelContextMetrics } from '../services/model-context.js';
+import { registerDowntimeDigestMetrics } from '../services/downtime-digest.js';
+import { registerAttackDebriefMetrics } from '../services/attack-debrief.js';
 import { registerOutboxMetrics } from '../bot/outbox.js';
 import { telegramDeliveryGovernorStatus } from '../bot/delivery-governor.js';
 import { resolveRuntimeSettings } from '../services/runtime-settings.js';
@@ -337,6 +339,14 @@ export async function buildServer(options: BuildServerOptions = {}) {
   // — appends, compactions and trims of the per-location contexts (migration 049).
   registerCodexClassifierMetrics(registry);
   registerModelContextMetrics(registry);
+  // `threatlens_downtime_digests_total{outcome}` — чи склалося зведення після простою, і чи мав хто
+  // його прочитати. Порожні проходи рахуються теж: «нічого не було» і «зведення не спрацювало» — це
+  // два різні стани, і без цієї серії вони виглядають однаково.
+  registerDowntimeDigestMetrics(registry);
+  // `threatlens_attack_debriefs_total{outcome}` — скільки розборів склалося після відбоїв і скільки
+  // тривог минуло без жодного повідомлення каналів. Друге число теж треба бачити: воно каже, чи
+  // мовчали канали, чи мовчимо ми.
+  registerAttackDebriefMetrics(registry);
 
   const app = Fastify({ logger: { level: config.NODE_ENV === 'development' ? 'debug' : 'info' }, trustProxy: true });
   await app.register(rateLimit, { max: 300, timeWindow: '1 minute' });

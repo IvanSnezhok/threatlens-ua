@@ -2,6 +2,10 @@ import type { FastifyPluginAsync, FastifyReply } from 'fastify';
 import { publicationSlice } from '../services/publication.js';
 import { ATTACK_PERIODS, attackAnalytics, isAttackPeriod } from '../services/attack-analytics.js';
 import { readTacticsBlock } from '../services/attack-tactics.js';
+import {
+  ATTACK_DEBRIEF_DISCLAIMER, attackDebriefLines, buildAttackDebrief, debriefWorthShowing,
+  lastEndedAlertPeriod, latestWorthwhileDebrief
+} from '../services/attack-debrief.js';
 
 /**
  * The public «Аналіз атак» endpoint.
@@ -89,6 +93,44 @@ const attackAnalyticsRoutes: FastifyPluginAsync = async (app) => {
     // tail possible, and an already-issued `s-maxage` cannot be expired on a flip.
     setCacheControl(reply, slice.mode === 'delayed_15s' ? 'no-store' : CACHEABLE);
     return { ...payload, tactics };
+  });
+
+  /**
+   * Розбір останньої закритої тривоги по одному місцю — той самий, що йде в бот після відбою.
+   *
+   * Окремим роутом, а не полем у відповіді вище, тому що це відповідь на інше питання й у неї інший
+   * час життя: аналітика описує добу, тиждень або місяць, а розбір — одну конкретну тривогу, і він
+   * незмінний з моменту, коли вона закрилася. Тому й кеш тут довший — розбір закритого вікна не
+   * може оновитися.
+   *
+   * `404` для місця без завершених тривог за добу і для тривоги, за час якої каналів майже не було
+   * чути, — це не помилка, а найчастіша й правильна відповідь: сторінка просто не показує блоку.
+   */
+  app.get<{ Querystring: { location?: string } }>('/api/v1/analytics/attacks/debrief', async (request, reply) => {
+    const locationId = String(request.query.location ?? '').trim();
+    if (locationId && !/^[a-z0-9-]{2,64}$/i.test(locationId)) {
+      return reply.code(400).send({ error: 'invalid_location' });
+    }
+    // Без `location` питання звучить як «що було останнім» — і відповідь на нього шукається серед
+    // кількох останніх відбоїв, бо тривог у країні за добу сотні, а розбору варті одиниці.
+    const debrief = locationId
+      ? await buildAttackDebrief(await lastEndedAlertPeriod(locationId) ?? '').catch(() => null)
+      : await latestWorthwhileDebrief();
+    if (!debriefWorthShowing(debrief)) return reply.code(404).send({ error: 'nothing_to_report' });
+    // Той самий режим публікації, що й у сусіда: під час затримки жоден публічний відповідач не
+    // має права лишити тіло в кеші браузера, бо перемикач оператора на нього вже не подіє.
+    const slice = await publicationSlice();
+    setCacheControl(reply, slice.mode === 'delayed_15s' ? 'no-store' : CACHEABLE);
+    return {
+      locationId: debrief.locationId,
+      locationName: debrief.locationName,
+      startedAt: debrief.startedAt.toISOString(),
+      endedAt: debrief.endedAt.toISOString(),
+      durationMinutes: debrief.durationMinutes,
+      messages: debrief.messages,
+      lines: attackDebriefLines(debrief),
+      disclaimer: ATTACK_DEBRIEF_DISCLAIMER
+    };
   });
 };
 

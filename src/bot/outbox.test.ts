@@ -11,9 +11,11 @@ const now = new Date('2026-08-08T00:13:46.000Z');
 
 describe('Telegram notification formatting', () => {
   it('escapes source-controlled HTML', () => {
+    // Обидва поля термінового попередження приходять від джерела: назву місця бере каталог, а
+    // напрямок — дослівно з тексту каналу, і саме він тепер друкується там, де раніше стояла цитата.
     const text = formatMessage({ notification_type: 'threat_update', payload: {
       locationName: '<b>Київ</b>', threatType: 'uav', evidenceLevel: 'monitoring',
-      summary: '<script>alert(1)</script>', validUntil: 'soon'
+      directionText: '<script>alert(1)</script>', summary: 'байдуже', validUntil: 'soon'
     } }, now);
     expect(text).not.toContain('<script>');
     expect(text).toContain('&lt;script&gt;');
@@ -30,21 +32,67 @@ describe('Telegram notification formatting', () => {
   });
 
   it('states validity in Kyiv time with a remaining-time hint instead of an ISO string', () => {
-    const text = formatMessage({ notification_type: 'threat_update', payload: {
+    // Дедлайн лишився там, де в читача є час його прочитати: у публікації каналу й у дельті. З
+    // термінового попередження він пішов навмисне — це не вказівка до дії, — але ISO-рядок не сміє
+    // просочитися в ЖОДНЕ повідомлення, і саме це друга половина перевірки.
+    const published = formatMessage({ notification_type: 'channel_publication', payload: {
+      locationName: 'Київ', threatType: 'ballistic_missile', evidenceLevel: 'unverified',
+      summary: 'Загроза застосування балістики', validUntil: '2026-08-08T00:38:46.000Z'
+    } }, now);
+    expect(published).toContain('Актуально до 03:38 (ще ~25 хв)');
+    const urgent = formatMessage({ notification_type: 'threat_update', payload: {
       locationName: 'Київ', threatType: 'ballistic_missile', evidenceLevel: 'confirmed',
       summary: 'Загроза застосування балістики', validUntil: '2026-08-08T00:38:46.000Z'
     } }, now);
-    expect(text).toContain('Актуально до 03:38 (ще ~25 хв)');
-    expect(text).not.toContain('2026-08-08T00:38:46.000Z');
-    expect(text).not.toMatch(/\d{4}-\d{2}-\d{2}T/);
+    for (const text of [published, urgent]) {
+      expect(text).not.toContain('2026-08-08T00:38:46.000Z');
+      expect(text).not.toMatch(/\d{4}-\d{2}-\d{2}T/);
+    }
   });
 
   it('spells out the evidence level instead of leaking the database enum', () => {
-    const text = formatMessage({ notification_type: 'threat_update', payload: {
+    // Повне речення — там, де людина читає не поспішаючи (канал, очікувана загроза).
+    const unhurried = formatMessage({ notification_type: 'channel_publication', payload: {
       locationName: 'Київ', threatType: 'ballistic_missile', evidenceLevel: 'confirmed', summary: 'Пуски'
     } }, now);
-    expect(text).toContain('Підтверджено кількома джерелами');
-    expect(text).not.toContain('confirmed');
+    expect(unhurried).toContain('Підтверджено кількома джерелами');
+    expect(unhurried).not.toContain('confirmed');
+  });
+
+  it('compresses the evidence level to a badge in an urgent warning without losing it', () => {
+    // Рівень доказовості не зникає з термінового попередження — він стає словом у заголовку.
+    // `CONTEXT.md` ставить офіційні сигнали над аналітикою, і читач мусить бачити цю різницю;
+    // абзац під заголовком коштує секунд там, де секунди коштують найдорожче.
+    const confirmed = formatMessage({ notification_type: 'threat_update', payload: {
+      locationName: 'Київ', threatType: 'ballistic_missile', evidenceLevel: 'confirmed', summary: 'Пуски'
+    } }, now);
+    expect(confirmed).toContain('⚠️ <b>Київ — балістичні ракети</b> · підтверджено');
+    expect(confirmed).not.toContain('Підтверджено кількома джерелами');
+    expect(confirmed).not.toContain('confirmed');
+
+    const unverified = formatMessage({ notification_type: 'threat_update', payload: {
+      locationName: 'Київ', threatType: 'uav', evidenceLevel: 'unverified', summary: 'Шахеди'
+    } }, now);
+    expect(unverified).toContain('· неперевірено');
+    expect(unverified).not.toContain('unverified');
+  });
+
+  it('leads an urgent warning with where the target is, taken verbatim from the source', () => {
+    const text = formatMessage({ notification_type: 'threat_update', payload: {
+      locationName: 'Київська область', threatType: 'uav', evidenceLevel: 'monitoring',
+      directionText: 'курсом на Бровари', summary: 'Ударні БпЛА курсом на Бровари, група з півдня'
+    } }, now);
+    expect(text).toContain('📍 курсом на Бровари');
+    expect(text.indexOf('📍')).toBeLessThan(text.indexOf('в укриття'));
+    // Цитата поста більше не їде в поштовх: заголовок і напрямок уже сказали те саме, коротше.
+    expect(text).not.toContain('група з півдня');
+  });
+
+  it('says nothing about the direction when the source named none', () => {
+    const text = formatMessage({ notification_type: 'threat_update', payload: {
+      locationName: 'Київ', threatType: 'uav', evidenceLevel: 'monitoring', summary: 'Шахеди'
+    } }, now);
+    expect(text).not.toContain('📍');
   });
 
   it('never emits a dead link: no source in the payload means no link at all', () => {
@@ -83,21 +131,26 @@ describe('Telegram notification formatting', () => {
   it('puts the action before the details in a threat message', () => {
     const text = formatMessage({ notification_type: 'threat_update', payload: {
       locationName: 'Київ', threatType: 'ballistic_missile', evidenceLevel: 'confirmed',
-      summary: 'Загроза балістики', validUntil: '2026-08-08T00:38:46.000Z'
+      directionText: 'курсом на Київ', summary: 'Загроза балістики',
+      validUntil: '2026-08-08T00:38:46.000Z',
+      sourceUrl: 'https://t.me/monitor/1234', sourceName: 'Моніторинг'
     } }, now);
-    expect(text.indexOf('перейдіть до укриття')).toBeGreaterThan(text.indexOf('Загроза балістики'));
-    expect(text.indexOf('Підтверджено кількома джерелами')).toBeGreaterThan(text.indexOf('перейдіть до укриття'));
+    // Порядок і є змістом: місце й клас → де ціль → що робити → чим перевірити.
+    expect(text.indexOf('📍 курсом на Київ')).toBeGreaterThan(text.indexOf('балістичні ракети'));
+    expect(text.indexOf('в укриття')).toBeGreaterThan(text.indexOf('📍 курсом на Київ'));
+    expect(text.indexOf('Першоджерело')).toBeGreaterThan(text.indexOf('в укриття'));
   });
 
   it('cleans channel formatting out of the summary and keeps a single leading emoji', () => {
+    // Цитата джерела лишилася в повідомленні про ОЧІКУВАНУ загрозу — там, де читач має час на абзац.
     const text = formatMessage({ notification_type: 'threat_update', payload: {
       locationName: 'Київ', threatType: 'ballistic_missile', evidenceLevel: 'confirmed',
-      summary: '⚠️Загроза  застосування балістики триває..'
+      timing: 'evening', summary: '⚠️Загроза  застосування балістики триває..'
     } }, now);
-    expect(text).toContain('⚠️ <b>Київ — балістичні ракети</b>');
+    expect(text).toContain('🕒 <b>Київ — балістичні ракети: очікується увечері</b>');
     expect(text).toContain('Загроза застосування балістики триває.');
     expect(text).not.toContain('триває..');
-    expect(text.match(/⚠️/g)).toHaveLength(1);
+    expect(text.match(/⚠️/g)).toBeNull();
   });
 
   it('translates the assessment confidence enum', () => {
@@ -118,14 +171,21 @@ describe('threat updates that follow an earlier message', () => {
     summary: 'Ударні БпЛА курсом на північ області.', validUntil: '2026-08-08T00:38:46.000Z'
   };
 
-  it('gives the whole picture in the first message about a threat', () => {
+  it('gives the place, the target and the instruction in the first message — and stops there', () => {
     const text = formatMessage({ notification_type: 'threat_update', payload: {
-      ...standing, updateKind: 'initial', changes: ['initial']
+      ...standing, directionText: 'курсом на північ області', updateKind: 'initial', changes: ['initial']
     } }, now);
-    expect(text).toContain('Ударні БпЛА курсом на північ області.');
-    expect(text).toContain('Повідомляють моніторингові канали');
-    expect(text).toContain('Актуально до 03:38');
+    expect(text).toContain('⚠️ <b>Київська область — ударні БпЛА</b> · моніторинг');
+    expect(text).toContain('📍 курсом на північ області');
+    expect(text).toContain('в укриття');
     expect(text).not.toContain('оновлення');
+    // Те, що пішло: цитата поста, повне речення про доказовість, дедлайн.
+    expect(text).not.toContain('Ударні БпЛА курсом на північ області.');
+    expect(text).not.toContain('Повідомляють моніторингові канали');
+    expect(text).not.toContain('Актуально до');
+    // Стислість вимірювана, а не на око: чотири рядки й менш ніж двісті символів на екрані блокування.
+    expect(text.split('\n').filter(Boolean).length).toBeLessThanOrEqual(4);
+    expect(text.length).toBeLessThan(200);
   });
 
   it('says what changed instead of repeating the warning when evidence is raised', () => {
@@ -376,5 +436,58 @@ describe('nightly digest AI summary line', () => {
       ...digestPayload, modelDisclosure: 7
     } });
     expect(wrongType).toBe(formatMessage({ notification_type: 'nightly_digest', payload: digestPayload }));
+  });
+});
+
+/**
+ * Два повідомлення, які дивляться НАЗАД: зведення після простою і розбір атаки після відбою
+ * (рішення власника 20.08.2026). Обидва мають читатися як довідка, а не як тривога, і обидва
+ * говорять про повідомлення каналів, а не про засоби — саме це тут і перевіряється.
+ */
+describe('повідомлення, що дивляться назад', () => {
+  it('зведення після простою підбиває підсумок і не має вигляду попередження', () => {
+    const text = formatMessage({ notification_type: 'downtime_digest', payload: {
+      from: '2026-08-07T22:40:00.000Z', to: '2026-08-08T00:12:00.000Z', silent: true, omitted: 2,
+      locations: [
+        { locationName: 'Київська область', messages: 7, classes: ['ударні БпЛА'],
+          line: 'Київська область — 7 повідомлень (ударні БпЛА), 01:40–03:12' },
+        { locationName: 'Полтавська область', messages: 3, classes: ['балістика'],
+          line: 'Полтавська область — 3 повідомлення (балістика), 02:05–02:31' }
+      ]
+    } }, now);
+    expect(text).toContain('🕓');
+    expect(text).toContain('Київська область — 7 повідомлень');
+    expect(text).toContain('Ще місць: 2');
+    // Числа — це повідомлення каналів, і повідомлення каже це вголос.
+    expect(text).toContain('кількість повідомлень каналів, а не кількість цілей');
+    // Ніякого силуету тривоги і жодного заклику до дії просто зараз.
+    expect(text).not.toContain('⚠️');
+    expect(text).not.toContain('🔴');
+    expect(text).not.toContain('в укриття.');
+  });
+
+  it('зведення без жодного місця каже це прямо, а не лишає порожнечу', () => {
+    const text = formatMessage({ notification_type: 'downtime_digest', payload: {
+      from: '2026-08-07T22:40:00.000Z', to: '2026-08-08T00:12:00.000Z', locations: [], omitted: 0
+    } }, now);
+    expect(text).toContain('Нових повідомлень по ваших підписках за цей час не було.');
+  });
+
+  it('розбір атаки несе застереження першим рядком, до першого числа', () => {
+    const text = formatMessage({ notification_type: 'attack_debrief', payload: {
+      locationName: 'Київ', durationMinutes: 92, messages: 14,
+      lines: [
+        'Тривога тривала 1 година 32 хв.',
+        'За цей час канали писали про: ударні БпЛА — 11 повідомлень; балістика — 3 повідомлення.',
+        'Кількість, яку називали самі джерела: ударні БпЛА — до 10 (найбільше, назване в одному повідомленні).',
+        'Повідомляли про роботу ППО: Бровари, Київ.'
+      ],
+      disclaimer: 'Це підсумок повідомлень моніторингових каналів за час тривоги, а не офіційні дані про наслідки.'
+    } }, now);
+    expect(text.indexOf('Це підсумок повідомлень')).toBeLessThan(text.indexOf('11 повідомлень'));
+    expect(text).toContain('📋 <b>Розбір атаки — Київ</b>');
+    expect(text).toContain('Повідомляли про роботу ППО: Бровари, Київ.');
+    // Розбір не сміє мати силуету тривоги, відбою чи попередження.
+    for (const marker of ['🔴', '⚪', '⚠️']) expect(text).not.toContain(marker);
   });
 });

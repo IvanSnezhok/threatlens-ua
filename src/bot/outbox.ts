@@ -5,14 +5,19 @@ import { pool } from '../db/pool.js';
 import { relatedLocationsCte } from '../repositories/events.js';
 import { onAlertPoke } from '../services/alert-poke.js';
 import { scopeToSubscription } from '../domain/location-label.js';
+import { sourceMessageUrl } from '../domain/source-link.js';
 import { locationCatalogue } from '../services/location-labels.js';
 import { summariseMovement } from '../services/movement-summary.js';
+import {
+  ATTACK_DEBRIEF_DISCLAIMER, attackDebriefLines, buildAttackDebrief, debriefWorthShowing
+} from '../services/attack-debrief.js';
 import { deliverableRun } from '../services/event-log-cursor.js';
 import {
   MODEL_CHANNEL_ACTION, MODEL_CHANNEL_DISCLAIMER, MODEL_CHANNEL_STANDING,
-  cleanSummary, confidenceLabel, evidenceRaisedLine, evidenceStatement, expectedWindowLine, extensionLine,
-  geographyChangedLine, humanMoment, isExpectedTiming, levelLabel, modelAnalysisHeading, probabilityLine,
-  riskLevelChangedLine, threatLabel, threatTypeChangedLine, timingBadge, validUntilLine
+  cleanSummary, confidenceLabel, evidenceBadge, evidenceRaisedLine, evidenceStatement, expectedWindowLine,
+  extensionLine, geographyChangedLine, humanMoment, isExpectedTiming, levelLabel, modelAnalysisHeading,
+  probabilityLine, riskLevelChangedLine, targetLine, threatLabel, threatTypeChangedLine, timingBadge,
+  validUntilLine
 } from './humanize.js';
 import {
   decideAssessmentNotification, decideThreatNotification, geographyKey, mergePublishedState,
@@ -55,8 +60,17 @@ function html(value: unknown): string {
 }
 
 async function insertForAlertSubscribers(args: {
-  locationId: string; type: 'alert_start' | 'alert_end'; entityId: string; eventVersion: number;
+  locationId: string;
+  /**
+   * Яку саме підписку питаємо. Це НЕ те саме, що `notificationType` нижче: розбір атаки читає ту
+   * саму згоду, що й відбій (`notify_alert_end`) — людина, яка просила знати, коли все скінчилося,
+   * і є тим, кому цікаво, чим це було, — але приходить окремим повідомленням із власним форматом.
+   */
+  type: 'alert_start' | 'alert_end';
+  entityId: string; eventVersion: number;
   priority: number; payload: Record<string, unknown>;
+  /** Типово збігається з `type`. Інакший — коли одна згода породжує друге, окреме повідомлення. */
+  notificationType?: string;
 }) {
   // Official alerts keep the set-based fanout that threats and analytics gave up. They carry no
   // per-chat published state, they ignore the evidence and threat-type filters, and every one of
@@ -69,14 +83,14 @@ async function insertForAlertSubscribers(args: {
   await pool.query(
     `${relatedLocationsCte()}
      INSERT INTO notification_outbox(alert_period_id,chat_id,notification_type,idempotency_key,priority,payload)
-     SELECT DISTINCT $3::uuid,s.chat_id,$2::text,$3||':'||s.chat_id||':'||$2||':'||$4,$5::integer,$6::jsonb
+     SELECT DISTINCT $3::uuid,s.chat_id,$7::text,$3||':'||s.chat_id||':'||$7||':'||$4,$5::integer,$6::jsonb
      FROM subscriptions s JOIN telegram_users u ON u.chat_id=s.chat_id
      WHERE s.enabled=true AND u.enabled=true
        AND EXISTS (SELECT 1 FROM related_locations r WHERE r.id=s.location_id)
        AND (($2='alert_start' AND s.notify_alert_start=true) OR ($2='alert_end' AND s.notify_alert_end=true))
      ON CONFLICT (idempotency_key) DO NOTHING`,
     [args.locationId, args.type, args.entityId, args.eventVersion, args.priority,
-      JSON.stringify(args.payload)]
+      JSON.stringify(args.payload), args.notificationType ?? args.type]
   );
 }
 
@@ -287,12 +301,9 @@ function locationLabel(names: string[]): string {
  * public address at all yields nothing rather than a link that goes nowhere.
  */
 function sourceUrlFor(row: any): string | null {
-  const username = String(row?.telegram_username ?? '').trim().replace(/^@/, '');
-  const externalId = String(row?.external_id ?? '').trim();
-  if (username && /^\d+$/.test(externalId)) return `https://t.me/${username}/${externalId}`;
-  if (username) return `https://t.me/${username}`;
-  const publicUrl = String(row?.public_url ?? '').trim();
-  return /^https?:\/\//i.test(publicUrl) ? publicUrl : null;
+  return sourceMessageUrl({
+    telegramUsername: row?.telegram_username, externalId: row?.external_id, publicUrl: row?.public_url
+  });
 }
 
 /** Spread into a payload: contributes the two source fields, or nothing when there is no citation. */
@@ -343,6 +354,31 @@ async function enqueueForEvent(event: any) {
         ...(await messageSource(alert?.source_message_id ?? null))
       }
     });
+    // Розбір атаки — ПІСЛЯ відбою і окремим повідомленням (рішення власника 20.08.2026).
+    //
+    // Окремим, а не рядками під відбоєм, з двох причин. Відбій має лишитися тим, чим є: чотирма
+    // рядками про те, що офіційна тривога скінчилася, — і жодне слово аналізу не має права стояти в
+    // повідомленні, яке людина читає, вирішуючи, чи виходити з укриття. І розбір іде тихо, найнижчим
+    // пріоритетом: він потрібен зранку, а не о 04:10.
+    //
+    // Порядок теж навмисний: спершу в чергу лягає відбій, потім розбір, і черга віддає їх у тому ж
+    // порядку. Розбір, що прийшов першим, читався б як повідомлення про те, що все ще триває.
+    if (type === 'alert_end' && config.ATTACK_DEBRIEF_ENABLED) {
+      // Найдорожча частина — читання архіву — робиться РАЗ на тривогу, а не раз на підписника: текст
+      // однаковий для всіх, і кожен його рядок порахований з тих самих рядків архіву.
+      const debrief = await buildAttackDebrief(entityId).catch(() => null);
+      if (debriefWorthShowing(debrief)) {
+        await insertForAlertSubscribers({
+          locationId, type: 'alert_end', entityId, eventVersion: Number(event.version),
+          priority: 4, notificationType: 'attack_debrief',
+          payload: {
+            locationName: debrief.locationName, silent: true,
+            durationMinutes: debrief.durationMinutes, messages: debrief.messages,
+            lines: attackDebriefLines(debrief), disclaimer: ATTACK_DEBRIEF_DISCLAIMER
+          }
+        });
+      }
+    }
     return;
   }
   // `threat.withdrawn` is excluded for the same reason as `threat.expired`: both mean the threat is
@@ -433,6 +469,10 @@ async function enqueueForEvent(event: any) {
           `${entityId}:${candidate.chat_id}:threat_update:${Number(event.version)}`, priority,
           JSON.stringify({
             locationName: names, threatType: snapshot.threatType, summary: threat.summary,
+            // Напрямок, дослівно з джерела — тепер це головний рядок термінового попередження, а не
+            // деталь, яку читали лише на карті. `null` тут нормальний і найчастіший стан: джерело
+            // назвало місце, але не сказало, куди саме йде ціль.
+            directionText: threat.direction_text ?? null,
             modelSummary: movement?.summary ?? null, modelSources: movement?.sources ?? null,
             evidenceLevel: snapshot.evidenceLevel, lastObservedAt: threat.last_observed_at,
             validUntil: threat.valid_until, ...threatSource,
@@ -655,6 +695,26 @@ export function formatMessage(row: any, now: Date = new Date()): string {
         sourceLine(p)
       );
   }
+  /**
+   * Розбір атаки — окреме повідомлення після відбою, з іншим силуетом і в минулому часі.
+   *
+   * Маркер 📋, а не 🔴/⚪/⚠️: читач сортує повідомлення за формою, і розбір не сміє мати вигляду ні
+   * тривоги, ні відбою, ні попередження. Застереження — ПЕРШИМ рядком, курсивом, до першого числа:
+   * саме числа з цього повідомлення переказуватимуть далі, і те, що переживе пересилання, мусить
+   * нести «це повідомлення каналів, а не офіційні дані».
+   *
+   * Рядки приходять готовими з `attackDebriefLines` і тут лише екрануються: формулювання належить
+   * тому модулю, який знає, що саме порахував.
+   */
+  if (row.notification_type === 'attack_debrief') {
+    const lines = (Array.isArray(p.lines) ? p.lines : [])
+      .filter((line: unknown) => typeof line === 'string' && line.trim())
+      .map((line: string) => `• ${html(line)}`);
+    if (!lines.length) return `📋 <b>Розбір атаки — ${html(p.locationName)}</b>`;
+    return `📋 <b>Розбір атаки — ${html(p.locationName)}</b>\n`
+      + `<i>${html(p.disclaimer ?? ATTACK_DEBRIEF_DISCLAIMER)}</i>\n\n`
+      + lines.join('\n');
+  }
   // The public channel, and the only message in this function that is not addressed to somebody who
   // asked for it. Three things about its shape are load-bearing rather than decorative:
   //
@@ -700,6 +760,30 @@ export function formatMessage(row: any, now: Date = new Date()): string {
         horizon && `Оцінка чинна до ${html(horizon)}`,
         'Це індекс публічних сигналів, не статистична ймовірність і не офіційна тривога.',
         sourceLine(p)
+      );
+  }
+  /**
+   * Що було за час простою — одне повідомлення замість сотні пропущених.
+   *
+   * Форма навмисно НЕ схожа на попередження: маркер 🕓, минулий час у кожному рядку, жодного заклику
+   * в укриття і жодного слова про «зараз». Читач о 07:00 має прочитати це як довідку про ніч, а не
+   * як тривогу, яку він проспав, — і саме тому «повідомлень», ніколи не «цілей»: скільки чого
+   * летіло, канали не пишуть, і зведення не має права це вигадати.
+   */
+  if (row.notification_type === 'downtime_digest') {
+    const from = humanMoment(p.from, now);
+    const to = humanMoment(p.to, now);
+    const lines = (Array.isArray(p.locations) ? p.locations : [])
+      .map((location: any) => `• ${html(String(location?.line ?? ''))}`)
+      .filter((line: string) => line.length > 2);
+    const omitted = Number(p.omitted ?? 0) > 0 ? `\n\nЩе місць: ${html(p.omitted)} — перегляньте на сайті.` : '';
+    return `🕓 <b>Поки зв'язок був відсутній${from && to ? `, ${html(from)}–${html(to)}` : ''}</b>\n\n`
+      + (lines.length ? lines.join('\n') : 'Нових повідомлень по ваших підписках за цей час не було.')
+      + omitted
+      + details(
+        'Це підсумок повідомлень джерел за минулий проміжок, а не сигнал про поточну загрозу.',
+        'Числа — це кількість повідомлень каналів, а не кількість цілей.',
+        'Про те, що відбувається зараз, повідомлять офіційні тривоги.'
       );
   }
   if (row.notification_type === 'nightly_digest') {
@@ -784,17 +868,31 @@ export function formatMessage(row: any, now: Date = new Date()): string {
         sourceLine(p)
       );
   }
-  return `⚠️ <b>${html(p.locationName)} — ${html(threatLabel(p.threatType))}</b>`
-    + (summary ? `\n\n${html(summary)}` : '')
-    + attribution
-    + '\n\nЯкщо ви в цьому районі — перейдіть до укриття або до приміщення без вікон '
-    + 'і дочекайтеся офіційного сповіщення.'
-    + details(
-      evidenceStatement(p.evidenceLevel),
-      probabilityLine(p.probability),
-      validUntilLine(p.validUntil, now),
-      sourceLine(p)
-    );
+  // ЗАГРОЗА ЗАРАЗ — і це єдине повідомлення в боті, яке читають на бігу.
+  //
+  // Рішення власника 20.08.2026: коли ціль уже в повітрі, читачеві потрібно знати ДЕ вона, а не на
+  // чому ґрунтується повідомлення. Тому тут лишилося рівно три речі — заголовок (місце й клас),
+  // напрямок цілі дослівно з джерела, і що робити, — а пояснення підстави пішли:
+  //
+  //  * **цитата поста** (`summary`) і **переказ моделі** — по чотириста символів кожен, і обидва
+  //    переказують те, що заголовок і напрямок уже сказали. Вони лишаються в події, на карті й у
+  //    /status; зникають вони лише з поштовху на екран блокування;
+  //  * **ймовірність** — оцінка моделі про те, чи реалізується загроза. Для події «зараз» її
+  //    здебільшого немає взагалі, а там, де є, вона відповідає на питання, якого людина в цю
+  //    хвилину не ставить;
+  //  * **«Актуально до …»** — дедлайн, а не вказівка до дії. Він лишився в дельті («⏱ Загрозу
+  //    продовжено до …»), де він і є всім змістом повідомлення;
+  //  * **повне речення про доказовість** — стиснуте до позначки в заголовку. Сам рівень нікуди не
+  //    подівся: `CONTEXT.md` ставить офіційні сигнали над аналітикою, і читач мусить бачити цю
+  //    різницю — але як слово в заголовку, а не як абзац під ним.
+  //
+  // Посилання на першоджерело лишається. Це вся перевірюваність, яку має повідомлення, і воно коштує
+  // одного рядка, який ніхто не читає під час тривоги й читають усі після неї.
+  const badge = evidenceBadge(p.evidenceLevel);
+  return `⚠️ <b>${html(p.locationName)} — ${html(threatLabel(p.threatType))}</b>${badge ? ` · ${html(badge)}` : ''}`
+    + (targetLine(p.directionText) ? `\n${html(targetLine(p.directionText))}` : '')
+    + '\n\nЯкщо ви в цьому районі — в укриття.'
+    + details(sourceLine(p));
 }
 
 const deltaHeadings: Record<string, string> = { escalation: '⬆️', change: '🔀', soft: '⏱' };

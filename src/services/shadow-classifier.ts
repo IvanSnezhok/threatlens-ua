@@ -6,6 +6,7 @@ import {
   CLASSIFIER_VERSION, significanceRejection, type LocationLexeme
 } from '../domain/classifier.js';
 import { THREAT_LABELS, resolveModelPlace } from '../domain/model-place.js';
+import { describeAge, momentIn } from '../domain/threat-timing.js';
 import { cachedLocationLexemes, ingestThreat } from '../repositories/events.js';
 import { THREAT_TYPES, type ClassifiedMessage, type NormalizedMessage } from '../types.js';
 import {
@@ -638,7 +639,14 @@ export async function shadowClassify(input: ShadowInput, options: ShadowOptions 
       status: 'skipped', reason: audioSeen ? 'transcription_failed' : 'media_unusable'
     });
   }
+  // Той самий часовий блок, що й у основного класифікатора (`./codex-classifier.ts`, рішення власника
+  // 20.08.2026). Тінь порівнюють з правилами й з основною моделлю, і вердикт, ухвалений без знання
+  // про те, коли канал це написав, порівнювати нема з чим: розбіжність читалася б як помилка моделі
+  // там, де це була різниця у вхідних даних.
   const prompt = JSON.stringify({
+    now: momentIn(new Date(), config.APP_TIMEZONE),
+    publishedAt: momentIn(input.publishedAt, config.APP_TIMEZONE),
+    messageAge: describeAge(input.publishedAt, new Date()),
     previousMessages: context.map((item) => ({ at: item.publishedAt.toISOString(), text: item.text })),
     currentMessage: text.slice(0, TEXT_LIMIT),
     audioTranscripts: transcripts
@@ -646,7 +654,7 @@ export async function shadowClassify(input: ShadowInput, options: ShadowOptions 
   const deterministic = deterministicVerdict(input.classified);
 
   const result = await chat({
-    promptVersion: 'shadow-classifier-v1',
+    promptVersion: 'shadow-classifier-v2',
     surface: 'shadow',
     classifierVersion: CLASSIFIER_VERSION,
     system: SYSTEM_PROMPT,
