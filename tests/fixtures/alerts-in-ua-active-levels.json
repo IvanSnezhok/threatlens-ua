@@ -1,0 +1,146 @@
+{
+  "alerts": [
+    {
+      "id": 8757,
+      "location_title": "Луганська область",
+      "location_type": "oblast",
+      "started_at": "2022-04-04T16:45:39.000Z",
+      "finished_at": null,
+      "updated_at": "2023-10-29T18:22:37.357Z",
+      "alert_type": "air_raid",
+      "location_oblast": "Луганська область",
+      "location_uid": "16",
+      "notes": null,
+      "country": null,
+      "alert_level": "red",
+      "location_title_en": "Luhansk Oblast",
+      "location_oblast_uid": 16
+    },
+    {
+      "id": 264928,
+      "location_title": "Покровський район",
+      "location_type": "raion",
+      "started_at": "2026-09-21T16:10:55.009Z",
+      "finished_at": null,
+      "updated_at": "2026-09-21T16:11:02.874Z",
+      "alert_type": "air_raid",
+      "location_oblast": "Донецька область",
+      "location_uid": "56",
+      "notes": null,
+      "country": null,
+      "alert_level": "red",
+      "location_title_en": "Pokrovskii raion",
+      "threats": [
+        {
+          "threat_type": "unspecified_missiles",
+          "level": "red",
+          "started_at": "2026-09-21T16:10:55.009Z",
+          "source_message": "Ракетна загроза (червоний рівень)"
+        }
+      ],
+      "location_oblast_uid": 56
+    },
+    {
+      "id": 265383,
+      "location_title": "Олександрійський район",
+      "location_type": "raion",
+      "started_at": "2026-09-22T09:32:40.966Z",
+      "finished_at": null,
+      "updated_at": "2026-09-22T09:32:47.205Z",
+      "alert_type": "air_raid",
+      "location_oblast": "Кіровоградська область",
+      "location_uid": "80",
+      "notes": null,
+      "country": null,
+      "alert_level": "yellow",
+      "location_title_en": "Oleksandriia raion",
+      "threats": [
+        {
+          "threat_type": "drones",
+          "level": "yellow",
+          "started_at": "2026-09-22T09:32:40.966Z",
+          "source_message": "Дронова загроза (жовтий рівень)"
+        }
+      ],
+      "location_oblast_uid": 80
+    },
+    {
+      "id": 76016,
+      "location_title": "Вовчанська територіальна громада",
+      "location_type": "hromada",
+      "started_at": "2024-05-20T09:31:37.000Z",
+      "finished_at": null,
+      "updated_at": "2024-05-20T09:31:39.351Z",
+      "alert_type": "artillery_shelling",
+      "location_oblast": "Харківська область",
+      "location_uid": "1313",
+      "notes": null,
+      "country": null,
+      "alert_level": "red",
+      "location_title_en": "Vovchanska terytorialna hromada",
+      "location_raion": "Чугуївський район",
+      "location_oblast_uid": 1313
+    },
+    {
+      "id": 76017,
+      "location_title": "Вовчанська територіальна громада",
+      "location_type": "hromada",
+      "started_at": "2024-05-20T09:31:41.000Z",
+      "finished_at": null,
+      "updated_at": "2024-05-20T09:31:44.929Z",
+      "alert_type": "urban_fights",
+      "location_oblast": "Харківська область",
+      "location_uid": "1313",
+      "notes": null,
+      "country": null,
+      "alert_level": "red",
+      "location_title_en": "Vovchanska terytorialna hromada",
+      "location_raion": "Чугуївський район",
+      "location_oblast_uid": 1313
+    },
+    {
+      "id": 265304,
+      "location_title": "м. Марганець",
+      "location_type": "city",
+      "started_at": "2026-09-22T05:31:20.950Z",
+      "finished_at": null,
+      "updated_at": "2026-09-22T05:31:22.755Z",
+      "alert_type": "artillery_shelling",
+      "location_oblast": "Дніпропетровська область",
+      "location_uid": "5349",
+      "notes": null,
+      "country": null,
+      "alert_level": "red",
+      "location_title_en": "Marhanets city",
+      "threats": [
+        {
+          "threat_type": "unspecified_missiles",
+          "level": "red",
+          "started_at": "2026-09-22T05:31:20.950Z"
+        }
+      ],
+      "location_oblast_uid": 349
+    },
+    {
+      "id": 265568,
+      "location_title": "Харківський район",
+      "location_type": "raion",
+      "started_at": "2026-09-22T16:22:26.217Z",
+      "finished_at": null,
+      "updated_at": "2026-09-22T16:22:29.806Z",
+      "alert_type": "air_raid",
+      "location_oblast": "Харківська область",
+      "location_uid": "124",
+      "notes": null,
+      "country": null,
+      "alert_level": "yellow",
+      "location_title_en": "Kharkiv raion",
+      "location_oblast_uid": 124
+    }
+  ],
+  "meta": {
+    "last_updated_at": "2026/09/22 16:47:41 +0000",
+    "type": "full"
+  },
+  "disclaimer": "If you use python try our official alerts_in_ua PiP package."
+}

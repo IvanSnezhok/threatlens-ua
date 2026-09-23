@@ -36,6 +36,8 @@
  * `parseAerialMirrorPayload` is the backstop for getting it wrong anyway.
  */
 
+import { asAlertLevel, strongerAlertLevel, type AlertLevel } from '../types.js';
+
 /** Registry id of the mirror. Matches the row inserted by `027_aerial_alert_mirror.sql`. */
 export const AERIAL_MIRROR_SOURCE_ID = 'aerial-alerts-mirror';
 /**
@@ -114,6 +116,19 @@ export interface AerialMirrorRegion {
    * `narrowByParent` in `src/services/ingestion.ts`.
    */
   parentName?: string;
+  /**
+   * Колір, яким фід уточнив цю тривогу: `yellow` чи `red`, або відсутній — кольору не назвали.
+   *
+   * НЕ `level` і навмисно не схоже на нього. `level` у цьому ж інтерфейсі — адміністративний щабель
+   * (State/District/Community), тобто ЯКИЙ ЦЕ рядок каталогу; `threatLevel` — наскільки страшно в
+   * ньому зараз. Два поняття, які англійською звуться однаково, і якби вони звалися однаково й тут,
+   * перша ж помилка була б тихою: `region.level === 'red'` компілюється як порівняння двох рядків
+   * і мовчки не збігається ніколи.
+   *
+   * Значення вже перевірене: усе, що не `yellow` і не `red`, сюди не потрапляє (див. `asAlertLevel`
+   * у `src/types.ts`). Апстрім, який вигадає четвертий колір, не розширить наш перелік випадково.
+   */
+  threatLevel?: AlertLevel;
 }
 
 export interface AerialMirrorSnapshot {
@@ -144,6 +159,18 @@ export interface AerialMirrorRawSnapshot extends AerialMirrorSnapshot {
    * рівно ті «тривоги в області», яких влада не оголошувала і яких ця система більше не повторює.
    */
   droppedRollupOblasts: number;
+  /**
+   * Вузли, ЩО ТРИМАЮТЬ тривогу, за кольором, який вони назвали, плюс кошик `unknown`.
+   *
+   * Три ряди, і всі три зафіксовані на етапі компіляції: сюди не потрапить ані назва локації, ані
+   * колір, якого ми не знаємо, — невідоме значення рахується в `unknown` і в `threatLevel` не
+   * їде. Метрика з цього числа відповідає на єдине питання, на яке більше не відповідає ніщо:
+   * «кольору зараз немає» і «фід перестав слати кольори» виглядають однаково, тож число мусить
+   * існувати, щоб було видно, що воно НЕ рухається впродовж усього нальоту.
+   *
+   * Фіди без кольорів (`ual`, `skog`) віддають тут нулі — це не збій, а правда про них.
+   */
+  byThreatLevel: Record<AlertLevel | 'unknown', number>;
 }
 
 /**
@@ -435,7 +462,11 @@ export function parseAerialMirrorRawPayload(
     nonAirRegions,
     duplicateLabels,
     // Рівень області в `ual` — оголошення влади, тож відкидати тут нема чого.
-    droppedRollupOblasts: 0
+    droppedRollupOblasts: 0,
+    // Тіло Ukraine Alarm v3 диференційованого кольору не несе: у ньому є `regionType` і
+    // `activeAlerts[].type`, і жодного поля рівня. Нулі тут — правда про фід, а не його збій; коли
+    // API додасть рівень, він читається тут, поруч із `levelOf`, і більше ніде.
+    byThreatLevel: emptyThreatLevels()
   };
 }
 
@@ -491,6 +522,14 @@ export interface AerialMirrorUpstream {
 
 function emptyLevels(): Record<AerialMirrorLevel, number> {
   return { State: 0, District: 0, Community: 0, other: 0 };
+}
+
+/**
+ * Нульовий лічильник кольорів. Три ключі, зафіксовані типом; жодного шляху, яким сюди може
+ * потрапити четвертий.
+ */
+function emptyThreatLevels(): Record<AlertLevel | 'unknown', number> {
+  return { yellow: 0, red: 0, unknown: 0 };
 }
 
 /**
@@ -567,17 +606,26 @@ export function parseAerialMirrorSkogPayload(
     byLevel,
     nonAirRegions: 0,
     duplicateLabels,
-    droppedRollupOblasts
+    droppedRollupOblasts,
+    // `skog` кольору не публікує: у його записах є лише `name`, `alert` і `changed`. Перевірено на
+    // живому фіді — жодного входження `alert_level` у тілі. Нулі тут чесні, і саме тому цей фід не
+    // може бути єдиним джерелом рівня, хоч він і фід деталізації за замовчуванням.
+    byThreatLevel: emptyThreatLevels()
   };
 }
 
 /**
  * `?source=klimenko&raw`: обʼєкт, ключі якого — назви областей, значення —
- * `{enabled, "type:", districts: {назва: {enabled, enabled_at}}}`.
+ * `{enabled, "type:", alert_level, districts: {назва: {enabled, enabled_at, alert_level}}}`.
  *
  * Тут рівень області — оголошення, тож він читається; райони — теж. Громад цей фід не має, і саме
  * тому він не може бути єдиним: у зрізі 19.08.2026 він не знав про повітряну тривогу для
  * Нікопольської та Марганецької громад, яку `skog` і `ual` показували.
+ *
+ * Єдиний із трьох фідів, який несе КОЛІР тривоги (`alert_level`) — з 06.09.2026, коли Уряд
+ * запровадив диференційоване оповіщення. Зріз 22.09.2026 19:06: 153 вузли, поле є на кожному;
+ * 34 ввімкнених, із них 12 `red`, 20 `yellow` і 2 без кольору (АР Крим, Севастополь). Тобто
+ * ввімкнено ≠ кольорово, і `null` тут — не збій фіда, а звичайна тривога без уточнення.
  */
 export function parseAerialMirrorKlimenkoPayload(
   body: unknown, now: Date, staleSeconds: number
@@ -590,6 +638,7 @@ export function parseAerialMirrorKlimenkoPayload(
   const { cachedAt, ageSeconds } = readCachedAt(root, now, staleSeconds);
   const byLabel = new Map<string, AerialMirrorRegion>();
   const byLevel = emptyLevels();
+  const byThreatLevel = emptyThreatLevels();
   let readableCount = 0;
   let duplicateLabels = 0;
 
@@ -600,16 +649,33 @@ export function parseAerialMirrorKlimenkoPayload(
     readableCount += 1;
     if (!entry.enabled) return;
     const changed = isoInstant(entry.enabled_at);
+    // Колір читається ЛИШЕ з вузлів, що тримають тривогу: у вимкнених `alert_level` завжди null, а
+    // якби не був — це кольоровий відбій, тобто твердження, якого цей адаптер не робить ніколи.
+    //
+    // `asAlertLevel` — єдиний шлюз перевірки. Усе, що не `yellow` і не `red`, стає `null` і
+    // рахується в `unknown`: колір, вигаданий апстрімом, не має права розширити наш перелік, а
+    // CHECK у міграції 054 усе одно відкинув би його — але вже транзакцією знімка цілком, а не
+    // одним значенням. Кардинальність лічильника фіксована трьома ключами, тож невідомий колір
+    // видно як число, а не як новий ряд метрики з чужою назвою в мітці.
+    const declared = entry.alert_level ?? null;
+    const threatLevel = asAlertLevel(declared);
+    if (declared !== null && threatLevel === null) byThreatLevel.unknown += 1;
     const key = name.toLocaleLowerCase('uk-UA');
     const existing = byLabel.get(key);
     if (existing) {
       duplicateLabels += 1;
       if ((changed ?? cachedAt) < existing.changedAt) existing.changedAt = changed ?? cachedAt;
+      // Дублікат мітки не має права ПОСЛАБИТИ колір: якщо той самий район приїхав двічі і хоч раз
+      // червоним, він червоний. Те саме правило, що й у зведенні, на щабель нижче.
+      const stronger = strongerAlertLevel(existing.threatLevel ?? null, threatLevel);
+      if (stronger) existing.threatLevel = stronger;
       return;
     }
     byLevel[level] += 1;
     byLabel.set(key, {
-      name, active: true, changedAt: changed ?? cachedAt, level, ...(parentName ? { parentName } : {})
+      name, active: true, changedAt: changed ?? cachedAt, level,
+      ...(parentName ? { parentName } : {}),
+      ...(threatLevel ? { threatLevel } : {})
     });
   };
 
@@ -628,6 +694,12 @@ export function parseAerialMirrorKlimenkoPayload(
     throw new Error('aerial mirror klimenko response carries no readable entries');
   }
 
+  // Колір рахується З ТОГО, ЩО ЛИШИЛОСЯ, а не під час читання: після згортки дублікатів у мапі
+  // стоїть рівно один запис на локацію з уже найсильнішим кольором, тож лічильник не може
+  // розійтися зі знімком. `unknown` — навпаки, про ПРОЧИТАНЕ: відкинуте значення в знімку не
+  // лишається, а знати про нього треба.
+  for (const region of byLabel.values()) if (region.threatLevel) byThreatLevel[region.threatLevel] += 1;
+
   return {
     upstream: typeof root.source === 'string' ? root.source : 'klimenko',
     cachedAt,
@@ -638,7 +710,8 @@ export function parseAerialMirrorKlimenkoPayload(
     byLevel,
     nonAirRegions: 0,
     duplicateLabels,
-    droppedRollupOblasts: 0
+    droppedRollupOblasts: 0,
+    byThreatLevel
   };
 }
 
@@ -682,6 +755,10 @@ export function aerialMirrorUpstream(name: string): AerialMirrorUpstream | null 
  * an all-clear from the mirror is still held for `ALERT_END_DEBOUNCE_SECONDS` exactly like silence.
  * That debounce is wanted here and not merely tolerated: `?source=default` switches upstream between
  * polls, and a switch that lands mid-transition must not be able to publish «Офіційний відбій».
+ *
+ * `alertLevel` їде поруч із `active`, а не замість чогось: `normalizeAlarmResponse` читає його як
+ * ПРИКМЕТУ рядка й ніколи як тип тривоги. Поле з'являється лише там, де фід назвав колір, тож
+ * звичайна тривога дає рівно те саме тіло, що й до 06.09.2026 — байт у байт.
  */
 export function toAlarmSnapshotBody(
   snapshot: AerialMirrorSnapshot, oblastLayer: AerialMirrorOblastLayer = 'declaration'
@@ -700,7 +777,8 @@ export function toAlarmSnapshotBody(
       regionName: region.name,
       active: region.active,
       startedAt: region.changedAt.toISOString(),
-      ...(region.parentName ? { parentName: region.parentName } : {})
+      ...(region.parentName ? { parentName: region.parentName } : {}),
+      ...(region.threatLevel ? { alertLevel: region.threatLevel } : {})
     }))
   };
 }

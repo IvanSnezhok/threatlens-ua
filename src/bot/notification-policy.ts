@@ -289,3 +289,106 @@ export function decideAssessmentNotification(
     ? { action: 'skip', kind: 'none', silent: false, reason: 'зміна індексу в межах паузи' }
     : { action: 'send', kind: 'drift', silent: false, reason: 'індекс змінився в межах того самого рівня' };
 }
+
+// ------------------------------------------------------------------------------------------------
+// Alert level (differentiated alerting, in force 06.09.2026)
+// ------------------------------------------------------------------------------------------------
+//
+// The level describes an alert that is ALREADY on. Nothing in this section can turn an alert on or
+// off, and nothing here is consulted by the on/off decision: the aggregate computes the colour
+// beside `bool_or(counts AND holds)`, never inside it. What is decided here is narrower and purely
+// editorial — a chat already holds a message about this alert, the colour under it moved, and the
+// question is whether that movement is worth a sound, worth a quiet line, or worth nothing at all.
+
+export const ALERT_LEVEL_ORDER = ['yellow', 'red'] as const;
+export type AlertLevel = typeof ALERT_LEVEL_ORDER[number];
+
+/**
+ * Rank on a scale whose ZERO is "no colour declared", which is the normal state of an alert.
+ *
+ * Both unknown values and `null` land on 0, and that is the safe direction in both halves: a colour
+ * the government has not defined can never outrank red and be announced as an escalation, and a
+ * colour disappearing ranks below every real colour, so it can only ever read as a de-escalation.
+ * Absence is not weakness, though — see {@link decideAlertLevelNotification}: the message that comes
+ * out of a de-escalation never says the danger is over.
+ */
+export function alertLevelRank(level: string | null | undefined): number {
+  return ALERT_LEVEL_ORDER.indexOf(String(level ?? '') as AlertLevel) + 1;
+}
+
+export const ALERT_KIND_ORDER = ['drones', 'missiles', 'drones_missiles'] as const;
+export type AlertKind = typeof ALERT_KIND_ORDER[number];
+
+/**
+ * Чи названо в цьому виді загрози ракети.
+ *
+ * Навмисно предикат, а не ще одна шкала. Повного порядку між `missiles` і `drones_missiles` не
+ * існує — це не «сильніше/слабше», а різні набори, — і вигадати його означало б оголосити
+ * підвищенням перехід, якого влада підвищенням не називала. Єдине, що тут справді є підвищенням і
+ * що читач мусить почути зі звуком, — поява ракет там, де їх раніше не називали.
+ */
+export function alertKindCarriesMissiles(kind: string | null | undefined): boolean {
+  return kind === 'missiles' || kind === 'drones_missiles';
+}
+
+export interface AlertLevelSnapshot {
+  /** `yellow` | `red`, or null — and null is the most common value, not an error. */
+  level: string | null;
+  /** `drones` | `missiles` | `drones_missiles`, or null when no source named one. */
+  kind: string | null;
+}
+
+export interface AlertLevelDecision {
+  action: 'send' | 'skip';
+  /**
+   * `escalation`    — the colour rose, appeared, or gained missiles. The moment a reader must act.
+   * `deescalation`  — the colour fell or disappeared. News, never an all-clear.
+   * `clarification` — the colour stands, the named kind moved sideways (or stopped being named).
+   * `none`          — nothing to say.
+   */
+  updateKind: 'escalation' | 'deescalation' | 'clarification' | 'none';
+  /** True for everything except an escalation: worth a line, not worth waking a phone. */
+  silent: boolean;
+  reason: string;
+}
+
+/**
+ * Один перехід кольору, і рівно три відповіді.
+ *
+ *  1. колір і вид ті самі                      -> мовчання;
+ *  2. колір виріс, зʼявився, або вид набув ракет -> підвищення, зі звуком;
+ *  3. колір упав або зник                      -> зниження, тихо;
+ *  4. колір той самий, вид змінився інакше     -> уточнення, тихо.
+ *
+ * Пункт 1 — оборона в глибину, а не робочий шлях: агрегат дописує подію лише на СПРАВЖНЮ зміну
+ * пари. Він лишається тут тому, що фан-аут читає журнал подій через власний курсор, і повтор події
+ * при відтворенні журналу не має права стати другим повідомленням.
+ *
+ * Пункт 4 надсилається, хоч і не є підвищенням: чат уже тримає повідомлення, у якому написано
+ * «ракетна загроза», і коли джерела перестали це твердити, твердження треба зняти. Тихо — бо діяти
+ * за ним нікому не треба.
+ *
+ * Чого тут немає й бути не може — відповіді «тривоги більше немає». Жодна гілка не повертає нічого,
+ * що доставлялося б як відбій: відбій приходить лише з `alert.ended`, і `CONTEXT.md` прямо
+ * забороняє підписувати зниження кольору як завершення тривоги.
+ */
+export function decideAlertLevelNotification(
+  previous: AlertLevelSnapshot,
+  next: AlertLevelSnapshot
+): AlertLevelDecision {
+  if (previous.level === next.level && previous.kind === next.kind) {
+    return { action: 'skip', updateKind: 'none', silent: true, reason: 'рівень і вид не змінилися' };
+  }
+  const previousRank = alertLevelRank(previous.level);
+  const nextRank = alertLevelRank(next.level);
+  if (nextRank > previousRank) {
+    return { action: 'send', updateKind: 'escalation', silent: false, reason: 'рівень тривоги підвищено' };
+  }
+  if (nextRank < previousRank) {
+    return { action: 'send', updateKind: 'deescalation', silent: true, reason: 'рівень тривоги знижено' };
+  }
+  if (!alertKindCarriesMissiles(previous.kind) && alertKindCarriesMissiles(next.kind)) {
+    return { action: 'send', updateKind: 'escalation', silent: false, reason: 'у загрозі названо ракети' };
+  }
+  return { action: 'send', updateKind: 'clarification', silent: true, reason: 'вид загрози уточнено' };
+}

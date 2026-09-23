@@ -1,0 +1,218 @@
+{
+ "source": "Vadym Klymenko API",
+ "cachedat": "2026-09-22 19:06:10",
+ "raw": {
+  "АР Крим": {
+   "enabled": true,
+   "type:": "state",
+   "districts": [],
+   "enabled_at": "2022-12-10T22:22:00+00:00",
+   "disabled_at": null,
+   "alert_level": null
+  },
+  "Донецька область": {
+   "enabled": false,
+   "type:": "state",
+   "districts": {
+    "Покровський район": {
+     "enabled": true,
+     "type": "district",
+     "enabled_at": "2026-09-21T16:10:55.009Z",
+     "disabled_at": null,
+     "alert_level": "red"
+    },
+    "Краматорський район": {
+     "enabled": true,
+     "type": "district",
+     "enabled_at": "2026-09-21T16:10:56.656Z",
+     "disabled_at": null,
+     "alert_level": "red"
+    },
+    "Бахмутський район": {
+     "enabled": true,
+     "type": "district",
+     "enabled_at": "2026-09-21T16:10:56.730Z",
+     "disabled_at": null,
+     "alert_level": "red"
+    },
+    "Волноваський район": {
+     "enabled": true,
+     "type": "district",
+     "enabled_at": "2026-09-21T16:10:55.725Z",
+     "disabled_at": null,
+     "alert_level": "red"
+    },
+    "Маріупольський район": {
+     "enabled": true,
+     "type": "district",
+     "enabled_at": "2026-09-21T16:10:55.934Z",
+     "disabled_at": null,
+     "alert_level": "red"
+    },
+    "Донецький район": {
+     "enabled": true,
+     "type": "district",
+     "enabled_at": "2026-09-21T16:10:56.584Z",
+     "disabled_at": null,
+     "alert_level": "red"
+    },
+    "Кальміуський район": {
+     "enabled": true,
+     "type": "district",
+     "enabled_at": "2026-09-21T16:10:55.806Z",
+     "disabled_at": null,
+     "alert_level": "red"
+    },
+    "Горлівський район": {
+     "enabled": true,
+     "type": "district",
+     "enabled_at": "2026-09-21T16:10:55.872Z",
+     "disabled_at": null,
+     "alert_level": "red"
+    }
+   },
+   "enabled_at": null,
+   "disabled_at": null,
+   "alert_level": null
+  },
+  "Луганська область": {
+   "enabled": true,
+   "type:": "state",
+   "districts": {
+    "Старобільський район": {
+     "enabled": false,
+     "type": "district",
+     "enabled_at": null,
+     "disabled_at": null,
+     "alert_level": null
+    },
+    "Сватівський район": {
+     "enabled": false,
+     "type": "district",
+     "enabled_at": null,
+     "disabled_at": null,
+     "alert_level": null
+    },
+    "Сіверськодонецький район": {
+     "enabled": false,
+     "type": "district",
+     "enabled_at": null,
+     "disabled_at": null,
+     "alert_level": null
+    },
+    "Щастинський район": {
+     "enabled": false,
+     "type": "district",
+     "enabled_at": null,
+     "disabled_at": null,
+     "alert_level": null
+    },
+    "Луганський район": {
+     "enabled": false,
+     "type": "district",
+     "enabled_at": null,
+     "disabled_at": null,
+     "alert_level": null
+    },
+    "Ровеньківський район": {
+     "enabled": false,
+     "type": "district",
+     "enabled_at": null,
+     "disabled_at": null,
+     "alert_level": null
+    },
+    "Алчевський район": {
+     "enabled": false,
+     "type": "district",
+     "enabled_at": null,
+     "disabled_at": null,
+     "alert_level": null
+    },
+    "Довжанський район": {
+     "enabled": false,
+     "type": "district",
+     "enabled_at": null,
+     "disabled_at": null,
+     "alert_level": null
+    }
+   },
+   "enabled_at": "2022-04-04T16:45:39+00:00",
+   "disabled_at": null,
+   "alert_level": "red"
+  },
+  "Тернопільська область": {
+   "enabled": false,
+   "type:": "state",
+   "districts": {
+    "Тернопільський район": {
+     "enabled": false,
+     "type": "district",
+     "enabled_at": null,
+     "disabled_at": null,
+     "alert_level": null
+    },
+    "Чортківський район": {
+     "enabled": false,
+     "type": "district",
+     "enabled_at": null,
+     "disabled_at": null,
+     "alert_level": null
+    },
+    "Кременецький район": {
+     "enabled": false,
+     "type": "district",
+     "enabled_at": null,
+     "disabled_at": null,
+     "alert_level": null
+    }
+   },
+   "enabled_at": null,
+   "disabled_at": null,
+   "alert_level": null
+  },
+  "Чернігівська область": {
+   "enabled": false,
+   "type:": "state",
+   "districts": {
+    "Ніжинський район": {
+     "enabled": true,
+     "type": "district",
+     "enabled_at": "2026-09-22T14:08:43.306Z",
+     "disabled_at": null,
+     "alert_level": "yellow"
+    },
+    "Чернігівський район": {
+     "enabled": true,
+     "type": "district",
+     "enabled_at": "2026-09-22T13:55:10.726Z",
+     "disabled_at": null,
+     "alert_level": "yellow"
+    },
+    "Прилуцький район": {
+     "enabled": false,
+     "type": "district",
+     "enabled_at": null,
+     "disabled_at": null,
+     "alert_level": null
+    },
+    "Новгород-Сіверський район": {
+     "enabled": true,
+     "type": "district",
+     "enabled_at": "2026-09-22T14:08:43.131Z",
+     "disabled_at": null,
+     "alert_level": "yellow"
+    },
+    "Корюківський район": {
+     "enabled": true,
+     "type": "district",
+     "enabled_at": "2026-09-22T13:55:10.725Z",
+     "disabled_at": null,
+     "alert_level": "yellow"
+    }
+   },
+   "enabled_at": null,
+   "disabled_at": null,
+   "alert_level": null
+  }
+ }
+}

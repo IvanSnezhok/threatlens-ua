@@ -42,12 +42,35 @@ export type TerritoryTier     = 'oblast' | 'special_city' | 'raion';
 export type TerritoryCoverage = 'direct' | 'partial' | 'unmapped';
 export type RiskLevel = 'background' | 'elevated' | 'significant' | 'high' | 'very_high';
 
+/**
+ * Колір, яким влада уточнює ВЖЕ оголошену тривогу (CONTEXT.md, «Рівень тривоги»): жовтий —
+ * «дронова небезпека», червоний — «масована дронова», «ракетна» або «ракетно-дронова загроза».
+ * Ніколи не ідентичність тривоги: `alertType` лишається `air_raid`, і зміна кольору всередині
+ * періоду не відкриває нового періоду й не є відбоєм. Відсутність рівня — звичайний і найчастіший
+ * стан, а не «менша тривога».
+ */
+export type AlertLevel = 'yellow' | 'red';
+
+/** Вид загрози, який влада назвала разом із кольором. */
+export type AlertKind = 'drones' | 'missiles' | 'drones_missiles';
+
 export interface TerritoryAlert {
   alertType: string;              // 'air_raid' | 'artillery' | 'urban_fighting' | 'chemical' | 'nuclear' | …
   startedAt: string;              // ISO
   locationId: string;             // the territory literally named by the source
   locationName: string;
   coverage: TerritoryCoverage;    // how this alert reaches *this* territory
+  /**
+   * The colour, and the kind of threat declared with it, when the source named them.
+   *
+   * Optional rather than `| null`, against this file's own idiom, and for one reason: an alert with
+   * no level must serialise BYTE FOR BYTE as it did before levels existed. The live mirror reading
+   * of 22.09.2026 carried a colour on 35 of 153 nodes; the other 118 do not have to pay two keys
+   * per alert in every snapshot to say «нічого не змінилося». Absent means the source named no
+   * colour — never that the danger is smaller.
+   */
+  level?: AlertLevel;
+  kind?: AlertKind;
 }
 
 export interface TerritoryThreat {
@@ -126,6 +149,14 @@ export interface TerritoryState {
   coverage: TerritoryCoverage;    // strongest coverage across all states on this territory
   alertActive: boolean;
   alertSince: string | null;      // ISO — earliest active alert start
+  /**
+   * Рівень і вид цієї ТЕРИТОРІЇ: найсильніший серед тривог, що її дістали (червоний > жовтий >
+   * без рівня). Те саме правило, яким агрегат зводить кілька джерел, і з тієї самої причини —
+   * обережність тут дорожча за консенсус (CONTEXT.md, межі безпеки). Ключів немає, коли рівня не
+   * назвало жодне джерело: така територія їде в знімку байт у байт такою, якою їхала завжди.
+   */
+  alertLevel?: AlertLevel;
+  alertKind?: AlertKind;
   alerts: TerritoryAlert[];
   threats: TerritoryThreat[];     // ordered by the icon priority, strongest first
   expected: TerritoryExpectedThreat[];  // очікувані (timing ≠ now), найближчі першими; без полігона й іконки
@@ -196,6 +227,40 @@ const COVERAGE_RANK: Record<TerritoryCoverage, number> = { direct: 2, unmapped: 
 /** `direct` beats `unmapped` beats `partial`, exactly as the browser resolves it at write time. */
 const strongerCoverage = (left: TerritoryCoverage, right: TerritoryCoverage): TerritoryCoverage =>
   COVERAGE_RANK[left] >= COVERAGE_RANK[right] ? left : right;
+
+/**
+ * Порядок кольорів. Написано розгалуженням, а не таблицею, свідомо: рівень приходить із бази
+ * рядком, і будь-що, крім двох відомих кольорів, мусить важити рівно стільки ж, скільки відсутність
+ * кольору. Невідомий рядок, який випадково став би найсильнішим, — це та сама вигадана заява.
+ */
+const levelRank = (level: AlertLevel | null | undefined): number =>
+  level === 'red' ? 2 : level === 'yellow' ? 1 : 0;
+
+/** Спільний результат «рівня немає»: найчастіший випадок не має платити алокацією на територію. */
+const NO_ALERT_LEVEL: Readonly<Pick<TerritoryState, 'alertLevel' | 'alertKind'>> = Object.freeze({});
+
+/**
+ * Рівень території з тривог, які її дістали: НАЙСИЛЬНІШИЙ колір, і вид — лише той, на якому
+ * тривоги цього кольору сходяться.
+ *
+ * Найсильніший, а не найновіший і не більшістю: зниження кольору одним джерелом не має гасити
+ * червоного, який тримає інше (CONTEXT.md, межі безпеки). Мовчання про вид — не незгода: джерело,
+ * що назвало колір без виду, не скасовує вид, названий іншим на тому самому кольорі. Два РІЗНІ
+ * названі види на одному кольорі скасовують обидва — вигадувати вид, якого не назвав ніхто, не
+ * можна.
+ */
+function alertLevelOf(alerts: readonly TerritoryAlert[]): Readonly<Pick<TerritoryState, 'alertLevel' | 'alertKind'>> {
+  let level: AlertLevel | undefined;
+  for (const alert of alerts) if (levelRank(alert.level) > levelRank(level)) level = alert.level;
+  if (!level) return NO_ALERT_LEVEL;
+  let kind: AlertKind | undefined;
+  for (const alert of alerts) {
+    if (alert.level !== level || !alert.kind) continue;
+    if (kind && kind !== alert.kind) return { alertLevel: level };
+    kind = alert.kind;
+  }
+  return kind ? { alertLevel: level, alertKind: kind } : { alertLevel: level };
+}
 
 const LIVE_THREAT_STATUSES = new Set<string>(['observed', 'confirmed', 'active']);
 
@@ -358,7 +423,15 @@ export function composeTerritoryStates(input: {
    */
   now: Date;
   nodes: TerritoryNode[];
-  alerts: Array<{ id: string; location_id: string; location_name: string; alert_type: string; started_at: string | Date }>;
+  /**
+   * `alert_level` / `alert_kind` (міграція 054) необовʼязкові й тут: знімок будується й проти бази,
+   * у якій колонок ще немає, і проти рядка, у якому вони NULL. Обидва випадки означають те саме —
+   * кольору не назвали, — і дають той самий результат.
+   */
+  alerts: Array<{
+    id: string; location_id: string; location_name: string; alert_type: string; started_at: string | Date;
+    alert_level?: AlertLevel | null; alert_kind?: AlertKind | null;
+  }>;
   threats: LiveEvent[];
   assessments: Array<{
     id: string; location_id: string; threat_type: ThreatType; risk_level: RiskLevel;
@@ -427,13 +500,18 @@ export function composeTerritoryStates(input: {
   for (const alert of input.alerts) {
     const startedAt = toIso(alert.started_at);
     for (const { node, coverage } of reachOf(alert.location_id)) {
-      draftFor(node, coverage).alerts.push({
+      const row: TerritoryAlert = {
         alertType: alert.alert_type,
         startedAt,
         locationId: alert.location_id,
         locationName: alert.location_name,
         coverage
-      });
+      };
+      // Присвоєння, а не spread: ключ мусить зʼявитися лише тоді, коли колір справді назвали, і
+      // тривога без кольору мусить лишитися тим самим обʼєктом, що й до міграції 054.
+      if (alert.alert_level) row.level = alert.alert_level;
+      if (alert.alert_kind) row.kind = alert.alert_kind;
+      draftFor(node, coverage).alerts.push(row);
     }
   }
 
@@ -572,6 +650,7 @@ export function composeTerritoryStates(input: {
       coverage: draft.coverage,
       alertActive: draft.alerts.length > 0,
       alertSince,
+      ...alertLevelOf(draft.alerts),
       alerts: draft.alerts,
       threats,
       expected,

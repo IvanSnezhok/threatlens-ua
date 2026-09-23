@@ -1,5 +1,5 @@
 import type { Bot } from 'grammy';
-import { Counter, type Registry } from 'prom-client';
+import { Counter, Histogram, type Registry } from 'prom-client';
 import { config } from '../config.js';
 import { pool } from '../db/pool.js';
 import { relatedLocationsCte } from '../repositories/events.js';
@@ -7,25 +7,26 @@ import { onAlertPoke } from '../services/alert-poke.js';
 import { scopeToSubscription } from '../domain/location-label.js';
 import { sourceMessageUrl } from '../domain/source-link.js';
 import { locationCatalogue } from '../services/location-labels.js';
-import { summariseMovement } from '../services/movement-summary.js';
+import { summariseMovement, type MovementSummary } from '../services/movement-summary.js';
 import {
   ATTACK_DEBRIEF_DISCLAIMER, attackDebriefLines, buildAttackDebrief, debriefWorthShowing
 } from '../services/attack-debrief.js';
-import { deliverableRun } from '../services/event-log-cursor.js';
+import { deliverableRun, type EventLogRow } from '../services/event-log-cursor.js';
 import {
-  MODEL_CHANNEL_ACTION, MODEL_CHANNEL_DISCLAIMER, MODEL_CHANNEL_STANDING,
+  ALERT_LEVEL_CHANGE_STANDING, MODEL_CHANNEL_ACTION, MODEL_CHANNEL_DISCLAIMER, MODEL_CHANNEL_STANDING,
+  alertLevelChangeLine, alertLevelChangeVoices, alertLevelLine,
   cleanSummary, confidenceLabel, evidenceBadge, evidenceRaisedLine, evidenceStatement, expectedWindowLine,
   extensionLine, geographyChangedLine, humanMoment, isExpectedTiming, levelLabel, modelAnalysisHeading,
   probabilityLine, riskLevelChangedLine, targetLine, threatLabel, threatTypeChangedLine, timingBadge,
   validUntilLine
 } from './humanize.js';
 import {
-  decideAssessmentNotification, decideThreatNotification, geographyKey, mergePublishedState,
-  threatContentHash,
-  type AssessmentPublishedState, type ThreatPublishedState, type ThreatSnapshot
+  decideAlertLevelNotification, decideAssessmentNotification, decideThreatNotification, geographyKey,
+  mergePublishedState, threatContentHash,
+  type AlertLevelSnapshot, type AssessmentPublishedState, type ThreatPublishedState, type ThreatSnapshot
 } from './notification-policy.js';
 import {
-  claimDeliveryBatch, deliveryClass, recordProviderBackoff, registerDeliveryGovernorMetrics
+  claimDeliveryBatch, deliveryClass, pruneDeliveryDecisions, recordProviderBackoff, registerDeliveryGovernorMetrics
 } from './delivery-governor.js';
 
 /**
@@ -38,17 +39,47 @@ import {
  * incident condition: the fan-out reads `system_event_log` through its own cursor, so a sustained
  * count means the cursor is running more than thirty minutes behind the events being written, and
  * subscribers are learning about threats after they stopped applying.
+ *
+ * Дві інші причини — з шляху зміни рівня тривоги, і жодна з них не є сигналом про збій.
+ * `alert_ended` — зміна кольору, що дійшла після закриття періоду; `alert_level_unchanged` — пара
+ * (колір, вид), яка насправді не рухалася, тобто відтворення журналу. Обидві рахують випадки, коли
+ * розсилка ВІДМОВИЛАСЯ надіслати те, чого надсилати не можна, і мала б бути малою ненульовою
+ * величиною на довгому аптаймі.
  */
 const notificationsSuppressed = new Counter({
   name: 'threatlens_notifications_suppressed_total',
-  help: 'Threat notifications not queued because the threat was no longer valid, by reason',
+  help: 'Notifications not queued because what they would say no longer holds, by reason',
   labelNames: ['reason'], registers: []
+});
+
+/**
+ * Скільки повідомлення прожило від рядка в черзі до підтвердженої відправки.
+ *
+ * Досі це число існувало лише як разовий SQL по `notification_deliveries(queued_at, sent_at)` —
+ * ним і виміряно p50 1.04 с у коментарі до воркерів нижче. Разовий запит не показує ні зміни після
+ * правки, ні деградації вночі, а саме цю величину обіцяє система: «попередження доїхало». Тепер
+ * вона є рядом, і розкладена за КЛАСОМ — офіційне попередження та нічна аналітика мають різні
+ * очікування, і спільна гістограма ховала б, який із двох хвостів виріс.
+ *
+ * Межі підібрані під виміряний розподіл (p50 близько секунди, p90 півтори) і тягнуться до п'яти
+ * хвилин — за нею лежить уже не затримка, а пауза провайдера, яку видно окремим
+ * `threatlens_telegram_delivery_blocked_seconds`.
+ */
+const deliveryLatency = new Histogram({
+  name: 'threatlens_notification_delivery_seconds',
+  help: 'Seconds from an outbox row being queued to Telegram confirming the send, by class',
+  labelNames: ['class'],
+  buckets: [0.25, 0.5, 1, 2, 4, 8, 15, 30, 60, 300],
+  registers: []
 });
 
 /** Attaches this module's metrics to the one HTTP registry. Idempotent, like its neighbours. */
 export function registerOutboxMetrics(registry: Registry): void {
   if (!registry.getSingleMetric('threatlens_notifications_suppressed_total')) {
     registry.registerMetric(notificationsSuppressed);
+  }
+  if (!registry.getSingleMetric('threatlens_notification_delivery_seconds')) {
+    registry.registerMetric(deliveryLatency);
   }
   registerDeliveryGovernorMetrics(registry);
 }
@@ -92,6 +123,62 @@ async function insertForAlertSubscribers(args: {
     [args.locationId, args.type, args.entityId, args.eventVersion, args.priority,
       JSON.stringify(args.payload), args.notificationType ?? args.type]
   );
+}
+
+/**
+ * Рядки черги для зміни рівня — і єдиний фан-аут тривог, який питає, ЩО ЧАТУ ВЖЕ СКАЗАЛИ.
+ *
+ * Тривога й відбій розсилаються множиною: їх має отримати кожен підписник, і питати нема про що.
+ * Зміна кольору — інша: вона ЗАМІНЮЄ сказане раніше, а замінити можна лише те, що людина справді
+ * прочитала. Тому тут є `told` — те, що чат востаннє чув про колір цієї самої тривоги, прочитане з
+ * рядків, які ми йому й поставили в чергу. Рядок черги і є записом сказаного; окремої таблиці стану
+ * для тривог не існує, і заводити її означало б повернути тривоги до циклу по підписниках, від
+ * якого цей файл пішов свідомо.
+ *
+ * Три правила придушення виходять із цього самого `told` і з `JOIN`, а не з трьох окремих перевірок:
+ *
+ *  * чат, якому про цю тривогу не казали, не має жодного рядка — `JOIN told` не дає збігу, і йому
+ *    не йде нічого. Саме це й потрібно: людина, яка підписалася посеред тривоги, не має отримати
+ *    «рівень підвищено» замість самої тривоги;
+ *  * чат, якому вже сказали рівно цю пару (колір, вид), відсікається `IS DISTINCT FROM`. Це ловить і
+ *    повтор події при відтворенні журналу, і гонку, коли `alert.started` прочитав уже ЗМІНЕНИЙ рядок
+ *    періоду й назвав новий колір ще в самій тривозі;
+ *  * зміна після відбою сюди не доходить узагалі — її відсікає перевірка `status` у викличній гілці,
+ *    до першого запису.
+ *
+ * `level`/`kind` лежать у payload ПЛАСКО — і в рядку тривоги, і в рядку зміни рівня — саме для того,
+ * щоб `told` читав їх одним виразом із будь-якого з двох типів.
+ *
+ * Індекс `outbox_alert_period_told_idx` (міграція 054) віддає `DISTINCT ON` без сортування:
+ * `notification_outbox` не має ретенції, і без індексу цей запит був би повним проходом таблиці на
+ * кожну зміну кольору.
+ */
+async function insertForAlertLevelChange(args: {
+  locationId: string; entityId: string; eventVersion: number;
+  level: string | null; kind: string | null;
+  priority: number; payload: Record<string, unknown>;
+}): Promise<number> {
+  const inserted = await pool.query(
+    `${relatedLocationsCte()}, told AS (
+       SELECT DISTINCT ON (chat_id) chat_id,payload->>'level' AS level,payload->>'kind' AS kind
+       FROM notification_outbox
+       WHERE alert_period_id=$2::uuid AND notification_type IN ('alert_start','alert_level_change')
+       ORDER BY chat_id,created_at DESC,id DESC
+     )
+     INSERT INTO notification_outbox(alert_period_id,chat_id,notification_type,idempotency_key,priority,payload)
+     SELECT DISTINCT $2::uuid,s.chat_id,'alert_level_change',
+            $2||':'||s.chat_id||':alert_level_change:'||$3,$4::integer,$5::jsonb
+     FROM subscriptions s
+     JOIN telegram_users u ON u.chat_id=s.chat_id
+     JOIN told t ON t.chat_id=s.chat_id
+     WHERE s.enabled=true AND u.enabled=true AND s.notify_alert_start=true
+       AND EXISTS (SELECT 1 FROM related_locations r WHERE r.id=s.location_id)
+       AND (t.level IS DISTINCT FROM $6 OR t.kind IS DISTINCT FROM $7)
+     ON CONFLICT (idempotency_key) DO NOTHING`,
+    [args.locationId, args.entityId, args.eventVersion, args.priority,
+      JSON.stringify(args.payload), args.level, args.kind]
+  );
+  return inserted.rowCount ?? 0;
 }
 
 /**
@@ -336,7 +423,90 @@ async function messageSource(sourceMessageId: string | null): Promise<Record<str
   return sourceFields(result.rows[0]);
 }
 
-async function enqueueForEvent(event: any) {
+/**
+ * Рядок `system_event_log`, яким його читає фан-аут.
+ *
+ * Розширює {@link EventLogRow} рівно двома полями, які тут справді читаються: `deliverableRun`
+ * потребує `version` і `created_at`, а гілки нижче — типу події та її навантаження. `payload` —
+ * `Record<string, unknown>`, бо кожна гілка знає лише СВОЇ поля й проводить їх через `String()`:
+ * журнал спільний для чотирьох різних видів подій, і тип, який перелічив би поля всіх чотирьох,
+ * обіцяв би кожній гілці поля трьох інших.
+ */
+interface FanoutEvent extends EventLogRow {
+  event_type: string;
+  payload: Record<string, unknown>;
+}
+
+/**
+ * Нижче цього пріоритету рядок доставляється тихо й чекати на нього немає сенсу.
+ *
+ * Три — межа, яку `deliverBatch` уже знає з іншого боку: усе від трійки й нижче йде з
+ * `disable_notification`, тобто без звуку. Отже «варте негайного проходу» = «має право розбудити
+ * телефон», і одне число задає обидва боки.
+ */
+const URGENT_PRIORITY_CEILING = 3;
+
+/**
+ * Проводить одну подію журналу в чергу й каже, чи поставила вона ТЕРМІНОВИЙ рядок.
+ *
+ * «Терміновий» тут має рівно одне означення — пріоритет рядка, який пішов у `notification_outbox`:
+ * 0 для початку тривоги, 1 або 3 для живої загрози, 4 для всього, що доставляється тихо (мʼяке
+ * оновлення, очікувана загроза, розбір атаки, оцінка ризику). Це не друга думка про терміновість, а
+ * те саме число, яким `deliverBatch` уже сортує чергу, — тож розбігтися вони не можуть.
+ *
+ * Повертається булеве, а не кількість: єдиний споживач питає «чи будити відправника негайно», і на
+ * це питання «сім» відповідає не краще за «так».
+ */
+async function enqueueForEvent(event: FanoutEvent): Promise<boolean> {
+  // ЗМІНА РІВНЯ — і вона стоїть ПЕРЕД гілкою `alert.`, бо `alert.level_changed` теж починається з
+  // `alert.`, а та гілка зводить усе, що не `alert.started`, до `alert_end`. Пропустити зміну рівня
+  // туди означало б надіслати «⚪ Відбій тривоги» посеред тривоги, яка щойно посилилася, — рівно та
+  // єдина відмова, якої `CONTEXT.md` не пробачає. Порядок гілок і є захистом від неї.
+  if (event.event_type === 'alert.level_changed') {
+    const locationId = String(event.payload.locationId);
+    const entityId = String(event.payload.alertPeriodId);
+    // Рядок періоду, а не payload події: подія — історичне твердження про один перехід, а рядок —
+    // поточна правда. Коли за час, поки подія лежала в журналі, колір уже змінився ще раз, у чергу
+    // мусить піти теперішній колір, а не той, що був хвилину тому. Два переходи, прочитані один за
+    // одним, так самі й згортаються: перший бачить, що рядок уже не той, і `told` нижче не знаходить
+    // кому писати.
+    const alert = (await pool.query<{ status: string; alert_level: string | null; alert_kind: string | null }>(
+      `SELECT status,alert_level,alert_kind FROM alert_periods WHERE id=$1`, [entityId]
+    )).rows[0];
+    // Зміна рівня, що дійшла ПІСЛЯ відбою, не доставляється нікому. Тривоги вже немає, а будь-який
+    // текст про її колір читався б як твердження, що вона триває.
+    if (!alert || alert.status !== 'active') {
+      notificationsSuppressed.inc({ reason: 'alert_ended' });
+      return false;
+    }
+    const next: AlertLevelSnapshot = { level: alert.alert_level, kind: alert.alert_kind };
+    const previous: AlertLevelSnapshot = {
+      level: typeof event.payload.previousLevel === 'string' ? event.payload.previousLevel : null,
+      kind: typeof event.payload.previousKind === 'string' ? event.payload.previousKind : null
+    };
+    const decision = decideAlertLevelNotification(previous, next);
+    if (decision.action === 'skip') {
+      notificationsSuppressed.inc({ reason: 'alert_level_unchanged' });
+      return false;
+    }
+    const location = (await pool.query(`SELECT name_uk FROM locations WHERE id=$1`, [locationId])).rows[0];
+    // Підвищення — пріоритет 0, як і сам початок тривоги: це та мить, коли читачеві треба діяти, і
+    // доставлятися воно мусить зі звуком і з голови черги. Усе інше — 4, тобто тихо
+    // (`deliverBatch` вимикає звук від трійки й нижче, а `silent` у payload каже це ще й прямо).
+    const priority = decision.updateKind === 'escalation' ? 0 : 4;
+    const queued = await insertForAlertLevelChange({
+      locationId, entityId, eventVersion: Number(event.version),
+      level: next.level, kind: next.kind, priority,
+      payload: {
+        locationName: location?.name_uk,
+        level: next.level, kind: next.kind,
+        previousLevel: previous.level, previousKind: previous.kind,
+        changedAt: event.payload.changedAt ?? null,
+        updateKind: decision.updateKind, silent: decision.silent
+      }
+    });
+    return queued > 0 && priority <= URGENT_PRIORITY_CEILING;
+  }
   if (event.event_type.startsWith('alert.')) {
     const locationId = String(event.payload.locationId);
     const entityId = String(event.payload.alertId);
@@ -344,13 +514,21 @@ async function enqueueForEvent(event: any) {
     const location = (await pool.query(`SELECT name_uk FROM locations WHERE id=$1`, [locationId])).rows[0];
     // The alert row carries the times a reader asks about first ("since when?", "when did it end?")
     // and the message that announced it, which is the only citation an alert notification can have.
+    // It also carries the colour, which is read here rather than from the event payload for the same
+    // reason as in the level branch above: the row is the current truth.
     const alert = (await pool.query(
-      `SELECT started_at,ended_at,source_message_id FROM alert_periods WHERE id=$1`, [entityId]
+      `SELECT started_at,ended_at,source_message_id,alert_level,alert_kind FROM alert_periods WHERE id=$1`,
+      [entityId]
     )).rows[0];
     await insertForAlertSubscribers({
       locationId, type, entityId, eventVersion: Number(event.version), priority: type === 'alert_start' ? 0 : 2,
       payload: {
         locationName: location?.name_uk, startedAt: alert?.started_at, endedAt: alert?.ended_at,
+        // Колір їде РІВНО в рядок тривоги, і ніколи у відбій. Відбій не має права назвати колір:
+        // він каже, що тривоги більше немає, і будь-яке слово про її рівень у цьому реченні —
+        // суперечність. Для `told` у {@link insertForAlertLevelChange} це теж важливо: він читає
+        // саме рядки тривоги, і колір, потрапивши у відбій, нічого б там не означав.
+        ...(type === 'alert_start' ? { level: alert?.alert_level ?? null, kind: alert?.alert_kind ?? null } : {}),
         ...(await messageSource(alert?.source_message_id ?? null))
       }
     });
@@ -379,7 +557,9 @@ async function enqueueForEvent(event: any) {
         });
       }
     }
-    return;
+    // Початок тривоги — пріоритет 0; відбій — 2, і будити заради нього нікого не треба: асиметрія
+    // «початок швидко, відбій неспішно» та сама, що в `src/services/alert-poke.ts`.
+    return type === 'alert_start';
   }
   // `threat.withdrawn` is excluded for the same reason as `threat.expired`: both mean the threat is
   // no longer standing, and the payload this branch builds is the *original* threat text. Fanning
@@ -397,7 +577,7 @@ async function enqueueForEvent(event: any) {
        JOIN threat_event_locations el ON el.event_id=e.id JOIN locations l ON l.id=el.location_id
        WHERE e.id=$1 ORDER BY el.location_id`, [entityId]
     );
-    if (!threats.rowCount) return;
+    if (!threats.rowCount) return false;
     const threat = threats.rows[0];
     // Defence in depth, and the last one on this path. `ingestThreat` already refuses to append a
     // `system_event_log` row for a message outside its own validity window, so nothing a catch-up
@@ -408,7 +588,7 @@ async function enqueueForEvent(event: any) {
     // one. A threat with no declared deadline is not suppressed — there is nothing to have passed.
     if (threat.valid_until && new Date(threat.valid_until).getTime() <= Date.now()) {
       notificationsSuppressed.inc({ reason: 'expired' });
-      return;
+      return false;
     }
     const threatSource = await latestEventSource(entityId);
     // One decision per chat about the *whole* threat, not one per location it touches: a threat that
@@ -423,17 +603,39 @@ async function enqueueForEvent(event: any) {
     // Каталог читається РАЗ на подію, а не на кожного підписника: підписи залежать від усього
     // каталогу, а не від того, хто читає, і фан-аут ходить сюди раз на секунду.
     const catalogue = await locationCatalogue();
+    // Очікувана загроза (timing ≠ now) — єдиний текст, у якому читач побачить переказ моделі.
+    // `formatMessage` доводить це структурно: дельта повертається вище за рядок, що читає
+    // `modelSummary`, а термінове «ЗАГРОЗА ЗАРАЗ» складається з заголовка, напрямку й вказівки на
+    // укриття — підстав воно не пояснює (рішення власника 20.08.2026, `CONTEXT.md`). Тож для них
+    // виклик моделі був чистою втратою: і бюджету, і — значно гірше — часу.
+    const expectedTiming = typeof threat.timing === 'string' && threat.timing !== 'now';
     // Переказ рахується РАЗ на подію, а не на підписника: текст той самий для всіх, і виклик моделі
     // на кожного з них був би тією самою відповіддю, помноженою на кількість чатів. Повертає `null`
     // тихо — вимкнена функція, один канал, відхилений абзац і мертва мережа тут нерозрізненні, і
     // жодне з цього не має права затримати попередження.
-    const movement = await summariseMovement(entityId);
+    //
+    // ЛІНИВО, і це головне. Раніше `await summariseMovement()` стояв перед запитом підписників і
+    // перед будь-яким INSERT, тобто до `AI_TIMEOUT_MS` (20 с) чекала не лише ця подія, а й КОЖНА
+    // наступна в проході — прохід послідовний, до ста подій, і серед них може бути початок
+    // офіційної тривоги. Тепер модель викликається тільки тоді, коли її абзац справді потрапить у
+    // повідомлення: перше повідомлення про очікувану загрозу. Проміс memoізовано, тож кілька таких
+    // підписників усе одно дають один виклик.
+    let movementFlight: Promise<MovementSummary | null> | null = null;
+    const movementFor = (kind: string) => {
+      if (!expectedTiming || kind !== 'initial') return null;
+      movementFlight ??= summariseMovement(entityId);
+      return movementFlight;
+    };
     const threatLocationIds = threats.rows.map((row) => String(row.location_id));
     const nameById = new Map(threats.rows.map((row) => [String(row.location_id), String(row.name_uk)]));
     const candidates = await threatCandidates({
       locationIds: snapshot.locationIds, entityId,
       threatType: snapshot.threatType, evidenceLevel: snapshot.evidenceLevel
     });
+    // Чи пішов у чергу хоч один рядок, який має право розбудити телефон. Рахується з того самого
+    // `priority`, який лягає в рядок, і саме після `inserted.rowCount` — рядок, поглинутий
+    // `idempotency_key`, нікого не попереджає вдруге й будити відправника заради нього нема чого.
+    let urgent = false;
     for (const candidate of candidates) {
       // A row exists but says nothing about a threat only when the join found no state at all.
       const published: ThreatPublishedState | null = candidate.last_evidence_level === null
@@ -459,8 +661,8 @@ async function enqueueForEvent(event: any) {
       // threat itself is official, because the only thing it says is "still standing, until later".
       // Очікувана загроза (міграція 049, timing ≠ now) — теж не попередження «зараз»: вона їде тихим
       // пріоритетом, без звуку, бо каже «увечері може бути», а не «в укриття».
-      const expected = typeof threat.timing === 'string' && threat.timing !== 'now';
-      const priority = decision.kind === 'soft' || expected ? 4 : (snapshot.evidenceLevel === 'official' ? 1 : 3);
+      const priority = decision.kind === 'soft' || expectedTiming ? 4 : (snapshot.evidenceLevel === 'official' ? 1 : 3);
+      const movement = await movementFor(decision.kind);
       const inserted = await pool.query(
         `INSERT INTO notification_outbox(event_id,chat_id,notification_type,idempotency_key,priority,payload)
          VALUES ($1::uuid,$2,'threat_update',$3,$4,$5::jsonb)
@@ -492,6 +694,7 @@ async function enqueueForEvent(event: any) {
           })]
       );
       if (!inserted.rowCount) continue;
+      urgent ||= priority <= URGENT_PRIORITY_CEILING;
       // What is recorded is what the chat was *told*, which is not the same as the current snapshot:
       // the fields a delta message stayed silent about keep their published value.
       await rememberThreatState({
@@ -511,14 +714,14 @@ async function enqueueForEvent(event: any) {
       locationLabel: locationLabel(threatLocationIds.map(
         (id) => catalogue.labels.get(id) ?? nameById.get(id) ?? id))
     });
-    return;
+    return urgent;
   }
   if (event.event_type === 'assessment.updated') {
     const entityId = String(event.payload.assessmentId);
     const assessment = (await pool.query(
       `SELECT a.*,l.name_uk FROM risk_assessments a JOIN locations l ON l.id=a.location_id WHERE a.id=$1`, [entityId]
     )).rows[0];
-    if (!assessment) return;
+    if (!assessment) return false;
     // The strongest contributing signal is the closest thing an assessment has to a first source:
     // the score is ours, but the observation that moved it belongs to whoever published it.
     const topSignal = (await pool.query(
@@ -580,29 +783,39 @@ async function enqueueForEvent(event: any) {
       });
     }
   }
+  // Оцінка ризику йде пріоритетом 4 завжди — це аналітика, а не попередження; так само й усе, що
+  // сюди не потрапило в жодну гілку.
+  return false;
 }
 
 /**
- * Проводить журнал у чергу й каже, чи був серед проведеного початок тривоги.
+ * Проводить журнал у чергу й каже, чи було серед проведеного щось ТЕРМІНОВЕ.
+ *
+ * Раніше питання звучало «чи був серед проведеного початок тривоги», і саме це залишало живе
+ * попередження моніторингового каналу чекати на тік відправника: `threat.created` ставив у чергу
+ * рядок пріоритету 1 або 3 — той самий, що будить телефон, — і не будив відправника, бо не був
+ * тривогою. Тепер відповідає сам рядок черги (`enqueueForEvent` повертає, чи поставив терміновий),
+ * а не тип події, тож класи сповіщень і правило пробудження не можуть розійтися.
  *
  * Повертається саме булеве значення, а не кількість: єдиний споживач питає «чи будити відправника
  * негайно», і на це питання «сім» відповідає не краще за «так».
  */
 async function fanoutNewEvents(): Promise<boolean> {
   const client = await pool.connect();
-  let raisedAlert = false;
+  let urgent = false;
   try {
     await client.query('BEGIN');
     await client.query(`INSERT INTO worker_state(worker_name,cursor_value) VALUES ('notification-fanout',0) ON CONFLICT DO NOTHING`);
     const state = await client.query(`SELECT cursor_value FROM worker_state WHERE worker_name='notification-fanout' FOR UPDATE`);
     let cursor = Number(state.rows[0].cursor_value);
-    const events = await client.query(`SELECT * FROM system_event_log WHERE version>$1 ORDER BY version LIMIT 100`, [cursor]);
+    const events = await client.query<FanoutEvent>(
+      `SELECT * FROM system_event_log WHERE version>$1 ORDER BY version LIMIT 100`, [cursor]
+    );
     await client.query('COMMIT');
     // Лише безперервний відрізок версій. Курсор тут довговічний, тож перестрибнута версія — це не
     // затримка, а непроведене сповіщення назавжди; див. `src/services/event-log-cursor.ts`.
-    for (const event of deliverableRun(events.rows, cursor, Date.now())) {
-      await enqueueForEvent(event);
-      if (event.event_type === 'alert.started') raisedAlert = true;
+    for (const event of deliverableRun(events.rows, cursor, Date.now(), 'notifications')) {
+      urgent = (await enqueueForEvent(event)) || urgent;
       cursor = Number(event.version);
       await pool.query(`UPDATE worker_state SET cursor_value=$2,updated_at=now() WHERE worker_name=$1`, ['notification-fanout', cursor]);
     }
@@ -610,7 +823,7 @@ async function fanoutNewEvents(): Promise<boolean> {
     await client.query('ROLLBACK').catch(() => undefined);
     throw error;
   } finally { client.release(); }
-  return raisedAlert;
+  return urgent;
 }
 
 /**
@@ -677,12 +890,41 @@ export function formatMessage(row: any, now: Date = new Date()): string {
   const p = row.payload;
   if (row.notification_type === 'alert_start') {
     const started = humanMoment(p.startedAt, now);
-    return `🔴 <b>Повітряна тривога — ${html(p.locationName)}</b>\n\n`
+    // Колір — рядок ПІД заголовком, а не в ньому. Заголовок відповідає на питання «що сталося»
+    // («тривога»), колір уточнює вже оголошене; помінявши їх місцями, ми зробили б колір
+    // ідентичністю повідомлення. `null` тут — найчастіше значення: {@link alertLevelLine} мовчить,
+    // `details` не викликається інакше, і текст виходить ПОБАЙТОВО такий самий, як до 06.09.2026.
+    const level = alertLevelLine(p.level, p.kind);
+    return `🔴 <b>Повітряна тривога — ${html(p.locationName)}</b>${level ? `\n${html(level)}` : ''}\n\n`
       + 'Прямуйте до визначеного укриття й дотримуйтеся вказівок офіційних служб.'
       + details(
         started && `Оголошено о ${html(started)}`,
         'Офіційне сповіщення про тривогу',
         sourceLine(p)
+      );
+  }
+  /**
+   * Зміна рівня всередині тривоги, що триває, — і головне про неї сказано силуетом.
+   *
+   * Гілка стоїть ПОРЯД з двома гілками тривоги й ВИЩЕ за все інше з тієї самої причини, з якої
+   * вони стоять вище за шлях дельти загрози: жодна форма payload не сміє привести офіційне
+   * повідомлення про тривогу у формат, що починається з дисклеймера.
+   *
+   * Чого тут немає: маркера 🔴 на початку, слова «Повітряна» в заголовку (це не друга тривога),
+   * силуету ⚪ і слова «відбій» у будь-якому відмінку (це не завершення). Вказівка про укриття є
+   * в обох напрямках — зниження кольору не випускає нікого з укриття. Посилання на першоджерело
+   * немає: зміну рівня обчислив агрегат з кількох джерел, і одного повідомлення, яке можна було б
+   * показати як підставу, у неї просто не існує.
+   */
+  if (row.notification_type === 'alert_level_change') {
+    const voice = alertLevelChangeVoices[String(p.updateKind ?? '')] ?? alertLevelChangeVoices.clarification!;
+    const changed = humanMoment(p.changedAt, now);
+    return `${voice.marker} <b>${html(voice.title)} — ${html(p.locationName)}</b>\n`
+      + `${html(alertLevelChangeLine(p.previousLevel, p.level, p.kind))}\n\n`
+      + voice.action
+      + details(
+        changed && `Рівень змінено о ${html(changed)}`,
+        ALERT_LEVEL_CHANGE_STANDING
       );
   }
   if (row.notification_type === 'alert_end') {
@@ -938,9 +1180,17 @@ async function reclaimStuckSending(): Promise<number> {
   return reclaimed.rowCount ?? 0;
 }
 
-async function deliverBatch(bot: Bot, log: { warn: Function }) {
-  const reclaimed = await reclaimStuckSending();
-  if (reclaimed) log.warn({ reclaimed }, 'reclaimed notifications stuck in sending');
+/**
+ * Одна партія доставки. Повертає, скільки рядків було взято — цим відправник вимірює, чи впирається
+ * черга в дозвіл governor'а, і НІЧОГО більше: темп задає відро токенів, а не той, хто це число читає.
+ *
+ * Підбирання завислих у `sending` звідси прибрано. Поріг там — пʼять хвилин
+ * (`sendingReclaimSeconds`), а UPDATE виконувався щосекунди: 86 400 записів на добу, які в
+ * нормальному стані не чіпають жодного рядка, і кожен із них — запис у WAL. Тепер він їде на
+ * повільному таймері поруч із прибиранням журналу; максимальна затримка підбирання зростає з
+ * 300 с + 1 с до 300 с + 60 с, що для шляху АВАРІЙНОГО відновлення не означає нічого.
+ */
+async function deliverBatch(bot: Bot, log: { warn: Function }): Promise<number> {
   const batch = await claimDeliveryBatch();
   for (let index = 0; index < batch.length; index += 1) {
     const row = batch[index]!;
@@ -976,6 +1226,14 @@ async function deliverBatch(bot: Bot, log: { warn: Function }) {
         const sent = await bot.api.sendMessage(String(row.chat_id), text, options);
         messageId = sent.message_id;
       }
+      // Спостереження стоїть одразу після підтвердження Telegram і ДО записів у базу: вимірюється
+      // те, що обіцяно читачеві — «повідомлення доїхало», — а не те, скільки ще зайняло наше
+      // діловодство. `created_at` рядка черги — та сама точка відліку, що й `queued_at` у
+      // `notification_deliveries` нижче, тож ряд і разовий SQL по архіву рахують одне й те саме.
+      deliveryLatency.observe(
+        { class: deliveryClass(row) },
+        Math.max(0, (Date.now() - new Date(row.created_at).getTime()) / 1000)
+      );
       await pool.query(`UPDATE notification_outbox SET status='sent',sent_at=now(),updated_at=now() WHERE id=$1`, [row.id]);
       await pool.query(
           `INSERT INTO notification_deliveries(outbox_id,telegram_message_id,delivered_status,queued_at,sent_at)
@@ -1034,6 +1292,7 @@ async function deliverBatch(bot: Bot, log: { warn: Function }) {
       }
     }
   }
+  return batch.length;
 }
 
 /**
@@ -1041,9 +1300,10 @@ async function deliverBatch(bot: Bot, log: { warn: Function }) {
  *
  * ## Why the fan-out is poked, and why the delivery worker now is too
  *
- * The fan-out is the step that turns a committed `alert.started` into outbox rows, and it is pure
- * database work with no external service in it — running it a second earlier costs one statement
- * and buys a second off every subscriber's warning.
+ * The fan-out is the step that turns a committed urgent row — `alert.started`, or a live
+ * `threat.created` from a monitoring channel — into outbox rows, and it is pure database work with
+ * no external service in it. Running it a second earlier costs one statement and buys a second off
+ * every subscriber's warning.
  *
  * The delivery worker was left on its bare timer, on the argument that poking it would spend the
  * Telegram budget to save «a fraction of the second the API itself takes». Тепер це виміряно, і
@@ -1052,14 +1312,21 @@ async function deliverBatch(bot: Bot, log: { warn: Function }) {
  * очікування наступного тіку, рівномірно розподілене на [0, 1 с]. Сам запит ховається всередині
  * цієї секунди.
  *
- * Тож відправника теж будять — але лише на початок тривоги, і будить його той самий прохід
- * фан-ауту, що поставив рядок у чергу (`fanoutNewEvents` повертає, чи був серед проведеного
- * `alert.started`). Бюджет Telegram при цьому не витрачається зайвим: `claimDeliveryBatch` бере
- * `FOR UPDATE` на рядку governor'а, тож зайвий виклик або бачить порожній кошик токенів, або
- * чекає на той, що вже виконується. Раніше прокидається доставка — не збільшується її дозвіл.
+ * Тож відправника теж будять — але лише на ТЕРМІНОВЕ, і будить його той самий прохід фан-ауту, що
+ * поставив рядок у чергу (`fanoutNewEvents` повертає, чи був серед поставленого рядок пріоритету
+ * {@link URGENT_PRIORITY_CEILING} або вище). Бюджет Telegram при цьому не витрачається зайвим:
+ * `claimDeliveryBatch` бере `FOR UPDATE` на рядку governor'а, тож зайвий виклик або бачить порожній
+ * кошик токенів, або чекає на той, що вже виконується. Раніше прокидається доставка — не
+ * збільшується її дозвіл.
  *
- * Відбій не будить нікого: асиметрія «початок швидко, відбій неспішно» тут та сама, що і в
- * `src/services/alert-poke.ts` та в `ALERT_END_DEBOUNCE_SECONDS`.
+ * Умова — саме пріоритет рядка, а не тип події, і це не дрібниця формулювання. Поки питали «чи був
+ * це `alert.started`», жива загроза моніторингового каналу — рядок пріоритету 1 або 3, той самий,
+ * що дзвонить у телефоні, — чекала на тік, бо тривогою не була. А очікувана загроза («увечері
+ * очікується», пріоритет 4) нікого не будить і тепер, бо пріоритет у неї тихий. Одне число тримає
+ * обидва випадки, і розійтися з класами сповіщень воно не може.
+ *
+ * Відбій (пріоритет 2) і розбір атаки (4) не будять нікого: асиметрія «початок швидко, відбій
+ * неспішно» тут та сама, що і в `src/services/alert-poke.ts` та в `ALERT_END_DEBOUNCE_SECONDS`.
  *
  * ## The publication hold does not apply here, and that is not new
  *
@@ -1081,14 +1348,40 @@ async function deliverBatch(bot: Bot, log: { warn: Function }) {
  * read its window before the poking transaction was visible.
  */
 export function startNotificationWorkers(bot: Bot | null, log: { warn: Function; error: Function }) {
-  const deliveryRun = () => bot && deliverBatch(bot, log).catch((error) => log.error({ error }, 'notification delivery failed'));
+  /**
+   * Той самий захист від накладання, що й у фан-ауту, і з гострішої причини.
+   *
+   * Партія з двадцяти пʼяти повідомлень — це двадцять пʼять послідовних викликів Telegram
+   * (≈100–300 мс кожен) плюс записи до бази між ними, тобто секунди. Таймер на одну секунду
+   * запускав НАСТУПНИЙ прохід поверх того, що ще йде: кожен із них брав власний дозвіл і власну
+   * партію, і кількість відправлень у польоті переставала мати будь-яку стелю — рівно тоді, коли
+   * черга велика, тобто під ударом. Далі 429 від Telegram зупиняє ВСІ класи, включно з
+   * `protected`.
+   *
+   * Переозброєння тут немає навмисно: темп задає відро токенів governor'а
+   * (`TELEGRAM_DELIVERY_RATE_PER_SECOND`, типово 25/с), а період таймера — одна секунда. Вони вже
+   * збігаються, тож зайвий прохід не дав би жодного зайвого повідомлення — лише порожнє захоплення
+   * і ще один рядок у журналі відмов.
+   */
+  let deliveryRunning = false;
+  const deliveryRun = async (): Promise<void> => {
+    if (!bot || deliveryRunning) return;
+    deliveryRunning = true;
+    try {
+      await deliverBatch(bot, log);
+    } catch (error) {
+      log.error({ error }, 'notification delivery failed');
+    } finally {
+      deliveryRunning = false;
+    }
+  };
   let fanoutRunning = false;
   let fanoutRearm = false;
   const fanoutRun = async (): Promise<void> => {
     if (fanoutRunning) return;
     fanoutRunning = true;
     try {
-      // Прохід, який щойно поставив у чергу початок тривоги, і будить відправника: черга вже
+      // Прохід, який щойно поставив у чергу терміновий рядок, і будить відправника: черга вже
       // наповнена, і чекати на тік немає чого. Помилка доставки лишається в її власному `catch`.
       if (await fanoutNewEvents()) void deliveryRun();
     } catch (error) {
@@ -1103,6 +1396,25 @@ export function startNotificationWorkers(bot: Bot | null, log: { warn: Function;
     if (fanoutRunning) { fanoutRearm = true; return; }
     void fanoutRun();
   });
-  const delivery = bot ? setInterval(deliveryRun, 1_000) : undefined; delivery?.unref(); if (bot) void deliveryRun();
-  return () => { clearInterval(fanout); if (delivery) clearInterval(delivery); detachPoke(); };
+  // Повільний таймер обслуговування. Обидва його завдання — прибирання журналу рішень і підбирання
+  // рядків, що зависли в `sending`, — раніше їхали на гарячому шляху: перше всередині
+  // `claimDeliveryBatch` (повносканувальний DELETE щосекунди), друге на початку кожної партії
+  // (UPDATE щосекунди, який у нормальному стані не чіпає жодного рядка). Обидва горизонти —
+  // сім діб і пʼять хвилин — на два порядки більші за хвилину.
+  const maintenanceRun = async (): Promise<void> => {
+    await pruneDeliveryDecisions().catch((error) => log.error({ error }, 'delivery decision prune failed'));
+    await reclaimStuckSending()
+      .then((reclaimed) => { if (reclaimed) log.warn({ reclaimed }, 'reclaimed notifications stuck in sending'); })
+      .catch((error) => log.error({ error }, 'stuck notification reclaim failed'));
+  };
+  const maintenance = setInterval(() => void maintenanceRun(), 60_000); maintenance.unref();
+  const delivery = bot ? setInterval(() => void deliveryRun(), 1_000) : undefined;
+  delivery?.unref();
+  // ПЕРШИЙ прохід — обслуговування, і лише потім доставка. Рядок, що завис у `sending`, лишає по
+  // собі саме той процес, який щойно помер; момент, коли новий процес піднімає воркери, — це і є
+  // мить відновлення після аварії, а не якась довільна хвилина після неї. Тому підбирання не чекає
+  // першого тіку хвилинного таймера: воно стається до того, як відправник візьме першу партію, і
+  // підібрані рядки їдуть уже в ній.
+  if (bot) void maintenanceRun().finally(() => void deliveryRun());
+  return () => { clearInterval(fanout); clearInterval(delivery); clearInterval(maintenance); detachPoke(); };
 }

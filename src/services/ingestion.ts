@@ -5,25 +5,29 @@ import { config } from '../config.js';
 import { pool } from '../db/pool.js';
 import { parseAlertChannelMessage } from '../domain/alert-parser.js';
 import { classifyMessage, CLASSIFIER_VERSION, isDeEscalation, significanceRejection } from '../domain/classifier.js';
+import { isBlockedPlaceToken, tokenize } from '../domain/place-morphology.js';
 import {
   applyDeEscalation, cachedLocationLexemes, ingestThreat, LOCATION_HIERARCHY_MAX_DEPTH,
   recordClassification, withinDeliveryAge,
-  type ClassificationDecision, type ClassificationLogEntry
+  type ClassificationDecision, type ClassificationLogEntry, type LocationLexemeRow
 } from '../repositories/events.js';
 import {
   AERIAL_MIRROR_SOURCE_ID, AERIAL_MIRROR_STATE_SOURCE_ID, AERIAL_MIRROR_USER_AGENT,
   aerialMirrorRawUrl, aerialMirrorUpstream, parseAerialMirrorPayload, toAlarmSnapshotBody,
   type AerialMirrorRawSnapshot, type AerialMirrorUpstream
 } from '../sources/aerial-mirror.js';
-import type { NormalizedMessage } from '../types.js';
-import { alertPokeMetrics, pokeAlertStarted } from './alert-poke.js';
+import {
+  ALERT_LEVELS, asAlertLevel, strongerAlertLevel,
+  type AlertKind, type AlertLevel, type NormalizedMessage
+} from '../types.js';
+import { alertPokeMetrics, pokeAlertStarted, pokeLiveThreat } from './alert-poke.js';
 import { legSchedulerMetrics, startLegScheduler, type SchedulerLeg } from './leg-scheduler.js';
 import { markSourceError, markSourceSuccess } from './operations.js';
 // One-way import, on purpose: the observations are ops instrumentation and this file stays free of
 // ops code by calling four named functions rather than by growing a second metrics block.
 import {
-  countChannelError, observeAlertPropagation, observeClassificationDuration, observeIngestionLag,
-  observeSourceCacheAge
+  countChannelError, countDroppedAlarmRecords, observeAlertPropagation,
+  observeClassificationDuration, observeIngestionLag, observeSourceCacheAge
 } from './publication.js';
 import { retrospectiveGate, retrospectiveGateMetrics } from './retrospective-gate.js';
 import { scheduleShadowClassification, shadowClassifierMetrics } from './shadow-classifier.js';
@@ -47,12 +51,92 @@ interface AlarmRecord {
   alertType: string;
   active: boolean;
   startedAt: Date;
+  /**
+   * Колір і різновид, які назвало ЦЕ джерело про ЦЕЙ рядок, або `null` — не назвало.
+   *
+   * Не `alertType` і ніколи ним не стане. `alertType` — тотожність періоду (`alert_periods`
+   * унікальний по (location_id, alert_type, started_at), зведення шукає активний період саме по
+   * цій парі), тож диференційований різновид, записаний туди, зробив би перехід жовтий→червоний
+   * ДРУГИМ періодом — з відбоєм першого посеред тривоги, яка щойно посилилася.
+   *
+   * `null` тут — звичайний і найчастіший стан, і він мусить бути явним: `undefined` було б «поле
+   * не дійшло», а це різні речі для запису, який гасить колір, що вже стоїть у таблиці.
+   */
+  alertLevel: AlertLevel | null;
+  alertKind: AlertKind | null;
 }
 
 const alarmTypeMap: Record<string, string> = {
-  AIR: 'air_raid', AIR_RAID: 'air_raid', ARTILLERY: 'artillery',
+  AIR: 'air_raid', AIR_RAID: 'air_raid', ARTILLERY: 'artillery', ARTILLERY_SHELLING: 'artillery',
   URBAN_FIGHTS: 'urban_fighting', CHEMICAL: 'chemical', NUCLEAR: 'nuclear'
 };
+
+/**
+ * Єдиний тип тривоги, який ця система має право записати в `alert_periods`.
+ *
+ * Не смак і не спрощення — це те, чим весь низ за течією вже є. `outbox.ts` рендерить КОЖЕН
+ * `alert_start` як «🔴 Повітряна тривога — …», `alert-parser.ts` рухає стан лише на «Повітряна
+ * тривога»/«Відбій тривоги», а в базі за весь час існування проєкту 6644 періоди і 100 % із них
+ * `air_raid`. Тобто «повітряна» — не поле, а інваріант.
+ *
+ * `alerts.in.ua` цей інваріант ламає мовчки: у зрізі 22.09.2026 з 43 активних тривог 36 були
+ * `air_raid`, 6 — `artillery_shelling` і 1 — `urban_fights`, причому прифронтові громади стоять у
+ * цих станах роками (Вовчанська — з 20.05.2024). Без цього фільтра перше ж вдале опитування
+ * відкрило б сім періодів, розіслало б по них пуш «🔴 Повітряна тривога» про обстріл, який триває
+ * два роки, і поклало б дворічний `started_at` у таймлайн і місячну аналітику.
+ *
+ * Тому: інші типи не пишуться, а рахуються — `threatlens_alarm_records_dropped_total{source,reason}`,
+ * де `reason` — сам тип (`artillery`, `urban_fighting`). Втрата видима, а не тиха, і день, коли
+ * система навчиться показувати артилерійську небезпеку окремою
+ * сутністю з власним формулюванням, почнеться з цього лічильника, а не з мовчазного перейменування
+ * обстрілу на повітряну тривогу.
+ */
+const INGESTED_ALERT_TYPE = 'air_raid';
+
+/**
+ * Який бік загрози називає `threat_type` з `alerts.in.ua`, і нічого більше.
+ *
+ * Тут рівно ті значення, які ФІД справді віддає: зріз 22.09.2026 (51 активна тривога, 31 із
+ * `threats[]`) дав `drones` і `unspecified_missiles`, і більше нічого. Невідоме значення не додає
+ * НІЧОГО — ні дронів, ні ракет: різновид, якого ніхто не оголошував, ця система не вигадує, і
+ * тривога тоді лишається без різновиду, а не отримує здогаданий. Нове значення дописується сюди
+ * після того, як його побачили в тілі, а не замість того.
+ */
+const alarmThreatAxis: Record<string, 'drones' | 'missiles'> = {
+  drones: 'drones',
+  unspecified_missiles: 'missiles',
+  // Ці два в живому зрізі не траплялися, але стоять у опублікованому переліку `threat_type` поруч
+  // із `unspecified_missiles`, і під час масованого удару приїде саме вони. Дописані як ЧИТАННЯ
+  // переліку, а не як здогад: обидва — ракета, тією самою віссю.
+  ballistic_missiles: 'missiles',
+  cruise_missiles: 'missiles'
+  // Рештa переліку (`air_defense`, `mig31k_departure`, `tactic_aircraft_activity`,
+  // `strategic_aircraft_activity`, `guided_aerial_bombs`, `unknown`) навмисно не дає осі. Робота
+  //ППО — не різновид загрози, зліт носія — не пуск, а КАБ у постанові про диференційовані тривоги
+  // взагалі не названий. Тривога тоді лишається з кольором і без різновиду, і це чесне тіло.
+};
+
+/**
+ * Різновид загрози з `threats[]`: обидві осі разом дають `drones_missiles`, одна — себе, жодної —
+ * `null`.
+ *
+ * `null` повертається і тоді, коли `threats[]` немає взагалі: у тому самому зрізі 17 із 51 тривоги
+ * мали колір і не мали жодної загрози в масиві. Колір без різновиду — нормальне тіло, а не
+ * половина тіла.
+ */
+function alarmKindFromThreats(value: unknown): AlertKind | null {
+  let drones = false;
+  let missiles = false;
+  for (const raw of Array.isArray(value) ? value : []) {
+    const threat = asObject(raw);
+    if (!threat) continue;
+    const axis = alarmThreatAxis[String(threat.threat_type ?? threat.threatType ?? '')];
+    if (axis === 'drones') drones = true;
+    else if (axis === 'missiles') missiles = true;
+  }
+  if (drones && missiles) return 'drones_missiles';
+  return drones ? 'drones' : missiles ? 'missiles' : null;
+}
 
 function asObject(value: unknown): Record<string, unknown> | null {
   return value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : null;
@@ -81,19 +165,55 @@ export function normalizeAlarmResponse(body: unknown): { records: AlarmRecord[];
       const alert = asObject(alertRaw);
       if (!alert) return;
       candidateCount += 1;
+      // Ключ локації беремо ЛИШЕ з поля, назва якого каже «локація»/«регіон», і ніколи з `id`
+      // самого рядка. `id` у кожного фіда — ідентифікатор ТРИВОГИ, а не місця: через цю гілку
+      // `alerts.in.ua` роками віддавав сюди 8757, 76016, 185413, вони йшли в
+      // `locations.id OR official_code`, не збігалися ні з чим — і джерело падало на «no provider
+      // locations matched» з першого дня, тобто не працювало ЖОДНОГО разу.
+      //
+      // `location_uid` цього фіда теж не ключ: це його власна нумерація («356» — Дніпропетровщина),
+      // яка з КАТОТТГ не має нічого спільного. Збіг із нашим `official_code` був би випадковим і
+      // тихим, тому сюди не подається зовсім — місце шукається за назвою.
       const locationKey = String(alert.locationId ?? alert.regionId ?? alert.region_id
-        ?? region.locationId ?? region.regionId ?? region.region_id ?? region.id ?? '');
+        ?? region.locationId ?? region.regionId ?? region.region_id ?? '');
       const locationName = String(alert.locationName ?? alert.regionName ?? alert.region_name
-        ?? region.locationName ?? region.regionName ?? region.region_name ?? region.name ?? '');
+        ?? alert.location_title ?? region.locationName ?? region.regionName ?? region.region_name
+        ?? region.location_title ?? region.name ?? '');
       if (!locationKey && !locationName) return;
-      const parentNameRaw = alert.parentName ?? alert.parent_name ?? region.parentName ?? region.parent_name;
+      // `alerts.in.ua` завжди каже, під чим лежить рядок: у громади є `location_raion`, у району й
+      // міста — лише `location_oblast`. Беремо ВУЖЧИЙ із наявних: район відрізняє дві однойменні
+      // громади, яких область не відрізняє (Вовчанська — Чугуївський район, Харківщина).
+      const parentNameRaw = alert.parentName ?? alert.parent_name ?? alert.location_raion
+        ?? alert.location_oblast ?? region.parentName ?? region.parent_name;
       const parentName = typeof parentNameRaw === 'string' && parentNameRaw.trim() ? parentNameRaw.trim() : undefined;
       const rawType = String(alert.alertType ?? alert.type ?? alert.alert_type ?? 'AIR').toUpperCase();
       const status = String(alert.status ?? region.status ?? '').toLowerCase();
       const activeValue = alert.active ?? alert.isActive ?? alert.is_active ?? region.active ?? region.isActive;
-      const active = typeof activeValue === 'boolean' ? activeValue : nested ? true : ['active','ongoing','true','1'].includes(status);
+      // `/v1/alerts/active.json` не має жодного поля «активна»: він віддає САМЕ відкриті тривоги і
+      // каже це через `finished_at: null`. Без цієї гілки `status` порожній, булевого поля немає,
+      // вкладеного масиву немає — і кожен рядок ставав `active: false`, тобто вдале опитування
+      // писало б у таблицю сорок три ПОГАШЕНІ тривоги. Наявність ключа тут і є формою відповіді:
+      // дата в ньому означає «закрита», і ми це так і читаємо.
+      const active = typeof activeValue === 'boolean' ? activeValue
+        : 'finished_at' in alert ? alert.finished_at === null || alert.finished_at === undefined
+          : nested ? true : ['active','ongoing','true','1'].includes(status);
       const startedAt = validDate(alert.startedAt ?? alert.started_at ?? alert.start ?? alert.lastUpdate
         ?? region.startedAt ?? region.started_at ?? region.lastUpdate);
+      // Колір із двох форм, які його несуть, і з жодної іншої:
+      //
+      //   * `alertLevel` — тіло знімка дзеркала, яке будує `toAlarmSnapshotBody`;
+      //   * `alert_level` — `alerts.in.ua` (`/v1/alerts/active.json`), де поле стоїть НА ТРИВОЗІ,
+      //     поруч із `alert_type`; у знятому зрізі 22.09.2026 19:47 колір мали всі 43 активні
+      //     тривоги (23 червоних, 20 жовтих), різновид — 30 із них.
+      //
+      // Ukraine Alarm v3 кольору не несе взагалі — у його тілі є `regionType` і
+      // `activeAlerts[].type`, і жодного поля рівня, — тож ця гілка дає `null`, і це правда про
+      // API, а не прогалина в читанні. Коли API додасть рівень, він читається тут.
+      //
+      // `asAlertLevel` відкидає все, що не `yellow` і не `red`: перелік домену розширюється
+      // міграцією, а не тілом, яке приїхало вночі.
+      const alertLevel = asAlertLevel(alert.alertLevel ?? alert.alert_level
+        ?? region.alertLevel ?? region.alert_level);
       records.push({
         externalId: String(alert.id ?? `${locationKey || locationName}-${rawType}-${startedAt.toISOString()}-${regionIndex}-${alertIndex}`),
         locationKey,
@@ -101,7 +221,12 @@ export function normalizeAlarmResponse(body: unknown): { records: AlarmRecord[];
         ...(parentName ? { parentName } : {}),
         alertType: alarmTypeMap[rawType] ?? rawType.toLocaleLowerCase(),
         active,
-        startedAt
+        startedAt,
+        alertLevel,
+        // Різновид виводиться з `threats[]` і ніколи з `alert_type`: `alert_type` лишається
+        // `air_raid`. Дзеркало `threats[]` не має, тож там різновид — `null` при живому кольорі, і
+        // це очікувано: klimenko називає колір, але не називає, чим саме загрожують.
+        alertKind: alarmKindFromThreats(alert.threats ?? region.threats)
       });
     });
   });
@@ -142,13 +267,25 @@ export function pickLocationMatch(candidates: LocationCandidate[]): string | nul
  */
 const APOSTROPHE_CHARACTERS = "'‘’ʼ`´";
 
+/**
+ * The alias branch is written as array containment, not as `EXISTS (SELECT … unnest(aliases) …)`.
+ *
+ * The two are the same question — «is $1 among this row's normalised aliases» — and the second one
+ * is the one an index can answer. An `unnest()` inside `EXISTS` is a set-returning subplan evaluated
+ * per row, which pins the whole statement to a sequential scan: an OR-chain is all-or-nothing for
+ * the planner, so one unindexable branch costs the other two their indexes as well.
+ * `location_aliases_normalized` (migration 053) is the same fold applied by a stable expression, and
+ * `@>` against it is served by a GIN index. Semantics are unchanged, including the NULL cases: a row
+ * with no aliases produces an empty array, which contains nothing, exactly as the EXISTS returned
+ * false.
+ */
 const LOCATION_MATCH_SQL = `SELECT id,type,
      CASE WHEN translate(lower(name_uk),$3,'')=$1 THEN 0
-          WHEN EXISTS (SELECT 1 FROM unnest(aliases) alias WHERE translate(lower(alias),$3,'')=$1) THEN 1
+          WHEN location_aliases_normalized(aliases,$3) @> ARRAY[$1::text] THEN 1
           ELSE 2 END AS match_rank
    FROM locations
    WHERE translate(lower(name_uk),$3,'')=$1
-      OR EXISTS (SELECT 1 FROM unnest(aliases) alias WHERE translate(lower(alias),$3,'')=$1)
+      OR location_aliases_normalized(aliases,$3) @> ARRAY[$1::text]
       OR translate(lower(name_uk),$3,'') LIKE $2||'%' ESCAPE E'\\\\'
    LIMIT 50`;
 
@@ -263,7 +400,7 @@ async function narrowByParent(
   return under.rowCount === 1 ? under.rows[0]!.id : null;
 }
 
-async function resolveLocationId(query: LocationQuery): Promise<string | null> {
+async function lookupLocationId(query: LocationQuery): Promise<string | null> {
   if (query.locationKey) {
     const byCode = await pool.query<{ id: string }>(
       `SELECT id FROM locations WHERE id=$1 OR official_code=$1 LIMIT 1`, [query.locationKey]
@@ -293,6 +430,88 @@ async function resolveLocationId(query: LocationQuery): Promise<string | null> {
   return null;
 }
 
+/**
+ * The answers to «which catalogue row is this label», remembered for as long as the catalogue is.
+ *
+ * ## Why a memo and not a faster query
+ *
+ * The question is asked once per published label per poll and the set of labels barely moves: the
+ * aggregated mirror feed emits all twenty-five oblasts on EVERY poll by design, the granular feed
+ * re-lists the same raions minute after minute, and `narrowByParent` asks for the same oblast name
+ * again for every ambiguous hromada under it. At a four-second poll across two feeds that is on the
+ * order of 900 resolutions a minute, of which perhaps a dozen are questions we have not already
+ * answered. Migration 053 makes each one index-served; this makes the repeated ones free.
+ *
+ * ## What the answer is allowed to depend on
+ *
+ * `lookupLocationId` reads nothing but `locations` and its three arguments, so the key is the whole
+ * argument triple and the generation is the catalogue.
+ *
+ * ## How the generation is observed, and why it is not a reset function
+ *
+ * `src/repositories/events.ts` already owns catalogue invalidation: `invalidateLocationLexemeCache()`
+ * is called by `location-catalog.ts` after the import COMMIT, and `cachedLocationLexemes()` then
+ * hands out a NEW array. Array identity is therefore an exact generation counter for the only writer
+ * this application has, and it is the seam that module already exposes — `indexFor` in
+ * `src/domain/classifier.ts` keys its token index on the same identity. Inventing a second reset
+ * function here would mean a second lifecycle to keep in agreement with the first, and the one that
+ * is not wired into the import is the one that goes stale.
+ *
+ * Reading it costs a resolved promise once the catalogue is warm. When it is cold this pays for the
+ * catalogue load — which any process that classifies a message pays anyway, six hours at a time —
+ * and when that load FAILS the resolution runs unmemoised rather than failing: a catalogue query
+ * that times out must not turn a poll that would have worked into a source error.
+ *
+ * ## Negative answers
+ *
+ * They have to be cached — an unmapped hromada is otherwise re-asked fifteen times a minute forever,
+ * which is the most expensive query shape there is, since a miss is the one that can match no index
+ * entry and read the furthest. They also have to expire: a catalogue gap is normally closed by an
+ * import, which moves the generation, but a row inserted by hand is a writer neither cache knows
+ * about, and a permanently negative memo would hide it until the next restart. A minute is short
+ * enough that nobody notices and long enough to remove fourteen of every fifteen polls' worth.
+ */
+const LOCATION_MEMO_MISS_TTL_MS = 60_000;
+/**
+ * Cleared wholesale rather than evicted one by one at this size. The catalogue has ~31 000 rows and
+ * the live label set is in the hundreds, so reaching this bound means a source has started emitting
+ * unbounded distinct labels — in which case the memo is worthless anyway and the only thing worth
+ * guaranteeing is that it cannot grow into the heap.
+ */
+const LOCATION_MEMO_MAX_ENTRIES = 8192;
+
+const locationMemo = new Map<string, { id: string | null; at: number }>();
+let locationMemoCatalogue: LocationLexemeRow[] | null = null;
+
+async function resolveLocationId(query: LocationQuery): Promise<string | null> {
+  const catalogue = await cachedLocationLexemes().catch(() => null);
+  if (!catalogue) return lookupLocationId(query);
+  if (catalogue !== locationMemoCatalogue) {
+    locationMemo.clear();
+    locationMemoCatalogue = catalogue;
+  }
+  // NUL-separated: no catalogue label contains it, so no two distinct triples can collide on one key.
+  const key = `${query.locationKey ?? ''}\u0000${query.locationName}\u0000${query.parentName ?? ''}`;
+  const memoized = locationMemo.get(key);
+  if (memoized && (memoized.id !== null || Date.now() - memoized.at < LOCATION_MEMO_MISS_TTL_MS)) {
+    return memoized.id;
+  }
+  const id = await lookupLocationId(query);
+  if (locationMemo.size >= LOCATION_MEMO_MAX_ENTRIES) locationMemo.clear();
+  locationMemo.set(key, { id, at: Date.now() });
+  return id;
+}
+
+/**
+ * Назви місць, яких каталог не має, по джерелах.
+ *
+ * Дві дороги сходяться в одну структуру, бо питання одне: «яких населених пунктів нам бракує, і хто
+ * їх називає». Офіційні фіди називають місце полем відповіді, і {@link recordUnresolvedLocations}
+ * ПЕРЕПИСУЄ рядок джерела на кожен знімок — там `count` означає «стільки не зіставлено в останньому
+ * знімку». Моніторингові канали називають місце прозою, по одному повідомленню, і там накопичується:
+ * `count` означає «стільки разів від старту процесу ми бачили назву, якої не знаємо». Семантика
+ * різна, бо різні самі джерела; структура одна, бо `/ops` питає про них однаково.
+ */
 export interface UnresolvedLocationReport {
   sourceId: string;
   count: number;
@@ -302,15 +521,37 @@ export interface UnresolvedLocationReport {
 
 const unresolvedLocationState = new Map<string, UnresolvedLocationReport>();
 
+/**
+ * Стеля структури, а не метрики.
+ *
+ * Назви місць з чужої прози — це необмежений словник, і мітка Prometheus з нього була б
+ * кардинальним вибухом. Тут вони живуть у памʼяті процесу, тож стеля потрібна все одно: джерел
+ * стільки, скільки рядків у `sources` (нині ~60), але рядок може завести будь-який `sourceId`, а
+ * зразків на джерело — стільки, скільки різних невпізнаних слів напише канал за добу.
+ */
+const UNRESOLVED_SOURCES_MAX = 64;
+const UNRESOLVED_SAMPLES_MAX = 20;
+
 export function unresolvedLocationReports(): UnresolvedLocationReport[] {
   return [...unresolvedLocationState.values()];
+}
+
+/** Витісняє найдавніше спостережене джерело, коли карта вперлася в стелю. */
+function makeRoomForSource(sourceId: string): void {
+  if (unresolvedLocationState.has(sourceId) || unresolvedLocationState.size < UNRESOLVED_SOURCES_MAX) return;
+  let oldest: UnresolvedLocationReport | null = null;
+  for (const report of unresolvedLocationState.values()) {
+    if (!oldest || report.observedAt < oldest.observedAt) oldest = report;
+  }
+  if (oldest) unresolvedLocationState.delete(oldest.sourceId);
 }
 
 // Unmapped provider locations are a catalogue gap, not a source outage: they are counted and
 // logged, but never reported through markSourceError.
 function recordUnresolvedLocations(sourceId: string, unresolved: string[], log?: { warn: Function }): void {
-  const samples = [...new Set(unresolved)].sort().slice(0, 20);
+  const samples = [...new Set(unresolved)].sort().slice(0, UNRESOLVED_SAMPLES_MAX);
   const previous = unresolvedLocationState.get(sourceId);
+  makeRoomForSource(sourceId);
   unresolvedLocationState.set(sourceId, {
     sourceId, count: unresolved.length, samples, observedAt: new Date().toISOString()
   });
@@ -320,11 +561,176 @@ function recordUnresolvedLocations(sourceId: string, unresolved: string[], log?:
 }
 
 /**
+ * Слова, які МОГЛИ БУТИ назвою місця, з повідомлення, що не дало каталогу жодного місця.
+ *
+ * Навіщо. `no_location` на моніторинговому каналі — це правильно складене повідомлення про загрозу,
+ * яке не підняло нічого, бо названого села немає в каталозі. Досі з нього лишався тільки лічильник:
+ * `threatlens_classification_rejections_total{reason="no_location"}` казав, що діра є, і ніколи не
+ * казав, ЯКА. Офіційні фіди такої проблеми не мають — вони називають місце окремим полем, і воно
+ * їде в {@link recordUnresolvedLocations}. Це та сама дорога для прози.
+ *
+ * Як. Тим самим токенізатором, яким каталог ріже і повідомлення, і власні назви
+ * (`src/domain/place-morphology.ts`) — другий токенізатор поряд із першим означав би, що «Кам'янець-
+ * Подільський» у двох місцях коду є різною кількістю слів. Груба форма ознаки — слово з великої
+ * літери, і чотири відсіви до неї, кожен проти конкретного шуму справжніх каналів:
+ *
+ *  * слово на початку речення відкидається — «Увага», «Загроза», «Терміново» стоять там завжди;
+ *  * слово, писане капслоком чи з великою літерою всередині, відкидається — це «ППО», «РФ», «БпЛА»,
+ *    «МіГ», тобто саме той словник, яким канал пише про зброю, а не про місце;
+ *  * кирилиця й щонайменше три літери — латиниця тут є хіба в назві каналу й у посиланні;
+ *  * {@link isBlockedPlaceToken} — сторони світу й звичайні слова, які морфологія вміє довести до
+ *    справжньої назви («південним», «мені»). Каталог відкидає їх при розборі, і список гіпотез не
+ *    має права показувати оператору те, що система свідомо не читає як місце.
+ *
+ * Сусідні слова, що пройшли відсів і розділені одним пробілом, склеюються: «Нова Каховка» — одна
+ * гіпотеза, а не дві. Це ЗДОГАДКИ, а не назви: рядок у `/ops` читають очима, щоб вирішити, чи це
+ * пропущене село, чи просто прізвище.
+ */
+const UNKNOWN_PLACE_MIN_LENGTH = 3;
+const CYRILLIC_WORD = /^\p{Script=Cyrillic}[\p{Script=Cyrillic}'’ʼ-]*$/u;
+const SENTENCE_END = /[.!?…:;\n]/u;
+
+export function unknownPlaceCandidates(text: string): string[] {
+  // Токенізується ОРИГІНАЛ, а не зведений до нижнього регістру рядок, яким його годує каталог.
+  // `tokenize` — чиста регулярка по межах слова, регістр їй байдужий, а зсуви `start`/`end` мають
+  // вказувати в той самий рядок, у якому ще видно велику літеру. Порівнювати зсуви від зведеного
+  // тексту з оригіналом було б припущенням, що зведення не змінює довжини, — правдивим для
+  // кирилиці й неправдивим взагалі.
+  const tokens = tokenize(text);
+  const candidates: string[] = [];
+  let run: string[] = [];
+  let runEnd = -1;
+  for (const token of tokens) {
+    const raw = text.slice(token.start, token.end);
+    const lowered = raw.toLocaleLowerCase('uk-UA');
+    // Перше слово речення пишеться з великої літери незалежно від того, що воно означає, тож ознака
+    // там не несе інформації. Продовження склейки — виняток: «Нова Каховка» після крапки почалася б
+    // з відкинутого слова, але друге слово її все одно підбере наступною ітерацією.
+    const before = text.slice(0, token.start);
+    const sentenceStart = !before.trim() || SENTENCE_END.test(before.slice(before.trimEnd().length - 1) || '.');
+    const capitalised = raw[0] !== lowered[0] && raw.slice(1) === lowered.slice(1);
+    const plausible = capitalised && !sentenceStart
+      && raw.length >= UNKNOWN_PLACE_MIN_LENGTH && CYRILLIC_WORD.test(raw)
+      && !isBlockedPlaceToken(token.key.toLocaleLowerCase('uk-UA'), true);
+    if (plausible && (runEnd < 0 || text.slice(runEnd, token.start) === ' ')) {
+      run.push(raw);
+      runEnd = token.end;
+      continue;
+    }
+    if (run.length) candidates.push(run.join(' '));
+    run = plausible ? [raw] : [];
+    runEnd = plausible ? token.end : -1;
+  }
+  if (run.length) candidates.push(run.join(' '));
+  return [...new Set(candidates)];
+}
+
+/**
+ * Дописує гіпотези одного повідомлення до накопиченого рядка джерела.
+ *
+ * Накопичує, а не переписує: у прози немає «знімка», з якого можна було б перечитати все наново, і
+ * рядок, переписаний останнім повідомленням, показував би оператору одне слово замість переліку
+ * дір. Стеля зразків тримає його скінченним, лічильник рахує спостереження — щоб «одне село
+ * згадали сто разів» і «сто різних сіл по разу» не виглядали однаково.
+ */
+function recordUnknownPlaces(sourceId: string, candidates: string[]): void {
+  if (!candidates.length) return;
+  const previous = unresolvedLocationState.get(sourceId);
+  makeRoomForSource(sourceId);
+  const samples = [...new Set([...(previous?.samples ?? []), ...candidates])]
+    .sort().slice(0, UNRESOLVED_SAMPLES_MAX);
+  unresolvedLocationState.set(sourceId, {
+    sourceId, count: (previous?.count ?? 0) + candidates.length, samples,
+    observedAt: new Date().toISOString()
+  });
+}
+
+/** Тестовий шов: стан живе в модулі, а сюїти в одному форку діляться ним. */
+export function resetUnresolvedLocations(): void {
+  unresolvedLocationState.clear();
+}
+
+/**
+ * The one lock every writer of official alert state takes, as the first statement of its
+ * transaction: `runSnapshotPass`, `applyAlertChannelStates` and `expireStuckAlertChannelAlerts`.
+ * Nothing outside this module writes `alert_source_states` or `alert_periods`, and
+ * `tests/integration/alert-state-lock.test.ts` fails if that stops being true.
+ *
+ * Distinct from `migrate()`'s 841005211 and `APP_SETTINGS_LOCK`'s 841005212, for the reason given
+ * there: unrelated writers must not queue behind each other.
+ *
+ * ## Why one global lock and not row locks
+ *
+ * Each source's pass re-reconciles every location that source has ever held, in the order its own
+ * rows come back, and each reconcile takes `FOR UPDATE` on that location's active period. Two
+ * sources that share active periods — the mirror every four seconds, alerts.in.ua every seven, and
+ * during a mass attack that is most of the map — take the same row locks in opposite orders. On
+ * 22.09.2026 a reproduction of exactly that lost a pass to `deadlock detected` in twenty-five rounds
+ * out of twenty-five: the losing source went to `error`, its leg backed off, and any alert raised
+ * only in that pass waited for the next one. Row locks also cannot protect the one row that does not
+ * exist yet: two passes that both see no active period for a new alert each INSERT their own, and
+ * with starts a few seconds apart the unique key does not stop them — two «🔴 Повітряна тривога»,
+ * later two «Відбій». And the aggregate is read BEFORE the period lock, so a pass could decide
+ * «ended» from a picture that omits the other pass's uncommitted «still active».
+ *
+ * A single lock taken before anything is read closes all three: the passes run one after another,
+ * and each reads everything the previous one committed. «Everything the previous one committed»
+ * holds only under READ COMMITTED, where each statement takes a fresh snapshot after the lock is
+ * granted; under REPEATABLE READ the snapshot would predate the lock and every race above returns.
+ * Nothing in `src/` sets another level, and nothing may.
+ *
+ * The price is that they no longer overlap. The time held is not the leg's wall time (1.27 s mean
+ * on production, mostly the HTTP fetch) but the reconcile, which walks every row the source has EVER
+ * held: measured ~1.8 ms a row when nothing changes and ~4 ms when writing, so ~0.25 s for the
+ * mirror's 132 rows today and seconds once a source has accumulated a thousand. A writer waits for
+ * whatever is queued ahead of it, where losing the deadlock cost a whole backed-off leg.
+ * Uncontended, the lock is one round trip.
+ *
+ * ## What bounds the wait
+ *
+ * `statement_timeout` (15 s, `src/db/pool.ts`), which covers the whole lock statement, wait
+ * included. A holder that stalls between statements is cut off sooner by
+ * `idle_in_transaction_session_timeout` (10 s), which terminates its session and the lock with it; a
+ * holder that keeps running statements is not bounded, but every waiter is, and it fails as an
+ * ordinary source error — rolled back, `markSourceError` — instead of hanging on a pool connection
+ * forever. A waiter that gave up wrote nothing, so it can never produce a false «Офіційний відбій».
+ * What it costs differs by writer: a snapshot leg retries on its own backoff and the next pass
+ * restates the whole picture, so there the result is a late alert; a LIVE alert-channel message is
+ * not retried (`src/sources/telegram.ts` logs and drops it), so its 🔴 is missed until a reconnect
+ * backfill re-reads it, and its 🟢 waits for the `ALERT_CHANNEL_MAX_ALERT_SECONDS` backstop.
+ */
+export const ALERT_STATE_LOCK = 841005213;
+
+/**
+ * `BEGIN` plus {@link ALERT_STATE_LOCK}, in that order and with nothing in between: a row lock taken
+ * before the advisory lock would be held while waiting for it, which is the inversion the lock
+ * exists to remove.
+ */
+async function beginAlertStateTransaction(client: PoolClient): Promise<void> {
+  await client.query('BEGIN');
+  try {
+    await client.query('SELECT pg_advisory_xact_lock($1)', [ALERT_STATE_LOCK]);
+  } catch (error) {
+    // 57014 is `query_canceled`: `statement_timeout` fired while another writer held the lock. The
+    // bare message — «canceling statement due to statement timeout» — would reach `sources.last_error`
+    // saying nothing about which statement, so it is named here. The caller still rolls back.
+    if ((error as { code?: string }).code === '57014') {
+      throw new Error(
+        `alert state lock not acquired: another alert writer held it past statement_timeout (${(error as Error).message})`,
+        { cause: error }
+      );
+    }
+    throw error;
+  }
+}
+
+/**
  * Recomputes the global alert period for one (location, alert type) from every source state.
  *
  * Shared by both reconciliation paths — the polled snapshot adapters and the event-driven alert
  * channel — so the two-source rule has exactly one implementation. Must run inside a transaction
- * that has already written the source state it is meant to observe.
+ * that opened with {@link beginAlertStateTransaction} and has already written the source state it
+ * is meant to observe.
  */
 /**
  * One `alert.started` row, as its writer saw it — the two instants the propagation metric is the
@@ -431,9 +837,18 @@ async function reconcileAggregateAlert(
   // Note what "available" costs to satisfy: one alert API, enabled, with a success inside
   // `ALERT_SOURCE_LIVENESS_SECONDS`. If every API is down, dead or switched off, the channels take
   // over automatically and the rule below is the same one that ran before this change.
+  //
+  // ## Колір рахується ПОРУЧ із цією диз'юнкцією, а не всередині неї
+  //
+  // Усе, що вирішує «тривога є чи немає», лишається дослівно тим, чим було: `bool_or(counts AND
+  // holds)`, ті самі `would_hold`, `alive`, `is_api`, той самий дебаунс. Рівень читається з тих
+  // самих рядків, ПІСЛЯ того, як вони вже отримали право тримати тривогу, і тому не може зробити
+  // `holds`, `counts` чи `would_hold` хибними — у виразах вище його просто немає. Рядок без
+  // кольору важить рівно стільки ж, скільки важив завжди.
   const aggregate = await client.query<{
     active: boolean; started_at: Date | null;
     ignored_precedence: number; ignored_stale: number; api_available: boolean;
+    declared: AlertDeclaration[] | null;
   }>(
     `WITH api AS (
        SELECT EXISTS (
@@ -450,9 +865,19 @@ async function reconcileAggregateAlert(
             -- source has gone dead and is the signal that something needs fixing.
             count(*) FILTER (WHERE NOT counts AND would_hold)::int AS ignored_precedence,
             count(*) FILTER (WHERE counts AND would_hold AND NOT holds)::int AS ignored_stale,
-            bool_or(api_available) AS api_available
+            bool_or(api_available) AS api_available,
+            -- Колір і різновид рівно тих рядків, що ТРИМАЮТЬ тривогу. Правило «найсильніший
+            -- перемагає» рахується в TypeScript (strongestDeclaredAlert), а не тут: воно має одну
+            -- реалізацію на три згортки й перевіряється без бази. Масив обмежений числом джерел на
+            -- пару (location, alert_type) — одиниці, не тисячі.
+            --
+            -- Фільтр по alert_level IS NOT NULL навмисний: різновид без кольору — це форма, якої
+            -- жоден фід не віддає, і брати його означало б підписати тривогу «ракетна», якої ніхто
+            -- не називав червоною чи жовтою.
+            json_agg(json_build_object('level',alert_level,'kind',alert_kind))
+              FILTER (WHERE counts AND holds AND alert_level IS NOT NULL) AS declared
      FROM (
-       SELECT would_hold, provider_started_at, api_available,
+       SELECT would_hold, provider_started_at, api_available, alert_level, alert_kind,
               -- Which rows are allowed a vote at all: API rows when an API is reachable, every row
               -- otherwise. A row that is not counted cannot hold the alert and cannot end it.
               CASE WHEN api_available THEN is_api ELSE true END AS counts,
@@ -465,7 +890,7 @@ async function reconcileAggregateAlert(
                   AS would_hold,
                 COALESCE(s.last_success_at > now()-($4::int * interval '1 second'),false) AS alive,
                 s.adapter_type = ANY($5::text[]) AS is_api,
-                a.provider_started_at,
+                a.provider_started_at, a.alert_level, a.alert_kind,
                 (SELECT available FROM api) AS api_available
          FROM alert_source_states a JOIN sources s ON s.id=a.source_id
          WHERE a.location_id=$1 AND a.alert_type=$2
@@ -477,12 +902,17 @@ async function reconcileAggregateAlert(
   const row = aggregate.rows[0];
   const ignoredStale = row?.ignored_stale ?? 0;
   const ignoredPrecedence = row?.ignored_precedence ?? 0;
-  if (ignoredStale > 0) alertStaleSourcesIgnored.inc({ location: locationId, reason: 'stale' }, ignoredStale);
-  if (ignoredPrecedence > 0) {
-    alertStaleSourcesIgnored.inc({ location: locationId, reason: 'api_precedence' }, ignoredPrecedence);
-  }
-  const global = await client.query<{ id: string }>(
-    `SELECT id FROM alert_periods WHERE location_id=$1 AND alert_type=$2 AND status='active' FOR UPDATE`,
+  // Counted by REASON only — see the counter's declaration for why the location id may not be a
+  // label. Which locations are affected is a question `alert_source_states` answers exactly.
+  if (ignoredStale > 0) alertStaleSourcesIgnored.inc({ reason: 'stale' }, ignoredStale);
+  if (ignoredPrecedence > 0) alertStaleSourcesIgnored.inc({ reason: 'api_precedence' }, ignoredPrecedence);
+  // Рівень зводиться тут, ПІСЛЯ рішення про ввімкнено/вимкнено і незалежно від нього: якщо жоден
+  // рядок не тримає тривоги, масив порожній і пара — два `null`, тобто рівно те, що було до
+  // диференційованого оповіщення.
+  const declared = strongestDeclaredAlert(aggregate.rows[0]?.declared ?? []);
+  const global = await client.query<{ id: string; alert_level: AlertLevel | null; alert_kind: AlertKind | null }>(
+    `SELECT id,alert_level,alert_kind FROM alert_periods
+      WHERE location_id=$1 AND alert_type=$2 AND status='active' FOR UPDATE`,
     [locationId, alertType]
   );
   if (aggregate.rows[0]?.active && !global.rowCount) {
@@ -491,8 +921,9 @@ async function reconcileAggregateAlert(
     // here and roll back the entire snapshot — every other location in the same poll included.
     // The conflict reopens that period instead: the alert is visible on the map either way, so
     // the unique index can never hide an active alert or discard a snapshot. Nothing is returned
-    // only when the period is already active, which happens when the two adapters reconcile the
-    // same location concurrently; the transaction that reopened it emits the event.
+    // only when the period is already active. That used to happen when two adapters reconciled the
+    // same location concurrently; `ALERT_STATE_LOCK` now serialises them, so the guard is a second
+    // line rather than the one that runs, and the transaction that reopened it still emits the event.
     //
     // `published_at` is refreshed here and nowhere else on this branch — but ONLY when the period
     // had genuinely stopped being public first. A period whose `ended_at` is younger than the
@@ -513,10 +944,14 @@ async function reconcileAggregateAlert(
     // in which `activeAlerts` could still have been serving the row, and in `live` mode the cutoff
     // is `now()` so `published_at <= cutoff` holds either way and the branch is unobservable.
     const created = await client.query<{ id: string }>(
-      `INSERT INTO alert_periods(location_id,alert_type,status,started_at,external_id)
-       VALUES ($1,$2,'active',COALESCE($3,now()),$4)
+      `INSERT INTO alert_periods(location_id,alert_type,status,started_at,external_id,alert_level,alert_kind)
+       VALUES ($1,$2,'active',COALESCE($3,now()),$4,$6,$7)
        ON CONFLICT (location_id,alert_type,started_at) DO UPDATE
          SET status='active',ended_at=NULL,updated_at=now(),
+             -- Перевідкриття — це новий публічний факт, тож колір береться поточний, а
+             -- alert_level_changed_at обнуляється: заміни ще не було, перший колір заміною не є.
+             alert_level=EXCLUDED.alert_level,alert_kind=EXCLUDED.alert_kind,
+             alert_level_changed_at=NULL,
              published_at = CASE
                WHEN alert_periods.ended_at > now() - make_interval(secs => $5::int)
                  THEN alert_periods.published_at
@@ -524,7 +959,7 @@ async function reconcileAggregateAlert(
          WHERE alert_periods.status<>'active'
        RETURNING id`,
       [locationId, alertType, aggregate.rows[0].started_at, `aggregate:${locationId}:${alertType}:${Date.now()}`,
-        config.PUBLICATION_DELAY_SECONDS]
+        config.PUBLICATION_DELAY_SECONDS, declared.level, declared.kind]
     );
     if (created.rowCount) {
       // `RETURNING created_at` rather than a second read or a `Date.now()`: this column IS the
@@ -533,7 +968,13 @@ async function reconcileAggregateAlert(
       // metric from anything else would produce two numbers that do not compose.
       const logged = await client.query<{ created_at: Date }>(
         `INSERT INTO system_event_log(event_type,payload) VALUES ('alert.started',$1) RETURNING created_at`,
-        [JSON.stringify({ alertId: created.rows[0]!.id, locationId, sourceId })]
+        // `level`/`kind` їдуть у корисному навантаженні поруч із `alertId`, а не замість чогось.
+        // Читач події має право знати колір одразу; актуальнішою правдою лишається рядок періоду —
+        // на момент розсилки колір міг уже ЗМІНИТИСЯ, і подія про це не знає й не мусить.
+        [JSON.stringify({
+          alertId: created.rows[0]!.id, locationId, sourceId,
+          level: declared.level, kind: declared.kind
+        })]
       );
       return {
         alertId: created.rows[0]!.id,
@@ -550,6 +991,54 @@ async function reconcileAggregateAlert(
     for (const row of ended.rows) {
       await client.query(`INSERT INTO system_event_log(event_type,payload) VALUES ('alert.ended',$1)`,
         [JSON.stringify({ alertId: row.id, locationId, sourceId })]);
+    }
+  } else if (aggregate.rows[0]?.active && global.rowCount) {
+    // ## Зміна кольору всередині тієї самої тривоги
+    //
+    // Єдина гілка, якої тут не було. Період ЖИВИЙ і лишається живим: жодного INSERT, жодного
+    // `status`, жодного `ended_at`, `started_at` не рухається. Це UPDATE прикмет — і рівно тому
+    // читач не отримує ні другого «🔴 Повітряна тривога», ні відбою, якого не було.
+    //
+    // Умова гілки — `active AND rowCount`, тобто «зведення каже ввімкнено, і період уже
+    // ввімкнений». На періоді, якого немає або який завершено, колір не з'являється ніколи: перша
+    // гілка створює період уже з кольором, друга завершує його не чіпаючи кольору, а сюди
+    // неактивний період просто не потрапляє.
+    //
+    // `WHERE` у самому UPDATE — не оптимізація, а друга половина умови: між читанням і записом
+    // усередині цієї ж транзакції рядок заблоковано `FOR UPDATE`, але предикат робить «пишемо лише
+    // те, що справді інше» властивістю запиту, а не послідовності дій навколо нього. Нуль рядків —
+    // нормальна відповідь, і тоді події немає.
+    const current = global.rows[0]!;
+    if (current.alert_level !== declared.level || current.alert_kind !== declared.kind) {
+      const changed = await client.query<{ alert_level_changed_at: Date }>(
+        `UPDATE alert_periods
+            SET alert_level=$2,alert_kind=$3,alert_level_changed_at=now(),updated_at=now()
+          WHERE id=$1 AND status='active'
+            AND (alert_level IS DISTINCT FROM $2 OR alert_kind IS DISTINCT FROM $3)
+          RETURNING alert_level_changed_at`,
+        [current.id, declared.level, declared.kind]
+      );
+      if (changed.rowCount) {
+        // У ТІЙ САМІЙ транзакції, що й UPDATE: рядок періоду й подія про його зміну не мають права
+        // розійтися навіть на мить — читач, який побачив би подію без рядка, підписав би зміну
+        // кольору, якої в таблиці немає.
+        //
+        // `previousLevel`/`previousKind` — те, що стояло ДО заміни, бо саме різниця й є змістом
+        // повідомлення: «було жовте, стало червоне». Без них читачеві довелося б згадувати, що йому
+        // казали, а `alert.started` він міг і не бачити.
+        await client.query(
+          `INSERT INTO system_event_log(event_type,payload) VALUES ('alert.level_changed',$1)`,
+          [JSON.stringify({
+            alertPeriodId: current.id,
+            locationId,
+            level: declared.level,
+            previousLevel: current.alert_level,
+            kind: declared.kind,
+            previousKind: current.alert_kind,
+            changedAt: changed.rows[0]!.alert_level_changed_at.toISOString()
+          })]
+        );
+      }
     }
   }
   // Ends deliberately report nothing. They are not poked and not measured: the asymmetry — starts
@@ -577,6 +1066,39 @@ function announceAlertStarts(sourceId: string, started: readonly AlertStartRecor
   pokeAlertStarted();
 }
 
+/** Колір і різновид, як їх назвало одне джерело про одну локацію. */
+export interface AlertDeclaration {
+  level: AlertLevel | null;
+  kind: AlertKind | null;
+}
+
+/**
+ * Правило «найсильніший перемагає», в одному екземплярі на всі три згортки.
+ *
+ * Колір — найсильніший із названих (`red` > `yellow` > не назвали): обережність тут дорожча за
+ * консенсус, бо ціна заниженого кольору — людина, яка не пішла в укриття, а ціна завищеного —
+ * людина, яка пішла даремно. `CONTEXT.md`, «Межі безпеки».
+ *
+ * Різновид — того рядка, чий колір переміг, і ЛИШЕ якщо на цьому кольорі він один. Двоє кажуть
+ * `drones` і `missiles` на червоному — різновид `null`, а не `drones_missiles`: «і те, і те» — це
+ * твердження, яке мусить зробити джерело, а не ми за нього. Рядки того рівня, що мовчать про
+ * різновид, не сперечаються ні з ким: мовчання — не третя думка.
+ *
+ * Порожній вхід дає пару з двох `null`, тобто «звичайна тривога», яка показується точно так, як
+ * показувалася завжди.
+ */
+export function strongestDeclaredAlert(declarations: readonly AlertDeclaration[]): AlertDeclaration {
+  let level: AlertLevel | null = null;
+  for (const declaration of declarations) level = strongerAlertLevel(level, declaration.level);
+  let kind: AlertKind | null = null;
+  for (const declaration of declarations) {
+    if (declaration.level !== level || declaration.kind === null) continue;
+    if (kind !== null && kind !== declaration.kind) return { level, kind: null };
+    kind = declaration.kind;
+  }
+  return { level, kind };
+}
+
 /**
  * Folds provider rows that turned out to name the same catalogue row.
  *
@@ -593,6 +1115,12 @@ function announceAlertStarts(sourceId: string, started: readonly AlertStartRecor
  * project takes deliberately. When nothing holds, the earliest start still wins so an inactive row
  * carries a stable timestamp rather than a coin flip.
  *
+ * Колір складається тим самим «найсильніший перемагає», що й у зведенні: дві мітки, які впали в
+ * один рядок каталогу, не мають права ПОСЛАБИТИ одна одну — червоний район, згорнутий у ту саму
+ * локацію, що й жовта громада, лишає локацію червоною. Різновид береться того боку, чий колір
+ * переміг; при однаковому кольорі й РІЗНИХ різновидах — `null`, бо вигадувати різновид, якого ніхто
+ * не оголошував, ця система не має права.
+ *
  * Applies to every snapshot source, not only the mirror. The two APIs have never been observed to
  * emit two labels for one location, so for them this is a no-op that removes a latent nondeterminism.
  */
@@ -605,10 +1133,16 @@ function dedupeResolvedRecords<T extends AlarmRecord & { locationId: string }>(r
     const winner = existing.active === record.active
       ? (record.startedAt < existing.startedAt ? record : existing)
       : (record.active ? record : existing);
+    const declared = strongestDeclaredAlert([
+      { level: existing.alertLevel, kind: existing.alertKind },
+      { level: record.alertLevel, kind: record.alertKind }
+    ]);
     byLocation.set(key, {
       ...winner,
       active: existing.active || record.active,
-      startedAt: winner.startedAt
+      startedAt: winner.startedAt,
+      alertLevel: declared.level,
+      alertKind: declared.kind
     });
   }
   return [...byLocation.values()];
@@ -619,9 +1153,20 @@ async function persistOfficialAlertSnapshot(sourceId: string, body: unknown): Pr
   if (normalized.candidateCount > 0 && normalized.records.length === 0) {
     throw new Error(`${sourceId}: response contained alerts but none could be normalized`);
   }
+  // Ворота типу стоять ПЕРЕД пошуком локації, а не після: інакше прифронтова громада, яку ми все
+  // одно не запишемо, з'їдала б запит до каталогу на кожному опитуванні (шість рядків × 8.6 раза на
+  // хвилину) і, що гірше, потрапляла б у `unresolved` — тобто в лог «не знайшли місце» про рядок,
+  // місце якого нас не цікавить.
+  const airRaid: AlarmRecord[] = [];
+  const droppedByType = new Map<string, number>();
+  for (const record of normalized.records) {
+    if (record.alertType === INGESTED_ALERT_TYPE) airRaid.push(record);
+    else droppedByType.set(record.alertType, (droppedByType.get(record.alertType) ?? 0) + 1);
+  }
+  for (const [alertType, count] of droppedByType) countDroppedAlarmRecords(sourceId, alertType, count);
   const resolved: Array<AlarmRecord & { locationId: string }> = [];
   const unresolved: string[] = [];
-  for (const record of normalized.records) {
+  for (const record of airRaid) {
     const locationId = await resolveLocationId({
       locationKey: record.locationKey,
       locationName: record.locationName,
@@ -630,39 +1175,152 @@ async function persistOfficialAlertSnapshot(sourceId: string, body: unknown): Pr
     if (locationId) resolved.push({ ...record, locationId });
     else unresolved.push(record.locationName || record.locationKey);
   }
-  if (normalized.records.length > 0 && resolved.length === 0) {
+  // «Прийшли тривоги, і жодна не лягла на каталог» — це зламане читання, і воно має бути помилкою
+  // джерела, а не тихим нулем. Рахується від ВІДФІЛЬТРОВАНИХ рядків: відповідь, у якій були самі
+  // обстріли, нічого не втратила й падати не повинна.
+  if (airRaid.length > 0 && resolved.length === 0) {
     throw new Error(`${sourceId}: no provider locations matched local locations (${unresolved.slice(0, 5).join(', ')})`);
   }
   const deduped = dedupeResolvedRecords(resolved);
+  await runSnapshotPass(sourceId, deduped);
+  // Distinct catalogue rows written, not provider labels read: after the fold above those are no
+  // longer the same number.
+  return { resolved: deduped.length, unresolved };
+}
+
+/** One `alert_source_states` row as the snapshot pass needs to see it before deciding to write. */
+interface StoredSourceState {
+  location_id: string;
+  alert_type: string;
+  active: boolean;
+  provider_started_at: Date | null;
+  external_id: string | null;
+  alert_level: AlertLevel | null;
+  alert_kind: AlertKind | null;
+}
+
+/**
+ * Whether the blanket clear and the upserts would leave every row exactly as it already is.
+ *
+ * Deliberately unforgiving: any row the snapshot names that is missing, any field that differs by so
+ * much as a millisecond, any row the snapshot omits that is still active — and the answer is no and
+ * the full pass runs. The cost of a false «no» is one wasted pass; the cost of a false «yes» is a
+ * row that silently stops tracking its provider.
+ *
+ * ## Чому колір тут ОБОВ'ЯЗКОВО мусить порівнюватися
+ *
+ * Це не повнота заради повноти, а єдиний спосіб, яким зміна рівня взагалі може бути помічена.
+ * Перехід жовтий→червоний усередині тієї самої тривоги не змінює НІЧОГО з того, що ця функція
+ * порівнювала раніше: район той самий, `active` той самий `true`, `provider_started_at` той самий —
+ * тривога ж не починалася заново, — і `external_id` теж, бо будується з назви, типу й старту.
+ * Знімок із червоним виглядав би як точна копія знімка з жовтим, запис не відбувся б, у рядку
+ * джерела лишився б жовтий, зведення прочитало б жовтий — і читач ніколи не дізнався б про
+ * посилення. Відмова тиха: жодної помилки, жодної метрики, просто колір, який не рухається.
+ */
+function snapshotWritesAreNoop(
+  stored: StoredSourceState[], records: Array<AlarmRecord & { locationId: string }>
+): boolean {
+  const byKey = new Map(stored.map((row) => [`${row.location_id}:${row.alert_type}`, row]));
+  for (const record of records) {
+    const row = byKey.get(`${record.locationId}:${record.alertType}`);
+    if (!row) return false;
+    if (row.active !== record.active) return false;
+    if (row.provider_started_at?.getTime() !== record.startedAt.getTime()) return false;
+    if (row.external_id !== record.externalId) return false;
+    if (row.alert_level !== record.alertLevel) return false;
+    if (row.alert_kind !== record.alertKind) return false;
+    byKey.delete(`${record.locationId}:${record.alertType}`);
+  }
+  // Whatever the snapshot did not name must already be inactive, or the blanket clear would stamp a
+  // fresh `missing_since` on it and start its debounce — the opposite of a no-op.
+  for (const row of byKey.values()) if (row.active) return false;
+  return true;
+}
+
+/**
+ * The snapshot transaction: rewrite what this source holds, then recompute every aggregate it can
+ * affect.
+ *
+ * ## Why the writes are conditional and the reconcile is not
+ *
+ * The first half is a blanket clear plus one upsert per reported row — for the granular mirror feed
+ * that is one UPDATE over every row the source has ever held plus fifty-odd upserts, fifteen times a
+ * minute, forever. Most of those passes write nothing new: the feed re-lists the same raions, and
+ * the upstream extract behind it only refreshes every eleven seconds, so at a four-second poll two
+ * passes in three restate a picture already in the table.
+ *
+ * So the pass asks the table first. The rows this source holds are already read here — the
+ * reconcile needs every one of them — and reading three more columns with them is free. If every
+ * reported row already stands in the table with the same `active`, `provider_started_at` and
+ * `external_id`, and every row NOT reported is already inactive, then the blanket clear and the
+ * upserts would each write a row back to the value it already had, and the only columns that would
+ * differ afterwards are `last_seen_at`/`updated_at` — which nothing reads. The liveness rule in
+ * `reconcileAggregateAlert` reads `sources.last_success_at` precisely BECAUSE
+ * `alert_source_states.last_seen_at` is the wrong signal for it; see the comment there.
+ *
+ * Comparing STATE rather than the response bytes is what makes this safe to hold as a fact. A digest
+ * of the body would be a claim about a previous run of this process, and it would go on being
+ * believed after a restore, a manual `DELETE`, or a truncated table. This claim is read out of the
+ * same transaction that acts on it: if anything has moved the rows, the comparison fails and the
+ * full pass runs. It is also strictly more effective, because the mirror's body changes its
+ * `cachedat` on every refresh while saying exactly the same thing about the country.
+ *
+ * What is NEVER skipped is the reconcile. The aggregate is time-dependent: a row that went missing
+ * three polls ago holds its alert until `ALERT_END_DEBOUNCE_SECONDS` elapses, and the pass that
+ * notices the deadline has passed is this one. A feed can report the same picture for hours — an
+ * empty raw payload on a quiet night reports it by definition — so tying the reconcile to a change
+ * in the feed would leave `alert_periods` rows open until the country next changed state. An
+ * «Офіційний відбій» that arrives late is the safe direction; one that never arrives is not.
+ */
+async function runSnapshotPass(
+  sourceId: string, records: Array<AlarmRecord & { locationId: string }>
+): Promise<void> {
   const client = await pool.connect();
   try {
-    await client.query('BEGIN');
-    const affected = await client.query<{ location_id: string; alert_type: string }>(
-      `SELECT location_id,alert_type FROM alert_source_states WHERE source_id=$1`, [sourceId]
-    );
-    const affectedKeys = new Set(affected.rows.map((row) => `${row.location_id}:${row.alert_type}`));
-    // Everything this source held is provisionally missing. `missing_since` is stamped only on the
-    // poll where a *holding* row goes quiet, so repeated absences never push the deadline forward,
-    // and a row that was already inactive is not made to look freshly missing.
-    await client.query(
-      `UPDATE alert_source_states
-         SET active=false,missing_since=CASE WHEN active THEN now() ELSE missing_since END,
-             last_seen_at=now(),updated_at=now()
-       WHERE source_id=$1`,
+    await beginAlertStateTransaction(client);
+    const affected = await client.query<StoredSourceState>(
+      `SELECT location_id,alert_type,active,provider_started_at,external_id,alert_level,alert_kind
+         FROM alert_source_states WHERE source_id=$1`,
       [sourceId]
     );
-    for (const record of deduped) {
-      affectedKeys.add(`${record.locationId}:${record.alertType}`);
+    const affectedKeys = new Set(affected.rows.map((row) => `${row.location_id}:${row.alert_type}`));
+    if (!snapshotWritesAreNoop(affected.rows, records)) {
+      // Everything this source held is provisionally missing. `missing_since` is stamped only on the
+      // poll where a *holding* row goes quiet, so repeated absences never push the deadline forward,
+      // and a row that was already inactive is not made to look freshly missing.
+      //
+      // Колір тут НЕ гаситься, і це навмисно: поки рядок у вікні дебаунсу, він усе ще ТРИМАЄ
+      // тривогу, а тримає він її тим кольором, який назвав востаннє. Занулити колір разом із
+      // `active` означало б, що джерело, яке пропустило одне опитування, мовчки знижує червоний до
+      // «без кольору», не припиняючи при цьому тримати тривогу. Коли воно перестане тримати,
+      // зведення перестане його читати — фільтр `counts AND holds` і є тим вимикачем.
       await client.query(
-        `INSERT INTO alert_source_states(source_id,location_id,alert_type,active,provider_started_at,external_id)
-         VALUES ($1,$2,$3,$4,$5,$6)
-         ON CONFLICT (source_id,location_id,alert_type) DO UPDATE SET
-           active=EXCLUDED.active,provider_started_at=EXCLUDED.provider_started_at,
-           external_id=EXCLUDED.external_id,
-           missing_since=CASE WHEN EXCLUDED.active THEN NULL ELSE alert_source_states.missing_since END,
-           last_seen_at=now(),updated_at=now()`,
-        [sourceId, record.locationId, record.alertType, record.active, record.startedAt, record.externalId]
+        `UPDATE alert_source_states
+           SET active=false,missing_since=CASE WHEN active THEN now() ELSE missing_since END,
+               last_seen_at=now(),updated_at=now()
+         WHERE source_id=$1`,
+        [sourceId]
       );
+      for (const record of records) {
+        affectedKeys.add(`${record.locationId}:${record.alertType}`);
+        await client.query(
+          `INSERT INTO alert_source_states(source_id,location_id,alert_type,active,provider_started_at,
+             external_id,alert_level,alert_kind)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+           ON CONFLICT (source_id,location_id,alert_type) DO UPDATE SET
+             active=EXCLUDED.active,provider_started_at=EXCLUDED.provider_started_at,
+             external_id=EXCLUDED.external_id,
+             -- Колір ЗАМІНЮЄТЬСЯ тим, що джерело сказало зараз, включно з «нічого»: знявши колір,
+             -- джерело знімає його, а не лишає вчорашній. Тотожності рядка це не чіпає — ключ
+             -- конфлікту той самий (source_id, location_id, alert_type), і зміна кольору не може
+             -- створити другого рядка.
+             alert_level=EXCLUDED.alert_level,alert_kind=EXCLUDED.alert_kind,
+             missing_since=CASE WHEN EXCLUDED.active THEN NULL ELSE alert_source_states.missing_since END,
+             last_seen_at=now(),updated_at=now()`,
+          [sourceId, record.locationId, record.alertType, record.active, record.startedAt,
+            record.externalId, record.alertLevel, record.alertKind]
+        );
+      }
     }
     const started: AlertStartRecord[] = [];
     for (const key of affectedKeys) {
@@ -678,9 +1336,6 @@ async function persistOfficialAlertSnapshot(sourceId: string, body: unknown): Pr
   } finally {
     client.release();
   }
-  // Distinct catalogue rows written, not provider labels read: after the fold above those are no
-  // longer the same number.
-  return { resolved: deduped.length, unresolved };
 }
 
 export async function syncOfficialAlerts(log?: { warn: Function }): Promise<void> {
@@ -824,6 +1479,10 @@ export async function syncAerialMirrorState(log?: { warn: Function }): Promise<v
     );
     observeSourceCacheAge(AERIAL_MIRROR_STATE_SOURCE_ID, 'state', snapshot.ageSeconds);
     aerialMirrorPolls.inc({ mode: 'state' });
+    // Типово саме цей фід (`klimenko`) — єдиний, який несе колір, тож здебільшого числа метрики
+    // приходять звідси. Виставляється на кожному придатному опитуванні: рухоме число і є доказом
+    // того, що колір досі надходить.
+    recordReportedAlertLevels(AERIAL_MIRROR_STATE_SOURCE_ID, snapshot.byThreatLevel);
     // Порожній знімок цього фіда — це «жодна область не оголошена цілою», і це нормальний стан
     // країни: постійні Луганщина й Крим є завжди, тож нуль записів тут означав би, що фід зламався.
     // `persistOfficialAlertSnapshot` сам відмовиться від тіла, у якому нічого не розпізналося.
@@ -865,17 +1524,63 @@ async function sourceCollectionEnabled(sourceId: string): Promise<boolean> {
   return result.rows[0]?.enabled === true;
 }
 
-/** One GET against the mirror, with the identification header and the non-2xx rule. */
+/**
+ * Validators and the last body each feed URL served.
+ *
+ * Bounded by construction: the keys are the two or three mirror URLs this process polls, and an
+ * entry is replaced, never appended to.
+ */
+const mirrorFeedCache = new Map<string, { etag?: string; lastModified?: string; body: unknown }>();
+
+/**
+ * One GET against the mirror, conditional on what it served last time.
+ *
+ * ## Why conditional
+ *
+ * The leg polls every four seconds; the upstream `skog` extract refreshes about every eleven. Most
+ * polls therefore re-downloaded and re-parsed a body identical to the one before it — the full
+ * national picture, twice per pass, forever. An `If-None-Match`/`If-Modified-Since` pair turns that
+ * into a 304 with no body at all: the bytes stay on the mirror's side of the wire and `JSON.parse`
+ * is not called. The mirror is a free, unauthenticated community endpoint, so spending fewer of its
+ * bytes is also the courteous reading of the User-Agent this adapter identifies itself with.
+ *
+ * ## Why a 304 is not a shortcut past the freshness gate
+ *
+ * «Not modified» is a statement about BYTES, never about alerts, and the body it refers to carries
+ * `cachedat` — so an unchanged body is, with every second that passes, an OLDER body. The cached
+ * copy is therefore returned to be re-parsed against the CURRENT instant, exactly as a freshly
+ * downloaded one would be: `readCachedAt` (`src/sources/aerial-mirror.ts`) still measures its age,
+ * `threatlens_source_cache_age_seconds` still records that age growing, and a mirror frozen behind a
+ * stable ETag still throws `AerialMirrorStaleError` the moment it passes
+ * `AERIAL_MIRROR_STALE_SECONDS`. A 304 buys a request; it does not buy belief.
+ *
+ * A conditional request is also never the reason a poll counts as missing: the response arrived, so
+ * the poll succeeded and `markSourceSuccess` runs exactly where it ran before. What a 304 does NOT
+ * do is decide whether anything is written — `runSnapshotPass` asks the table that question, because
+ * an answer derived from HTTP would be a claim about this process rather than about the rows.
+ */
 async function fetchAerialMirror(url: string): Promise<unknown> {
-  const response = await fetch(url, {
-    headers: { Accept: 'application/json', 'User-Agent': AERIAL_MIRROR_USER_AGENT },
-    signal: AbortSignal.timeout(10_000)
-  });
+  const cached = mirrorFeedCache.get(url);
+  const headers: Record<string, string> = {
+    Accept: 'application/json', 'User-Agent': AERIAL_MIRROR_USER_AGENT
+  };
+  if (cached?.etag) headers['If-None-Match'] = cached.etag;
+  if (cached?.lastModified) headers['If-Modified-Since'] = cached.lastModified;
+  const response = await fetch(url, { headers, signal: AbortSignal.timeout(10_000) });
+  if (response.status === 304 && cached) return cached.body;
   // 429 included: the published limit is two requests per second per host and this leg's worst case
   // at its three-second floor is 0.67 rps, so a 429 means something else is sharing the egress IP —
   // a source error, not a reason to touch alert state.
   if (!response.ok) throw new Error(`Aerial alert mirror ${response.status}`);
-  return response.json();
+  const body = await response.json();
+  // `headers` is absent on a hand-rolled response object; a feed with no validators simply never
+  // gets a conditional request, which is the correct degradation rather than a reason to guess one.
+  const etag = response.headers?.get('etag') ?? undefined;
+  const lastModified = response.headers?.get('last-modified') ?? undefined;
+  mirrorFeedCache.set(url, {
+    body, ...(etag ? { etag } : {}), ...(lastModified ? { lastModified } : {})
+  });
+  return body;
 }
 
 /**
@@ -948,6 +1653,7 @@ async function collectAerialMirrorSnapshot(
     for (const level of ['State', 'District', 'Community', 'other'] as const) {
       aerialMirrorRawRegions.set({ level }, granular.byLevel[level]);
     }
+    recordReportedAlertLevels(AERIAL_MIRROR_SOURCE_ID, granular.byThreatLevel);
     return granular;
   }
 
@@ -970,6 +1676,10 @@ async function collectAerialMirrorSnapshot(
     for (const level of ['State', 'District', 'Community', 'other'] as const) {
       aerialMirrorRawRegions.set({ level }, 0);
     }
+    // Підтверджена тиша — це нулі й у кольорах: жоден вузол нічого не тримає, отже нікому й
+    // називати колір. Замерзле число тут було б гірше за нуль — воно виглядало б як триваючий
+    // червоний.
+    recordReportedAlertLevels(AERIAL_MIRROR_SOURCE_ID, { yellow: 0, red: 0, unknown: 0 });
     return granular;
   }
 
@@ -1085,6 +1795,52 @@ const aerialMirrorDroppedOblasts = new Gauge({
   registers: []
 });
 
+/**
+ * Вузли дзеркала, що ТРИМАЮТЬ тривогу, за кольором, який вони назвали, на останньому придатному
+ * опитуванні.
+ *
+ * Метрика існує заради однієї відмінності, якої більше не видно ніде: «кольору зараз ніхто не
+ * називає» і «фід перестав слати кольори» виглядають однаково — обидва ряди в нулі. Різниця в
+ * русі: у першому випадку числа ходять протягом нальоту, у другому стоять мертво, і щоб це
+ * побачити, число мусить існувати. Саме тому ряди виставляються НА КОЖНОМУ придатному опитуванні,
+ * включно з нулями, а не лише тоді, коли є що показати.
+ *
+ * Рівно три ряди, зафіксовані на етапі компіляції: `yellow`, `red` і `unknown`. Мітки локації тут
+ * немає й бути не може — на які саме райони припав колір, точно відповідає `alert_source_states`, а
+ * метрика з 31 000 можливих значень мітки поклала б Prometheus. `unknown` — вузли, чий колір не
+ * `yellow` і не `red`: у знімок він не потрапляє й у базу не пишеться, але мовчки зникнути теж не
+ * має права. Ненульовий `unknown` означає рівно одне: апстрім почав називати колір, якого домен не
+ * знає, і перелік треба розширювати міграцією.
+ *
+ * Сумується по фідах дзеркала, бо їх два й кожен опитується окремо (міграція 050: `skog` для
+ * деталізації, `klimenko` для оголошень області). Фід без кольорів дає нулі й нічого не псує.
+ */
+const alertLevelsReported = new Gauge({
+  name: 'threatlens_alert_levels_reported',
+  help: 'Holding aerial-mirror nodes by the differentiated alert level they reported, last usable poll',
+  labelNames: ['level'],
+  registers: []
+});
+
+/**
+ * Останній прочитаний розподіл кольорів, по одному запису на фід дзеркала.
+ *
+ * Обмежена за побудовою: ключі — це два (найбільше три) ідентифікатори джерел дзеркала, які цей
+ * процес опитує, і запис замінюється, а не додається. Та сама форма, що й `mirrorFeedCache`.
+ */
+const reportedLevelsByFeed = new Map<string, Record<AlertLevel | 'unknown', number>>();
+
+function recordReportedAlertLevels(
+  sourceId: string, counts: Record<AlertLevel | 'unknown', number>
+): void {
+  reportedLevelsByFeed.set(sourceId, counts);
+  for (const level of [...ALERT_LEVELS, 'unknown'] as const) {
+    let total = 0;
+    for (const feed of reportedLevelsByFeed.values()) total += feed[level];
+    alertLevelsReported.set({ level }, total);
+  }
+}
+
 const alertChannelMessages = new Counter({
   name: 'threatlens_alert_channel_messages_total',
   help: 'Messages read from the official alert Telegram channels, by source and parse outcome',
@@ -1113,11 +1869,23 @@ const alertChannelStuckAlerts = new Counter({
  * something the APIs are not, or a channel is stuck, and the archive is where to look next.
  *
  * Neither number is visible anywhere else — without it the aggregate simply comes out different.
+ *
+ * ## Why `reason` is the ONLY label
+ *
+ * It used to carry the location id too. prom-client keeps every label tuple it has ever seen for
+ * the life of the process, and this counter is incremented from the reconcile of every
+ * (location, alert_type) pair a snapshot touches — which since migration 051 means hromadas. One
+ * busy night of raion- and hromada-level holds writes thousands of permanent child metrics, each
+ * one a resident object AND a line in every `/metrics` scrape from then until restart, to answer a
+ * question nobody asks of a counter: «which location» is a question about state, and
+ * `alert_source_states` holds that state exactly, with the source, the timestamps and the
+ * `missing_since` the metric could never carry. What the counter is for is the RATE and its split,
+ * and both survive the drop untouched.
  */
 const alertStaleSourcesIgnored = new Counter({
   name: 'threatlens_alert_stale_sources_ignored_total',
   help: 'Alert-holding source rows discounted from the aggregate, by why they were not counted',
-  labelNames: ['location', 'reason'],
+  labelNames: ['reason'],
   registers: []
 });
 const monitorMessages = new Counter({
@@ -1223,6 +1991,7 @@ export function registerAlertChannelMetrics(registry: Registry): void {
     ['threatlens_aerial_mirror_dropped_rollup_oblasts', aerialMirrorDroppedOblasts],
     ['threatlens_alert_channel_messages_total', alertChannelMessages],
     ['threatlens_alert_channel_stuck_alerts_total', alertChannelStuckAlerts],
+    ['threatlens_alert_levels_reported', alertLevelsReported],
     ['threatlens_alert_stale_sources_ignored_total', alertStaleSourcesIgnored],
     ['threatlens_monitor_messages_total', monitorMessages],
     ['threatlens_messages_stale_for_delivery_total', staleForDelivery],
@@ -1302,7 +2071,7 @@ async function applyAlertChannelStates(
   if (!states.length) return { applied: 0, skippedStale: 0 };
   const client = await pool.connect();
   try {
-    await client.query('BEGIN');
+    await beginAlertStateTransaction(client);
     let applied = 0;
     let skippedStale = 0;
     const started: AlertStartRecord[] = [];
@@ -1314,10 +2083,18 @@ async function applyAlertChannelStates(
       // `missing_since` is cleared on both branches. It is the marker the snapshot debounce reads,
       // and an explicit 🟢 is not a source going quiet — inheriting that window here would delay
       // every genuine all-clear this channel publishes.
+      //
+      // `alert_level`/`alert_kind` пишуться ЯВНИМ NULL, а не пропускаються. Канал ОВА кольору не
+      // публікує: `parseAlertChannelMessage` читає 🔴/🟢 і назви місць, і поняття рівня в його
+      // граматиці немає взагалі. Пропустити стовпці означало б «лишити те, що стояло» — і рядок
+      // каналу вічно тримав би колір, який колись приїхав звідкись іще, хоча сам канал про нього
+      // нічого не знає й не може ні підтвердити, ні зняти. NULL тут — це не «немає небезпеки», а
+      // «це джерело кольору не називає», і саме так його читає зведення: рядок тримає тривогу
+      // нарівні з усіма, але в суперечку про колір не вступає.
       const upsert = await client.query<{ location_id: string }>(
         `INSERT INTO alert_source_states(source_id,location_id,alert_type,active,provider_started_at,
-           external_id,last_event_at,missing_since)
-         VALUES ($1,$2,$3,$4,CASE WHEN $4 THEN $5::timestamptz ELSE NULL END,$6,$5,NULL)
+           external_id,last_event_at,missing_since,alert_level,alert_kind)
+         VALUES ($1,$2,$3,$4,CASE WHEN $4 THEN $5::timestamptz ELSE NULL END,$6,$5,NULL,NULL,NULL)
          ON CONFLICT (source_id,location_id,alert_type) DO UPDATE SET
            active=EXCLUDED.active,
            provider_started_at=CASE
@@ -1327,6 +2104,7 @@ async function applyAlertChannelStates(
            external_id=EXCLUDED.external_id,
            last_event_at=EXCLUDED.last_event_at,
            missing_since=NULL,
+           alert_level=NULL,alert_kind=NULL,
            last_seen_at=now(),updated_at=now()
          WHERE alert_source_states.last_event_at IS NULL
             OR alert_source_states.last_event_at <= EXCLUDED.last_event_at
@@ -1457,7 +2235,7 @@ export async function expireStuckAlertChannelAlerts(log?: { warn: Function }): P
   if (!config.ALERT_CHANNEL_ENABLED) return 0;
   const client = await pool.connect();
   try {
-    await client.query('BEGIN');
+    await beginAlertStateTransaction(client);
     const stuck = await client.query<{
       source_id: string; location_id: string; alert_type: string; started_at: string;
     }>(
@@ -1728,6 +2506,8 @@ interface ArchiveEntry extends ClassificationLogEntry {
   contextLocationIds?: string[];
   /** Що про джерело знає конвеєр: для рядка контексту. */
   sourceName?: string | null;
+  /** Вкладення, що качалися паралельно з класифікацією; див. `ProcessMessageOptions.pendingMedia`. */
+  pendingMedia?: Promise<ClassificationLogEntry['media']>;
 }
 
 /** Назва, рівень і офіційність джерела — один запит на джерело, памʼять процесу на десять хвилин. */
@@ -1790,13 +2570,18 @@ async function archiveClassification(entry: ArchiveEntry): Promise<void> {
   // The original text and envelope are passed because an image/audio-only post can have no useful
   // deterministic summary, and because an analytical promotion must preserve its source identity.
   if (!entry.modelClassified) {
+    // ЄДИНЕ місце, де чекають на файл, що качався паралельно, — і це не критичний шлях: сюди
+    // доходять уже після того, як `ingestThreat` закомітив подію й підняв поштовх, тож попередження
+    // вже в дорозі. У режимі `codex` цієї гілки немає взагалі: там файл потрібен був ДО рішення,
+    // колектор його дочекався сам, і `pendingMedia` порожній.
+    const media = entry.pendingMedia ? await entry.pendingMedia : entry.media;
     scheduleShadowClassification({
       sourceMessageId: entry.sourceMessageId,
       sourceId: entry.sourceId,
       publishedAt: entry.publishedAt,
       text: entry.message?.text ?? entry.classified.summary,
       classified: entry.classified,
-      media: entry.media,
+      media,
       message: entry.message,
       allowAnalyticalPromotion: entry.decision === 'ignored' || entry.decision === 'unrecognized',
       // The complement of the flag above, and the reason both live on this one line: a message either
@@ -1861,6 +2646,19 @@ export interface ProcessMessageOptions {
    * deliberately identical for a replayed message and a live one.
    */
   historical?: boolean;
+  /**
+   * Вкладення, які ще качаються, коли класифікація вже почалася.
+   *
+   * Існує рівно для одного випадку: єдиний споживач файлу — тіньовий класифікатор, тобто
+   * відʼєднаний шлях, який читає його ПІСЛЯ того, як подію записано й поштовх піднято. Колектор
+   * (`src/sources/telegram.ts`) у цьому випадку не чекає на завантаження перед викликом, а віддає
+   * сюди проміс; чекають на нього в {@link archiveClassification}, де файл і потрібен.
+   *
+   * Не другий спосіб передати `media`: коли на файл чекає ОСНОВНИЙ класифікатор, колектор
+   * завантажує його сам і кладе в `message.media`, як і раніше, а це поле лишається порожнім.
+   * Обидва поля заповненими не бувають.
+   */
+  pendingMedia?: Promise<NormalizedMessage['media']>;
 }
 
 /**
@@ -1941,7 +2739,7 @@ async function classifyAndIngest(message: NormalizedMessage, options: ProcessMes
     await archiveClassification({
       sourceId: message.sourceId, sourceMessageId: outcome.sourceMessageId,
       publishedAt: message.publishedAt, classified, decision: 'de_escalation', media: message.media,
-      message, historical: options.historical,
+      message, historical: options.historical, pendingMedia: options.pendingMedia,
       withdrawal: outcome.withdrawal, ...modelFields()
     });
     return { deEscalation: true as const, classified, withdrawal: outcome.withdrawal };
@@ -1964,11 +2762,24 @@ async function classifyAndIngest(message: NormalizedMessage, options: ProcessMes
   if (rejection) {
     const sourceMessageId = await recordUnprocessedMessage(message, 'ignored');
     count('ignored');
-    classificationRejections.inc({ source: message.sourceId, reason: rejection });
+    // «Модель придушила» — не «правила не впізнали твердження». Обидва повертають
+    // `not_an_assertion`, бо `notSignificant` будує класифікацію з `intent:'none'`, і на лічильнику
+    // вони зливалися в одне слово: оператор не міг відрізнити «словник каналу поїхав» від «модель
+    // мовчить саме про цей канал». Слово те саме, що вже пише архів у `ignored_reason` нижче, —
+    // один факт має мати одну назву, у якій би поверхні його не читали.
+    classificationRejections.inc({
+      source: message.sourceId, reason: modelSuppressed ? 'model_not_significant' : rejection
+    });
+    // Місце, якого каталог не має, — єдина причина відмови, з якої можна щось ПОЧИНИТИ, і єдина, з
+    // якої досі не лишалося назви. Лише для моніторингових каналів: офіційні фіди називають місце
+    // полем, і їхні назви вже їдуть через `recordUnresolvedLocations`.
+    if (rejection === 'no_location' && options.monitor) {
+      recordUnknownPlaces(message.sourceId, unknownPlaceCandidates(message.text));
+    }
     await archiveClassification({
       sourceId: message.sourceId, sourceMessageId, publishedAt: message.publishedAt, classified,
       media: message.media,
-      message, historical: options.historical,
+      message, historical: options.historical, pendingMedia: options.pendingMedia,
       // "Recognised nothing", "recognised something that is nowhere" and "recognised a report about
       // last night" are three different findings: the first says the vocabulary has drifted or the
       // message was never about a threat, the second says the place is missing from the catalogue,
@@ -1993,7 +2804,7 @@ async function classifyAndIngest(message: NormalizedMessage, options: ProcessMes
     await archiveClassification({
       sourceId: message.sourceId, sourceMessageId, publishedAt: message.publishedAt, classified,
       decision: 'coalesced', ignoredReason: 'restated_within_coalesce_window', media: message.media,
-      message, historical: options.historical, ...modelFields()
+      message, historical: options.historical, pendingMedia: options.pendingMedia, ...modelFields()
     });
     return { coalesced: true as const };
   }
@@ -2026,7 +2837,7 @@ async function classifyAndIngest(message: NormalizedMessage, options: ProcessMes
       await archiveClassification({
         sourceId: message.sourceId, sourceMessageId, publishedAt: message.publishedAt, classified,
         decision: 'ignored_retrospective_model', ignoredReason: 'retrospective_model', media: message.media,
-        message, historical: options.historical, ...modelFields()
+        message, historical: options.historical, pendingMedia: options.pendingMedia, ...modelFields()
       });
       return { ignored: true as const };
     }
@@ -2041,6 +2852,26 @@ async function classifyAndIngest(message: NormalizedMessage, options: ProcessMes
       note: modelAssessment.note
     } } : {})
   });
+  // Миттєве поширення для ЖИВОЇ загрози — те саме, що `alert.started` має відтоді, як зʼявився
+  // `./alert-poke.ts`, і чого не мав моніторинговий шлях. Ціна мовчання тут детермінована: тік
+  // хаба SSE (1 с, `src/services/sse.ts`) плюс тік фан-ауту (1 с, `src/bot/outbox.ts`) плюс тік
+  // відправника (1 с) — нуль-три секунди на попередженні, яке часто є ЄДИНИМ, що існує, бо влада
+  // ще не заговорила.
+  //
+  // Дві умови, і жодна не є здогадкою про зміст:
+  //
+  //  * `result.published` — транзакція справді дописала рядок у `system_event_log`. Повідомлення
+  //    старше за стелю віку, дублікат і злиття-без-змін не пишуть нічого, і будити двох опитувачів
+  //    заради порожнього SELECT — чиста витрата;
+  //  * `timing === 'now'` — подія є живою загрозою. Очікувана («увечері очікується») за
+  //    `CONTEXT.md` живою загрозою не є: вона не заливає територію, йде тихим повідомленням без
+  //    заклику в укриття, і купувати для неї секунду немає з чого. Подія правил — завжди «зараз»
+  //    (там `modelAssessment` порожній), тож режим `rules` поводиться так, наче цього рядка немає.
+  //
+  // Відбій, де-ескалація й повтор у вікні склеювання сюди не доходять зовсім: обидві гілки
+  // повертаються вище. І сам поштовх не змінює НІЧОГО, крім моменту опитування: затримка публікації
+  // живе в SELECT хаба (`sse.ts`), і жоден рядок тут її не торкається.
+  if (result.published && (modelAssessment?.timing ?? 'now') === 'now') pokeLiveThreat();
   if (result.withdrawal.withdrawnAssertions || result.withdrawal.endedEventIds.length) {
     threatWithdrawals.inc({
       source: message.sourceId,
@@ -2050,7 +2881,7 @@ async function classifyAndIngest(message: NormalizedMessage, options: ProcessMes
   await archiveClassification({
     sourceId: message.sourceId, sourceMessageId: result.sourceMessageId,
     publishedAt: message.publishedAt, classified, media: message.media,
-    message, historical: options.historical,
+    message, historical: options.historical, pendingMedia: options.pendingMedia,
     // `redirect` keeps its own decision because it is the only message class that asserts and
     // withdraws at once; `createdEvent` still records whether the event it asserted was new.
     decision: classified.intent === 'redirect' ? 'redirect' : result.created ? 'event_created' : 'event_merged',
@@ -2190,9 +3021,11 @@ export function ingestionLegs(log: { info: Function; warn: Function; error: Func
  * is the accidental half of the old guard — one leg's slow upstream no longer suppresses the other
  * three, which is exactly the case that used to cost fifteen seconds of every leg's freshness.
  *
- * Two legs of DIFFERENT sources can now overlap, and that is safe for the reason it always was:
- * `persistOfficialAlertSnapshot` is scoped `WHERE source_id=$1`, and the only shared row is the
- * `alert_periods` one, which every path takes `FOR UPDATE` before reading the aggregate.
+ * Two legs of DIFFERENT sources can now overlap, and their alert-state transactions still cannot:
+ * each opens with `ALERT_STATE_LOCK`, so a snapshot pass, a channel message and the backstop run
+ * one at a time. The `FOR UPDATE` on the shared `alert_periods` row was not enough on its own — it
+ * is taken after the aggregate is read, and two sources took those row locks in opposite orders and
+ * deadlocked; see {@link ALERT_STATE_LOCK}.
  */
 export function startIngestionScheduler(
   log: { info: Function; warn: Function; error: Function },

@@ -1,6 +1,8 @@
 import { Registry } from 'prom-client';
 import { afterEach, describe, expect, it } from 'vitest';
-import { alertPokeMetrics, onAlertPoke, pokeAlertStarted, resetAlertPoke } from './alert-poke.js';
+import {
+  alertPokeMetrics, onAlertPoke, pokeAlertStarted, pokeLiveThreat, resetAlertPoke
+} from './alert-poke.js';
 
 /**
  * The coalescing half of instant propagation.
@@ -48,7 +50,7 @@ describe('poke coalescing', () => {
     expect(fired).toBe(2);
   });
 
-  it('counts what it fired and what it dropped', async () => {
+  it('counts what it fired and what it dropped, per origin', async () => {
     const registry = new Registry();
     for (const [, metric] of alertPokeMetrics()) registry.registerMetric(metric);
     const before = await scrape(registry);
@@ -56,9 +58,35 @@ describe('poke coalescing', () => {
     pokeAlertStarted();
     pokeAlertStarted();
     await nextTurn();
+    pokeLiveThreat();
+    pokeLiveThreat();
+    await nextTurn();
     const after = await scrape(registry);
     expect(after.fired - before.fired).toBe(1);
     expect(after.coalesced - before.coalesced).toBe(2);
+    // Окремі значення, а не окрема мітка: панель, що вже читає `fired`, і далі читає рівно ті самі
+    // тривоги, а «скільки разів жива загроза купила собі секунду» стає власним рядом.
+    expect(after.threatFired - before.threatFired).toBe(1);
+    expect(after.threatCoalesced - before.threatCoalesced).toBe(1);
+  });
+
+  it('wakes the same listeners for a live threat as for an alert start', async () => {
+    let fired = 0;
+    onAlertPoke(() => { fired += 1; });
+    pokeLiveThreat();
+    await nextTurn();
+    expect(fired).toBe(1);
+  });
+
+  it('collapses an alert start and a live threat in one turn into a single wake-up', async () => {
+    // Обидва споживачі перечитують журнал власним запитом, тож один прохід знаходить обидва рядки.
+    // Два пробудження на один макротакт були б двома зайвими SELECT і жодним зайвим повідомленням.
+    let fired = 0;
+    onAlertPoke(() => { fired += 1; });
+    pokeAlertStarted();
+    pokeLiveThreat();
+    await nextTurn();
+    expect(fired).toBe(1);
   });
 
   it('survives a listener that throws, and still tells the others', async () => {
@@ -98,11 +126,16 @@ describe('subscription lifecycle', () => {
   });
 });
 
-async function scrape(registry: Registry): Promise<{ fired: number; coalesced: number }> {
+async function scrape(registry: Registry): Promise<{
+  fired: number; coalesced: number; threatFired: number; threatCoalesced: number;
+}> {
   const text = await registry.metrics();
   const read = (outcome: string) => {
     const match = new RegExp(`^threatlens_alert_pokes_total\\{outcome="${outcome}"\\} (\\d+)$`, 'm').exec(text);
     return match ? Number(match[1]) : 0;
   };
-  return { fired: read('fired'), coalesced: read('coalesced') };
+  return {
+    fired: read('fired'), coalesced: read('coalesced'),
+    threatFired: read('threat_fired'), threatCoalesced: read('threat_coalesced')
+  };
 }

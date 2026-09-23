@@ -248,6 +248,64 @@ describe.skipIf(!integrationDatabaseAvailable)('outbox delivery and stuck-messag
   });
 
   describe('aggregate delivery governor', () => {
+    /**
+     * Рядок зміни рівня — єдиний у цьому файлі, що вказує на період тривоги, а не на подію загрози:
+     * `notification_outbox_subject_check` (міграція 052) вимагає непорожнього предмета, і для
+     * `alert_level_change` ним є саме `alert_period_id`.
+     */
+    async function seedLevelChange(chatId: number, updateKind: string, priority: number): Promise<string> {
+      const period = await sql<{ id: string }>(
+        `INSERT INTO alert_periods(location_id,alert_type,status,started_at,alert_level,alert_kind)
+         VALUES ($1,'air_raid','active',now(),'red','drones_missiles') RETURNING id`, [OBLAST]
+      );
+      const row = await sql<{ id: string }>(
+        `INSERT INTO notification_outbox(alert_period_id,chat_id,notification_type,idempotency_key,priority,payload,
+           status,attempts,next_attempt_at,created_at,updated_at)
+         VALUES ($1,$2,'alert_level_change',$3,$4,$5,'pending',0,now(),now(),now()) RETURNING id`,
+        [period.rows[0]!.id, chatId, `${period.rows[0]!.id}:${chatId}:alert_level_change:1`, priority,
+          JSON.stringify({
+            locationName: 'Київська область', level: 'red', kind: 'drones_missiles',
+            previousLevel: 'yellow', previousKind: 'drones', updateKind,
+            silent: updateKind !== 'escalation'
+          })]
+      );
+      return row.rows[0]!.id;
+    }
+
+    it('claims an alert-level escalation ahead of older, better-prioritised standard traffic', async () => {
+      // Контракт — «жовтий → червоний не стоїть у черзі за звичайним трафіком», і перевіряється він
+      // у найнесприятливішому для нього вигляді: звичайний рядок і СТАРШИЙ (створений хвилину тому),
+      // і з КРАЩИМ пріоритетом. Виграти підвищення може тільки класом, бо `claimDeliveryBatch`
+      // сортує `CASE WHEN class='protected' THEN 0 ELSE 1 END` перед `priority,created_at`.
+      await seedUser(8206);
+      const eventId = await seedThreatEvent({ locationIds: [OBLAST] });
+      const standard = await seedOutbox({
+        chatId: 8206, eventId, status: 'pending', attempts: 0, priority: 1, updatedSecondsAgo: 60,
+        payload: { locationName: 'Київ', threatType: 'uav', evidenceLevel: 'monitoring', updateKind: 'initial' }
+      });
+      const escalation = await seedLevelChange(8206, 'escalation', 4);
+
+      const claimed = await claimDeliveryBatch();
+
+      expect(claimed.map((row) => row.id)).toEqual([escalation, standard]);
+      expect(claimed.map(deliveryClass)).toEqual(['protected', 'standard']);
+    });
+
+    it('leaves an alert-level de-escalation in the discretionary half of the queue', async () => {
+      await seedUser(8207);
+      const eventId = await seedThreatEvent({ locationIds: [OBLAST] });
+      const official = await seedOutbox({
+        chatId: 8207, eventId, status: 'pending', attempts: 0, priority: 3,
+        payload: { locationName: 'Київ', evidenceLevel: 'official', updateKind: 'initial' }
+      });
+      const deescalation = await seedLevelChange(8207, 'deescalation', 4);
+
+      const claimed = await claimDeliveryBatch();
+
+      expect(claimed.map((row) => row.id)).toEqual([official, deescalation]);
+      expect(claimed.map(deliveryClass)).toEqual(['protected', 'soft']);
+    });
+
     it('classifies and claims official and escalation rows before discretionary traffic', async () => {
       await seedUser(8201);
       const eventId = await seedThreatEvent({ locationIds: [OBLAST] });

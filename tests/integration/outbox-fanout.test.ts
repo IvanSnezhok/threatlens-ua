@@ -5,6 +5,9 @@ import {
   outboxRows, resetDatabase, runFanout, runFanoutSettling, seedSubscription, seedThreatEvent, seedUser, sql
 } from '../helpers/db.js';
 import { pool } from '../../src/db/pool.js';
+import { formatMessage } from '../../src/bot/outbox.js';
+import { deliveryClass } from '../../src/bot/delivery-governor.js';
+import { humanMoment } from '../../src/bot/humanize.js';
 
 /**
  * Covers the eight-parameter fanout query in `src/bot/outbox.ts`.
@@ -743,6 +746,192 @@ describe.skipIf(!integrationDatabaseAvailable)('subscription fanout', () => {
       expect(await count('notification_outbox')).toBe(1);
       expect(String(row.rows[0]!.payload.locationName)).toContain('Київська область');
       expect(String(row.rows[0]!.payload.locationName)).toContain('Біла Церква');
+    });
+  });
+
+  /**
+   * Диференційоване оповіщення (міграція 054): колір усередині тривоги, що вже триває.
+   *
+   * Тут перевіряється те, чого не видно в юніт-тесті форматувальника, — КОМУ рядок дістається і з
+   * яким пріоритетом; і найголовніше з цього негативне: зміна кольору не має права стати другою
+   * тривогою, відбоєм, або повідомленням для того, кому про тривогу взагалі не казали.
+   */
+  describe('рівень тривоги', () => {
+    async function seedLeveledPeriod(locationId: string, level: string | null, kind: string | null): Promise<string> {
+      const row = await sql<{ id: string }>(
+        `INSERT INTO alert_periods(location_id,alert_type,status,started_at,alert_level,alert_kind)
+         VALUES ($1,'air_raid','active',now(),$2,$3) RETURNING id`, [locationId, level, kind]
+      );
+      return row.rows[0]!.id;
+    }
+
+    /**
+     * Те, що робить агрегат: UPDATE наявного періоду плюс подія. Період той самий — ні нового
+     * рядка, ні `ended_at`, ні нового `started_at`.
+     */
+    async function changeLevel(args: {
+      alertId: string; locationId: string;
+      level: string | null; kind: string | null;
+      previousLevel: string | null; previousKind: string | null;
+    }): Promise<void> {
+      await sql(
+        `UPDATE alert_periods SET alert_level=$2,alert_kind=$3,alert_level_changed_at=now(),updated_at=now()
+         WHERE id=$1`, [args.alertId, args.level, args.kind]
+      );
+      await appendSystemEvent('alert.level_changed', {
+        alertPeriodId: args.alertId, locationId: args.locationId,
+        level: args.level, previousLevel: args.previousLevel,
+        kind: args.kind, previousKind: args.previousKind,
+        changedAt: new Date().toISOString()
+      });
+    }
+
+    async function alertRows(alertId: string): Promise<Array<Record<string, any>>> {
+      const rows = await sql(
+        `SELECT * FROM notification_outbox WHERE alert_period_id=$1 ORDER BY created_at,id`, [alertId]
+      );
+      return rows.rows;
+    }
+
+    it('тривога без рівня доходить до читача тим самим текстом, що й до 06.09.2026', async () => {
+      await seedUser(9701);
+      await seedSubscription({ chatId: 9701, locationId: OBLAST });
+      const alertId = await seedLeveledPeriod(OBLAST, null, null);
+      await appendSystemEvent('alert.started', { alertId, locationId: OBLAST });
+
+      await runFanout();
+
+      const row = (await alertRows(alertId))[0]!;
+      expect(row.payload.level).toBeNull();
+      expect(row.payload.kind).toBeNull();
+      expect(formatMessage(row)).toBe(
+        '🔴 <b>Повітряна тривога — Київська область</b>\n\n'
+        + 'Прямуйте до визначеного укриття й дотримуйтеся вказівок офіційних служб.\n\n'
+        + `Оголошено о ${humanMoment(row.payload.startedAt)}\nОфіційне сповіщення про тривогу`
+      );
+    });
+
+    it('підвищення рівня — окреме оновлення з голови черги, а не друга тривога', async () => {
+      await seedUser(9702);
+      await seedSubscription({ chatId: 9702, locationId: CITY_IN_OBLAST });
+      const alertId = await seedLeveledPeriod(OBLAST, 'yellow', 'drones');
+      await appendSystemEvent('alert.started', { alertId, locationId: OBLAST });
+      await runFanout();
+
+      await changeLevel({
+        alertId, locationId: OBLAST,
+        level: 'red', kind: 'drones_missiles', previousLevel: 'yellow', previousKind: 'drones'
+      });
+      await runFanout();
+
+      const rows = await alertRows(alertId);
+      expect(rows.map((row) => row.notification_type)).toEqual(['alert_start', 'alert_level_change']);
+      // Сама тривога назвала жовтий; оновлення замінює сказане, а не повторює його.
+      expect(formatMessage(rows[0]!)).toContain('🟡 Жовтий рівень — дронова небезпека');
+      const change = rows[1]!;
+      expect(Number(change.priority)).toBe(0);
+      expect(change.payload.silent).toBe(false);
+      // Клас важить більше за пріоритет у `claimDeliveryBatch`: підвищення мусить бути `protected`.
+      expect(deliveryClass(change)).toBe('protected');
+      const text = formatMessage(change);
+      expect(text.startsWith('⬆️ <b>Рівень тривоги підвищено — Київська область</b>')).toBe(true);
+      expect(text).toContain('🟡 Жовтий → 🔴 Червоний: ракетно-дронова загроза');
+      expect(text).not.toContain('Повітряна тривога');
+      expect(text.toLowerCase()).not.toContain('відбій');
+    });
+
+    it('зниження рівня йде тихо, не називається завершенням і лишає вказівку про укриття', async () => {
+      await seedUser(9703);
+      await seedSubscription({ chatId: 9703, locationId: OBLAST });
+      const alertId = await seedLeveledPeriod(OBLAST, 'red', 'drones_missiles');
+      await appendSystemEvent('alert.started', { alertId, locationId: OBLAST });
+      await runFanout();
+
+      await changeLevel({
+        alertId, locationId: OBLAST,
+        level: 'yellow', kind: 'drones', previousLevel: 'red', previousKind: 'drones_missiles'
+      });
+      await runFanout();
+
+      const change = (await alertRows(alertId))[1]!;
+      expect(change.notification_type).toBe('alert_level_change');
+      // Пріоритет 4 і `silent` — два незалежні шляхи до `disable_notification` у `deliverBatch`.
+      expect(Number(change.priority)).toBe(4);
+      expect(change.payload.silent).toBe(true);
+      expect(deliveryClass(change)).toBe('soft');
+      const text = formatMessage(change);
+      expect(text.startsWith('🔽 <b>Рівень тривоги знижено — Київська область</b>')).toBe(true);
+      expect(text).toContain('Тривога триває. Залишайтеся в укритті');
+      expect(text.toLowerCase()).not.toContain('відбій');
+      expect(text).not.toContain('⚪');
+    });
+
+    it('чатові, якому про цю тривогу не казали, зміна рівня не надсилається', async () => {
+      const alertId = await seedLeveledPeriod(OBLAST, 'yellow', 'drones');
+      await appendSystemEvent('alert.started', { alertId, locationId: OBLAST });
+      await runFanout();
+      expect(await count('notification_outbox')).toBe(0);
+
+      // Підписка з'явилася ПОСЕРЕД тривоги. «Тепер червоний» без «була тривога» — повідомлення
+      // нізвідки, і цей чат має почути систему вперше на наступній тривозі, а не посеред цієї.
+      await seedUser(9704);
+      await seedSubscription({ chatId: 9704, locationId: OBLAST });
+      await changeLevel({
+        alertId, locationId: OBLAST,
+        level: 'red', kind: 'missiles', previousLevel: 'yellow', previousKind: 'drones'
+      });
+      await runFanout();
+
+      expect(await count('notification_outbox')).toBe(0);
+    });
+
+    it('зміна рівня, що дійшла після відбою, не доставляється нікому', async () => {
+      await seedUser(9705);
+      await seedSubscription({ chatId: 9705, locationId: OBLAST });
+      const alertId = await seedLeveledPeriod(OBLAST, 'yellow', 'drones');
+      await appendSystemEvent('alert.started', { alertId, locationId: OBLAST });
+      await runFanout();
+
+      await sql(`UPDATE alert_periods SET status='ended',ended_at=now(),updated_at=now() WHERE id=$1`, [alertId]);
+      await appendSystemEvent('alert.ended', { alertId, locationId: OBLAST });
+      // Колір у рядку вже не оновлюється — період закрито; подія лишилася в журналі позаду відбою.
+      await appendSystemEvent('alert.level_changed', {
+        alertPeriodId: alertId, locationId: OBLAST,
+        level: 'red', previousLevel: 'yellow', kind: 'missiles', previousKind: 'drones',
+        changedAt: new Date().toISOString()
+      });
+      await runFanout();
+
+      const types = (await alertRows(alertId)).map((row) => row.notification_type);
+      expect(types).toContain('alert_end');
+      expect(types).not.toContain('alert_level_change');
+    });
+
+    it('повтор тієї самої пари кольору й виду не породжує другого повідомлення', async () => {
+      await seedUser(9706);
+      await seedSubscription({ chatId: 9706, locationId: OBLAST });
+      const alertId = await seedLeveledPeriod(OBLAST, 'yellow', 'drones');
+      await appendSystemEvent('alert.started', { alertId, locationId: OBLAST });
+      await runFanout();
+
+      await changeLevel({
+        alertId, locationId: OBLAST,
+        level: 'red', kind: 'missiles', previousLevel: 'yellow', previousKind: 'drones'
+      });
+      await runFanout();
+      // Той самий перехід, дописаний удруге: відтворення журналу, а не нова новина. Перша лінія
+      // оборони — `decideAlertLevelNotification` (рядок періоду вже червоний, отже змін немає),
+      // друга — `told`: чатові вже сказали саме цю пару.
+      await appendSystemEvent('alert.level_changed', {
+        alertPeriodId: alertId, locationId: OBLAST,
+        level: 'red', previousLevel: 'yellow', kind: 'missiles', previousKind: 'drones',
+        changedAt: new Date().toISOString()
+      });
+      await runFanout();
+
+      const changes = (await alertRows(alertId))
+        .filter((row) => row.notification_type === 'alert_level_change');
+      expect(changes).toHaveLength(1);
     });
   });
 });

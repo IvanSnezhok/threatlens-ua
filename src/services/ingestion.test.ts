@@ -1,10 +1,12 @@
+import { readFileSync } from 'node:fs';
 import { Registry } from 'prom-client';
 import { afterEach, describe, expect, it } from 'vitest';
 import { config } from '../config.js';
 import {
   AERIAL_MIRROR_MIN_POLL_SECONDS, ALERTS_IN_UA_MIN_POLL_SECONDS, SLOW_LEG_INTERVAL_SECONDS,
   UKRAINE_ALARM_MIN_POLL_SECONDS, alertLegIntervalMs, escapeLikePattern, ingestionLegs,
-  locationNameCandidates, normalizeAlarmResponse, pickLocationMatch, registerAlertChannelMetrics
+  locationNameCandidates, normalizeAlarmResponse, pickLocationMatch, registerAlertChannelMetrics,
+  strongestDeclaredAlert, unknownPlaceCandidates
 } from './ingestion.js';
 
 describe('official alert normalization', () => {
@@ -23,6 +25,218 @@ describe('official alert normalization', () => {
       region_id: 'ua-53', region_name: 'Полтавська область', alert_type: 'ARTILLERY', status: 'inactive'
     }] });
     expect(result.records[0]).toMatchObject({ locationKey: 'ua-53', alertType: 'artillery', active: false });
+  });
+});
+
+/**
+ * `alerts.in.ua` (`/v1/alerts/active.json`) таким, яким його віддає живий API, а не таким, яким його
+ * зручно уявляти.
+ *
+ * `tests/fixtures/alerts-in-ua-active-levels.json` — сім тривог, вирізаних без правок зі зрізу
+ * 22.09.2026 на 43 активні. Кожна форма рядка там по одному разу: область без `threats[]`, два
+ * райони з різним кольором і різновидом, третій район без різновиду, громада з `location_raion`,
+ * місто, і два типи, які не є повітряною тривогою.
+ *
+ * Регресія, яку тримає цей блок: нормалізатор брав `id` рядка за ключ локації й не читав
+ * `location_title` взагалі. Кожен рядок ставав «місцем» з номером ТРИВОГИ замість назви, жоден не
+ * лягав на каталог, і джерело падало на «no provider locations matched local locations (8757, 28288,
+ * 76016, 76017, 185413)» — з першого опитування й назавжди. Відсутність `finished_at`-гілки при цьому
+ * робила б кожну тривогу `active: false`, тож навіть зіставлене тіло записало б погашені тривоги.
+ */
+const ALERTS_IN_UA = JSON.parse(
+  readFileSync(new URL('../../tests/fixtures/alerts-in-ua-active-levels.json', import.meta.url), 'utf8')
+) as { alerts: Array<Record<string, unknown>> };
+
+describe('an alerts.in.ua snapshot as the live API sends it', () => {
+  const normalized = normalizeAlarmResponse(ALERTS_IN_UA);
+  const byAlertId = (id: number) => {
+    const record = normalized.records.find((candidate) => candidate.externalId === String(id));
+    if (!record) throw new Error(`no record for alert ${id}`);
+    return record;
+  };
+
+  it('turns every alert into one record carrying the alert id as its external id', () => {
+    expect(normalized.candidateCount).toBe(7);
+    expect(normalized.records.map((record) => record.externalId))
+      .toEqual(['8757', '264928', '265383', '76016', '76017', '265304', '265568']);
+  });
+
+  it('names the place from location_title', () => {
+    expect(normalized.records.map((record) => record.locationName)).toEqual([
+      'Луганська область', 'Покровський район', 'Олександрійський район',
+      'Вовчанська територіальна громада', 'Вовчанська територіальна громада', 'м. Марганець',
+      'Харківський район'
+    ]);
+  });
+
+  it('never keys the place by the alert id or by the feed\'s own location_uid', () => {
+    // Обидва — числа у власному просторі фіда. `id` — номер тривоги; `location_uid` — нумерація
+    // alerts.in.ua («16» — Луганщина, «1313» — Вовчанська), яка з КАТОТТГ не має нічого спільного.
+    // Будь-яке з них у `id OR official_code` означало б або тихий промах, або тихий збіг з чужим
+    // рядком. Ключа немає зовсім — місце шукається лише за назвою.
+    ALERTS_IN_UA.alerts.forEach((raw, index) => {
+      const record = normalized.records[index]!;
+      expect(record.locationKey).not.toBe(String(raw.id));
+      expect(record.locationKey).not.toBe(String(raw.location_uid));
+      expect(record.locationKey).not.toBe(String(raw.location_oblast_uid));
+    });
+    expect(normalized.records.every((record) => record.locationKey === '')).toBe(true);
+  });
+
+  it('files a hromada under its raion and everything else under its oblast', () => {
+    // Район — вужчий із двох, і лише він відрізняє дві однойменні громади однієї області.
+    expect(byAlertId(76016).parentName).toBe('Чугуївський район');
+    expect(byAlertId(76017).parentName).toBe('Чугуївський район');
+    expect(byAlertId(264928).parentName).toBe('Донецька область');
+    expect(byAlertId(265383).parentName).toBe('Кіровоградська область');
+    expect(byAlertId(265568).parentName).toBe('Харківська область');
+    expect(byAlertId(265304).parentName).toBe('Дніпропетровська область');
+    // Область лежить «під собою»: підказка звужує лише нічию, тож тут вона нічого не змінює.
+    expect(byAlertId(8757).parentName).toBe('Луганська область');
+  });
+
+  it('reads finished_at: null as a standing alert and a date there as a finished one', () => {
+    // У цьому тілі немає ні `status`, ні булевого поля — лише `finished_at`. Без нього всі сім
+    // рядків були б `active: false`.
+    expect(normalized.records.every((record) => record.active)).toBe(true);
+    const finished = normalizeAlarmResponse({ alerts: [
+      { ...ALERTS_IN_UA.alerts[2], finished_at: '2026-09-22T10:05:00.000Z' }
+    ] });
+    expect(finished.records[0]).toMatchObject({ externalId: '265383', active: false });
+  });
+
+  it('carries the provider start, however old it is', () => {
+    // Луганщина під тривогою з 04.04.2022. Це правда про тривогу, а не зіпсоване поле.
+    expect(byAlertId(8757).startedAt.toISOString()).toBe('2022-04-04T16:45:39.000Z');
+    expect(byAlertId(265568).startedAt.toISOString()).toBe('2026-09-22T16:22:26.217Z');
+  });
+
+  it('reads alert_level and derives the kind from threats[] alone', () => {
+    expect(byAlertId(8757)).toMatchObject({ alertLevel: 'red', alertKind: null });
+    expect(byAlertId(264928)).toMatchObject({ alertLevel: 'red', alertKind: 'missiles' });
+    expect(byAlertId(265383)).toMatchObject({ alertLevel: 'yellow', alertKind: 'drones' });
+    // Колір без `threats[]` — повне тіло: різновид лишається неназваним, а не здогаданим.
+    expect(byAlertId(265568)).toMatchObject({ alertLevel: 'yellow', alertKind: null });
+  });
+
+  it('keeps shelling and urban fighting as their own types, never as an air raid', () => {
+    // Власні типи — те, що дає `persistOfficialAlertSnapshot` відкинути їх до пошуку місця.
+    expect(byAlertId(76016).alertType).toBe('artillery');
+    expect(byAlertId(265304).alertType).toBe('artillery');
+    expect(byAlertId(76017).alertType).toBe('urban_fighting');
+    expect(normalized.records.filter((record) => record.alertType === 'air_raid')
+      .map((record) => record.externalId)).toEqual(['8757', '264928', '265383', '265568']);
+  });
+});
+
+/**
+ * Колір і різновид, прочитані з двох форм, які їх несуть, і згорнуті правилом «найсильніший».
+ *
+ * Значення `threat_type` тут — ті, що їх справді віддає `alerts.in.ua`: зріз 22.09.2026 (51 активна
+ * тривога, 31 із `threats[]`) дав рівно `drones` і `unspecified_missiles`.
+ */
+describe('the colour an alert carries', () => {
+  it('reads the level off an alerts.in.ua alert and the kind off its threats', () => {
+    const result = normalizeAlarmResponse({ alerts: [{
+      region_id: 'ua-32', region_name: 'Київська область', alert_type: 'air_raid', status: 'active',
+      alert_level: 'yellow',
+      threats: [{ threat_type: 'drones', level: 'yellow', source_message: 'Дронова загроза (жовтий рівень)' }]
+    }] });
+    expect(result.records[0]).toMatchObject({
+      alertType: 'air_raid', active: true, alertLevel: 'yellow', alertKind: 'drones'
+    });
+  });
+
+  it('names both kinds only when the source named both', () => {
+    const both = normalizeAlarmResponse({ alerts: [{
+      region_id: 'ua-32', region_name: 'Київська область', status: 'active', alert_level: 'red',
+      threats: [{ threat_type: 'drones' }, { threat_type: 'unspecified_missiles' }]
+    }] });
+    expect(both.records[0]).toMatchObject({ alertLevel: 'red', alertKind: 'drones_missiles' });
+  });
+
+  it('leaves the kind unnamed when the level came without threats', () => {
+    // 17 із 51 тривоги в зрізі мали колір і жодної загрози в масиві. Колір без різновиду — повне
+    // тіло, а не половина: вигадувати різновид ми не маємо права.
+    const bare = normalizeAlarmResponse({ alerts: [{
+      region_id: 'ua-32', region_name: 'Київська область', status: 'active', alert_level: 'red'
+    }] });
+    expect(bare.records[0]).toMatchObject({ alertLevel: 'red', alertKind: null });
+  });
+
+  it('contributes nothing for a threat type it does not know', () => {
+    const unknown = normalizeAlarmResponse({ alerts: [{
+      region_id: 'ua-32', region_name: 'Київська область', status: 'active', alert_level: 'red',
+      threats: [{ threat_type: 'sabotage_group' }]
+    }] });
+    expect(unknown.records[0]).toMatchObject({ alertLevel: 'red', alertKind: null });
+  });
+
+  it('reads the level off the mirror snapshot body too', () => {
+    const mirror = normalizeAlarmResponse({ states: [
+      { regionName: 'Луганська область', active: true, alertLevel: 'red' },
+      { regionName: 'АР Крим', active: true }
+    ] });
+    expect(mirror.records[0]).toMatchObject({ alertLevel: 'red', alertKind: null });
+    // Дзеркало `threats[]` не має, тож різновид тут `null` при живому кольорі — і це очікувано.
+    expect(mirror.records[1]).toMatchObject({ alertLevel: null, alertKind: null });
+  });
+
+  it('drops a colour the domain does not know rather than widening the enum', () => {
+    const invented = normalizeAlarmResponse({ alerts: [{
+      region_id: 'ua-32', region_name: 'Київська область', status: 'active', alert_level: 'crimson'
+    }] });
+    // Тривога лишається; відкинуто ЛИШЕ прикмету.
+    expect(invented.records[0]).toMatchObject({ active: true, alertLevel: null });
+  });
+
+  it('leaves Ukraine Alarm v3 colourless, because its body carries no level', () => {
+    const v3 = normalizeAlarmResponse([{ regionId: '31', regionName: 'Київ', activeAlerts: [
+      { id: 'air-1', type: 'AIR', lastUpdate: '2026-01-02T03:04:05Z' }
+    ] }]);
+    expect(v3.records[0]).toMatchObject({ alertType: 'air_raid', alertLevel: null, alertKind: null });
+  });
+});
+
+/**
+ * Правило зведення: найсильніший колір серед тих, ХТО ТРИМАЄ, і різновид того рівня — або нічого.
+ *
+ * Перевіряється без бази, бо це домен, а не SQL: сам запит лише приносить рядки, що тримають
+ * тривогу, а рішення ухвалює ця функція.
+ */
+describe('the level an aggregate concludes', () => {
+  it('takes the strongest colour, not the commonest', () => {
+    expect(strongestDeclaredAlert([
+      { level: 'yellow', kind: 'drones' },
+      { level: 'yellow', kind: 'drones' },
+      { level: 'red', kind: 'missiles' }
+    ])).toEqual({ level: 'red', kind: 'missiles' });
+  });
+
+  it('treats silence as weaker than any colour', () => {
+    expect(strongestDeclaredAlert([{ level: null, kind: null }, { level: 'yellow', kind: 'drones' }]))
+      .toEqual({ level: 'yellow', kind: 'drones' });
+  });
+
+  it('refuses to invent a kind when the strongest level disagrees with itself', () => {
+    expect(strongestDeclaredAlert([
+      { level: 'red', kind: 'drones' },
+      { level: 'red', kind: 'missiles' }
+    ])).toEqual({ level: 'red', kind: null });
+  });
+
+  it('ignores the kind of a weaker row entirely', () => {
+    // Жовтий рядок каже «дрони», червоний мовчить про різновид. Різновид беремо з переможця, тобто
+    // не беремо: підписати червону тривогу «дронова» на підставі жовтої — це сказати за джерело.
+    expect(strongestDeclaredAlert([
+      { level: 'yellow', kind: 'drones' },
+      { level: 'red', kind: null }
+    ])).toEqual({ level: 'red', kind: null });
+  });
+
+  it('says nothing about an alert nobody coloured', () => {
+    expect(strongestDeclaredAlert([])).toEqual({ level: null, kind: null });
+    expect(strongestDeclaredAlert([{ level: null, kind: null }])).toEqual({ level: null, kind: null });
   });
 });
 
@@ -157,7 +371,11 @@ describe('metric registration', () => {
     'threatlens_alert_pokes_total',
     // Скільки обласних «тривог», яких влада не оголошувала, адаптер відкинув на останньому опитуванні
     // (міграція 050). Нуль тут — не мета: на ніч із районними тривогами це кілька одиниць.
-    'threatlens_aerial_mirror_dropped_rollup_oblasts'
+    'threatlens_aerial_mirror_dropped_rollup_oblasts',
+    // Вузли, що тримають тривогу, за кольором (міграція 054). Три ряди й ніколи більше: yellow,
+    // red і unknown. Ряд має існувати навіть у нулі — інакше «кольору немає» й «фід перестав слати
+    // колір» неможливо розрізнити.
+    'threatlens_alert_levels_reported'
   ];
 
   it('attaches every counter this module owns, model-layer ones included', () => {
@@ -250,5 +468,49 @@ describe('the leg split', () => {
   it('names every leg exactly once, because the names are metric labels', () => {
     const names = ingestionLegs(silent).map((leg) => leg.name);
     expect(new Set(names).size).toBe(names.length);
+  });
+});
+
+// --------------------------------------------------------------------------------------------
+// Гіпотези про назви місць, яких каталог не має
+// --------------------------------------------------------------------------------------------
+
+describe('place candidates from a message the catalogue matched nothing in', () => {
+  it('reads a capitalised word inside a sentence as a candidate', () => {
+    expect(unknownPlaceCandidates('Ударні БпЛА курсом на Кароліну, будьте уважні'))
+      .toEqual(['Кароліну']);
+  });
+
+  it('joins adjacent capitalised words into one candidate', () => {
+    // «Нова Каховка» — одна пропущена назва, а не дві; оператор читає перелік очима, і два уламки
+    // однієї назви коштують йому саме того часу, заради якого цей перелік існує.
+    expect(unknownPlaceCandidates('Загроза для Нова Каховка та околиць'))
+      .toEqual(['Нова Каховка']);
+  });
+
+  it('ignores the first word of a sentence, where a capital letter says nothing', () => {
+    expect(unknownPlaceCandidates('Увага! Терміново. Вибухи.')).toEqual([]);
+    expect(unknownPlaceCandidates('Ворог підняв борти.')).toEqual([]);
+  });
+
+  it('ignores the weapon and agency vocabulary a capital letter otherwise catches', () => {
+    // «ППО», «РФ», «БпЛА», «МіГ» — це словник, яким канал пише про зброю; жодне з них не є місцем,
+    // і всі чотири ловляться однією ознакою: велика літера не лише перша.
+    expect(unknownPlaceCandidates('Працює ППО, збито БпЛА, злетів МіГ-31К з аеродрому РФ')).toEqual([]);
+  });
+
+  it('ignores a bearing and an ordinary word the morphology could reach a real name through', () => {
+    // `isBlockedPlaceToken` — той самий список, яким каталог відмовляється читати «південним» як
+    // Південне і «мені» як Мену. Перелік гіпотез не має показувати те, що система свідомо не читає.
+    expect(unknownPlaceCandidates('Ціль йде Південним курсом, і Мені це не подобається')).toEqual([]);
+  });
+
+  it('ignores latin words, which on these channels are handles and links', () => {
+    expect(unknownPlaceCandidates('Підписуйтеся на Eradar та Monitor')).toEqual([]);
+  });
+
+  it('names each candidate once however often the message repeats it', () => {
+    expect(unknownPlaceCandidates('По Кароліну йдуть, повторюю, по Кароліну'))
+      .toEqual(['Кароліну']);
   });
 });

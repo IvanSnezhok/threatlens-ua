@@ -402,3 +402,92 @@ describe('composeTerritoryStates — analytic status', () => {
     expect(raion.analyticStatus).toBe('very_high');
   });
 });
+
+/**
+ * Рівень тривоги (CONTEXT.md, «Рівень тривоги»): колір, яким влада уточнює ВЖЕ оголошену тривогу.
+ * Він не є ідентичністю тривоги, не створює й не завершує її, і найчастіше його просто немає.
+ */
+describe('composeTerritoryStates — alert level', () => {
+  it('carries the colour and the kind onto the alert row and onto the territory', () => {
+    const states = compose({ alerts: [alertRow({ alert_level: 'yellow', alert_kind: 'drones' })] });
+    const raion = byLocation(states, 'ua-32-01');
+    expect(raion.alertLevel).toBe('yellow');
+    expect(raion.alertKind).toBe('drones');
+    expect(raion.alerts[0]).toMatchObject({ level: 'yellow', kind: 'drones' });
+    // Похідне покриття несе той самий рівень: полігон області не світиться, але панель області
+    // мусить називати те саме, що назвала влада для району всередині.
+    expect(byLocation(states, 'ua-32').alertLevel).toBe('yellow');
+  });
+
+  it('folds several alerts on one territory by the strongest colour, never the newest', () => {
+    // Дві громади одного району: одна ще жовта, друга вже червона. Район — червоний. Порядок рядків
+    // тут навмисно «спадний»: правило — найсильніший, а не останній і не більшість.
+    const states = compose({ alerts: [
+      alertRow({ id: 'a-red', location_id: 'ua-32-01', alert_level: 'red', alert_kind: 'missiles' }),
+      alertRow({ id: 'a-yellow', location_id: 'ua-32-01', alert_level: 'yellow', alert_kind: 'drones' })
+    ] });
+    const raion = byLocation(states, 'ua-32-01');
+    expect(raion.alertLevel).toBe('red');
+    expect(raion.alertKind).toBe('missiles');
+  });
+
+  it('drops the kind when two sources name different kinds at the same colour', () => {
+    const states = compose({ alerts: [
+      alertRow({ id: 'a-1', alert_level: 'red', alert_kind: 'missiles' }),
+      alertRow({ id: 'a-2', alert_level: 'red', alert_kind: 'drones' })
+    ] });
+    // Колір лишається — його назвали обидва. Виду немає: «ракетно-дронова» була б третьою заявою,
+    // якої не зробило жодне джерело.
+    expect(byLocation(states, 'ua-32-01')).toMatchObject({ alertLevel: 'red' });
+    expect(byLocation(states, 'ua-32-01').alertKind).toBeUndefined();
+  });
+
+  it('treats silence about the kind as silence, not as disagreement', () => {
+    const states = compose({ alerts: [
+      alertRow({ id: 'a-1', alert_level: 'red' }),
+      alertRow({ id: 'a-2', alert_level: 'red', alert_kind: 'drones_missiles' })
+    ] });
+    expect(byLocation(states, 'ua-32-01').alertKind).toBe('drones_missiles');
+  });
+
+  it('ignores a colour nobody declared, whatever the string says', () => {
+    // Рівень приходить із бази рядком. Невідомий рядок мусить важити рівно стільки ж, скільки
+    // відсутність рівня, — інакше зіпсоване значення ставало б найсильнішим на території.
+    const states = compose({ alerts: [
+      alertRow({ id: 'a-1', alert_level: 'purple' as unknown as 'red' }),
+      alertRow({ id: 'a-2', alert_level: 'yellow', alert_kind: 'drones' })
+    ] });
+    expect(byLocation(states, 'ua-32-01').alertLevel).toBe('yellow');
+  });
+
+  it('serialises an alert with no colour byte for byte as it did before levels existed', () => {
+    // Найчастіший випадок і єдиний, у якому «нічого не змінилося» треба довести буквально: ні
+    // територія, ні її рядок тривоги не мають отримати ЖОДНОГО нового ключа — ані `null`.
+    const [oblast, raion] = compose({ alerts: [alertRow()] });
+    expect(JSON.stringify(raion!.alerts)).toBe(JSON.stringify([{
+      alertType: 'air_raid', startedAt: ago(20 * 60_000),
+      locationId: 'ua-32-01', locationName: 'Бучанський район', coverage: 'direct'
+    }]));
+    for (const state of [oblast!, raion!]) {
+      expect(Object.keys(state)).toEqual([
+        'locationId', 'tier', 'name', 'parentId', 'coverage', 'alertActive', 'alertSince', 'alerts',
+        'threats', 'expected', 'threatActive', 'consequences', 'assessment', 'analyticStatus',
+        'icons', 'iconOverflow', 'publishedAt'
+      ]);
+      expect(Object.keys(state.alerts[0]!))
+        .toEqual(['alertType', 'startedAt', 'locationId', 'locationName', 'coverage']);
+    }
+    expect(JSON.stringify(raion)).not.toContain('level');
+    expect(JSON.stringify(raion)).not.toContain('kind');
+  });
+
+  it('puts the two keys beside alertSince when the colour is there', () => {
+    // Порядок ключів — це й є формат: `alertLevel` стоїть там, де стоїть решта сказаного про
+    // тривогу, а не дописується в хвіст обʼєкта.
+    const raion = byLocation(compose({ alerts: [alertRow({ alert_level: 'red', alert_kind: 'missiles' })] }), 'ua-32-01');
+    expect(Object.keys(raion).slice(0, 10)).toEqual([
+      'locationId', 'tier', 'name', 'parentId', 'coverage',
+      'alertActive', 'alertSince', 'alertLevel', 'alertKind', 'alerts'
+    ]);
+  });
+});

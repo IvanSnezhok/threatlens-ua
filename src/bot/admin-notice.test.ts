@@ -2,8 +2,8 @@ import { Registry } from 'prom-client';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { config } from '../config.js';
 import {
-  ADMIN_NOTICE_COOLDOWN_MS, notifyAdmin, registerAdminNoticeMetrics, resetAdminNotices,
-  setAdminNoticeBot, type AdminNoticeReason
+  ADMIN_NOTICE_COOLDOWN_MS, notifyAdmin, notifyUnsubscribedChannels, registerAdminNoticeMetrics,
+  resetAdminNotices, setAdminNoticeBot, type AdminNoticeReason, type UnsubscribedChannel
 } from './admin-notice.js';
 
 /**
@@ -139,6 +139,68 @@ describe('cooldown', () => {
     ]);
     expect(outcomes.sort()).toEqual(['sent', 'suppressed']);
     expect(sent).toHaveLength(1);
+  });
+});
+
+/**
+ * Канал зв'язано, акаунт не підписаний — умова, яку колектор не називає станом.
+ *
+ * Стан колектора лишається `ready`, тож структурного дебаунса «по зміні стану», на якому тримаються
+ * решта причин, тут немає взагалі: детектор викликається щопроходу. Через це набір каналів — єдине,
+ * що відрізняє подію від повтору, і саме це перевіряється нижче.
+ */
+describe('bound but not subscribed', () => {
+  const route = (username: string, kind: UnsubscribedChannel['kind'] = 'classifier'):
+  UnsubscribedChannel => ({ username, sourceId: `osint-${username}`, kind });
+
+  it('announces a changed set at once and holds an unchanged one to the cooldown', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-08-10T09:00:00Z'));
+    const sent = recorder();
+
+    expect(await notifyUnsubscribedChannels([route('alpha', 'alert')])).toBe('sent');
+    expect(sent[0]!.text).toContain('@alpha (тривоги)');
+    vi.advanceTimersByTime(60_000);
+    expect(await notifyUnsubscribedChannels([route('alpha', 'alert')])).toBe('suppressed');
+
+    // Оператор зареєстрував другий канал і теж не підписався. Півгодинний кулдаун проковтнув би
+    // рівно цю лінію — і оператор вважав би, що з другим каналом усе гаразд.
+    vi.advanceTimersByTime(60_000);
+    expect(await notifyUnsubscribedChannels([route('beta'), route('alpha', 'alert')])).toBe('sent');
+    expect(sent).toHaveLength(2);
+    expect(sent[1]!.text).toContain('@beta (моніторинг)');
+  });
+
+  it('compares the set, not the order the resolve pass happened to walk the dialogs in', async () => {
+    const sent = recorder();
+    expect(await notifyUnsubscribedChannels([route('alpha'), route('beta')])).toBe('sent');
+    expect(await notifyUnsubscribedChannels([route('beta'), route('alpha')])).toBe('suppressed');
+    expect(sent).toHaveLength(1);
+  });
+
+  it('re-arms on a clean pass, so the next unsubscribed channel is not swallowed', async () => {
+    const registry = new Registry();
+    registerAdminNoticeMetrics(registry);
+    const before = await counted(registry, 'collector_unsubscribed', 'clear');
+    const sent = recorder();
+
+    expect(await notifyUnsubscribedChannels([route('alpha')])).toBe('sent');
+    expect(await notifyUnsubscribedChannels([])).toBe('clear');
+    expect(await counted(registry, 'collector_unsubscribed', 'clear')).toBe(before + 1);
+    // Той самий канал, але між двома появами був прохід, який нічого не знайшов: підписку зняли
+    // вдруге, і це друга подія, а не продовження першої.
+    expect(await notifyUnsubscribedChannels([route('alpha')])).toBe('sent');
+    expect(sent).toHaveLength(2);
+  });
+
+  it('names a bounded prefix and counts the rest, whatever the registry size', async () => {
+    const sent = recorder();
+    const many = Array.from({ length: 11 }, (_, index) =>
+      route(`chan${String(index).padStart(2, '0')}`));
+    expect(await notifyUnsubscribedChannels(many)).toBe('sent');
+    expect(sent[0]!.text).toContain('@chan00');
+    expect(sent[0]!.text).not.toContain('@chan10');
+    expect(sent[0]!.text).toContain('та ще 3');
   });
 });
 

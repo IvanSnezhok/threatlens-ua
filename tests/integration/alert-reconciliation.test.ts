@@ -27,6 +27,38 @@ function alarmBody(regions: RegionAlert[]): unknown {
   }));
 }
 
+/**
+ * Тіло `alerts.in.ua`: колір стоїть НА ТРИВОЗІ, поруч із `alert_type`, а різновид виводиться з
+ * `threats[]`. Значення `threat_type` — ті, що їх віддає живий API (зріз 22.09.2026: `drones` і
+ * `unspecified_missiles`).
+ *
+ * Те саме тіло подається і на URL Ukraine Alarm там, де тестові потрібні ДВА джерела з РІЗНИМИ
+ * кольорами. Це скорочення гарнесу, а не твердження про v3: у бойовій системі другим кольоровим
+ * джерелом є дзеркало. Правило, яке тут перевіряється, — зведення, і воно не питає, хто саме
+ * назвав колір.
+ */
+interface LevelledAlert {
+  regionId: string;
+  regionName: string;
+  level?: 'yellow' | 'red';
+  threats?: string[];
+  startedAt?: string;
+}
+
+function levelBody(alerts: LevelledAlert[]): unknown {
+  return {
+    alerts: alerts.map((alert) => ({
+      region_id: alert.regionId,
+      region_name: alert.regionName,
+      alert_type: 'air_raid',
+      status: 'active',
+      started_at: alert.startedAt ?? ALERT_START,
+      ...(alert.level ? { alert_level: alert.level } : {}),
+      ...(alert.threats ? { threats: alert.threats.map((threat) => ({ threat_type: threat })) } : {})
+    }))
+  };
+}
+
 /** Per-URL response queue; each adapter reads only its own entry. */
 const responses = new Map<string, unknown>();
 
@@ -50,9 +82,21 @@ async function syncAlertsInUa(body: unknown): Promise<void> {
   await sync();
 }
 
-async function alertPeriods(): Promise<Array<{ id: string; status: string; started_at: string; ended_at: string | null }>> {
-  const rows = await sql<{ id: string; status: string; started_at: string; ended_at: string | null }>(
-    `SELECT id,status,started_at::text,ended_at::text FROM alert_periods ORDER BY started_at,id`
+interface PeriodRow {
+  id: string;
+  status: string;
+  started_at: string;
+  ended_at: string | null;
+  alert_level: string | null;
+  alert_kind: string | null;
+  alert_level_changed_at: string | null;
+}
+
+async function alertPeriods(): Promise<PeriodRow[]> {
+  const rows = await sql<PeriodRow>(
+    `SELECT id,status,started_at::text,ended_at::text,alert_level,alert_kind,
+            alert_level_changed_at::text
+       FROM alert_periods ORDER BY started_at,id`
   );
   return rows.rows;
 }
@@ -68,6 +112,16 @@ async function sourceStates(): Promise<Array<{ source_id: string; active: boolea
   const rows = await sql<{ source_id: string; active: boolean }>(
     `SELECT source_id,active FROM alert_source_states ORDER BY source_id`
   );
+  return rows.rows;
+}
+
+/** Те саме, але з кольором: що САМЕ сказало кожне джерело про цю пару. */
+async function sourceLevels(): Promise<Array<{
+  source_id: string; active: boolean; alert_level: string | null; alert_kind: string | null;
+}>> {
+  const rows = await sql<{
+    source_id: string; active: boolean; alert_level: string | null; alert_kind: string | null;
+  }>(`SELECT source_id,active,alert_level,alert_kind FROM alert_source_states ORDER BY source_id`);
   return rows.rows;
 }
 
@@ -270,40 +324,37 @@ describe.skipIf(!integrationDatabaseAvailable)('official alert reconciliation', 
     expect(periods[0]!.status).toBe('active');
   });
 
-  it('tracks alert types independently for the same location', async () => {
+  it('writes only the air raid when a location also reports another alert type', async () => {
+    // `alert_periods` holds air raids and nothing else (`INGESTED_ALERT_TYPE` in ingestion.ts):
+    // every `alert_start` downstream is rendered as «🔴 Повітряна тривога», so an artillery row
+    // written here would be announced to subscribers as an air raid. The other type is dropped
+    // before the location lookup, counted on `threatlens_alarm_records_dropped_total`, and never
+    // becomes a source row that could hold anything.
     await syncUkraineAlarm(alarmBody([
       { regionId: OBLAST, regionName: 'Київська область', types: ['AIR', 'ARTILLERY'] }
     ]));
 
-    const rows = await sql<{ alert_type: string }>(
-      `SELECT alert_type FROM alert_periods ORDER BY alert_type`
-    );
-    expect(rows.rows.map((row) => row.alert_type)).toEqual(['air_raid', 'artillery']);
-
-    await syncUkraineAlarm(alarmBody([
-      { regionId: OBLAST, regionName: 'Київська область', types: ['AIR'] }
-    ]));
-    // The dropped type is debounced on its own, independently of the type that is still reported.
-    const debounced = await sql<{ alert_type: string; status: string }>(
+    const rows = await sql<{ alert_type: string; status: string }>(
       `SELECT alert_type,status FROM alert_periods ORDER BY alert_type`
     );
-    expect(debounced.rows).toEqual([
-      { alert_type: 'air_raid', status: 'active' },
-      { alert_type: 'artillery', status: 'active' }
-    ]);
+    expect(rows.rows).toEqual([{ alert_type: 'air_raid', status: 'active' }]);
+    expect(await sourceStates()).toEqual([{ source_id: 'ukraine-alarm', active: true }]);
 
+    // Nor can the dropped type keep the air raid alive: once only shelling is reported, the air raid
+    // is debounced and ended exactly as if the location had gone quiet.
+    await syncUkraineAlarm(alarmBody([
+      { regionId: OBLAST, regionName: 'Київська область', types: ['ARTILLERY'] }
+    ]));
     await ageAbsencesPastDebounce();
     await syncUkraineAlarm(alarmBody([
-      { regionId: OBLAST, regionName: 'Київська область', types: ['AIR'] }
+      { regionId: OBLAST, regionName: 'Київська область', types: ['ARTILLERY'] }
     ]));
 
     const after = await sql<{ alert_type: string; status: string }>(
       `SELECT alert_type,status FROM alert_periods ORDER BY alert_type`
     );
-    expect(after.rows).toEqual([
-      { alert_type: 'air_raid', status: 'active' },
-      { alert_type: 'artillery', status: 'ended' }
-    ]);
+    expect(after.rows).toEqual([{ alert_type: 'air_raid', status: 'ended' }]);
+    expect(await sourceStates()).toEqual([{ source_id: 'ukraine-alarm', active: false }]);
   });
 
   it('adopts the earliest provider start timestamp across sources', async () => {
@@ -431,5 +482,173 @@ describe.skipIf(!integrationDatabaseAvailable)('official alert reconciliation', 
     expect(periods.map((period) => period.status)).toEqual(['ended', 'active']);
     expect((await alertEvents()).map((event) => event.event_type))
       .toEqual(['alert.started', 'alert.ended', 'alert.started']);
+  });
+
+  // ------------------------------------------------------------------------------------------
+  // Рівень тривоги: прикмета, яка не має права стати тотожністю
+  // ------------------------------------------------------------------------------------------
+  //
+  // Диференційоване оповіщення, чинне з 06.09.2026. Усе нижче перевіряє одну межу: колір описує
+  // тривогу, яку вже визнали ввімкненою, і не бере участі в рішенні «тривога є чи немає».
+
+  const kyiv = (level?: 'yellow' | 'red', threats?: string[]) => levelBody([{
+    regionId: OBLAST, regionName: 'Київська область',
+    ...(level ? { level } : {}), ...(threats ? { threats } : {})
+  }]);
+
+  it('replaces the colour inside one standing period instead of opening a second one', async () => {
+    await syncAlertsInUa(kyiv('yellow', ['drones']));
+    const opened = await alertPeriods();
+    expect(opened).toHaveLength(1);
+    expect(opened[0]).toMatchObject({
+      status: 'active', alert_level: 'yellow', alert_kind: 'drones', alert_level_changed_at: null
+    });
+
+    await syncAlertsInUa(kyiv('red', ['unspecified_missiles']));
+
+    const periods = await alertPeriods();
+    // ОДИН період, той самий рядок, той самий старт, без відбою. Це і є вся суть зміни: якби колір
+    // жив у `alert_type`, тут було б два періоди і «⚪ Відбій тривоги» посеред посилення.
+    expect(periods).toHaveLength(1);
+    expect(periods[0]!.id).toBe(opened[0]!.id);
+    expect(periods[0]!.started_at).toBe(opened[0]!.started_at);
+    expect(periods[0]).toMatchObject({ status: 'active', ended_at: null, alert_level: 'red', alert_kind: 'missiles' });
+    expect(periods[0]!.alert_level_changed_at).not.toBeNull();
+
+    const events = await alertEvents();
+    expect(events.map((event) => event.event_type)).toEqual(['alert.started', 'alert.level_changed']);
+    expect(events[0]!.payload).toMatchObject({ level: 'yellow', kind: 'drones' });
+    expect(events[1]!.payload).toMatchObject({
+      alertPeriodId: periods[0]!.id, locationId: OBLAST,
+      level: 'red', previousLevel: 'yellow', kind: 'missiles', previousKind: 'drones'
+    });
+    expect(events[1]!.payload.changedAt).toEqual(expect.any(String));
+  });
+
+  it('does not repeat alert.level_changed when the same colour is re-reported', async () => {
+    await syncAlertsInUa(kyiv('red', ['unspecified_missiles']));
+    await syncAlertsInUa(kyiv('red', ['unspecified_missiles']));
+    await syncAlertsInUa(kyiv('red', ['unspecified_missiles']));
+
+    expect((await alertEvents()).map((event) => event.event_type)).toEqual(['alert.started']);
+  });
+
+  it('takes the strongest colour when two sources holding the alert disagree', async () => {
+    const red = levelBody([{
+      regionId: OBLAST, regionName: 'Київська область', level: 'red', threats: ['unspecified_missiles']
+    }]);
+    await syncAlertsInUa(kyiv('yellow', ['drones']));
+    await syncUkraineAlarm(red);
+    // Друге опитування — не повтор заради повтору. `markSourceSuccess` пишеться ПІСЛЯ знімка, тож
+    // під час свого найпершого проходу джерело ще виглядає мертвим і правило живості не дає йому
+    // голосу — а разом із голосом і кольору. Щоб перевірялося саме «найсильніший СЕРЕД ТИХ, ХТО
+    // ТРИМАЄ», обидва джерела мусять бути живими.
+    await syncUkraineAlarm(red);
+
+    // Кожне джерело зберігає СВІЙ колір — саме з цих двох рядків зведення й рахує найсильніший.
+    expect(await sourceLevels()).toEqual([
+      { source_id: 'alerts-in-ua', active: true, alert_level: 'yellow', alert_kind: 'drones' },
+      { source_id: 'ukraine-alarm', active: true, alert_level: 'red', alert_kind: 'missiles' }
+    ]);
+    const periods = await alertPeriods();
+    // Обережність дорожча за консенсус: більшість каже «жовтий», період червоний.
+    expect(periods).toHaveLength(1);
+    expect(periods[0]).toMatchObject({ status: 'active', alert_level: 'red', alert_kind: 'missiles' });
+  });
+
+  it('refuses the colour of a source that is too dead to hold the alert', async () => {
+    // Та сама межа, з якої починається все інше: рівень рахується РІВНО з тих рядків, що тримають
+    // тривогу. Рядок, який правило живості відкинуло, не голосує — отже й не фарбує. Інакше
+    // джерело, яке замовкло годину тому, могло б лишити на карті червоний, якого вже ніхто не
+    // підтверджує.
+    const red = levelBody([{
+      regionId: OBLAST, regionName: 'Київська область', level: 'red', threats: ['unspecified_missiles']
+    }]);
+    await syncUkraineAlarm(red);
+    await syncUkraineAlarm(red);
+    // Друге джерело приходить живим і слабшим: поки обидва живі, перемагає червоний.
+    await syncAlertsInUa(kyiv('yellow', ['drones']));
+    await syncAlertsInUa(kyiv('yellow', ['drones']));
+    expect((await alertPeriods())[0]).toMatchObject({ alert_level: 'red', alert_kind: 'missiles' });
+
+    // Тепер Ukraine Alarm мертвий, alerts.in.ua живий. Живий виграє не тому, що він гучніший, — а
+    // тому, що мертвого взагалі не рахують. Правило `any_alive` при цьому не вимикається: живе
+    // джерело в наборі є, тож відкидання мертвого дозволене.
+    await sql(`UPDATE sources SET last_success_at=now()-interval '2 hours' WHERE id='ukraine-alarm'`);
+    await syncAlertsInUa(kyiv('yellow', ['drones']));
+
+    const periods = await alertPeriods();
+    expect(periods).toHaveLength(1);
+    // Тривога СТОЇТЬ — її тримає живе джерело, — а колір знизився до жовтого. Зниження кольору не
+    // є відбоєм і ніколи ним не підписується: `ended_at` лишається NULL, події `alert.ended` немає.
+    expect(periods[0]).toMatchObject({ status: 'active', ended_at: null, alert_level: 'yellow', alert_kind: 'drones' });
+    expect((await alertEvents()).map((event) => event.event_type))
+      .toEqual(['alert.started', 'alert.level_changed']);
+  });
+
+  it('keeps the alert standing when the colour disappears from every source', async () => {
+    await syncAlertsInUa(kyiv('red', ['unspecified_missiles']));
+    const opened = await alertPeriods();
+
+    // Те саме джерело, та сама тривога, кольору більше не називають. Це НЕ відбій і навіть не
+    // послаблення — джерело перестало уточнювати, а не перестало тримати.
+    await syncAlertsInUa(kyiv());
+
+    const periods = await alertPeriods();
+    expect(periods).toHaveLength(1);
+    expect(periods[0]).toMatchObject({ id: opened[0]!.id, status: 'active', ended_at: null });
+    expect(periods[0]!.alert_level).toBeNull();
+    expect(periods[0]!.alert_kind).toBeNull();
+    // Зникнення кольору — це зміна прикмети, а не завершення: подія є, відбою немає.
+    const events = await alertEvents();
+    expect(events.map((event) => event.event_type)).toEqual(['alert.started', 'alert.level_changed']);
+    expect(events[1]!.payload).toMatchObject({ level: null, previousLevel: 'red', kind: null });
+  });
+
+  it('never puts a colour on a period that is not active', async () => {
+    await syncAlertsInUa(kyiv('red', ['unspecified_missiles']));
+    await syncAlertsInUa(levelBody([]));
+    await ageAbsencesPastDebounce();
+    await syncAlertsInUa(levelBody([]));
+
+    const ended = await alertPeriods();
+    expect(ended[0]!.status).toBe('ended');
+    const levelAtEnd = ended[0]!.alert_level;
+
+    // Джерело знову називає колір — але воно ОДНЕ й нічого не тримає між опитуваннями, тож
+    // завершений період кольору не набуває: гілка зміни рівня вимагає активного періоду, а гілка
+    // створення відкриває НОВИЙ період зі своїм кольором. Старий рядок не рухається взагалі.
+    await syncAlertsInUa(levelBody([{
+      regionId: OBLAST, regionName: 'Київська область', level: 'yellow', threats: ['drones'],
+      startedAt: '2026-02-01T23:15:00.000Z'
+    }]));
+
+    const periods = await alertPeriods();
+    expect(periods.map((period) => period.status)).toEqual(['ended', 'active']);
+    // Завершений рядок лишився таким, яким був у мить відбою — це запис про те, якою тривога БУЛА,
+    // і жодна зміна рівня його більше не торкається.
+    expect(periods[0]!.alert_level).toBe(levelAtEnd);
+    expect(periods[0]!.alert_level_changed_at).toBeNull();
+    expect(periods[1]).toMatchObject({ status: 'active', alert_level: 'yellow', alert_kind: 'drones' });
+
+    // Жодного `alert.level_changed` про завершений період.
+    const changes = (await alertEvents())
+      .filter((event) => event.event_type === 'alert.level_changed')
+      .map((event) => event.payload.alertPeriodId);
+    expect(changes).not.toContain(periods[0]!.id);
+  });
+
+  it('leaves an uncoloured alert exactly as it was before differentiated alerting', async () => {
+    // Найчастіший випадок і єдиний, який не має права змінитися: жодного кольору ніде, рядок
+    // періоду такий самий, як був, подія `alert.started` несе два `null`.
+    await syncUkraineAlarm(kyivAlert());
+
+    const periods = await alertPeriods();
+    expect(periods[0]).toMatchObject({
+      status: 'active', alert_level: null, alert_kind: null, alert_level_changed_at: null
+    });
+    const events = await alertEvents();
+    expect(events.map((event) => event.event_type)).toEqual(['alert.started']);
+    expect(events[0]!.payload).toMatchObject({ locationId: OBLAST, level: null, kind: null });
   });
 });

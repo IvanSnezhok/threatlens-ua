@@ -48,7 +48,9 @@ const MIGRATION_FILES = [
   '044_publication_channels.sql',
   '045_model_enrichment.sql',
   '046_origin_zone.sql', '047_codex_speed.sql', '048_attack_stats.sql', '049_codex_primary.sql', '050_alert_granularity.sql', '051_hromada_rows.sql',
-  '052_downtime_digest.sql'
+  '052_downtime_digest.sql',
+  '053_hot_path_indexes.sql',
+  '054_alert_level.sql'
 ];
 
 /**

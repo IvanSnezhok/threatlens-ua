@@ -19,10 +19,33 @@ const FIXTURES = resolve(import.meta.dirname, '../../tests/fixtures');
 const skogBody = JSON.parse(readFileSync(resolve(FIXTURES, 'aerial-mirror-raw-skog.json'), 'utf8')) as unknown;
 const klimenkoBody = JSON.parse(readFileSync(resolve(FIXTURES, 'aerial-mirror-raw-klimenko.json'), 'utf8')) as unknown;
 
-// Обидві фікстури мають `cachedat` 19.08.2026 ~17:10 за Києвом; `now` береться поруч, щоб перевірка
-// свіжості не відкинула тіло й не перетворила кожен тест на перевірку staleness.
+/**
+ * Другий зріз того самого фіда — 22.09.2026 19:06 за Києвом, уже З КОЛЬОРОМ.
+ *
+ * Окрема фікстура, а не оновлення попередньої, і це навмисно. Зріз 19.08.2026 знятий ДО того, як
+ * Уряд запровадив диференційоване оповіщення (06.09.2026), тож поля `alert_level` у ньому немає
+ * взагалі — і саме тому він цінний: він доводить, що тіло без кольору парситься точно так, як
+ * парсилося завжди, і жодна тривога від цього не зникає. Перезняти його означало б цю перевірку
+ * втратити, а заразом переписати п'ять тверджень про ГРАНУЛЯРНІСТЬ (п'ять районів Харківщини,
+ * `enabled_at` Богодухівського, три оголошені області), які до кольору не мають стосунку: у
+ * вересневому зрізі Харківщина має один район, а Луганщина — вісім.
+ *
+ * Обрізано до п'яти областей, у яких видно кожну форму, що має значення: оголошена ціла область із
+ * червоним (Луганщина), вимкнена область із вісьмома червоними районами (Донеччина), вимкнена
+ * область із жовтими районами й одним тихим (Чернігівщина), ввімкнена область БЕЗ кольору
+ * (АР Крим — постійний запис із 2022 року) і тиха область (Тернопільщина).
+ */
+const klimenkoLevelsBody = JSON.parse(
+  readFileSync(resolve(FIXTURES, 'aerial-mirror-raw-klimenko-levels.json'), 'utf8')
+) as unknown;
+
+// Обидві серпневі фікстури мають `cachedat` 19.08.2026 ~17:10 за Києвом; `now` береться поруч, щоб
+// перевірка свіжості не відкинула тіло й не перетворила кожен тест на перевірку staleness.
 const NOW = new Date('2026-08-19T14:11:00Z');
 const STALE = 300;
+
+/** Поруч із `cachedat` вересневої фікстури: 19:06:10 за Києвом — це 16:06:10 UTC. */
+const NOW_LEVELS = new Date('2026-09-22T16:07:00Z');
 
 describe('skog: райони й громади, без обласної згортки', () => {
   const snapshot = parseAerialMirrorSkogPayload(skogBody, NOW, STALE);
@@ -99,6 +122,94 @@ describe('klimenko: оголошення рівня області', () => {
   it('refuses a body that is not this feed', () => {
     expect(() => parseAerialMirrorKlimenkoPayload({ raw: [] }, NOW, STALE)).toThrow(/no `raw` object/);
     expect(() => parseAerialMirrorKlimenkoPayload(null, NOW, STALE)).toThrow(/not a JSON object/);
+  });
+
+  it('reads a body captured before differentiated alerting as a body with no colour at all', () => {
+    // Зріз 19.08.2026 не має поля `alert_level` ніде. Це не збій і не привід нічого відкинути:
+    // тривоги лишаються всі до одної, просто жодна з них не має кольору. Саме так має виглядати
+    // будь-яка тривога, про колір якої джерело мовчить, — і саме це найчастіший випадок.
+    expect(snapshot.regions).toHaveLength(8);
+    expect(snapshot.regions.every((region) => region.threatLevel === undefined)).toBe(true);
+    expect(snapshot.byThreatLevel).toEqual({ yellow: 0, red: 0, unknown: 0 });
+  });
+});
+
+/**
+ * Колір тривоги, прочитаний із живого тіла.
+ *
+ * Числа взяті з того самого зрізу, у якому вони виміряні, тож вони перевіряються, а не вигадані:
+ * повне тіло 22.09.2026 19:06 мало 153 вузли, 34 ввімкнених, 12 `red`, 20 `yellow` і 2 ввімкнених
+ * без кольору. Фікстура — п'ять областей із нього.
+ */
+describe('klimenko: колір тривоги', () => {
+  const snapshot = parseAerialMirrorKlimenkoPayload(klimenkoLevelsBody, NOW_LEVELS, STALE);
+  const byName = new Map(snapshot.regions.map((region) => [region.name, region]));
+
+  it('carries the colour the feed declared, on the oblast and on the raion alike', () => {
+    expect(byName.get('Луганська область')?.threatLevel).toBe('red');
+    expect(byName.get('Покровський район')?.threatLevel).toBe('red');
+    expect(byName.get('Ніжинський район')?.threatLevel).toBe('yellow');
+    // Щабель адміністративний і колір — дві різні осі, і поля в них різні. Луганщина тут State і
+    // водночас red; якби це було одне поле, одне зі значень довелося б втратити.
+    expect(byName.get('Луганська область')?.level).toBe('State');
+  });
+
+  it('leaves a holding region without a colour when the feed named none', () => {
+    // АР Крим і Севастополь стоять ввімкненими з 2022 року й кольору не мають. Це НЕ означає «менша
+    // небезпека» — лише «кольору не назвали», і тривога від цього нікуди не дівається.
+    expect(byName.get('АР Крим')?.active).toBe(true);
+    expect(byName.get('АР Крим')).not.toHaveProperty('threatLevel');
+  });
+
+  it('counts holding nodes by colour, and only holding ones', () => {
+    // Донеччина: сама область вимкнена, під нею вісім червоних районів. Чернігівщина: область
+    // вимкнена, чотири жовті райони й один тихий. Плюс червона Луганщина.
+    expect(snapshot.byThreatLevel).toEqual({ yellow: 4, red: 9, unknown: 0 });
+    // Рівно стільки ж кольорових записів, скільки регіонів із кольором у знімку: лічильник не
+    // може розійтися з тим, що поїде далі.
+    expect(snapshot.regions.filter((region) => region.threatLevel).length).toBe(13);
+    expect(snapshot.regions).toHaveLength(14);
+  });
+
+  it('never reads a colour off a region that is switched off', () => {
+    expect(byName.has('Донецька область')).toBe(false);
+    expect(byName.has('Тернопільська область')).toBe(false);
+    expect(byName.has('Прилуцький район')).toBe(false);
+  });
+
+  it('drops a colour the domain does not know instead of widening the enum', () => {
+    // Не з фікстури, бо апстрім такого не віддає — і саме тому це треба перевірити окремо. Колір,
+    // якого немає в переліку, не має права доїхати ні до знімка, ні до CHECK у міграції 054:
+    // перелік домену розширюється міграцією, а не тілом, яке приїхало вночі.
+    const invented = parseAerialMirrorKlimenkoPayload({
+      source: 'klimenko', cachedat: '2026-09-22 19:06:10',
+      raw: {
+        'Сумська область': {
+          enabled: true, 'type:': 'state', alert_level: 'crimson',
+          districts: {
+            'Сумський район': { enabled: true, alert_level: 'red', enabled_at: '2026-09-22T14:00:00.000Z' }
+          },
+          enabled_at: '2026-09-22T14:00:00.000Z'
+        }
+      }
+    }, NOW_LEVELS, STALE);
+    const oblast = invented.regions.find((region) => region.name === 'Сумська область')!;
+    // Тривога лишається — відкинуто ЛИШЕ колір. Втратити тривогу через незнайоме значення прикмети
+    // було б рівно тим, чого ця система не має права робити.
+    expect(oblast.active).toBe(true);
+    expect(oblast).not.toHaveProperty('threatLevel');
+    expect(invented.byThreatLevel).toEqual({ yellow: 0, red: 1, unknown: 1 });
+  });
+
+  it('emits the colour into the snapshot body, and omits the field where there is none', () => {
+    const body = toAlarmSnapshotBody(snapshot, 'declaration') as {
+      states: Array<{ regionName: string; alertLevel?: string }>;
+    };
+    const state = (name: string) => body.states.find((row) => row.regionName === name)!;
+    expect(state('Луганська область').alertLevel).toBe('red');
+    expect(state('Ніжинський район').alertLevel).toBe('yellow');
+    // Тіло тривоги без кольору — байт у байт те саме, що й до 06.09.2026.
+    expect(state('АР Крим')).not.toHaveProperty('alertLevel');
   });
 });
 

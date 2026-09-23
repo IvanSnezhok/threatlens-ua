@@ -2,6 +2,7 @@ import { Counter, Gauge, Histogram, type Registry } from 'prom-client';
 import { config } from '../config.js';
 import { pool } from '../db/pool.js';
 import { PUBLICATION_MODES, type PublicationMode } from '../types.js';
+import { eventLogGapBlockedAge, eventLogGapCrossed, eventLogGapStalls } from './event-log-cursor.js';
 import { resolveRuntimeSettings, settingsReadFailures } from './runtime-settings.js';
 
 /**
@@ -24,9 +25,11 @@ import { resolveRuntimeSettings, settingsReadFailures } from './runtime-settings
  * code (CONTRACT §2.4, `docs/METHODOLOGY.md` §Publication).
  *
  * The import list is deliberately short — `../config.js`, `../db/pool.js`, `./runtime-settings.js`,
- * `../types.js` and `prom-client`, nothing ops-only. `src/api/vector-isolation.test.ts` walks the
- * module graph from `src/services/sse.ts` and `src/repositories/events.ts`, both of which now reach
- * this file, and lists this file itself as a public entry point.
+ * `./event-log-cursor.js`, `../types.js` and `prom-client`, nothing ops-only.
+ * `src/api/vector-isolation.test.ts` walks the module graph from `src/services/sse.ts` and
+ * `src/repositories/events.ts`, both of which now reach this file, and lists this file itself as a
+ * public entry point. `./event-log-cursor.js` is imported for its metric objects alone (see
+ * {@link METRICS}); it imports nothing of its own, so it adds one node to that graph and no edges.
  */
 
 export interface PublicationSlice {
@@ -83,10 +86,30 @@ const ingestionLag = new Histogram({
   help: 'Seconds between a source message\'s publication time and the moment ingestion accepted it',
   labelNames: ['source'], buckets: [0.5, 1, 2, 5, 10, 30, 60, 300], registers: []
 });
+/**
+ * Скільки триває класифікація й запис ОДНОГО повідомлення, по шляху конвеєра.
+ *
+ * Верхня корзина — 60 с, і вибрана вона проти `CODEX_PRIMARY_TIMEOUT_MS` (`src/config.ts`, типово
+ * 20 000 мс). Доти тут стояло 5 с, а це менше за саму лише стелю очікування моделі: у режимі
+ * `classifier_mode=codex` шлях `classifier` містить виклик моделі, тож УВЕСЬ хвіст, заради якого це
+ * число й читають, падав у `+Inf` — одна корзина, з якої не видно ні p95, ні різниці між «модель
+ * відповіла повільно» і «модель не відповіла».
+ *
+ * Корзини нижче 5 с лишилися незмінними, тож історична форма розподілу (шлях `alert` і правила, які
+ * вкладаються в десяті частки секунди) читається так само, як читалася. Додані три:
+ *
+ *   * **20 с** — рівно типове `CODEX_PRIMARY_TIMEOUT_MS`, тобто межа «модель відповіла» / «ми
+ *     перестали чекати». Різниця двох сусідніх корзин навколо неї — це і є частка вичерпаних
+ *     таймаутів, без окремої серії;
+ *   * **30 с** — таймаут ПЛЮС запасний шлях: вичерпавши очікування, повідомлення класифікують
+ *     правила й пишуть подію, і ця добавка мусить бути видима як корзина, а не як переповнення;
+ *   * **60 с** — запас на оператора, який підняв тюнабл (`db_tunable`, стеля 120 000 мс): інакше
+ *     перша ж ніч із підвищеним таймаутом знову склалася б у `+Inf`.
+ */
 const classificationDuration = new Histogram({
   name: 'threatlens_classification_duration_seconds',
   help: 'Seconds spent classifying and persisting one message, by pipeline path',
-  labelNames: ['path'], buckets: [0.01, 0.05, 0.1, 0.25, 0.5, 1, 2, 5], registers: []
+  labelNames: ['path'], buckets: [0.01, 0.05, 0.1, 0.25, 0.5, 1, 2, 5, 10, 20, 30, 60], registers: []
 });
 const publicationLag = new Gauge({
   name: 'threatlens_publication_lag_seconds',
@@ -158,6 +181,18 @@ const sourceCacheAge = new Gauge({
   help: 'How old the data in a provider response was, by the provider own cache stamp',
   labelNames: ['source', 'feed'], registers: []
 });
+/**
+ * Рядки, які офіційний фід прислав, а ця система свідомо не записала.
+ *
+ * Лічильник, а не тиша, бо це єдина форма втрати, яку інакше нізвідки не видно: джерело здорове,
+ * опитування вдале, помилки немає — просто частина відповіді не лягла в таблицю. Мітка `reason`
+ * тримає причину такою ж вузькою, як рішення, що її створило.
+ */
+const alarmRecordsDropped = new Counter({
+  name: 'threatlens_alarm_records_dropped_total',
+  help: 'Provider alert rows deliberately not written, by source and reason',
+  labelNames: ['source', 'reason'], registers: []
+});
 
 const METRICS: ReadonlyArray<[string, Counter<string> | Gauge<string> | Histogram<string>]> = [
   ['threatlens_ingestion_lag_seconds', ingestionLag],
@@ -170,11 +205,21 @@ const METRICS: ReadonlyArray<[string, Counter<string> | Gauge<string> | Histogra
   ['threatlens_channel_errors_total', channelErrors],
   ['threatlens_alert_propagation_seconds', alertPropagation],
   ['threatlens_source_cache_age_seconds', sourceCacheAge],
+  ['threatlens_alarm_records_dropped_total', alarmRecordsDropped],
   // Declared in `runtime-settings.ts` — the failure it counts happens inside
   // `resolveRuntimeSettings()`, and declaring it here would close an import cycle. Registered here
   // because this is the registrar `buildServer()` calls; without this row the series never appears
   // on /metrics and `docs/OPERATIONS.md` names an incident condition nobody can observe.
-  ['threatlens_publication_settings_read_failures_total', settingsReadFailures]
+  ['threatlens_publication_settings_read_failures_total', settingsReadFailures],
+  // Declared in `./event-log-cursor.ts`, registered here for the same reason as the row above and
+  // one more: the gap stall is a stage of the SAME delivery road `threatlens_sse_delivery_lag_seconds`
+  // measures, one step earlier — the row exists, its version is held back, and the frame has not
+  // been released yet. Both readers that can stall (`./sse.ts`, `src/bot/outbox.ts`) are already
+  // behind this registrar, so a separate call in `src/api/server.ts` would be a second place to
+  // forget rather than a clearer one.
+  ['threatlens_event_log_gap_stalls_total', eventLogGapStalls],
+  ['threatlens_event_log_gap_blocked_age_seconds', eventLogGapBlockedAge],
+  ['threatlens_event_log_gap_crossed_total', eventLogGapCrossed]
 ];
 
 export function registerPublicationMetrics(registry: Registry): void {
@@ -217,6 +262,10 @@ export function observeSseDeliveryLag(kind: 'live' | 'backfill', seconds: number
 
 export function countChannelError(sourceId: string, stage: 'collect' | 'parse' | 'persist'): void {
   channelErrors.inc({ source: sourceId, stage });
+}
+
+export function countDroppedAlarmRecords(sourceId: string, reason: string, count: number): void {
+  if (count > 0) alarmRecordsDropped.inc({ source: sourceId, reason }, count);
 }
 
 // ------------------------------------------------------------------------------------------------

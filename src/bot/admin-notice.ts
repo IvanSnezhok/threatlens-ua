@@ -49,9 +49,18 @@ export type AdminNoticeReason =
   | 'collector_degraded'
   | 'collector_flood_wait'
   | 'collector_failed'
+  | 'collector_unsubscribed'
   | 'app_settings_read_failed';
 
-export type AdminNoticeOutcome = 'sent' | 'failed' | 'suppressed' | 'disabled';
+/**
+ * `clear` is emitted by {@link notifyUnsubscribedChannels} and by nothing else.
+ *
+ * It is the same argument `disabled` makes one paragraph below: a check that ran and found nothing
+ * must be distinguishable from a check that never ran. Without the series, «жодного повідомлення
+ * про непідписані канали» is ambiguous between «усі канали підписані» and «детектор не
+ * викликається», and those two are one broken call site apart.
+ */
+export type AdminNoticeOutcome = 'sent' | 'failed' | 'suppressed' | 'disabled' | 'clear';
 
 /** Thirty minutes. Long enough that a flap is one line; short enough that a real outage repeats. */
 export const ADMIN_NOTICE_COOLDOWN_MS = 30 * 60_000;
@@ -89,6 +98,15 @@ let sender: AdminNoticeBot | null = null;
 const lastSentAt = new Map<AdminNoticeReason, number>();
 
 /**
+ * Останній оголошений набір непідписаних каналів, рядком.
+ *
+ * Один рядок, не множина: сам перелік уже обмежений реєстром, а тут потрібне лише «той самий набір
+ * чи інший». Пусто — коли непідписаних немає; тоді наступна поява оголошується негайно, не чекаючи
+ * півгодини, бо саме ця поява і є подією.
+ */
+let unsubscribedSignature = '';
+
+/**
  * Hands the notifier the process's one bot, from `src/index.ts` and nowhere else.
  *
  * Null when `createBot()` declined (no token, or `TELEGRAM_MODE=disabled`), which is a `disabled`
@@ -102,6 +120,7 @@ export function setAdminNoticeBot(bot: AdminNoticeBot | null): void {
 export function resetAdminNotices(): void {
   sender = null;
   lastSentAt.clear();
+  unsubscribedSignature = '';
 }
 
 /**
@@ -139,4 +158,80 @@ export async function notifyAdmin(
     log?.error?.({ error, reason }, 'admin notice could not be delivered');
     return 'failed';
   }
+}
+
+/** Один зв'язаний маршрут, якого немає серед діалогів акаунта колектора. */
+export interface UnsubscribedChannel {
+  /** Хендл у нижньому регістрі, як його зберігає `sources.telegram_username`. */
+  username: string;
+  sourceId: string;
+  /** `alert` іде в реконсиляцію тривог, `classifier` — у `processMessage`. Ціна мовчання різна. */
+  kind: 'alert' | 'classifier';
+}
+
+/**
+ * Скільки каналів називаємо поіменно, перш ніж дописати «та ще N».
+ *
+ * Вісім — це рядок, який ще читається в сповіщенні Telegram. Реєстр має 54 маршрути; без межі
+ * невдалий прохід резолву перетворив би повідомлення оператору на дамп реєстру.
+ */
+const UNSUBSCRIBED_NAMED_LIMIT = 8;
+
+const UNSUBSCRIBED_KIND_WORDS: Record<UnsubscribedChannel['kind'], string> = {
+  alert: 'тривоги', classifier: 'моніторинг'
+};
+
+/**
+ * Канал зв'язано, але акаунт на нього не підписаний — тобто джерело є, а повідомлень не буде.
+ *
+ * ================================================================================================
+ * Чому це окрема причина, а не `collector_degraded`
+ * ================================================================================================
+ *
+ * `degraded` означає «маршрут НЕ зв'язано»: його видно одразу, він не рахується ніде й лікується
+ * виправленням хендла. Тут протилежне: `resolveChannelPeers` дістає peer id через
+ * `contacts.ResolveUsername`, маршрут потрапляє в `byPeerId`, колектор лишається `ready`, а
+ * heartbeat щохвилини пише джерелу `last_success_at`. Джерело звітує «актуальне» і не доставляє
+ * нічого. Сховати це під словом «деградував» означало б віддати його кулдауну чужої причини — і
+ * втратити рівно тоді, коли колектор здоровий, а канал мовчить.
+ *
+ * ================================================================================================
+ * Чому зміна набору пробиває кулдаун
+ * ================================================================================================
+ *
+ * Кулдаун {@link notifyAdmin} — півгодинний і по причині. Для цього детектора це дало б рівно ту
+ * поведінку, заради якої він і писався: оператор реєструє канал А (не підписаний) — лінія пішла;
+ * через п'ять хвилин реєструє канал Б (теж не підписаний) — лінію проковтнуло, і оператор вважає,
+ * що з Б усе гаразд. Тому НОВИЙ набір скидає позначку часу й оголошується негайно, а незмінний
+ * лишається під звичайним кулдауном: постійна умова повторюється раз на півгодини, як і решта.
+ *
+ * Порожній список — не «нічого не робимо»: він гасить підпис, тож наступна поява буде оголошена
+ * одразу, і піднімає серію `clear`, яка відрізняє «перевірили й усе добре» від «не перевіряли».
+ *
+ * Ніколи не кидає у викликача: як і {@link notifyAdmin}, це побічна лінія на шляху, який мусить
+ * тривати. Очікуваний виклик — `void notifyUnsubscribedChannels(...)`.
+ */
+export async function notifyUnsubscribedChannels(
+  channels: readonly UnsubscribedChannel[], log?: { warn?: Function; error?: Function }
+): Promise<AdminNoticeOutcome> {
+  const reason: AdminNoticeReason = 'collector_unsubscribed';
+  // Сортуємо, бо підпис має залежати від НАБОРУ, а не від порядку, у якому цей прохід резолву
+  // перебирав діалоги: інакше та сама трійка каналів оголошувалася б щопроходу як нова.
+  const sorted = [...channels].sort((left, right) => left.username.localeCompare(right.username));
+  const signature = sorted.map((channel) => `${channel.kind}:${channel.username}`).join(',');
+  if (!signature) {
+    unsubscribedSignature = '';
+    adminNotices.inc({ reason, outcome: 'clear' });
+    return 'clear';
+  }
+  if (signature !== unsubscribedSignature) lastSentAt.delete(reason);
+  unsubscribedSignature = signature;
+  const named = sorted.slice(0, UNSUBSCRIBED_NAMED_LIMIT)
+    .map((channel) => `@${channel.username} (${UNSUBSCRIBED_KIND_WORDS[channel.kind]})`).join(', ');
+  const rest = sorted.length - Math.min(sorted.length, UNSUBSCRIBED_NAMED_LIMIT);
+  // Дія стоїть у тексті, бо вона єдина: підписати акаунт колектора. Кодом це не лікується, і
+  // повідомлення, яке цього не каже, відправляє оператора шукати помилку там, де її немає.
+  return notifyAdmin(reason, `${sorted.length} канал(ів) зв'язано, але акаунт колектора на них не `
+    + `підписаний: ${named}${rest > 0 ? ` та ще ${rest}` : ''}. Живих оновлень від них не буде, `
+    + 'а джерела звітують як здорові — підпишіть акаунт на канал.', log);
 }

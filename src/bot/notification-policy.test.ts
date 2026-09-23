@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
-  ASSESSMENT_COOLDOWN_MINUTES, EVIDENCE_ORDER, decideAssessmentNotification, decideThreatNotification,
+  ASSESSMENT_COOLDOWN_MINUTES, EVIDENCE_ORDER, alertLevelRank, decideAlertLevelNotification,
+  decideAssessmentNotification, decideThreatNotification,
   evidenceRank, geographyKey, mergePublishedState, riskRank, threatContentHash,
   type ThreatPublishedState, type ThreatSnapshot
 } from './notification-policy.js';
@@ -298,5 +299,71 @@ describe('what a chat is recorded as having been told', () => {
   it('takes the new threat type, which is always announced', () => {
     const merged = mergePublishedState(published(), snapshot({ threatType: 'cruise_missile' }));
     expect(merged.threatType).toBe('cruise_missile');
+  });
+});
+
+/**
+ * Диференційоване оповіщення: колір усередині тривоги, що вже триває.
+ *
+ * Перевіряється рівно те, за чим читач діє: чи буде звук і чи не назветься зниження завершенням.
+ */
+describe('alert level policy', () => {
+  it('stays quiet when neither the colour nor the kind moved', () => {
+    const decision = decideAlertLevelNotification(
+      { level: 'red', kind: 'missiles' }, { level: 'red', kind: 'missiles' }
+    );
+    expect(decision).toMatchObject({ action: 'skip', updateKind: 'none' });
+  });
+
+  it('sounds when the colour rises', () => {
+    const decision = decideAlertLevelNotification(
+      { level: 'yellow', kind: 'drones' }, { level: 'red', kind: 'drones_missiles' }
+    );
+    expect(decision).toMatchObject({ action: 'send', updateKind: 'escalation', silent: false });
+  });
+
+  it('sounds when a colour appears where the authorities had named none', () => {
+    const decision = decideAlertLevelNotification(
+      { level: null, kind: null }, { level: 'yellow', kind: 'drones' }
+    );
+    expect(decision).toMatchObject({ action: 'send', updateKind: 'escalation', silent: false });
+  });
+
+  it('sounds when the kind gains missiles at an unchanged colour', () => {
+    const decision = decideAlertLevelNotification(
+      { level: 'red', kind: 'drones' }, { level: 'red', kind: 'drones_missiles' }
+    );
+    expect(decision).toMatchObject({ action: 'send', updateKind: 'escalation', silent: false });
+  });
+
+  it('drops to a silent de-escalation when the colour falls', () => {
+    const decision = decideAlertLevelNotification(
+      { level: 'red', kind: 'drones_missiles' }, { level: 'yellow', kind: 'drones' }
+    );
+    expect(decision).toMatchObject({ action: 'send', updateKind: 'deescalation', silent: true });
+  });
+
+  it('treats a colour disappearing as a de-escalation, never as an end', () => {
+    const decision = decideAlertLevelNotification(
+      { level: 'yellow', kind: 'drones' }, { level: null, kind: null }
+    );
+    expect(decision).toMatchObject({ action: 'send', updateKind: 'deescalation', silent: true });
+  });
+
+  it('says a sideways kind change quietly, without calling it a rise or a fall', () => {
+    const decision = decideAlertLevelNotification(
+      { level: 'red', kind: 'drones_missiles' }, { level: 'red', kind: 'missiles' }
+    );
+    expect(decision).toMatchObject({ action: 'send', updateKind: 'clarification', silent: true });
+  });
+
+  it('never reads an undefined colour as stronger than red', () => {
+    // Валідацію робить база (CHECK у міграції 054), але шкала мусить бути безпечною й сама по собі:
+    // третій колір, вигаданий вище за течією, не має права прозвучати як підвищення з червоного.
+    expect(alertLevelRank('orange')).toBe(0);
+    const decision = decideAlertLevelNotification(
+      { level: 'red', kind: null }, { level: 'orange', kind: null }
+    );
+    expect(decision.updateKind).toBe('deescalation');
   });
 });

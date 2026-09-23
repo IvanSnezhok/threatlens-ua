@@ -1299,6 +1299,12 @@ export async function activeAlerts(cutoff: Date) {
   const result = await pool.query(
     `SELECT a.id,a.location_id,l.name_uk AS location_name,l.latitude,l.longitude,
             a.alert_type,
+            -- The differentiated level (migration 054) travels BESIDE \`alert_type\`, never inside
+            -- it. \`alert_type\` stays 'air_raid' on every one of these rows: writing a colour into
+            -- it would make an escalation look like a different alert, closing one period and
+            -- opening another — «Відбій тривоги» published in the middle of a standing alert. Both
+            -- columns are NULL for most rows, and a reader must render that exactly as before.
+            a.alert_level,a.alert_kind,
             -- Status as of the cutoff. Branch 2 below returns periods that ended AFTER the cutoff:
             -- at the cutoff instant they were running, and that instant is what this whole response
             -- describes. \`actual_status\` carries the truth for /ops and for tests; the map reads
@@ -1423,6 +1429,12 @@ export async function locationTimeline(locationId: string, cutoff: Date, limit =
               CASE WHEN c.active_at_cutoff THEN 'active' ELSE a.status END AS status,
               a.status AS actual_status,
               a.alert_type AS threat_type,'official' AS evidence_level,
+              -- The colour the period carried, for the history tab. It rides its own two columns
+              -- rather than the prose: the title and the summary above are the record of what was
+              -- announced, and re-writing them for a level would change rows that describe alerts
+              -- announced before levels existed. Rows of the other two kinds simply have no such
+              -- key — the three result sets are concatenated in JS, never UNIONed.
+              a.alert_level,a.alert_kind,
               CASE WHEN c.active_at_cutoff THEN NULL ELSE a.ended_at END AS valid_until,
               NULL::numeric AS risk_score,NULL::text AS risk_level
        FROM alert_periods a JOIN locations target ON target.id=a.location_id

@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { formatMessage } from './outbox.js';
+import { deliveryClass } from './delivery-governor.js';
 import {
   cleanSummary, evidenceRaisedLine, evidenceStatement, extensionLine, geographyChangedLine,
   humanMoment, riskLevelChangedLine, threatTypeChangedLine, validUntilLine
@@ -489,5 +490,124 @@ describe('повідомлення, що дивляться назад', () => {
     expect(text).toContain('Повідомляли про роботу ППО: Бровари, Київ.');
     // Розбір не сміє мати силуету тривоги, відбою чи попередження.
     for (const marker of ['🔴', '⚪', '⚠️']) expect(text).not.toContain(marker);
+  });
+});
+
+/**
+ * Диференційоване оповіщення (міграція 054): колір усередині тривоги, що вже триває.
+ *
+ * Найважливіший тест тут — ПЕРШИЙ. Переважна більшість тривог кольору не має й не матиме, і
+ * повідомлення про них мусить лишитися побайтово тим самим; усе інше в цьому блоці описує рідший
+ * випадок.
+ */
+describe('рівень тривоги в повідомленнях', () => {
+  const alertNow = new Date('2026-09-22T16:04:00.000Z');
+
+  it('тривога без рівня виглядає точно так, як виглядала завжди', () => {
+    const payload = { locationName: 'Київська область', startedAt: '2026-09-22T15:40:00.000Z' };
+    const expected = '🔴 <b>Повітряна тривога — Київська область</b>\n\n'
+      + 'Прямуйте до визначеного укриття й дотримуйтеся вказівок офіційних служб.\n\n'
+      + 'Оголошено о 18:40\nОфіційне сповіщення про тривогу';
+    // Три форми «кольору немає», які приходять із різних місць: payload старішого бінарника, що
+    // поля не знав; рядок періоду, де колонка NULL; і подія, у якій колір є, а виду немає.
+    expect(formatMessage({ notification_type: 'alert_start', payload }, alertNow)).toBe(expected);
+    expect(formatMessage({ notification_type: 'alert_start', payload: { ...payload, level: null, kind: null } },
+      alertNow)).toBe(expected);
+    expect(formatMessage({ notification_type: 'alert_start', payload: { ...payload, level: null, kind: 'drones' } },
+      alertNow)).toBe(expected);
+  });
+
+  it('називає колір і вид загрози під заголовком, не замість нього', () => {
+    const text = formatMessage({ notification_type: 'alert_start', payload: {
+      locationName: 'Київська область', startedAt: '2026-09-22T15:40:00.000Z',
+      level: 'yellow', kind: 'drones'
+    } }, alertNow);
+    // Жовта тривога — це тривога: силует лишається тривожним, а заклик в укриття нікуди не дівається.
+    expect(text.startsWith('🔴 <b>Повітряна тривога — Київська область</b>\n🟡 Жовтий рівень — дронова небезпека')).toBe(true);
+    expect(text).toContain('Прямуйте до визначеного укриття');
+  });
+
+  it('ті самі дрони на червоному звуться так, як їх називає влада', () => {
+    const text = formatMessage({ notification_type: 'alert_start', payload: {
+      locationName: 'Дніпропетровська область', startedAt: '2026-09-22T15:40:00.000Z',
+      level: 'red', kind: 'drones'
+    } }, alertNow);
+    expect(text).toContain('🔴 Червоний рівень — масована дронова загроза');
+  });
+
+  it('підвищення рівня не є ні другою тривогою, ні відбоєм', () => {
+    const text = formatMessage({ notification_type: 'alert_level_change', payload: {
+      locationName: 'Київська область', previousLevel: 'yellow', previousKind: 'drones',
+      level: 'red', kind: 'drones_missiles', changedAt: '2026-09-22T16:01:00.000Z',
+      updateKind: 'escalation', silent: false
+    } }, alertNow);
+    expect(text.startsWith('⬆️ <b>Рівень тривоги підвищено — Київська область</b>')).toBe(true);
+    expect(text).toContain('🟡 Жовтий → 🔴 Червоний: ракетно-дронова загроза');
+    expect(text).toContain('Прямуйте до визначеного укриття');
+    expect(text).toContain('а не нова тривога і не її завершення');
+    expect(text).not.toContain('Повітряна тривога');
+    expect(text).not.toContain('⚪');
+    expect(text.toLowerCase()).not.toContain('відбій');
+  });
+
+  it('зниження рівня не підписується завершенням і не випускає з укриття', () => {
+    const text = formatMessage({ notification_type: 'alert_level_change', payload: {
+      locationName: 'Київська область', previousLevel: 'red', previousKind: 'drones_missiles',
+      level: 'yellow', kind: 'drones', changedAt: '2026-09-22T16:01:00.000Z',
+      updateKind: 'deescalation', silent: true
+    } }, alertNow);
+    expect(text.startsWith('🔽 <b>Рівень тривоги знижено — Київська область</b>')).toBe(true);
+    expect(text).toContain('🔴 Червоний → 🟡 Жовтий: дронова небезпека');
+    expect(text).toContain('Тривога триває. Залишайтеся в укритті');
+    // Слова «відбій» немає в жодному відмінку: прочитане одним оком, воно виводить людей з укриття.
+    expect(text.toLowerCase()).not.toContain('відбій');
+    expect(text).not.toContain('⚪');
+    expect(text).not.toContain('Повітряна тривога');
+  });
+
+  it('зникнення кольору читається словами, а не порожнім боком стрілки', () => {
+    const text = formatMessage({ notification_type: 'alert_level_change', payload: {
+      locationName: 'Сумська область', previousLevel: 'yellow', previousKind: 'drones',
+      level: null, kind: null, changedAt: '2026-09-22T16:01:00.000Z',
+      updateKind: 'deescalation', silent: true
+    } }, alertNow);
+    expect(text).toContain('🟡 Жовтий → рівень більше не вказано');
+    expect(text).toContain('Тривога триває.');
+  });
+
+  it('поява кольору там, де його не було, друкується без стрілки з порожнечі', () => {
+    const text = formatMessage({ notification_type: 'alert_level_change', payload: {
+      locationName: 'Одеська область', previousLevel: null, previousKind: null,
+      level: 'red', kind: 'missiles', changedAt: '2026-09-22T16:01:00.000Z',
+      updateKind: 'escalation', silent: false
+    } }, alertNow);
+    expect(text).toContain('🔴 Червоний рівень: ракетна загроза');
+    expect(text).not.toContain('→');
+  });
+
+  it('невідомий напрямок зміни читається як нейтральне уточнення, а не як підвищення', () => {
+    const text = formatMessage({ notification_type: 'alert_level_change', payload: {
+      locationName: 'Черкаська область', previousLevel: 'red', previousKind: 'drones_missiles',
+      level: 'red', kind: 'missiles', changedAt: '2026-09-22T16:01:00.000Z',
+      updateKind: 'щось-новіше', silent: true
+    } }, alertNow);
+    expect(text.startsWith('🔀 <b>Рівень тривоги уточнено — Черкаська область</b>')).toBe(true);
+  });
+
+  it('відбій ніколи не називає кольору, навіть коли payload його несе', () => {
+    const text = formatMessage({ notification_type: 'alert_end', payload: {
+      locationName: 'Київська область', endedAt: '2026-09-22T16:01:00.000Z', level: 'red', kind: 'missiles'
+    } }, alertNow);
+    expect(text).not.toContain('Червоний');
+    expect(text).not.toContain('ракетна');
+  });
+
+  it('підвищення доставляється з голови черги, зниження — ні', () => {
+    // Клас важить більше за пріоритет: `claimDeliveryBatch` сортує `protected` поперед усього.
+    expect(deliveryClass({ notification_type: 'alert_level_change', payload: { updateKind: 'escalation' } }))
+      .toBe('protected');
+    expect(deliveryClass({ notification_type: 'alert_level_change', payload: { updateKind: 'deescalation' } }))
+      .toBe('soft');
+    expect(deliveryClass({ notification_type: 'alert_level_change', payload: {} })).toBe('soft');
   });
 });

@@ -36,6 +36,13 @@ export type DeliveryClass = 'protected' | 'standard' | 'soft' | 'analytics' | 'c
  * one row per enabled channel, against a budget of `TELEGRAM_DELIVERY_RATE_PER_SECOND` (default 25)
  * per second. There is no attack shape in which this class can crowd anything out; the ordering
  * above is what guarantees it cannot even try.
+ *
+ * ## Це рішення існує ДВІЧІ
+ *
+ * Нижче стоїть {@link classSql} — той самий каскад мовою SQL, у тому самому порядку. Черга сортує
+ * себе ним, а не цією функцією, тож правка лише в одному з двох місць не дає помилки компіляції й
+ * не падає в тестах — вона просто робить так, що воркер вважає рядок одним класом, а черга віддає
+ * його як інший. Кожна зміна тут мусить мати близнюка там, і навпаки.
  */
 export function deliveryClass(row: any): DeliveryClass {
   const payload = row?.payload ?? {};
@@ -53,26 +60,46 @@ export function deliveryClass(row: any): DeliveryClass {
   const expected = row?.notification_type === 'threat_update'
     && typeof payload.timing === 'string' && payload.timing !== 'now';
   if (expected) return 'soft';
+  // Підвищення рівня тривоги (міграція 054) стоїть у `protected` поруч із самою тривогою, і не з
+  // ввічливості: черга сортується `CASE WHEN class='protected' THEN 0 ELSE 1 END,priority,created_at`,
+  // тобто клас важить БІЛЬШЕ за пріоритет. Рядок із пріоритетом 0 у класі `standard` усе одно
+  // поїхав би позаду звичайного трафіку, і «жовтий → червоний» дочекався б своєї черги вже після
+  // того, як читач мав би бути в укритті.
   if (row?.notification_type === 'alert_start' || row?.notification_type === 'alert_end'
+    || (row?.notification_type === 'alert_level_change' && payload.updateKind === 'escalation')
     || (row?.notification_type === 'threat_update'
       && (payload.evidenceLevel === 'official' || payload.updateKind === 'escalation'))) return 'protected';
   if (row?.notification_type === 'assessment_update' || row?.notification_type === 'nightly_digest') {
     return 'analytics';
   }
   if (row?.notification_type === 'threat_update' && payload.updateKind === 'soft') return 'soft';
+  // Зниження й уточнення рівня — `soft`, а не `standard`, щоб відставання «колір упав» було видно
+  // окремо від решти черги. `soft` тут НЕ означає «можна поглинути»: `coalesceQueued` перелічує
+  // типи поіменно (`assessment_update` і `threat_update` з `updateKind='soft'`), тож рядок зміни
+  // рівня під нього не підпадає — і не має, бо дві зміни рівня в одній тривозі є двома різними
+  // твердженнями, а не двома копіями одного стану.
+  if (row?.notification_type === 'alert_level_change') return 'soft';
   return 'standard';
 }
 
-/** The same decision in SQL, in the same order and for the same reason. */
+/**
+ * The same decision in SQL, in the same order and for the same reason.
+ *
+ * Це ДЗЕРКАЛО функції вище, і воно мусить рухатися разом із нею: розбіжність між ними означає, що
+ * черга сортується за одним рішенням, а метрики й журнал пишуть інше. Кожна правка тут має
+ * близнюка в {@link deliveryClass}, і навпаки.
+ */
 const classSql = `CASE
   WHEN notification_type='channel_publication' THEN 'channel'
   WHEN notification_type IN ('attack_debrief','downtime_digest') THEN 'analytics'
   WHEN notification_type='threat_update' AND payload->>'timing' IS NOT NULL AND payload->>'timing'<>'now' THEN 'soft'
   WHEN notification_type IN ('alert_start','alert_end')
+    OR (notification_type='alert_level_change' AND payload->>'updateKind'='escalation')
     OR (notification_type='threat_update'
       AND (payload->>'evidenceLevel'='official' OR payload->>'updateKind'='escalation')) THEN 'protected'
   WHEN notification_type IN ('assessment_update','nightly_digest') THEN 'analytics'
   WHEN notification_type='threat_update' AND payload->>'updateKind'='soft' THEN 'soft'
+  WHEN notification_type='alert_level_change' THEN 'soft'
   ELSE 'standard' END`;
 
 const governorDecisions = new Counter({
@@ -193,6 +220,16 @@ async function coalesceQueued(client: any): Promise<void> {
   }
 }
 
+/**
+ * Те єдине, що транзакція захоплення читає зі свого ж `SELECT *`.
+ *
+ * Рядок черги має два десятки колонок, і всі вони потрібні ВІДПРАВНИКУ, а не цій транзакції: тут
+ * рядок лише переводиться в `sending`, тобто потрібен рівно ідентифікатор. Назвати його — дешевше,
+ * ніж нетипізований `any` у тому самому місці, де зі списку ідентифікаторів будується параметр
+ * `uuid[]`.
+ */
+interface ClaimedRow { id: string }
+
 export async function claimDeliveryBatch(): Promise<any[]> {
   const client = await pool.connect();
   try {
@@ -229,15 +266,24 @@ export async function claimDeliveryBatch(): Promise<any[]> {
     const tokens = Math.min(config.TELEGRAM_DELIVERY_BURST,
       Number(row.tokens) + elapsed * config.TELEGRAM_DELIVERY_RATE_PER_SECOND);
     const allowance = Math.min(25, Math.floor(tokens));
-    const batch = allowance > 0 ? await client.query(
+    // `ClaimedRow` називає рівно те, що потрібне САМІЙ транзакції — ідентифікатор, яким вона
+    // переводить рядки в `sending`. Решта колонок їде далі нетипізованою, як і їхала: `SELECT *`
+    // повертає весь рядок черги, і його читає відправник, а не цей файл.
+    const batch: { rows: ClaimedRow[] } = allowance > 0 ? await client.query<ClaimedRow>(
       `SELECT * FROM notification_outbox WHERE status IN ('pending','retry') AND next_attempt_at<=now()
        ORDER BY CASE WHEN ${classSql}='protected' THEN 0 ELSE 1 END,priority,created_at
        LIMIT $1 FOR UPDATE SKIP LOCKED`, [allowance]
-    ) : { rows: [] as any[] };
-    for (const item of batch.rows) {
+    ) : { rows: [] };
+    // Один UPDATE на партію, а не двадцять пʼять по одному. Рядки вже взято `FOR UPDATE SKIP
+    // LOCKED` цією ж транзакцією, тож `= ANY` бачить рівно їх — та сама форма, що вже стоїть у
+    // `coalesceQueued` і в `recordProviderBackoff`. Двадцять чотири зайві round trip'и тут коштували
+    // не лише часу: кожен із них тримав і зʼєднання з дванадцяти, і `FOR UPDATE` на рядку governor'а,
+    // тобто затримували КОЖНОГО іншого відправника, а не лише свою партію.
+    if (batch.rows.length) {
       await client.query(
-        `UPDATE notification_outbox SET status='sending',attempts=attempts+1,updated_at=now() WHERE id=$1`,
-        [item.id]
+        `UPDATE notification_outbox SET status='sending',attempts=attempts+1,updated_at=now()
+         WHERE id=ANY($1::uuid[])`,
+        [batch.rows.map((item) => String(item.id))]
       );
     }
     if (!batch.rows.length) {
@@ -253,12 +299,20 @@ export async function claimDeliveryBatch(): Promise<any[]> {
         }
       }
     }
+    // ВІДНЯТИ взяте. Без цього рядка відро — не відро: `tokens` назавжди лишається значенням із
+    // `DEFAULT 25`, `last_refill_at` — миттю встановлення, `elapsed` росте до нескінченності, і
+    // `allowance` вічно дорівнює `min(25, 25)`. Тоді `TELEGRAM_DELIVERY_RATE_PER_SECOND` (гарячий
+    // перемикач у /ops) не впливає ні на що, а гілка відмови `aggregate_rate_budget` нижче
+    // недосяжна. Саме цей UPDATE робить дозвіл справжнім — і саме він дозволяє відправнику
+    // переозброюватися одразу після повної партії, бо стелю тепер тримає відро, а не таймер.
+    //
+    // `blocked_until=NULL` — не косметика: `recovered` вище спрацьовує на ПЕРЕХІД, а перехід
+    // існує лише доти, доки хтось очищає поле. Без очищення кожен наступний тік бачив би
+    // непорожній `blocked_until`, писав би ще один рядок у журнал рішень і піднімав би лічильник —
+    // раз на секунду, назавжди.
     await client.query(
       `UPDATE telegram_delivery_governor SET tokens=$1,last_refill_at=$2,blocked_until=NULL,updated_at=now()
        WHERE singleton`, [Math.max(0, tokens - batch.rows.length), now]
-    );
-    await client.query(
-      `DELETE FROM telegram_delivery_decisions WHERE created_at < now()-interval '7 days'`
     );
     await client.query('COMMIT');
     return batch.rows;
@@ -268,6 +322,19 @@ export async function claimDeliveryBatch(): Promise<any[]> {
   } finally {
     client.release();
   }
+}
+
+/**
+ * Retention for the decision journal, run on its own slow timer instead of inside
+ * {@link claimDeliveryBatch}: the DELETE is a full scan of a table that only grows when the
+ * governor defers or backs off, and a quiet system produces nothing to prune. One pass a
+ * minute is far faster than the seven-day horizon, and the journal is read by `/ops` only.
+ */
+export async function pruneDeliveryDecisions(): Promise<number> {
+  const pruned = await pool.query(
+    `DELETE FROM telegram_delivery_decisions WHERE created_at < now()-interval '7 days'`
+  );
+  return pruned.rowCount ?? 0;
 }
 
 export async function recordProviderBackoff(outboxId: string, notificationClass: DeliveryClass,
