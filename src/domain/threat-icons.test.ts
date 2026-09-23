@@ -227,7 +227,71 @@ describe('rankThreatIcons', () => {
   });
 });
 
+/**
+ * How far a glyph reaches from the chip centre (12, 12), and its extent on both axes, in grid units.
+ *
+ * Arcs count as their whole circle — a conservative bound that is exact for the full circles the
+ * catalogue draws (wheels, ring, dot) and generous for the question-mark hook.
+ */
+function glyphExtent(path: string): { reach: number; min: number; max: number } {
+  const tokens = path.match(/[A-Za-z]|-?\d*\.?\d+/g) ?? [];
+  let reach = 0, min = Infinity, max = -Infinity;
+  let x = 0, y = 0, startX = 0, startY = 0, command = '';
+  const visit = (px: number, py: number, radius = 0) => {
+    reach = Math.max(reach, Math.hypot(px - 12, py - 12) + radius);
+    min = Math.min(min, px - radius, py - radius);
+    max = Math.max(max, px + radius, py + radius);
+  };
+  for (let index = 0; index < tokens.length;) {
+    if (/[A-Za-z]/.test(tokens[index]!)) command = tokens[index++]!;
+    const number = () => Number(tokens[index++]);
+    const relative = command === command.toLowerCase();
+    const ox = relative ? x : 0, oy = relative ? y : 0;
+    switch (command.toUpperCase()) {
+      case 'M': x = ox + number(); y = oy + number(); startX = x; startY = y; visit(x, y); break;
+      case 'L': x = ox + number(); y = oy + number(); visit(x, y); break;
+      case 'H': x = ox + number(); visit(x, y); break;
+      case 'V': y = oy + number(); visit(x, y); break;
+      case 'C': {
+        visit(ox + number(), oy + number());
+        visit(ox + number(), oy + number());
+        x = ox + number(); y = oy + number(); visit(x, y);
+        break;
+      }
+      case 'A': {
+        // The endpoint parameterisation of SVG (F.6.5), for a circle: rx = ry, no rotation.
+        const radius = number(); number(); number();
+        const large = number(), sweep = number();
+        const x2 = ox + number(), y2 = oy + number();
+        const hx = (x - x2) / 2, hy = (y - y2) / 2;
+        const half = Math.hypot(hx, hy);
+        const r = Math.max(radius, half);
+        const k = Math.sqrt(Math.max(0, (r * r - half * half) / (half * half))) * (large === sweep ? -1 : 1);
+        visit((x + x2) / 2 + k * hy, (y + y2) / 2 - k * hx, r);
+        x = x2; y = y2;
+        break;
+      }
+      case 'Z': x = startX; y = startY; break;
+      default: throw new Error(`unsupported path command ${command}`);
+    }
+  }
+  return { reach, min, max };
+}
+
 describe('the icon catalogue', () => {
+  it('draws every glyph on the 24 grid, inside the round chip', () => {
+    // The chip is a circle 24 px across whose dark outline starts 10.5 px from its centre, and the
+    // glyph box is 19 px: 10.5 × 24 / 19 = 13.26 grid units. A glyph that reaches past that is cut by
+    // the outline; a glyph from another grid — the 512 one game-icons draws on — would show the chip
+    // one corner of itself and read as a smudge.
+    for (const [threatType, path] of Object.entries(THREAT_ICON_PATHS)) {
+      const { reach, min, max } = glyphExtent(path);
+      expect(min, threatType).toBeGreaterThanOrEqual(0);
+      expect(max, threatType).toBeLessThanOrEqual(24);
+      expect(reach, threatType).toBeLessThanOrEqual(13.26);
+    }
+  });
+
   it('gives every class a distinct danger rank', () => {
     expect(new Set(Object.values(DANGER_RANK)).size).toBe(10);
   });

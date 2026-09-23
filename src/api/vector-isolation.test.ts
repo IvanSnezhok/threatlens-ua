@@ -2,6 +2,7 @@ import { readFileSync, readdirSync, statSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { THREAT_ICON_LABELS_UK, THREAT_ICON_PATHS } from '../domain/threat-icons.js';
+import { THREAT_TYPES } from '../types.js';
 
 /**
  * Structural proof that the operator-only extrapolation cannot reach a public response.
@@ -474,12 +475,14 @@ describe('map layer order', () => {
   });
 
   it('mirrors every threat-icon glyph and label into the browser bundle', () => {
-    // Текстове сканування src/domain/threat-icons.ts тут не працює: там кожен path зібрано з
-    // кількох рядків через `+`, тож повного значення в тому файлі немає як суцільного підрядка.
-    // Тому значення імпортуються в рантаймі, а web/app.js зобовʼязаний писати кожен path ОДНИМ
-    // нерозривним літералом — інакше ця перевірка нічого б не означала.
-    for (const value of [...Object.values(THREAT_ICON_PATHS), ...Object.values(THREAT_ICON_LABELS_UK)]) {
-      expect(APP_SOURCE, `web/app.js is missing the mirrored value ${value.slice(0, 24)}…`).toContain(value);
+    // Таблиця гліфів порівнюється цілком, ключ за ключем: обчислений літерал web/app.js проти
+    // THREAT_ICON_PATHS, імпортованого в рантаймі. Пошук підрядка по тексту файлу, яким це було
+    // раніше, пропускав би два path, переставлені між класами, — карта малювала б бомбу на місці
+    // дрона, а тест лишався б зеленим.
+    const mirror = evaluateSlice<Record<string, string>>(constDeclaration('threatIconPaths'), 'threatIconPaths');
+    expect(mirror).toEqual(THREAT_ICON_PATHS);
+    for (const value of Object.values(THREAT_ICON_LABELS_UK)) {
+      expect(APP_SOURCE, `web/app.js is missing the mirrored label ${value}`).toContain(value);
     }
   });
 
@@ -654,6 +657,42 @@ function lazy<T>(build: () => T): () => T {
 // ------------------------------------------------------------------------------------------------
 
 /**
+ * The track helpers every vector collection builder reads — head, head leg, class, age in words and
+ * as opacity, fade, heading and segment identity. One slice shared by the suites below: a builder
+ * compiled without them fails on `trackHeadIndex is not defined`, i.e. reports its own
+ * incompleteness rather than the behaviour under test.
+ */
+const trackSource = lazy(() => [
+  constDeclaration('TRACK_FADE'),
+  `function trackHeadIndex(vector) ${bodyOf('trackHeadIndex')}`,
+  `function trackHeadLeg(vector) ${bodyOf('trackHeadLeg')}`,
+  `function trackClass(vector) ${bodyOf('trackClass')}`,
+  `function trackAgeOpacity(ageSeconds, horizonSeconds) ${bodyOf('trackAgeOpacity')}`,
+  `function trackAgeText(seconds) ${bodyOf('trackAgeText')}`,
+  `function trackHeadTag(track) ${bodyOf('trackHeadTag')}`,
+  constDeclaration('trackFade'),
+  `function trackedEventIds() ${bodyOf('trackedEventIds')}`,
+  `function trackHeadingLine(vector) ${bodyOf('trackHeadingLine')}`,
+  constDeclaration('segmentId')
+].join('\n'));
+
+/** `track` as `/api/v1/vectors` sends it (the shared contract); each test overrides what it is about. */
+const trackOf = (over: Record<string, unknown> = {}) => ({
+  status: 'moving', headIndex: 1, heading: null, headAgeSeconds: 120, staleAfterSeconds: 720,
+  horizonSeconds: 1500, basis: 'rules', summary: null, model: null, confidence: null, ...over
+});
+
+/** A node and a leg of the list payload. `locationId` is the name: tests read ids back as places. */
+const place = (name: string, coordinates: [number, number] | null, over: Record<string, unknown> = {}) => ({
+  locationId: name, name, coordinates, coordinatePrecision: coordinates ? 'point' : 'unavailable', ...over
+});
+const hop = (from: number, to: number, basis: string, over: Record<string, unknown> = {}) => ({
+  from, to, basis, drawable: true, evidenceLevel: 'monitoring', threatType: 'uav', ...over
+});
+
+interface MapFeature { id?: string; properties: Record<string, unknown>; geometry: { coordinates: unknown } }
+
+/**
  * The arrowhead is the first thing this map has ever drawn that *points*, and the honesty rule is
  * the whole of its specification:
  *
@@ -672,8 +711,6 @@ function lazy<T>(build: () => T): () => T {
  * wrong decision inside the function and not only on a renamed layer.
  */
 describe('vector heads', () => {
-  interface Head { properties: Record<string, string | number> }
-
   const bearingSource = lazy(() => [
     `function mercatorY(latitude) ${bodyOf('mercatorY')}`,
     `function segmentBearing(from, to) ${bodyOf('segmentBearing')}`
@@ -692,30 +729,24 @@ describe('vector heads', () => {
     `function mercatorLatitude(y) ${bodyOf('mercatorLatitude')}`,
     `function vectorArc(from, to) ${bodyOf('vectorArc')}`,
     `function vectorClassTone(evidenceLevel) ${bodyOf('vectorClassTone')}`,
+    trackSource(),
     `function vectorHeadCollection() ${bodyOf('vectorHeadCollection')}`
   ].join('\n'));
 
-  /** Runs the shipped builder over injected chains and threats, exactly as the bundle calls it. */
-  function heads(vectors: unknown[], threats: unknown[] = []): Head[] {
-    return evaluateSlice<() => { features: Head[] }>(headSource(), 'vectorHeadCollection', {
+  /** Runs the shipped builder over injected tracks and threats, exactly as the bundle calls it. */
+  function heads(vectors: unknown[], threats: unknown[] = []): MapFeature[] {
+    return evaluateSlice<() => { features: MapFeature[] }>(headSource(), 'vectorHeadCollection', {
       vectors,
       snapshot: { threats },
-      iconImageId: (threatType: string, tone: string) => `ti-${threatType}-${tone}`,
-      // Реальна таблиця, а не заглушка: підпис класу на голові ланцюга — це те, що читач бачить
-      // замість гліфа, коли гліфа не знає, тож тест має ловити й клас, для якого підпису немає.
-      threatIconLabels: THREAT_ICON_LABELS_UK
+      iconImageId: (threatType: string, tone: string) => `ti-${threatType}-${tone}`
     })().features;
   }
 
-  const node = (name: string, coordinates: [number, number] | null) => ({
-    name, coordinates, coordinatePrecision: coordinates ? 'point' : 'unavailable'
-  });
-  const leg = (from: number, to: number, basis: string, options: Record<string, unknown> = {}) => ({
-    from, to, basis, drawable: true, evidenceLevel: 'monitoring', threatType: 'ballistic_missile', ...options
-  });
+  const leg = (from: number, to: number, basis: string, options: Record<string, unknown> = {}) =>
+    hop(from, to, basis, { threatType: 'ballistic_missile', ...options });
 
-  const arrows = (features: Head[]) => features.filter((feature) => feature.properties.kind === 'arrow');
-  const chips = (features: Head[]) => features.filter((feature) => feature.properties.kind === 'class');
+  const arrows = (features: MapFeature[]) => features.filter((feature) => feature.properties.kind === 'arrow');
+  const chips = (features: MapFeature[]) => features.filter((feature) => feature.properties.kind === 'class');
 
   describe('the bearing an arrow is drawn at', () => {
     /**
@@ -755,8 +786,8 @@ describe('vector heads', () => {
     it('gives an arrow to reported_transit and reported_direction, and never to observation_sequence', () => {
       const features = heads([{
         eventId: 'e1', threatType: 'ballistic_missile',
-        nodes: [node('Суми', [34.8, 50.9]), node('Полтава', [34.55, 49.59]),
-          node('Харків', [36.23, 49.99]), node('Мерефа', [36.05, 49.81])],
+        nodes: [place('Суми', [34.8, 50.9]), place('Полтава', [34.55, 49.59]),
+          place('Харків', [36.23, 49.99]), place('Мерефа', [36.05, 49.81])],
         segments: [leg(0, 1, 'reported_transit'), leg(1, 2, 'reported_direction'), leg(2, 3, 'observation_sequence')]
       }]);
       expect(arrows(features).map((feature) => feature.properties.basis))
@@ -770,7 +801,7 @@ describe('vector heads', () => {
       // node numbers stay; the map still says "ці повідомлення, в цьому порядку" and nothing more.
       const features = heads([{
         eventId: 'e1', threatType: 'uav',
-        nodes: [node('Чернігів', [31.29, 51.5]), node('Бровари', [30.79, 50.51]), node('Бориспіль', [30.96, 50.35])],
+        nodes: [place('Чернігів', [31.29, 51.5]), place('Бровари', [30.79, 50.51]), place('Бориспіль', [30.96, 50.35])],
         segments: [leg(0, 1, 'observation_sequence'), leg(1, 2, 'observation_sequence')]
       }]);
       expect(arrows(features)).toEqual([]);
@@ -790,7 +821,7 @@ describe('vector heads', () => {
     it('places the arrow at the head of the leg, pointing the way the leg was drawn', () => {
       const features = heads([{
         eventId: 'e1', threatType: 'ballistic_missile',
-        nodes: [node('Полтава', [34, 50]), node('Харків', [36, 50])],
+        nodes: [place('Полтава', [34, 50]), place('Харків', [36, 50])],
         segments: [leg(0, 1, 'reported_transit')]
       }]);
       const [arrow] = arrows(features);
@@ -802,36 +833,47 @@ describe('vector heads', () => {
       expect(arrow!.properties.bearing).toBeCloseTo(102, 0);
     });
 
-    it('draws no arrow on a leg the map is not drawing', () => {
+    it('draws no arrow on a leg the map is not drawing, and still marks where the head is', () => {
       // `drawable: false` is a leg that exists as a stated fact and has no coordinate for one end.
       // The line is not drawn, so an arrowhead would be a floating glyph asserting a movement
-      // between a place and nowhere.
+      // between a place and nowhere. The head itself does have a coordinate, and «the last report
+      // put it here» is the one claim a track makes before any other.
       const features = heads([{
-        eventId: 'e1', threatType: 'ballistic_missile',
-        nodes: [node('Якась громада', null), node('Харків', [36.23, 49.99])],
+        eventId: 'e1', threatType: 'ballistic_missile', track: trackOf({ headIndex: 1 }),
+        nodes: [place('Якась громада', null), place('Харків', [36.23, 49.99])],
         segments: [leg(0, 1, 'reported_transit', { drawable: false })]
       }]);
       expect(arrows(features)).toEqual([]);
-      expect(chips(features)).toEqual([]);
+      expect(chips(features).map((chip) => chip.geometry.coordinates)).toEqual([[36.23, 49.99]]);
     });
   });
 
   describe('the class chip', () => {
-    it('draws one per chain, at the newest point the chain actually reached', () => {
+    it('draws one per track, at the head the server named', () => {
       const features = heads([{
-        eventId: 'e1', threatType: 'ballistic_missile',
-        nodes: [node('Суми', [34.8, 50.9]), node('Полтава', [34.55, 49.59]), node('Харків', [36.23, 49.99])],
+        eventId: 'e1', threatType: 'ballistic_missile', track: trackOf({ headIndex: 2 }),
+        nodes: [place('Суми', [34.8, 50.9]), place('Полтава', [34.55, 49.59]), place('Харків', [36.23, 49.99])],
         segments: [leg(0, 1, 'reported_transit'), leg(1, 2, 'reported_transit')]
       }]);
       expect(chips(features)).toHaveLength(1);
-      expect((chips(features)[0] as unknown as { geometry: { coordinates: number[] } }).geometry.coordinates)
-        .toEqual([36.23, 49.99]);
+      expect(chips(features)[0]!.geometry.coordinates).toEqual([36.23, 49.99]);
+    });
+
+    it('stands where the model put the head, not at the last point in the array', () => {
+      // Трек, уточнений моделлю, може лишити після голови місця, які вже стали історією: голова — це
+      // `track.headIndex`, а не «найновіша намальована точка», як було в ланцюгів.
+      const features = heads([{
+        eventId: 'e1', threatType: 'uav', track: trackOf({ headIndex: 1, basis: 'model' }),
+        nodes: [place('Суми', [34.8, 50.9]), place('Полтава', [34.55, 49.59]), place('Харків', [36.23, 49.99])],
+        segments: [leg(0, 1, 'observation_sequence', { threatType: 'uav' }), leg(1, 2, 'observation_sequence', { threatType: 'uav' })]
+      }]);
+      expect(chips(features)[0]!.geometry.coordinates).toEqual([34.55, 49.59]);
     });
 
     it('reuses the registered threat-icon image instead of a second icon pipeline', () => {
       const features = heads([{
         eventId: 'e1', threatType: 'uav',
-        nodes: [node('Полтава', [34, 50]), node('Харків', [36, 50])],
+        nodes: [place('Полтава', [34, 50]), place('Харків', [36, 50])],
         segments: [leg(0, 1, 'reported_transit', { threatType: 'uav', evidenceLevel: 'official' })]
       }]);
       // The same 40-image catalogue the territory stacks draw from: `ti-<class>-<tone>`, with the
@@ -842,7 +884,7 @@ describe('vector heads', () => {
     it('takes the tone of the leg it stands on, never a stronger one', () => {
       const monitoring = heads([{
         eventId: 'e1', threatType: 'uav',
-        nodes: [node('Полтава', [34, 50]), node('Харків', [36, 50])],
+        nodes: [place('Полтава', [34, 50]), place('Харків', [36, 50])],
         segments: [leg(0, 1, 'reported_transit', { threatType: 'uav', evidenceLevel: 'monitoring' })]
       }]);
       expect(chips(monitoring)[0]!.properties.icon).toBe('ti-uav-reported');
@@ -853,7 +895,7 @@ describe('vector heads', () => {
       // reported as ballistics. The head says what the newest message said.
       const features = heads([{
         eventId: 'e1', threatType: 'combined',
-        nodes: [node('Суми', [34.8, 50.9]), node('Полтава', [34.55, 49.59]), node('Харків', [36.23, 49.99])],
+        nodes: [place('Суми', [34.8, 50.9]), place('Полтава', [34.55, 49.59]), place('Харків', [36.23, 49.99])],
         segments: [
           leg(0, 1, 'reported_transit', { threatType: 'uav' }),
           leg(1, 2, 'reported_transit', { threatType: 'ballistic_missile' })
@@ -903,28 +945,343 @@ describe('vector heads', () => {
     expect(legend).toContain('На крапковій лінії вістря немає ніколи');
   });
 
-  it('flies the class glyph itself, with a fallback for a class the catalogue does not know', () => {
-    // Підпис класу з карти прибрано: тепер «що летить» каже сам рухомий гліф. Тож перевіряємо не
-    // текст, а те, що рухомий символ бере ПРАВИЛЬНЕ зображення — і не ламається на невідомому класі,
-    // бо `iconImageId` мовчки склав би id неіснуючої картинки, а MapLibre замінив би її прозорим
-    // пікселем: рух зник би без жодної помилки в консолі.
-    const travel = bodyOf('vectorTravelCollection');
-    expect(travel).toMatch(/iconImageId\(\s*segment\.threatType\s*\?\?\s*vector\.threatType\s*\?\?\s*'unknown'/);
-    // Тон береться з доказовості саме цієї ланки, як і у фішки на голові.
-    expect(travel).toContain('vectorClassTone(segment.evidenceLevel)');
+  describe('the head of a track', () => {
+    const uavTrack = (over: Record<string, unknown> = {}) => ({
+      eventId: 'e1', threatType: 'uav', track: trackOf({ headIndex: 2, ...over }),
+      nodes: [place('Суми', [34.8, 50.9]), place('Ромни', [33.49, 50.75]), place('Полтава', [34.55, 49.59])],
+      segments: [leg(0, 1, 'observation_sequence', { threatType: 'uav' }), leg(1, 2, 'observation_sequence', { threatType: 'uav' })]
+    });
+    const tagOf = (over: Record<string, unknown>) => chips(heads([uavTrack(over)]))[0]!.properties.tag;
+    const kyiv = { locationId: 'kyiv', name: 'Київ', coordinates: [30.52, 50.45] };
+
+    it('says how old the head is, and that the target circles when it does', () => {
+      expect(tagOf({ headAgeSeconds: 125 })).toBe('2 хв');
+      expect(tagOf({ headAgeSeconds: 20 })).toBe('<1 хв');
+      expect(tagOf({ status: 'loitering', headAgeSeconds: 240 })).toBe('кружляє · 4 хв');
+    });
+
+    it('turns grey and says «тому» once the head is stale', () => {
+      // «13 хв» біля фішки читалося б як «ще 13 хв», тобто як прогноз; сірий — той самий, яким карта
+      // позначає все, що не є живим твердженням.
+      const [chip] = chips(heads([uavTrack({ status: 'stale', headAgeSeconds: 780 })]));
+      expect(chip!.properties.icon).toBe('ti-uav-analytic');
+      expect(chip!.properties.tag).toBe('13 хв тому');
+    });
+
+    it('fades a passed or ended track instead of dropping it', () => {
+      expect(chips(heads([uavTrack()]))[0]!.properties.fade).toBe(1);
+      for (const status of ['passed', 'ended']) {
+        const [chip] = chips(heads([uavTrack({ status, headAgeSeconds: 300 })]));
+        expect(chip!.properties.fade, status).toBeLessThan(1);
+        expect(chip!.properties.fade, status).toBeGreaterThan(0);
+        expect(String(chip!.properties.tag), status).toContain('5 хв тому');
+      }
+    });
+
+    it('points a hollow arrow at the heading a source named', () => {
+      const heading = arrows(heads([uavTrack({ heading: kyiv })]));
+      expect(heading).toHaveLength(1);
+      expect(heading[0]!.geometry.coordinates).toEqual([30.52, 50.45]);
+      expect(heading[0]!.properties.arrow).toBe('threat-vector-arrow-open');
+      expect(heading[0]!.properties.basis).toBe('reported_direction');
+    });
+
+    it('draws no heading to a place without a coordinate, or after the threat has passed', () => {
+      expect(arrows(heads([uavTrack({ heading: { ...kyiv, coordinates: null } })]))).toEqual([]);
+      expect(arrows(heads([uavTrack({ heading: kyiv, status: 'passed' })]))).toEqual([]);
+      expect(arrows(heads([uavTrack({ heading: kyiv, status: 'ended' })]))).toEqual([]);
+    });
+
+    it('keeps the head of a track that has no leg at all', () => {
+      // Одна голова, над якою ціль кружляє, публікується навмисно: «кружляє над Херсоном» — це і є вся заява.
+      const features = heads([{
+        eventId: 'e1', threatType: 'uav', track: trackOf({ status: 'loitering', headIndex: 0 }),
+        nodes: [place('Херсон', [32.62, 46.64], { loiter: true })], segments: []
+      }]);
+      expect(chips(features)).toHaveLength(1);
+      expect(chips(features)[0]!.properties.tag).toBe('кружляє · 2 хв');
+    });
+
+    it('leaves an event with a track to its track, and still draws the direction of one without', () => {
+      // Та сама подія, намальована і треком, і власною лінією напрямку, давала дві фішки й дві стрілки
+      // одного курсу — той безлад, через який не було видно, що куди летить.
+      const line = { type: 'LineString', coordinates: [[30, 50], [24, 50]] };
+      const features = heads([uavTrack()], [
+        { id: 'e1', title: 'Та сама подія', threatType: 'uav', evidenceLevel: 'monitoring', geometry: line },
+        { id: 't2', title: 'Подія без треку', threatType: 'cruise_missile', evidenceLevel: 'confirmed', geometry: line }
+      ]);
+      expect(features.map((feature) => feature.id)).toEqual(['vc-e1', 'da-t2', 'dc-t2']);
+    });
+
+    it('labels the head with its age and nothing else', () => {
+      // Кількості на карті немає й бути не може, а клас уже каже гліф: текст біля фішки — лише
+      // свіжість, якої гліф сказати не може.
+      const [chip] = chips(heads([uavTrack()]));
+      expect(chip!.properties.icon).toBe('ti-uav-reported');
+      expect(chip!.properties.tag).toBe('2 хв');
+      expect(chip!.properties).not.toHaveProperty('typeLabel');
+    });
+  });
+});
+
+/**
+ * Колір — клас, яскравість — свіжість, назви — лише на кінцях.
+ *
+ * Відповідь на скаргу «не видно, що звідки куди летить»: усі ланцюги були одного білого кольору,
+ * ланка двадцятихвилинної давності нічим не відрізнялася від щойно названої, а назва стояла на кожній
+ * крапці. Ці тести запускають справжні збірки відрізків і вузлів і читають те, що вони віддають карті.
+ */
+describe('a track draws its current part, coloured by class', () => {
+  const geometrySource = lazy(() => [
+    constDeclaration('vectorClassColors'),
+    constDeclaration('vectorColorOf'),
+    constDeclaration('analyticColor'),
+    constDeclaration('VECTOR_ARC_BEND'),
+    constDeclaration('VECTOR_ARC_STEPS'),
+    `function mercatorY(latitude) ${bodyOf('mercatorY')}`,
+    `function mercatorLatitude(y) ${bodyOf('mercatorLatitude')}`,
+    `function vectorArc(from, to) ${bodyOf('vectorArc')}`,
+    'const vectorArcCache = new Map();',
+    `function segmentArc(id, from, to) ${bodyOf('segmentArc')}`,
+    constDeclaration('VECTOR_DRAW_MS'),
+    'const vectorDrawStart = new Map();',
+    `function vectorDrawProgress(id, now) ${bodyOf('vectorDrawProgress')}`,
+    `function partialArc(points, progress) ${bodyOf('partialArc')}`,
+    `function shortPlace(name) ${bodyOf('shortPlace')}`,
+    trackSource(),
+    `function vectorSegmentCollection(now = performance.now()) ${bodyOf('vectorSegmentCollection')}`,
+    `function vectorNodeCollection() ${bodyOf('vectorNodeCollection')}`
+  ].join('\n'));
+  const colors = lazy(() => evaluateSlice<Record<string, string>>(constDeclaration('vectorClassColors'), 'vectorClassColors'));
+
+  /** Both builders over the same tracks. Motion off: every leg is fully drawn, no animation state. */
+  function draw(vectors: unknown[]): { segments: MapFeature[]; nodes: MapFeature[] } {
+    const built = evaluateSlice<{ segments: () => { features: MapFeature[] }; nodes: () => { features: MapFeature[] } }>(
+      geometrySource(), '({ segments: vectorSegmentCollection, nodes: vectorNodeCollection })',
+      { vectors, motionAllowed: () => false });
+    return { segments: built.segments().features, nodes: built.nodes().features };
+  }
+
+  const sumy = place('Суми', [34.8, 50.9], { role: 'origin' });
+  const poltava = place('Полтава', [34.55, 49.59]);
+
+  it('colours every leg by the class its own message named', () => {
+    const { segments } = draw([{
+      eventId: 'e1', threatType: 'combined', track: trackOf({ headIndex: 2 }),
+      nodes: [sumy, poltava, place('Харків', [36.23, 49.99])],
+      segments: [hop(0, 1, 'reported_transit', { threatType: 'uav' }), hop(1, 2, 'reported_transit', { threatType: 'ballistic_missile' })]
+    }]);
+    expect(segments.map((segment) => segment.properties.color)).toEqual([colors().uav, colors().ballistic_missile]);
+    expect(colors().uav).toBe('#ffb13d');
   });
 
-  it('keeps the head chip carrying an icon and no text', () => {
-    const chips = heads([{
+  it('has a colour for every class: one for the three ground classes, and its own for every other', () => {
+    // Клас без рядка мовчки ставав би сірим «невизначеним» — і «Шахед» на карті виглядав би як ніщо.
+    expect(Object.keys(colors()).sort()).toEqual([...THREAT_TYPES].sort());
+    expect(new Set([colors().mlrs, colors().artillery, colors().mortar]).size).toBe(1);
+    const families = THREAT_TYPES.filter((type) => type !== 'artillery' && type !== 'mortar').map((type) => colors()[type]);
+    expect(new Set(families).size).toBe(families.length);
+  });
+
+  it('fades a leg with the age of its message, down to a third at the class window', () => {
+    const opacity = (ageSeconds: number, status = 'moving') => draw([{
+      eventId: 'e1', threatType: 'uav', track: trackOf({ status, horizonSeconds: 1500 }),
+      nodes: [sumy, poltava], segments: [hop(0, 1, 'observation_sequence', { ageSeconds })]
+    }]).segments[0]!.properties.opacity as number;
+    expect(opacity(0)).toBeCloseTo(1, 9);
+    expect(opacity(750)).toBeCloseTo(.65, 9);
+    expect(opacity(1500)).toBeCloseTo(.3, 9);
+    // Старшого за вікно сервер не шле; якщо й надішле — нижче третини лінія не тьмяніє.
+    expect(opacity(3000)).toBeCloseTo(.3, 9);
+    // Минула загроза лишається на карті блідою, а не зникає.
+    expect(opacity(0, 'passed')).toBeLessThan(opacity(0));
+    expect(opacity(0, 'passed')).toBeGreaterThan(0);
+  });
+
+  it('draws the heading as a dashed reported direction and never as a place of its own', () => {
+    const { segments, nodes } = draw([{
       eventId: 'e1', threatType: 'uav',
-      nodes: [node('Миколаїв', [32, 47]), node('Херсон', [32.6, 46.6])],
-      segments: [leg(0, 1, 'reported_transit', { threatType: 'uav' })]
-    }]).filter((feature) => feature.properties.kind === 'class');
-    expect(chips).toHaveLength(1);
-    expect(chips[0]!.properties.icon).toBe('ti-uav-reported');
-    expect(chips[0]!.properties).not.toHaveProperty('typeLabel');
+      track: trackOf({ headIndex: 1, heading: { locationId: 'kyiv', name: 'Київ', coordinates: [30.52, 50.45] } }),
+      nodes: [sumy, poltava], segments: [hop(0, 1, 'observation_sequence')]
+    }]);
+    const heading = segments.filter((segment) => segment.properties.heading);
+    expect(heading).toHaveLength(1);
+    expect(heading[0]!.properties.basis).toBe('reported_direction');
+    const line = heading[0]!.geometry.coordinates as number[][];
+    expect(line[0]![0]).toBeCloseTo(34.55, 9);                    // з голови
+    expect(line[line.length - 1]![0]).toBeCloseTo(30.52, 9);      // до названого місця
+    // Туди ціль ніхто не ставив: ні крапки, ні назви.
+    expect(nodes.map((node) => node.properties.name)).toEqual(['Суми', 'Полтава']);
   });
 
+  it('names only the two ends of a track', () => {
+    const { nodes } = draw([{
+      eventId: 'e1', threatType: 'uav', track: trackOf({ headIndex: 3 }),
+      nodes: [place('Суми', [34.8, 50.9], { role: 'origin' }), place('Ромни', [33.49, 50.75], { role: 'trail' }),
+        place('Лохвиця', [33.26, 50.36], { role: 'trail' }), place('Полтава', [34.55, 49.59], { role: 'head' })],
+      segments: [hop(0, 1, 'observation_sequence'), hop(1, 2, 'observation_sequence'), hop(2, 3, 'observation_sequence')]
+    }]);
+    expect(nodes.map((node) => [node.properties.role, node.properties.name])).toEqual([
+      ['origin', 'Суми'], ['trail', ''], ['trail', ''], ['head', 'Полтава']
+    ]);
+  });
+
+  it('keeps a head with no leg on the map, and greys the nodes of a stale track', () => {
+    const lone = (status: string) => draw([{
+      eventId: 'e1', threatType: 'uav', track: trackOf({ status, headIndex: 0 }),
+      nodes: [place('Херсон', [32.62, 46.64], { loiter: status === 'loitering' })], segments: []
+    }]).nodes;
+    expect(lone('loitering').map((node) => [node.properties.name, node.properties.color])).toEqual([['Херсон', colors().uav]]);
+    expect(lone('stale')[0]!.properties.color).toBe(evaluateSlice(constDeclaration('analyticColor'), 'analyticColor'));
+  });
+});
+
+/**
+ * Одна рухома іконка на трек.
+ *
+ * Раніше гліф їхав КОЖНИМ відрізком кожного ланцюга, і десять петель на одному ланцюзі читалися як
+ * десять цілей. Тепер рухається лише останній крок до голови, і лише поки трек `moving`; ціль, що
+ * кружляє, ходить малим колом над місцем; застаріле, минуле й завершене стоїть.
+ */
+describe('one travelling icon per track', () => {
+  const travelSource = lazy(() => [
+    constDeclaration('VECTOR_ARC_BEND'),
+    constDeclaration('VECTOR_ARC_STEPS'),
+    `function mercatorY(latitude) ${bodyOf('mercatorY')}`,
+    `function mercatorLatitude(y) ${bodyOf('mercatorLatitude')}`,
+    `function vectorArc(from, to) ${bodyOf('vectorArc')}`,
+    'const vectorArcCache = new Map();',
+    `function segmentArc(id, from, to) ${bodyOf('segmentArc')}`,
+    constDeclaration('VECTOR_DRAW_MS'),
+    constDeclaration('THREAT_CRUISE_KMH'),
+    constDeclaration('VECTOR_TIME_COMPRESSION'),
+    constDeclaration('VECTOR_TRAVEL_MIN_MS'),
+    constDeclaration('VECTOR_TRAVEL_MAX_MS'),
+    constDeclaration('VECTOR_ORBIT_RADIUS'),
+    constDeclaration('VECTOR_ORBIT_MS'),
+    `function haversineKm(from, to) ${bodyOf('haversineKm')}`,
+    `function vectorTravelDurationMs(from, to, threatType) ${bodyOf('vectorTravelDurationMs')}`,
+    `function arcPointAt(points, t) ${bodyOf('arcPointAt')}`,
+    `function vectorClassTone(evidenceLevel) ${bodyOf('vectorClassTone')}`,
+    trackSource(),
+    `function trackLoiterNode(vector) ${bodyOf('trackLoiterNode')}`,
+    `function vectorTravelCollection(now = performance.now()) ${bodyOf('vectorTravelCollection')}`
+  ].join('\n'));
+
+  function travel(vectors: unknown[], now = 1_000_000, motion = true): MapFeature[] {
+    return evaluateSlice<(now: number) => { features: MapFeature[] }>(travelSource(), 'vectorTravelCollection', {
+      vectors,
+      motionAllowed: () => motion,
+      // Кожен відрізок домальовано давно: тут перевіряється, ЯКИМ відрізком їхати, а не очікування
+      // промальовування — його тримає «the travelling dot» нижче.
+      vectorDrawStart: { get: () => 0 },
+      iconImageId: (threatType: string, tone: string) => `ti-${threatType}-${tone}`
+    })(now).features;
+  }
+
+  const threeLegs = (status: string, over: Record<string, unknown> = {}) => ({
+    eventId: 'e1', threatType: 'uav', track: trackOf({ status, headIndex: 3 }),
+    nodes: [place('Суми', [34.8, 50.9]), place('Ромни', [33.49, 50.75]), place('Лохвиця', [33.26, 50.36]), place('Полтава', [34.55, 49.59])],
+    segments: [hop(0, 1, 'observation_sequence'), hop(1, 2, 'reported_direction'), hop(2, 3, 'reported_transit')],
+    ...over
+  });
+
+  it('moves one icon per track, and only along the leg that ends at the head', () => {
+    const features = travel([threeLegs('moving'), threeLegs('moving', { eventId: 'e2' })]);
+    expect(features.map((feature) => feature.properties.label)).toEqual(['Лохвиця → Полтава', 'Лохвиця → Полтава']);
+  });
+
+  it('holds still on a stale, passed, ended or unclear track', () => {
+    for (const status of ['stale', 'passed', 'ended', 'unclear']) {
+      expect(travel([threeLegs(status)]), status).toEqual([]);
+    }
+  });
+
+  it('circles the place the target loiters over instead of travelling', () => {
+    const loitering = threeLegs('loitering');
+    loitering.nodes[1] = { ...loitering.nodes[1]!, loiter: true };
+    const radius = evaluateSlice<number>(constDeclaration('VECTOR_ORBIT_RADIUS'), 'VECTOR_ORBIT_RADIUS');
+    const [before] = travel([loitering], 1_000_000);
+    const [after] = travel([loitering], 1_001_500);
+    // Над вузлом, позначеним `loiter`, — не над головою, і не деінде на лінії.
+    expect(before!.geometry.coordinates).toEqual([33.49, 50.75]);
+    expect(after!.geometry.coordinates).toEqual([33.49, 50.75]);
+    const [x0, y0] = before!.properties.offset as number[];
+    const [x1, y1] = after!.properties.offset as number[];
+    expect(Math.hypot(x0!, y0!)).toBeCloseTo(radius, 9);
+    expect(Math.hypot(x1! - x0!, y1! - y0!)).toBeGreaterThan(1);
+  });
+
+  it('flies the class glyph, with a fallback for a class the catalogue does not know', () => {
+    // `iconImageId` мовчки склав би id неіснуючої картинки, а MapLibre замінив би її прозорим
+    // пікселем: рух зник би без жодної помилки в консолі.
+    expect(travel([threeLegs('moving')])[0]!.properties.icon).toBe('ti-uav-reported');
+    const unnamed = threeLegs('moving');
+    const [fallback] = travel([{ ...unnamed, threatType: null,
+      segments: unnamed.segments.map((segment) => ({ ...segment, threatType: null })) }]);
+    expect(fallback!.properties.icon).toBe('ti-unknown-reported');
+  });
+
+  it('says nothing at all when the reader refused motion', () => {
+    const loitering = threeLegs('loitering');
+    expect(travel([threeLegs('moving'), { ...loitering, eventId: 'e2' }], 1_000_000, false)).toEqual([]);
+  });
+});
+
+/**
+ * Діалог події каже словами те, що карта каже кольором і рухом, — і підписує модель як модель.
+ *
+ * Трек, уточнений швидкою моделлю, без підпису читався б як факт; трек правил із підписом моделі — як
+ * припущення, якого ніхто не робив. Обидві помилки — про походження твердження, тож обидві тут.
+ */
+describe('the event dialog says what state the track is in', () => {
+  // escapeHtml береться до першої закривальної дужки на початку рядка, а не через `balanced()`: у
+  // його регулярному виразі стоять обидві лапки, і `balanced()` прочитав би їх як початок рядка.
+  const escapeHtmlSource = lazy(() => {
+    const start = APP_SOURCE.indexOf('function escapeHtml(');
+    return APP_SOURCE.slice(start, APP_SOURCE.indexOf('\n}\n', start) + 2);
+  });
+  const dialogSource = lazy(() => [
+    escapeHtmlSource(),
+    `function shortTime(value) ${bodyOf('shortTime')}`,
+    `function probabilityText(value) ${bodyOf('probabilityText')}`,
+    constDeclaration('threatNames'),
+    constDeclaration('evidenceNames'),
+    constDeclaration('vectorBasisLabels'),
+    constDeclaration('trackStatusNames'),
+    `function trackAgeText(seconds) ${bodyOf('trackAgeText')}`,
+    `function vectorTrackHtml(vector) ${bodyOf('vectorTrackHtml')}`,
+    `function vectorChainHtml(vector) ${bodyOf('vectorChainHtml')}`
+  ].join('\n'));
+  const html = (track: unknown) => evaluateSlice<(vector: unknown) => string>(dialogSource(), 'vectorChainHtml')({
+    eventId: 'e1', threatType: 'uav', disclaimer: 'Не траєкторія.', span: { sourceCount: 2, elapsedSeconds: 600 },
+    nodes: [place('Суми', [34.8, 50.9]), place('Полтава', [34.55, 49.59])],
+    segments: [hop(0, 1, 'observation_sequence', {
+      reportedAt: '2026-09-23T10:00:00Z', ageSeconds: 3000, source: { name: 'Канал' }
+    })],
+    track
+  });
+
+  it('names the model, its confidence and its summary when the model shaped the track', () => {
+    const text = html(trackOf({
+      basis: 'model', summary: 'Кружляє над Полтавою', model: 'gpt-6-luna', confidence: .82, status: 'loitering'
+    }));
+    expect(text).toContain('Оцінка моделі: Кружляє над Полтавою');
+    expect(text).toContain('gpt-6-luna');
+    expect(text).toContain('≈82 %');
+  });
+
+  it('says the state and the head of a rules track, with no model attribution', () => {
+    const text = html(trackOf());
+    expect(text).not.toContain('Оцінка моделі');
+    expect(text).toContain('<b>Рухається</b>');
+    expect(text).toContain('голова — Полтава, 2 хв тому');
+  });
+
+  it('marks a leg older than the class window as history, in words', () => {
+    expect(html(trackOf({ horizonSeconds: 1500 }))).toContain('історія · ');
+    expect(html(trackOf({ horizonSeconds: 6000 }))).not.toContain('історія · ');
+  });
 });
 
 function* permutations<T>(items: T[]): Generator<T[]> {

@@ -26,29 +26,33 @@
 import { THREAT_TYPES, type EvidenceLevel, type RelationType, type ThreatType } from '../types.js';
 
 /**
- * The ten threat classes as filled 512×512 silhouettes.
+ * The ten threat classes as filled 24×24 silhouettes: one path each, drawn for fill-rule `evenodd`.
  *
- * ## Where the glyphs come from, and what that obliges us to
+ * ## Where the glyphs come from
  *
- * Every path below is a glyph from **game-icons.net**, used under **CC BY 3.0**. The per-class
- * comments name the exact author and icon, and the licence notice is shown to the reader in the map
- * legend (`web/app.js`, `renderVectorLegend`) — attribution that lives only in a source comment is
- * not attribution, because nobody who receives the work ever sees it.
+ * Original drawings made for this project (2026-09-23), so no third-party licence is attached and
+ * the map legend carries no attribution line. They replaced a set of game-icons.net glyphs (CC BY
+ * 3.0) for one reason: those did not depict their class. `uav` was a B-2 stealth bomber, `combined`
+ * a missile swarm, `cruise_missile` and `ballistic_missile` two near-identical rockets, `mlrs` read
+ * as an air-defence launcher and `artillery` was a bullet. An icon whose only job is to say what is
+ * flying cannot borrow the silhouette of something else.
  *
- * They replaced ten hand-drawn 24×24 silhouettes. Two reasons, and the second is the load-bearing
- * one. The hand-drawn set had gone stale in style; more seriously, `cruise_missile` and `aviation`
- * had converged on almost the same aeroplane, `artillery` had degenerated into a bare trapezium and
- * `combined` into a triangle — three classes the reader could not tell apart on the map, which is
- * the only thing an icon is for. The replacements were chosen against that test and checked by
- * rendering all ten at 20 px before any of this was written.
+ * Every glyph was judged by rendering it at 19 px — the glyph box inside the 24 px map chip, i.e.
+ * the size the territory stacks draw — and at 48 px, and redrawn until each read as its class at
+ * 19 px on its own. The vector head draws the same chip at 0.62–0.86 of that; a silhouette that
+ * needed its detail to be read would be unreadable there, so none of them does.
  *
- * The grid changed with them: 24 → 512, because that is what game-icons draws on. Rescaling the
- * paths by hand would gain nothing and lose fidelity — `web/app.js` already scales the glyph box by
- * `ICON_GLYPH_BOX / ICON_GLYPH_GRID`, so the grid is a number in one place, not a format.
+ * Drawing rules the paths keep:
  *
- * These are richer in detail than what they replaced, which is why the glyph now occupies 80% of the
- * chip rather than 60% while the chip itself shrank from 30 px to 24 px. At the old 60% the thin
- * elements — a launcher's rails, a drone's arms — disappeared entirely at overview zoom.
+ * - **24 grid.** `web/app.js` scales the glyph box by `ICON_GLYPH_BOX / ICON_GLYPH_GRID`, so the grid
+ *   is a number in one place, not a format.
+ * - **Inside the round chip.** Everything stays within ~12 units of the centre (12, 12): the chip is a
+ *   circle, and a wingtip in the corner of the square would be cut by its dark outline.
+ * - **evenodd, not nonzero.** Sub-paths never overlap except where a hole is the drawing: the wheel
+ *   and hub of the howitzer, the tube slits of the rocket pack, the ring around the question mark.
+ *   Anything that must read as one piece is one outline; two parts that merely touch stay two.
+ * - **Negative space as a separator.** Where a class is two objects (`combined`), the one behind is cut
+ *   back along the one in front, so the pair reads as two silhouettes rather than as one blob.
  *
  * Why path strings and not files: `npm run build:web` is a bare `esbuild --bundle` with no
  * asset-copy step, and production CSP is `default-src 'self'`. An icon that lives in a file is an
@@ -61,153 +65,90 @@ import { THREAT_TYPES, type EvidenceLevel, type RelationType, type ThreatType } 
  * An arrow drawn on a territory asserts a predicted target. This system does not predict targets,
  * and says so in eight places.
  *
- * Several of these glyphs do have an inherent orientation, because the objects do: a rocket has a
- * nose, a falling bomb has a down. That is a depiction, not a bearing, and the distinction is
- * mechanical rather than a matter of reading — **the chip is never rotated**. `icon-rotate` is not
- * set on any of the four territory-icon layers, so the glyph sits at the same angle over Sumy as
- * over Odesa and cannot encode a direction even in principle. The one bitmap on this map that IS
- * rotated is the vector arrowhead, and it is not from this table.
+ * Several of these glyphs do have an inherent orientation, because the objects do: a drone and a
+ * missile have a nose, a falling bomb has a down. That is a depiction, not a bearing, and the
+ * distinction is mechanical rather than a matter of reading — **the chip is never rotated**.
+ * `icon-rotate` is not set on any of the four territory-icon layers, so the glyph sits at the same
+ * angle over Sumy as over Odesa and cannot encode a direction even in principle. The one bitmap on
+ * this map that IS rotated is the vector arrowhead, and it is not from this table.
  *
- * The map does draw one arrowhead, and it is not one of these and never will be: it belongs to a
- * threat-vector leg whose basis is `reported_transit` or `reported_direction` — a movement a source
- * stated in so many words, between two places that source named — and it lives in `web/app.js` as
- * its own bitmap. The difference is the whole rule: that arrow points from a reported place to
- * another reported place, while an arrow on a *territory glyph* would point at a target nobody
- * reported. A leg the sources did not assert (`observation_sequence`) gets no arrowhead either.
+ * The map does draw arrows, and they are not these and never will be: they belong to a threat-vector
+ * leg whose basis is `reported_transit` or `reported_direction`, or to the heading a source named for
+ * a track's head — a movement a source stated in so many words, towards a place that source named —
+ * and they live in `web/app.js` as their own bitmaps and lines. The difference is the whole rule:
+ * those arrows point from a reported place to another reported place, while an arrow on a *territory
+ * glyph* would point at a target nobody reported. A leg the sources did not assert
+ * (`observation_sequence`) gets no arrowhead either.
  *
  * Дзеркальна копія цієї мапи живе у web/app.js (`threatIconPaths`). Змінюєш тут — зміни й там.
  */
 export const THREAT_ICON_PATHS: Record<ThreatType, string> = {
-  // Балістична: тіло на висхідній гілці з розкиданим слідом.
-  // Джерело: game-icons.net · lorc/rocket-flight · CC BY 3.0
+  // Балістична: ракета круто вгору, з оперенням і коротким факелом, над дугою сліду — висхідна гілка
+  // параболи. Крутизна й факел відрізняють її від крилатої, яка летить горизонтально.
   ballistic_missile:
-    'M482.22 44.844l-50.533 46.25-21.937 57.22c-34.637 15.445-47.955 24.442-61.47 74.874l39.564-17.657-1.875 '
-    + '32.095 37.342 14.344 21.75-24.5 17.625 39.56c24.52-42.467 25.663-63.24 '
-    + '4.282-96.78l21.936-57.22-6.687-68.186zM389.093 263.22c-16.33 25.16-38.017 48.57-63.063 '
-    + '68.217-.022.018-.038.045-.06.063-37.302 23.693-83.27 29.138-118.095 15.688 16.236 15.056 37.635 20.705 '
-    + '59.156 19.156-49.41 14.874-102.32 9.118-139.624-14.28 14.142 19.334 34.493 31.22 56.97 36.592-58.93 '
-    + '3.328-117.894-19.792-162.44-84l.002 168.03c65.91 28.65 135.148 19.62 196.218-11.56l-16.97 35.78 '
-    + '88.126-85.03h-.093c2-1.796 3.973-3.6 5.936-5.438l-11.28 43.937 59.812-99.438c19.668-27.56 35.253-57.384 '
-    + '45.406-87.718z',
+    'M17.6 2.2L18.01 3.93L17.87 5.64L15.84 9.99L16.69 14.8L15.42 14.2L14.49 12.89L11.41 11.45'
+    + 'L9.8 11.58L8.53 10.99L12.76 8.55L14.79 4.2L16.01 3ZM13.83 13.35L11.01 16.34L11.48 12.25Z'
+    + 'M3.6 21.6C4.4 17.4 6.4 15 9.4 14.4L9.8 15.8C7.3 16.4 6 18.3 5.3 21.8Z',
 
-  // КАБ: важке тіло носом донизу з оперенням і без двигуна — саме це відрізняє його від крилатої ракети.
-  // Джерело: game-icons.net · delapouite/falling-bomb · CC BY 3.0
+  // КАБ: товста бомба носом донизу з розкладеними крилами планувального модуля (УМПК) і коробчастим
+  // хвостом. Крила — те, що відрізняє керовану бомбу від звичайної.
   guided_air_bomb:
-    'M50.18 16.44L71.49 318.7 93.28 16.44h-43.1zm399.82 0l24.5 405.86 16.4-405.86H450zM256 28.46l-7.2 '
-    + '21.62-15.5 108.62c.6.5 1.6 1.1 3.5 1.8 4.6 1.5 12 2.5 19.2 2.5 7.3 0 14.6-1 19.2-2.5 1.9-.7 2.9-1.3 '
-    + '3.5-1.8L263.2 50.08 256 28.46zm-116.2 3.45l12.4 74.49 62.8 37.7V69.51l-75.2-37.6zm232.4.05L297 '
-    + '69.56v74.54l62.8-37.7 12.4-74.44zm37 89.14L370 177.2 387 402l22.2-280.9zm-184.8 53.4L185 227v118.8c47.5 '
-    + '17.7 94.4 17.7 142 0V227l-39.4-52.5c-2.1 1.3-4.4 2.2-6.8 3-7.4 2.5-16 3.5-24.8 '
-    + '3.5s-17.4-1-24.8-3.5c-2.4-.8-4.7-1.7-6.8-3zm-112.5 25.9l18.6 290.9 13-255.6-31.6-35.3zm-59.51 '
-    + '58.4l-30.2 22.3 22.27 165 7.93-187.3zm361.31 52.8l11.2 180.3 17.3-134.5-28.5-45.8zM185 364.9V400c0-.3.4 '
-    + '2.4 1.6 5.6 1.2 3.2 3 7.4 5.4 12 4.8 9.3 11.6 20.5 19.3 31.1 7.7 10.6 16.4 20.7 24.6 27.7 8.2 7.1 15.9 '
-    + '10.6 20.1 10.6 4.2 0 11.9-3.5 20.1-10.6 8.2-7 16.9-17.1 24.6-27.7 7.7-10.6 14.5-21.8 19.3-31.1 2.4-4.6 '
-    + '4.2-8.8 5.4-12 1.2-3.2 1.6-5.8 1.6-5.6v-35.1c-47.2 16.1-94.9 16-142 0z',
+    'M8.4 2.2H15.6L13.3 5.4L15 7.8V9.2H22.6V11.1H15V17.2C15 20.2 13.4 22.2 12 23'
+    + 'C10.6 22.2 9 20.2 9 17.2V11.1H1.4V9.2H9V7.8L10.7 5.4Z',
 
-  // Крилата: тіло, що входить полого, зі слідом позаду. Читається інакше, ніж літак — нинішній гліф плутався з авіацією.
-  // Джерело: game-icons.net · lorc/incoming-rocket · CC BY 3.0
+  // Крилата: вид збоку, рівний політ — довгий циліндр із загостреним носом, малі крила посередині й
+  // хрестоподібний хвіст. Крило лише знизу робило з неї пістолет, тому пари дві, як у справжньої.
   cruise_missile:
-    'M18.36 18.336V93.59l317.51 262.287-52.917.53 82.58 63.884-71.963.394 80.102 32.728-17.404 15.14c34.87 '
-    + '16.374 70.587 22.075 135.648 22.718l.008-.002c-.314-44.892-11.583-91.282-28.666-126.69l-12.5 '
-    + '25.762-43.65-104.975-8.303 72.656-53.752-70.182 5.8 55.584L85.86 18.336h-67.5zm148.736 0L336.303 271.23 '
-    + '232.88 18.336h-65.784zm123.34 0l50.753 183.898 2.468-183.898h-53.22zM18.363 160.074v82.963l241.853 '
-    + '99.272L18.36 160.073zm0 141.29v57.396l201.552-4.795-201.55-52.6zm357.154 77.212c41.388 7.493 81.473 '
-    + '39.554 93.138 89.248-30.75-5.512-52.902-16.592-67.86-31.74-14.722-14.907-22.987-34.03-25.278-57.508z',
+    'M23 12C21.8 11 20 10.8 17.8 10.8H14L10.6 7.8H9.2L11.8 10.8H6.8L3.6 8.2H2.4V15.8H3.6L6.8 13.2'
+    + 'H11.8L9.2 16.2H10.6L14 13.2H17.8C20 13.2 21.8 13 23 12Z',
 
-  // БпЛА: дельтоподібне крило. Форма збігається з силуетом ударного дрона типу Shahed, і саме тому вона тут, а не квадрокоптер.
-  // Джерело: game-icons.net · delapouite/stealth-bomber · CC BY 3.0
+  // БпЛА: «Шахед-136» згори — дельтакрило з вертикальними шайбами на кінцях, короткий фюзеляж і
+  // штовхальний гвинт позаду. Шайби й гвинт відрізняють його і від літака, і від «невидимки».
   uav:
-    'M256 32L20 400l60 64 52.1-75.9L176 432l50.5-50.5L256 448l29.5-66.5L336 432l43.9-43.9L432 464l60-64L256 '
-    + '32zm-9 47v78l-39-13 39-65zm18 0l39 65-39 13V79z',
+    'M12 1.9C12.8 1.9 13.2 3 13.2 4.2V6L20.4 13.6V12.4H21.8V18.6H20.4V17.2L13.2 18.2V19.4H10.8V18.2'
+    + 'L3.6 17.2V18.6H2.2V12.4H3.6V13.6L10.8 6V4.2C10.8 3 11.2 1.9 12 1.9ZM8.6 20.2H15.4V21.4H8.6Z',
 
-  // Авіація: винищувач у плані. Раніше цей клас і крилата ракета були двома майже однаковими літаками.
-  // Джерело: game-icons.net · delapouite/jet-fighter · CC BY 3.0
+  // Авіація: реактивний літак згори — стрілоподібне крило посередині й окремий хвостовий стабілізатор.
+  // Хрест «крило + хвіст» не сплутати з дельтою БпЛА.
   aviation:
-    'M461.5 31.85c-5 1.2-10.4 3.4-16.4 6.4-12 6-26.7 15.3-42.1 26.1-26.7 18.7-55.5 41.75-75 59.95l39.8 19.9 '
-    + '19.9 39.8c18.2-19.5 41.2-48.3 59.9-75 10.8-15.35 20.1-30.05 26.2-42.15 3-6 5.2-11.3 6.3-16.3 1.2-5 '
-    + '1.9-10.9-2.9-15.7-4.8-4.56-10-4.25-15.7-3zm-14.8 33.4c4.9 4.71 5.6 12.1 3.8 18.7-1.8 6.6-6.1 13.3-12.9 '
-    + '20.15l-42.2 42.2-29.6-29.7L408 74.45c6.8-6.8 13.5-11.06 20.1-12.9 6.1-1.71 14.3-.44 18.6 3.7zM183.2 '
-    + '109.5l-21.3 21.2 45.6 5v-26.2zm129.9 25.2l-43.5 21.8-153 200.1 13.7 13.8 97.5-97.5 11.3 11.3c-32.5 '
-    + '32.5-65 65.1-97.5 97.6l13.8 13.6 200.1-153 21.8-43.5-21.4-42.8zm-256.59.4l7.4 22.2 120.99 83.5 '
-    + '64.5-84.3zm38.1 62.8l-13.1 13.2 24.39 24.3 17.6-17.5zm260.89 64.7l-84.3 64.5 83.5 121 22.2 7.3zm-190.9 '
-    + '4.8l-110.99 9.1-22.6 22.6 82.39 35.4zm212.1 41.2l4.6 41.5 17.1-17.2v-24.3zm-132.1 38.8l-67 51.2 35.3 '
-    + '82.4 22.6-22.6zm-138.7 21.2l-13.09 13.1 37.49 37.4 13.1-13zm188.2 19.9l-17.5 17.6 24.3 24.3 13.2-13.1z',
+    'M12 1.2L13.1 4.4V8.2L21.8 14V15.6L13.1 13.4V17.4L17.8 20.6V22L13.1 21.2L12.6 22.8H11.4L10.9 21.2'
+    + 'L6.2 22V20.6L10.9 17.4V13.4L2.2 15.6V14L10.9 8.2V4.4Z',
 
-  // РСЗВ: пускова на станині під кутом.
-  // Джерело: game-icons.net · delapouite/missile-launcher · CC BY 3.0
+  // РСЗВ: вантажівка з пакетом труб, піднятим під кутом над кабіною. Прорізи в пакеті — самі труби:
+  // саме вони відрізняють реактивну систему від пускової ППО з двома-трьома контейнерами.
   mlrs:
-    'M490.74 21.411c-8.947.782-20.72 3.22-33.566 7.781-16.386 5.82-34.345 14.758-50.969 25.893l26.783 '
-    + '36.525c15.712-12.52 29.853-26.925 40.428-40.757 8.265-10.811 14.055-21.243 17.324-29.442zm-99.265 '
-    + '44.026L57.609 310.24l8.28 11.291 83.062-60.906 10.643 14.516-83.063 60.906 8.28 11.29 '
-    + '333.865-244.806zm-18.252 92.746L203.164 282.876l13.924 7.15L375.855 173.61zm-48.602 75.316l-35.775 '
-    + '26.234c3.899 3.046 8.821 4.856 14.213 4.856 12.809 0 23-10.191 23-23 '
-    + '0-2.855-.51-5.579-1.438-8.09zm-255.267 7.527L21.26 260.67l25.705 35.057 65.54-48.057zm226.705 '
-    + '40.948v30.615h14v-30.615a40.734 40.734 0 0 1-7 .615c-2.386 0-4.723-.219-7-.615zm-135.065 31.822l-65.54 '
-    + '48.058 25.706 35.06 33.194-39.964zm-117.9 7.09l-11.291 8.279 27.2 37.096 11.29-8.28zm236.965 '
-    + '9.703v78h46v-78zm-18 54.336l-61.426 71.664h23.709l37.717-44.004zm82 0v27.66l37.716 44.004h23.71zm-192 '
-    + '89.664v16h94v-16zm208 0v16h94v-16z',
+    'M1.8 15H17.2V10.2H20.6L22.4 12.4V17.2H1.8ZM2.9 19.7A2.1 2.1 0 1 0 7.1 19.7'
+    + 'A2.1 2.1 0 1 0 2.9 19.7ZM7.7 19.7A2.1 2.1 0 1 0 11.9 19.7A2.1 2.1 0 1 0 7.7 19.7ZM17.1 19.7'
+    + 'A2.1 2.1 0 1 0 21.3 19.7A2.1 2.1 0 1 0 17.1 19.7ZM3 14.2L14.04 8.33L12.07 4.62L1.03 10.49Z'
+    + 'M3.5 12.58L13.47 7.27L13.14 6.65L3.17 11.96ZM2.89 11.43L12.86 6.12L12.53 5.51L2.56 10.81ZM6 15'
+    + 'V12.6L8 11.54V15Z',
 
-  // Артилерія: снаряд. Ствол читався б як мінометна труба, а снаряд — ні з чим.
-  // Джерело: game-icons.net · quoting/artillery-shell · CC BY 3.0
+  // Артилерія: гаубиця на колесі — довгий ствол із дульним гальмом під пологим кутом, станина до
+  // землі й колесо зі ступицею. Довгий пологий ствол і колесо — те, чим вона не схожа на міномет.
   artillery:
-    'M372.386 52.97l-14.822 13.064 103.244 117.142 14.822-13.064zm-30.23 26.646l-36.649 32.303 15.549 '
-    + '17.64zm16.865 16.346l-20.442 48.382-1.457 3.448 19.012 21.57 21.897-51.832zm-67.537 28.318L119.939 '
-    + '275.485l.054.062-1.294 1.141c-19.625 17.298-36.277 35.67-49.407 53.91l92.854 105.356c19.745-10.734 '
-    + '40.062-24.948 59.687-42.246l1.295-1.143.055.063 6.23-5.493 165.313-145.713zm102.615 11.482l-20.443 '
-    + '48.385-1.456 3.445 20.838 23.641 21.897-51.83zm36.904 41.873l-20.441 48.385-.973 2.303 '
-    + '37.194-32.783zM58.583 346.723c-4.228 6.959-7.93 13.848-11.015 20.592-6.73 14.712-10.7 28.778-11.157 '
-    + '41.78-.457 13.001 2.827 25.259 10.93 34.452 8.103 9.194 19.85 13.989 32.805 15.168 12.955 1.18 '
-    + '27.408-.992 42.847-5.822 7.078-2.214 14.377-5.02 21.811-8.342z',
+    'M5.23 11.66L13.03 7.56L13.29 8.05L19.47 4.76L19.28 4.41L20.52 3.75L21.6 5.78L20.36 6.44'
+    + 'L20.17 6.09L13.99 9.37L14.25 9.86L7.51 13.39L4 20.2H2.4L2.7 19.4L5.98 13.07ZM6.3 17.3'
+    + 'A4.4 4.4 0 1 0 15.1 17.3A4.4 4.4 0 1 0 6.3 17.3ZM7.8 17.3A2.9 2.9 0 1 0 13.6 17.3'
+    + 'A2.9 2.9 0 1 0 7.8 17.3ZM9.45 17.3A1.25 1.25 0 1 0 11.95 17.3A1.25 1.25 0 1 0 9.45 17.3Z',
 
-  // Міномет: труба на двонозі.
-  // Джерело: game-icons.net · delapouite/mortar · CC BY 3.0
+  // Міномет: коротка товста труба круто вгору на двоногому лафеті, з опорною плитою під казенником.
   mortar:
-    'M336.313 25.057l-42.536 73.45-1.718 28.036 45.754 26.498 23.463-15.446 42.535-73.448zm-50.3 '
-    + '118.785l-31.07 53.654 30.307 17.55c.91-.06 1.825-.103 2.75-.103 3.218 0 6.35.39 9.36 '
-    + '1.1l28.46-49.148zm-61.238 20.455l-4.63 7.72-33.665 56.106-11.09-7.19-7.55-4.9-9.795 15.102 7.55 4.896 '
-    + '11.618 7.538-5.068 8.448-4.63 7.716 15.434 9.262 4.63-7.72 48-80 4.63-7.715zm14.22 44.766l-31.07 53.652 '
-    + '53.655 31.072 2.623-4.53c-10.39-7.46-17.203-19.63-17.203-33.314 0-13.334 6.466-25.24 16.412-32.742zM288 '
-    + '232.942c-12.81 0-23 10.19-23 23s10.19 23 23 23 23-10.19 23-23-10.19-23-23-23zM205.83 282.3l-78.078 '
-    + '134.827c5.496 5.717 8.967 13.386 9.223 21.816h31.298l77.364-133.59zm109.432 4.184c-3.484 3.116-7.498 '
-    + '5.644-11.885 7.436l89.393 161.023h16.01zM104 424.944c-8.39 0-15 6.608-15 15 0 8.39 6.61 15 15 '
-    + '15s15-6.61 15-15c0-8.392-6.61-15-15-15zm-63 32v30h35.498c5.765-4.327 12.842-6.912 20.772-8.764 '
-    + '9.43-2.204 20.05-3.237 30.675-3.237 10.626 0 21.22 1.03 30.608 3.24 7.86 1.847 14.873 4.418 20.568 '
-    + '8.76H215v-30h-82.766c-5.803 9.562-16.317 16-28.234 16-11.917 0-22.43-6.438-28.234-16zm336 16v14h94v-14z',
+    'M7.78 20.26L16.98 3.86L14.62 2.54L5.42 18.94ZM4.2 20.6H11.2V21.8H4.2ZM13.5 10.2L14.9 9.9L20 20.8'
+    + 'H18.4L15.5 14.8L15.9 20.8H14.3Z',
 
-  // Комбінована: рій. Множинність — це і є те, що каже клас.
-  // Джерело: game-icons.net · lorc/missile-swarm · CC BY 3.0
+  // Комбінована: малий «Шахед» і ракета поруч, ракета попереду — крило дрона підрізано вздовж неї.
+  // Два різні засоби в одному повідомленні, а не рій однакових.
   combined:
-    'M17.34 17.38v34.08C37.24 85.91 61.4 120.5 95.03 151c6.97 24.6 23.57 43.7 46.27 '
-    + '53.9-5.9-8.2-9.4-18.1-9.6-30.1 12 .1 21.9 3.7 30.1 '
-    + '9.6-10.1-22.5-28.7-39-52.9-46-40.28-36.2-66.64-78.82-89.03-121.02zm26.96 0C98.65 32.32 173.5 71.74 '
-    + '240.5 124.5l16.3-11.6C205.6 71.81 149.6 38.58 99.97 17.38zm110.1 0c28.4 8.14 52.8 19.57 75.3 32.83 13 '
-    + '21.96 34.1 36.14 58.6 40.15-7.8-6.38-13.7-15.05-17-26.58 11.7-2.98 22.1-2.09 31.5 '
-    + '1.46-15.5-19.08-37.8-30.23-63-30.76-10.3-6.07-21-11.82-32.3-17.1zm171.3 4.96L321 71.62c-6.1 10.46-12.1 '
-    + '20.92-18.2 31.38-14.6 11.2-26.3 18.7-40.6 29l39.6 22.8h.1l38.3-13.9c37.3 28.7 84.7 43.6 133.5 '
-    + '39.8-21.2-44.6-57.8-78.2-101.5-96.03l-7-39.5zM194.9 148.8l-17.2 46.4c-8.6 8.4-17.2 17.1-25.7 25.7-14.9 '
-    + '5.8-31.2 11.8-46.6 17.5l32.3 32.3 40.6-3.5c28.6 37.3 70.5 64 118.6 '
-    + '72.9-8.9-48.5-35.6-90.5-73.1-119l3.4-40zm123.3 20l-18.2 6.6c17.1 17.7 33.5 38.1 44.3 52.6 1.1 24.4 12.1 '
-    + '46.1 30.6 61.3-3.5-9.5-4.3-19.9-1.4-31.6 11.6 3.3 20.2 9.3 26.6 '
-    + '17.1-4.1-25.4-19-47-42.3-59.9-12-15.9-25.3-31.3-39.6-46.1zM17.34 247.2v49.7c14.05 24.6 33.51 44.5 56.99 '
-    + '61 12.88 23.6 34.67 38.8 60.27 43-7.8-6.4-13.8-15.1-17.1-26.6 11.7-3 22.2-2.1 31.6 '
-    + '1.5-15-18.5-36.3-29.5-60.47-30.7-35.62-23.9-60.18-54.2-71.29-97.9zM441.3 249l-28.7 40.4c-10.5 6-20.9 '
-    + '12.1-31.4 18.1-16.1 1.9-33.2 3.3-49.6 4.8l22.9 39.6 40.1 7.1c17.9 43.5 51.5 80.1 95.7 101.2 '
-    + '4-49.2-10.9-96.7-39.9-133.9l13.7-37.7zm-269.4 83.9l-4.6 49.3c-6.1 10.3-12.2 20.9-18.2 31.4-13 9.6-27 '
-    + '19.4-40.5 28.9l39.6 22.9 38.3-13.9c37.3 28.7 84.6 43.6 133.4 '
-    + '39.8-21.1-44.7-57.7-78.3-101.4-96.1l-7-39.5z',
+    'M8.6 5.8L9.42 7.09V8.52L14.31 13.69V12.87H15.05V17.09H14.31V16.14L9.42 16.82V17.63H7.78V16.82'
+    + 'L2.89 16.14V17.09H1.94V12.87H2.89V13.69L7.78 8.52V7.09ZM6.29 18.18H10.91V18.99H6.29ZM17.6 2.2'
+    + 'L18.76 4L19.05 5.6V15.8L21.35 18.8V20L19.05 19.2V18.4H16.15V19.2L13.85 20V18.8L16.15 15.8V5.6'
+    + 'L16.44 4Z',
 
-  // Невизначена: знак питання. Відсутність класифікації, а не її різновид.
-  // Джерело: game-icons.net · lorc/uncertainty · CC BY 3.0
+  // Невизначена: жирний знак питання в кільці. Відсутність класифікації, а не її різновид.
   unknown:
-    'M257.78 19.438c-127.92.016-231.75 103.855-231.75 231.78 0 55.734 19.71 106.776 52.532 146.72L57.75 '
-    + '434.094h132.406l-66.312-114.72-22.375 39c-20.9-30.478-33.064-67.442-33.064-107.155 0-104.523 '
-    + '84.854-189.376 189.375-189.376 104.523 0 189.408 84.853 189.408 189.375 0 39.108-11.68 75.664-32 '
-    + '105.874l-21.875-37.72L327 434.095h132.406l-21.594-37.47c32.225-39.78 51.75-90.253 51.75-145.405 '
-    + '0-127.927-103.827-231.766-231.75-231.782h-.03zm-.655 75.468c-49.528-.047-110.474 29.232-128.406 '
-    + '104.938l60.75 14.312c26.965-76.242 90.87-70.824 113.31-28.625 26.775 50.346-89.687 107.283-84.124 '
-    + '190.407h77.688c6.49-98.144 118.973-123.49 59.562-229.53C337.963 114.38 301 96.572 261.876 '
-    + '95.03V95c-1.573-.062-3.153-.092-4.75-.094zM258.5 395.97c-26.95 0-48.594 21.644-48.594 48.592 0 26.95 '
-    + '21.645 48.594 48.594 48.594 26.95 0 48.594-21.645 48.594-48.594 0-26.948-21.645-48.593-48.594-48.593z'
+    'M.8 12A11.2 11.2 0 1 0 23.2 12A11.2 11.2 0 1 0 .8 12ZM2.8 12A9.2 9.2 0 1 0 21.2 12'
+    + 'A9.2 9.2 0 1 0 2.8 12ZM7.3 9A4.7 4.7 0 1 1 15.6 12.02L13.4 13.4V15.4H10.6V12.8L13.46 10.22'
+    + 'A1.9 1.9 0 1 0 10.1 9ZM10.45 18.3A1.55 1.55 0 1 0 13.55 18.3A1.55 1.55 0 1 0 10.45 18.3Z'
 };
 
 /**
