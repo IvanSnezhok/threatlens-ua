@@ -3,6 +3,7 @@ dist/
 .env
 public/assets/app.js
 public/assets/app.css
+public/assets/maplibre-gl-worker.js
 public/assets/*.map
 # Стиснуті близнюки збірки. Їх пише `npm run build:static` усередині образу поруч із тим самим
 # бандлом, який їх і породив; у чекауті вони були б копією, що старіє з першою ж перезбіркою —

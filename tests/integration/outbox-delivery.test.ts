@@ -58,6 +58,27 @@ async function statusOf(id: string): Promise<{ status: string; attempts: number 
   return { status: row.rows[0]!.status, attempts: Number(row.rows[0]!.attempts) };
 }
 
+/*
+ * What a `runDelivery` wait must observe: the LAST statement the pass writes for a row, not the first.
+ *
+ * `deliverBatch` handles one row as a chain of autocommitted statements — the outbox status first,
+ * then the `notification_deliveries` row, then whatever follows it (the user disabled on 403, the
+ * standing message recorded for a soft update, the aggregate pause stored on 429). `stop()` only
+ * clears the timers; the pass already running carries on. So a wait on the status returns while the
+ * rest of the chain is still in flight, and an assertion on it reads the state from before it. A
+ * slow runner widens that window from microseconds to a failed build (the 403 test on 65ad905).
+ */
+async function deliveryRecorded(id: string): Promise<boolean> {
+  return Boolean((await sql(`SELECT 1 FROM notification_deliveries WHERE outbox_id=$1`, [id])).rowCount);
+}
+
+/** A 429 ends the pass with `recordProviderBackoff`, which journals the row that hit the limit last. */
+async function backoffRecorded(id: string): Promise<boolean> {
+  return Boolean((await sql(
+    `SELECT 1 FROM telegram_delivery_decisions WHERE decision='provider_backoff' AND outbox_id=$1`, [id]
+  )).rowCount);
+}
+
 /** Telegram-shaped rejection, matching what grammy surfaces to `deliverBatch`. */
 function telegramError(code: number, retryAfter?: number): Error {
   const error = new Error(`Telegram ${code}`) as Error & { error: unknown };
@@ -88,8 +109,7 @@ describe.skipIf(!integrationDatabaseAvailable)('outbox delivery and stuck-messag
     // Reject every send so the reclaimed row cannot immediately be marked 'sent', which would hide
     // the reclaim transition. 429 with a long retry_after also keeps it out of the next batch.
     const stub = fakeBot(() => { throw telegramError(429, 900); });
-    await runDelivery(stub, async () => (await statusOf(exhausted)).status === 'failed',
-      'the exhausted sending row to be marked failed');
+    await runDelivery(stub, () => backoffRecorded(stale), 'the 429 on the reclaimed row to store the aggregate pause');
 
     expect(await statusOf(exhausted)).toEqual({ status: 'failed', attempts: MAX_ATTEMPTS });
     // Reclaimed back to 'retry', then picked up by the same pass and retried once more.
@@ -108,7 +128,7 @@ describe.skipIf(!integrationDatabaseAvailable)('outbox delivery and stuck-messag
     });
 
     const stub = fakeBot(() => { throw telegramError(429, 900); });
-    await runDelivery(stub, async () => (await statusOf(stale)).attempts === 2, 'the stale row to be retried');
+    await runDelivery(stub, () => backoffRecorded(stale), 'the retried row to store the aggregate pause');
 
     const row = await sql<{ delta: string }>(
       `SELECT extract(epoch FROM next_attempt_at-now())::text AS delta FROM notification_outbox WHERE id=$1`,
@@ -123,7 +143,7 @@ describe.skipIf(!integrationDatabaseAvailable)('outbox delivery and stuck-messag
     const pending = await seedOutbox({ chatId: 8103, eventId, status: 'pending', attempts: 0 });
 
     const stub = fakeBot();
-    await runDelivery(stub, async () => (await statusOf(pending)).status === 'sent', 'the pending row to be sent');
+    await runDelivery(stub, () => deliveryRecorded(pending), 'the pending row to be sent and recorded');
 
     expect(await statusOf(pending)).toEqual({ status: 'sent', attempts: 1 });
     const deliveries = await sql<{ delivered_status: string; telegram_message_id: string }>(
@@ -139,11 +159,13 @@ describe.skipIf(!integrationDatabaseAvailable)('outbox delivery and stuck-messag
     const blocked = await seedOutbox({ chatId: 8104, eventId, status: 'pending', attempts: 0 });
 
     const stub = fakeBot(() => { throw telegramError(403); });
-    await runDelivery(stub, async () => (await statusOf(blocked)).status === 'failed', 'the blocked row to fail');
+    // Disabling the user is the last statement of the 403 branch, after the status and the delivery
+    // row, so it is what the wait observes. Waiting on `failed` alone read `enabled` before that
+    // UPDATE landed («expected true to be false»).
+    await runDelivery(stub, async () => !(await sql<{ enabled: boolean }>(
+      `SELECT enabled FROM telegram_users WHERE chat_id=8104`)).rows[0]!.enabled, 'the blocked user to be disabled');
 
     expect((await statusOf(blocked)).status).toBe('failed');
-    const user = await sql<{ enabled: boolean }>(`SELECT enabled FROM telegram_users WHERE chat_id=8104`);
-    expect(user.rows[0]!.enabled).toBe(false);
     const deliveries = await sql<{ error_code: string }>(
       `SELECT error_code FROM notification_deliveries WHERE outbox_id=$1`, [blocked]
     );
@@ -160,7 +182,7 @@ describe.skipIf(!integrationDatabaseAvailable)('outbox delivery and stuck-messag
     const pending = await seedOutbox({ chatId: 8105, eventId, status: 'pending', attempts: 0 });
 
     const stub = fakeBot();
-    await runDelivery(stub, async () => (await statusOf(pending)).status === 'sent', 'the pending row to be sent');
+    await runDelivery(stub, () => deliveryRecorded(pending), 'the pending row to be sent and recorded');
 
     expect(await statusOf(fresh)).toEqual({ status: 'sending', attempts: 2 });
     expect(stub.warnings.filter((entry) => 'reclaimed' in entry)).toEqual([]);
@@ -186,6 +208,14 @@ describe.skipIf(!integrationDatabaseAvailable)('outbox delivery and stuck-messag
       );
     }
 
+    /** A soft update's chain ends with the standing message recorded on its `notification_state` row. */
+    async function stateDelivered(eventId: string, chatId: number): Promise<boolean> {
+      return Boolean((await sql(
+        `SELECT 1 FROM notification_state WHERE entity_key=$1 AND chat_id=$2 AND delivered_at IS NOT NULL`,
+        [eventId, chatId]
+      )).rowCount);
+    }
+
     it('edits the standing message instead of pushing a new one', async () => {
       await seedUser(8107);
       const eventId = await seedThreatEvent({ locationIds: [OBLAST] });
@@ -195,8 +225,9 @@ describe.skipIf(!integrationDatabaseAvailable)('outbox delivery and stuck-messag
       });
 
       const stub = fakeBot();
-      await runDelivery(stub, async () => (await statusOf(queued)).status === 'sent', 'the soft update to be sent');
+      await runDelivery(stub, () => stateDelivered(eventId, 8107), 'the soft update to be sent and recorded');
 
+      expect(await statusOf(queued)).toEqual({ status: 'sent', attempts: 1 });
       expect(stub.calls).toHaveLength(0);
       expect(stub.edits).toEqual([expect.objectContaining({ chatId: '8107', messageId: 555 })]);
       expect(stub.edits[0]!.text).toContain('Загрозу продовжено до');
@@ -213,7 +244,7 @@ describe.skipIf(!integrationDatabaseAvailable)('outbox delivery and stuck-messag
       });
 
       const stub = fakeBot({ onEdit: () => { throw telegramError(400); } });
-      await runDelivery(stub, async () => (await statusOf(queued)).status === 'sent', 'the fallback send to happen');
+      await runDelivery(stub, () => stateDelivered(eventId, 8108), 'the fallback send to be recorded');
 
       expect(await statusOf(queued)).toEqual({ status: 'sent', attempts: 1 });
       expect(stub.calls).toHaveLength(1);
@@ -232,9 +263,8 @@ describe.skipIf(!integrationDatabaseAvailable)('outbox delivery and stuck-messag
     const high = await seedOutbox({ chatId: 8106, eventId, status: 'pending', attempts: 0, priority: 0, updatedSecondsAgo: 10 });
 
     const stub = fakeBot();
-    await runDelivery(stub, async () =>
-      (await statusOf(low)).status === 'sent' && (await statusOf(high)).status === 'sent',
-    'both rows to be sent');
+    await runDelivery(stub, async () => (await deliveryRecorded(low)) && deliveryRecorded(high),
+      'both rows to be sent and recorded');
 
     expect(stub.calls).toHaveLength(2);
     // priority 0 is an official alert start; it must precede the analytics-grade row queued earlier.

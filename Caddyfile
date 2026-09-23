@@ -6,7 +6,9 @@
     Referrer-Policy "strict-origin-when-cross-origin"
     X-Frame-Options "SAMEORIGIN"
     Permissions-Policy "geolocation=(), microphone=(), camera=()"
-    Content-Security-Policy "default-src 'self'; script-src 'self' https://telegram.org; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob: https:; connect-src 'self' https:; worker-src blob:; child-src blob:; font-src 'self' data:; frame-ancestors 'self'"
+    # `worker-src 'self'`: MapLibre 6 запускає воркер модулем з /assets/maplibre-gl-worker.js (той самий
+    # origin), а не з blob:, як робила збірка 5.x. Дозвіл на blob: лише розширював би поверхню атаки.
+    Content-Security-Policy "default-src 'self'; script-src 'self' https://telegram.org; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob: https:; connect-src 'self' https:; worker-src 'self'; child-src blob:; font-src 'self' data:; frame-ancestors 'self'"
   }
 
   # Everything Caddy can answer without waking the application.

@@ -1,9 +1,15 @@
-import maplibregl from 'maplibre-gl';
+import * as maplibregl from 'maplibre-gl';
 import 'maplibre-gl/dist/maplibre-gl.css';
 import './styles.css';
 import {
   HISTORY_EXPORT_FORMATS, buildHistoryExport, historyExportFilename, historyExportMime
 } from './history-export.js';
+
+// MapLibre 6 постачається лише як ES-модулі, а воркер — окремим файлом. Сам він шукає воркер поруч
+// зі своїм import.meta.url, але в нашому бандлі такого URL немає: esbuild злив бібліотеку в app.js.
+// Тому воркер збирається окремо (`npm run build:web` → /assets/maplibre-gl-worker.js) і вказується
+// явно. Та сама адреса — це й причина, чому CSP у Caddyfile дозволяє `worker-src 'self'`, а не blob:.
+maplibregl.setWorkerUrl('/assets/maplibre-gl-worker.js');
 
 const $ = (selector, root = document) => root.querySelector(selector);
 const threatNames = {
@@ -197,7 +203,8 @@ const updateReasonNames = {
   two_independent_tier_a_or_b_sources: 'підтвердили два незалежні джерела',
   source_message_edited: 'джерело відредагувало повідомлення',
   last_source_assertion_withdrawn: 'джерело відкликало повідомлення',
-  validity_window_elapsed: 'минув строк дії повідомлення'
+  validity_window_elapsed: 'минув строк дії повідомлення',
+  threat_type_refined: 'уточнено клас загрози'
 };
 const statusNames = {
   active: 'триває', observed: 'спостерігається', confirmed: 'підтверджено',
@@ -3081,8 +3088,11 @@ function initMap() {
   territoryStateSignatures.clear();
   ensureMapOverlays();
   map = new maplibregl.Map({ container: 'map', style: config.mapStyleUrl, center: [31.2, 48.8], zoom: 5.1, attributionControl: false });
-  map.on('styleimagemissing', (event) => {
-    if (!map.hasImage(event.id)) map.addImage(event.id, { width: 1, height: 1, data: new Uint8Array([0,0,0,0]) });
+  // Підкладка openfreemap посилається на значки, яких у її спрайті може не бути. Без відповіді
+  // MapLibre пише попередження на кожен такий значок; прозорий піксель 1×1 закриває їх мовчки.
+  // У MapLibre 6 подія styleimagemissing лише сповіщає — підставити зображення може тільки резолвер.
+  map.setMissingStyleImageResolver((id) => {
+    if (!map.hasImage(id)) map.addImage(id, { width: 1, height: 1, data: new Uint8Array([0,0,0,0]) });
   });
   // Єдиний обробник масштабу у файлі. MapLibre забороняє вираз ['zoom'] усередині filter, а згасання
   // прозорістю лишило б невидимі іконки займати місце в колізіях і виштовхувати справжні за межі

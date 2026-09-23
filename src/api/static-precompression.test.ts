@@ -112,8 +112,9 @@ const BUILT_PRECOMPRESSED = BUILT.some((file) =>
 describe('precompressed bundle assets', () => {
   it.skipIf(!BUILT.length)('covers the whole bundle, not only the script', () => {
     // Same reason the GeoJSON list is spelled out: a second entry point that slips in uncompressed
-    // is 1.4 MiB of Caddy CPU per cold visit that nothing else would notice.
-    expect(BUILT).toEqual([`${BUILT_DIR}/app.css`, `${BUILT_DIR}/app.js`]);
+    // is 1.4 MiB of Caddy CPU per cold visit that nothing else would notice. The MapLibre worker is
+    // the second entry point that already exists: every map visit loads it beside `app.js`.
+    expect(BUILT).toEqual([`${BUILT_DIR}/app.css`, `${BUILT_DIR}/app.js`, `${BUILT_DIR}/maplibre-gl-worker.js`]);
   });
 
   it.skipIf(!BUILT_PRECOMPRESSED)('inflates every sibling back to its source, byte for byte', () => {
