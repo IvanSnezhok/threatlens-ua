@@ -241,11 +241,20 @@ interface CandidateSource {
   longitude: number | string | null;
 }
 
+/**
+ * Places the cone may name: settlements at their points, raions at their polygon centroids, oblasts at
+ * their administrative centres (deduplicated against the capital below).
+ *
+ * Hromadas are left out. Migration 056 gives about 1,760 of them a coordinate, and that coordinate is
+ * the centre of an area — or the settlement that governs it — rather than a place. Admitting them would
+ * add four area centres, labelled as points, for every settlement the catalogue has, and push the
+ * settlements an operator reads the cone by out of the capped list.
+ */
 async function candidateLocations(): Promise<Array<{
   id: string; name: string; type: string; point: [number, number]; precision: 'point' | 'approximate';
 }>> {
   const rows = (await pool.query<CandidateSource>(
-    `SELECT id,name_uk,type,latitude,longitude FROM locations WHERE type <> 'country'`
+    `SELECT id,name_uk,type,latitude,longitude FROM locations WHERE type NOT IN ('country','hromada')`
   )).rows;
   const centroids = raionCentroids();
   const out: Array<{ id: string; name: string; type: string; point: [number, number]; precision: 'point' | 'approximate' }> = [];
@@ -264,7 +273,7 @@ async function candidateLocations(): Promise<Array<{
 
 /** Which name wins when two catalogue entries resolve to the same point. */
 const CANDIDATE_SPECIFICITY: Readonly<Record<string, number>> = {
-  city: 0, special_city: 1, hromada: 2, raion: 3, oblast: 4
+  city: 0, special_city: 1, raion: 3, oblast: 4
 };
 
 export function rankCandidates(

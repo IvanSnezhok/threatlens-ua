@@ -257,9 +257,10 @@ describe('classifyMessage on telegraphic and conversational styles', () => {
  * `v7`: репорт, у якому зброю не названо жодним словом.
  *
  * Кожен текст нижче — дослівно з розміченого корпусу, і кожен із них `v6` мовчки відкидав як
- * `not_an_assertion`. Разом вони були 9.6 % усіх справжніх попереджень у вибірці. Клас у всіх
- * `unknown` навмисно: зброю в цих каналах встановлює контекст каналу, а не текст, і дочитувати її —
- * саме та інференція, якої модуль не робить.
+ * `not_an_assertion`. Разом вони були 9.6 % усіх справжніх попереджень у вибірці. Клас `unknown`
+ * навмисно: зброю в цих каналах встановлює контекст каналу, а не текст, і дочитувати її — саме та
+ * інференція, якої модуль не робить. Виняток із `v8` — рядок, що починається з піктограми легенди
+ * (два з цих текстів): там клас назвало саме джерело, і він `uav`.
  */
 describe('classifyMessage on telegraphic targeting with no weapon named', () => {
   const telegraphic = [
@@ -285,21 +286,25 @@ describe('classifyMessage on telegraphic targeting with no weapon named', () => 
 
   it('never names a weapon class the message did not name', () => {
     // Порожній `threatTypes` у цих індикаторів — не недогляд: подія чесно каже «Повідомлення про
-    // загрозу». Клас узявся б лише з попереднього поста або з піктограми, а це і є та інференція,
-    // яку робити заборонено.
+    // загрозу». Клас узявся б лише з попереднього поста, а це і є та інференція, яку робити
+    // заборонено. Рядок, що починається з 🛵 чи 🏍, — інший випадок: там клас назвало саме джерело
+    // своєю легендою (див. `v8` нижче).
     expect(classify('Ціль на Бровари').threatType).toBe('unknown');
-    expect(classify('🛵 Курс Бровари').threatType).toBe('unknown');
   });
 
   it('never lets the bulletin emoji raise anything on its own', () => {
-    // Обидва замки на 🛵, по одному на кожен спосіб помилитися. Перший: без розвʼязаного місця
-    // контекстні індикатори не збираються взагалі, тож мопед без назви — це повідомлення про
-    // нікуди, і воно не стає ні подією, ні тривогою по всій країні. Другий: мем із мопедом ловить
-    // сторож `COMMENTARY_MARKERS` до того, як справа дійде до індикаторів.
-    const bare = classify('🛵');
-    expect(isSignificant(bare)).toBe(false);
-    expect(bare.nationalScope).toBe(false);
+    // Обидва замки на 🛵 і 🏍, по одному на кожен спосіб помилитися. Перший: без розвʼязаного місця
+    // контекстні індикатори не збираються взагалі, тож піктограма без назви — це повідомлення про
+    // нікуди, і воно не стає ні подією, ні тривогою по всій країні, хоч би який клас цей знак
+    // називав у легенді. Другий: мем ловить сторож `COMMENTARY_MARKERS` до того, як справа дійде до
+    // індикаторів.
+    for (const pictogram of ['🛵', '🏍']) {
+      const bare = classify(pictogram);
+      expect(isSignificant(bare), pictogram).toBe(false);
+      expect(bare.nationalScope, pictogram).toBe(false);
+    }
     expect(isSignificant(classify('🛵 мем про мопеди у Броварах 😂'))).toBe(false);
+    expect(isSignificant(classify('🏍 мем про байкерів у Броварах 😂'))).toBe(false);
   });
 
   it('keeps a currency report out, which is what the capitalisation lock is for', () => {
@@ -328,6 +333,42 @@ describe('classifyMessage on telegraphic targeting with no weapon named', () => 
     // Випадок, заради якого сторож написаний, лишається закритим: ні слова про загрозу, ні
     // прийменника походження перед чужою назвою.
     expect(isSignificant(classify('Над Курськом працює ворожа ППО'))).toBe(false);
+  });
+});
+
+/**
+ * `v8`: піктограма на початку рядка — легенда класів самого джерела.
+ *
+ * Повітряні сили підписують рядок бюлетеня знаком класу: 🛵 — ударний БпЛА, 🏍 — реактивний. Це
+ * текст повідомлення, а не здогад із попереднього поста, тож рядок, що починається зі знака, має клас
+ * `uav` — але лише там, де жодне слово класу не назвало, і лише поруч із розвʼязаним місцем.
+ */
+describe('classifyMessage on the bulletin legend', () => {
+  it('reads a line that opens with 🛵 or 🏍 as a UAV when no word names the class', () => {
+    expect(classify('🛵 Курс Бровари').threatType).toBe('uav');
+    // U+FE0F після 🏍 — так знак надсилає клавіатура; веб-сторінка каналу його опускає. Слова про
+    // зброю тут немає зовсім: і значущість, і клас дає лише знак поруч із розвʼязаним місцем.
+    const jet = classify('🏍️ Київщина: на Бровари');
+    expect(significanceRejection(jet)).toBeNull();
+    expect(jet.threatType).toBe('uav');
+    expect(jet.signalThreatTypes).toEqual(['uav']);
+    // Будь-який рядок, а не лише перший: веб-транспорт перетворює `<br>` бюлетеня на `\n`.
+    expect(classify('Київщина:\n🛵 знову на Бровари').threatType).toBe('uav');
+  });
+
+  it('lets a word that names the class outrank the legend', () => {
+    // Слово конкретніше за знак, і клас, названий словом, мусить лишитися тим самим, що й у `v7`:
+    // легенда не має права зробити з КАБів `combined`.
+    const bombs = classify('🛵 КАБи на Бровари');
+    expect(bombs.threatType).toBe('guided_air_bomb');
+    expect(bombs.signalThreatTypes).toEqual(['guided_air_bomb']);
+  });
+
+  it('reads no class from a pictogram that does not open a line', () => {
+    // Знак у кінці речення — прикраса чи наголос, а не легенда. Попередження лишається, класу немає.
+    const decorated = classify('Ціль на Бровари 🛵');
+    expect(significanceRejection(decorated)).toBeNull();
+    expect(decorated.threatType).toBe('unknown');
   });
 });
 

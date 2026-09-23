@@ -27,7 +27,10 @@ export interface OriginZoneActivity {
   name: string;
   /** [довгота, широта] — грубий якір зони, не позиція чогось. */
   anchor: [number, number];
-  /** Класи зброї, названі разом із зоною. Порожній масив, якщо жоден не розпізнано. */
+  /**
+   * Класи зброї, названі разом із зоною, — найсвіжіший першим. Порожній масив, якщо жоден не
+   * розпізнано. Карта малює іконку зони за першим, тож порядок тут і є рішенням.
+   */
   threatTypes: string[];
   lastReportedAt: string;
   /** Скільки повідомлень назвали зону у вікні, і скільки незалежних джерел за ними стоїть. */
@@ -41,6 +44,13 @@ export interface OriginZoneActivity {
  * Читає лише `message_classifications` — тобто те, що вже вичитано з тексту, — і не звертається ні
  * до подій, ні до тривог. Порожній масив тут абсолютно нормальний: більшість повідомлень походження
  * не називає, і тиша в цьому списку означає «джерела не сказали звідки», а не «нічого не летить».
+ *
+ * Класи зони впорядковано за останнім повідомленням кожного, а не за алфавітом. `array_agg(DISTINCT)`
+ * віддавав їх відсортованими, і карта, яка бере перший, годинами малювала над морем `aviation` чи
+ * `ballistic_missile` лише тому, що ці слова стоять в абетці раніше за `cruise_missile` і `uav`, про
+ * які джерела повідомляли щойно. `unknown` іде після будь-якого названого класу: це не клас, а його
+ * відсутність, і свіжіше повідомлення, яке зброї не назвало, нічого не каже проти класу, названого
+ * трохи раніше в тому самому вікні.
  */
 export async function activeOriginZones(now = new Date()): Promise<OriginZoneActivity[]> {
   const since = new Date(now.getTime() - ORIGIN_ACTIVITY_WINDOW_MS);
@@ -51,14 +61,20 @@ export async function activeOriginZones(now = new Date()): Promise<OriginZoneAct
     reports: string;
     sources: string;
   }>(
+    // `newest_of_class` лишає по рядку на клас — його останню згадку, — тож упорядкований агрегат
+    // бачить кожен клас рівно раз, а лічильники нижче й далі рахують усі повідомлення вікна.
     `SELECT origin_zone,
-            array_remove(array_agg(DISTINCT threat_type), NULL) AS threat_types,
+            array_agg(threat_type ORDER BY threat_type = 'unknown', published_at DESC, threat_type)
+              FILTER (WHERE newest_of_class AND threat_type IS NOT NULL) AS threat_types,
             max(published_at) AS last_reported_at,
             count(*) AS reports,
             count(DISTINCT source_id) AS sources
-       FROM message_classifications
-      WHERE origin_zone IS NOT NULL
-        AND published_at > $1
+       FROM (SELECT origin_zone, threat_type, published_at, source_id,
+                    row_number() OVER (PARTITION BY origin_zone, threat_type ORDER BY published_at DESC) = 1
+                      AS newest_of_class
+               FROM message_classifications
+              WHERE origin_zone IS NOT NULL
+                AND published_at > $1) recent
       GROUP BY origin_zone
       ORDER BY max(published_at) DESC`,
     [since]

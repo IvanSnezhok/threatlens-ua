@@ -872,12 +872,13 @@ describe.skipIf(!integrationDatabaseAvailable)('publication mode', () => {
       const { processMessage, resetMonitorCoalescing } = await import('../../src/services/ingestion.js');
       resetMonitorCoalescing();
       const now = Date.now();
+      // Inside the six-minute ballistic horizon, so the list has a track to hold anything back from.
       await processMessage({
-        sourceId: 'osint-aeris-rimor', externalId: 'chain-1', publishedAt: new Date(now - 8 * 60_000),
+        sourceId: 'osint-aeris-rimor', externalId: 'chain-1', publishedAt: new Date(now - 3 * 60_000),
         text: 'Балістика повз Суми на Полтаву.', rawPayload: { test: true }
       }, { monitor: true });
       await processMessage({
-        sourceId: WAR_MONITOR, externalId: 'chain-2', publishedAt: new Date(now - 4 * 60_000),
+        sourceId: WAR_MONITOR, externalId: 'chain-2', publishedAt: new Date(now - 60_000),
         text: 'Балістика повз Полтаву на Харків.', rawPayload: { test: true }
       }, { monitor: true });
       const events = await sql<{ id: string }>(`SELECT id FROM threat_events`);
@@ -896,8 +897,11 @@ describe.skipIf(!integrationDatabaseAvailable)('publication mode', () => {
       const held = await getJson('/api/v1/vectors');
       const heldDetail = await getJson(`/api/v1/threats/${events.rows[0]!.id}/vector`);
 
+      // The only visible message is «повз Суми на Полтаву»: the track stands at Суми and points at
+      // Полтава, and nothing in it — not a node, not the heading — may name the held Харків.
       expect(held.items).toHaveLength(1);
-      expect(held.items[0].nodes.map((node: any) => node.locationId)).toEqual(['ua-city-sumy', 'ua-city-poltava']);
+      expect(held.items[0].nodes.map((node: { locationId: string }) => node.locationId)).toEqual(['ua-city-sumy']);
+      expect(held.items[0].track.heading.locationId).toBe('ua-city-poltava');
       expect(JSON.stringify(held.items)).not.toContain('Харків');
       // `/threats/:id/vector` gates the EVENT and then returned the unbounded chain — the same leak
       // through a route that had the slice in its hand already.
@@ -907,8 +911,9 @@ describe.skipIf(!integrationDatabaseAvailable)('publication mode', () => {
 
       await setMode('live');
       const live = await getJson('/api/v1/vectors');
-      expect(live.items[0].nodes.map((node: any) => node.locationId))
-        .toEqual(['ua-city-sumy', 'ua-city-poltava', 'ua-city-kharkiv']);
+      expect(live.items[0].nodes.map((node: { locationId: string }) => node.locationId))
+        .toEqual(['ua-city-sumy', 'ua-city-poltava']);
+      expect(live.items[0].track.heading.locationId).toBe('ua-city-kharkiv');
       expect((await getJson('/api/v1/threats'))[0].locations.map((l: any) => l.id))
         .toContain('ua-city-kharkiv');
     }, 60_000);

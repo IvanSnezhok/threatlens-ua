@@ -29,10 +29,12 @@ const uuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}
 const VECTORS_MEMO_MS = config.NODE_ENV === 'test' ? 0 : 1_000;
 
 /**
- * Public threat vectors: the chain of reported observations for live threat events.
+ * Public threat vectors: the current track of every live threat event for the map, and the whole
+ * chain of reported observations — with the same track described over it — for one event's dialog.
  *
  * Nothing reachable from this file reaches `../services/vector-projection.js`. The chains come from
- * `../services/threat-vectors.js`, which reaches only the classification archive; the cutoff comes
+ * `../services/threat-vectors.js`, which reaches only the classification archive and the model's
+ * stored track actualizations (`../services/track-actualization.js`, display-only); the cutoff comes
  * from `../services/publication.js`; the response cache comes from `./http-cache.js`, which has no
  * relative imports at all and is its own module for exactly this reason — the same helper lives on
  * `./server.ts`'s routes, and importing it FROM there would drag the composition root, and with it
@@ -72,10 +74,15 @@ const vectorRoutes: FastifyPluginAsync = async (app) => {
    * is cleared in `finally`, so the next request retries rather than inheriting a failure.
    */
   const liveView = cachedBody(async (slice: PublicationSlice) => {
+    // One instant for the whole body: every `ageSeconds` in it is measured against `generatedAt`, so
+    // a client can tell exactly how old each report was when the payload was built. The ages tick
+    // every second, which is why they are computed here, inside the memo, and why the memo must not
+    // grow past one second — an age older than its body would be a stale number presented as fresh.
+    const now = new Date();
     const body = Buffer.from(JSON.stringify({
-      generatedAt: new Date().toISOString(),
+      generatedAt: now.toISOString(),
       disclaimer: REPORTED_VECTOR_DISCLAIMER,
-      items: await reportedVectorsForLiveEvents(slice.cutoffAt)
+      items: await reportedVectorsForLiveEvents(slice.cutoffAt, now)
     }));
     // `no-store` in BOTH modes, which is what this route already inherited from the server-wide
     // JSON policy — stated explicitly here because `sendCached` sets the header itself. In
@@ -85,7 +92,7 @@ const vectorRoutes: FastifyPluginAsync = async (app) => {
     // still ships, so a client that does revalidate is answered with 304 instead of megabytes.
     return { body, etag: strongEtag(body), expiresAt: Date.now() + VECTORS_MEMO_MS, cacheControl: 'no-store' };
   }, (slice) => slice.mode);
-  /** Every live chain, in one request. This is what the map layer consumes. */
+  /** Every current track, in one request. This is what the map layer consumes. */
   app.get('/api/v1/vectors', async (request, reply) => {
     try {
       // Inside the try on purpose: a failed slice must degrade to "no chains" exactly as a failed
@@ -112,15 +119,18 @@ const vectorRoutes: FastifyPluginAsync = async (app) => {
     }
     // The SAME slice the visibility check above used, threaded into the chain: `threatEventExists`
     // only decides whether the event may be seen at all, and without this the chain of a published
-    // event still grows nodes and segments out of classifications recorded after the cutoff.
-    const vector = await reportedVectorForEvent(request.params.id, slice.cutoffAt);
+    // event still grows nodes and segments out of classifications recorded after the cutoff. The
+    // dialog asks for the model's actualization too, so its `track` is the one the map draws; the
+    // same slice decides whether that actualization may be used at all.
+    const vector = await reportedVectorForEvent(request.params.id, slice.cutoffAt, { actualize: true });
     if (vector) return vector;
     // "This event has no chain" and "this event does not exist" are different answers, and the
     // client renders them differently: the first is an ordinary single-message threat.
     //
     // `threatType` is null here for the same reason `strongestBasis` is: this envelope describes a
-    // chain that does not exist, and every field of it that describes one is empty. The class of the
-    // EVENT is not missing — it is on `/api/v1/threats/:id`, which is the payload that owns it.
+    // chain that does not exist, and every field of it that describes one is empty — `track` too.
+    // The class of the EVENT is not missing — it is on `/api/v1/threats/:id`, which is the payload
+    // that owns it.
     return reply.send({
       eventId: request.params.id,
       kind: 'reported_observation_chain',
@@ -130,7 +140,8 @@ const vectorRoutes: FastifyPluginAsync = async (app) => {
       span: {
         from: null, to: null, elapsedSeconds: 0, sourceCount: 0,
         independenceGroupCount: 0, drawableSegments: 0, strongestBasis: null
-      }
+      },
+      track: null
     });
   });
 };

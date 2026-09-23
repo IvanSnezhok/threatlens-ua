@@ -138,8 +138,37 @@ import {
  *   `ignored`**: справжні попередження, які система прочитала й викинула. Решта — рядки, де
  *   рішення ухвалив не класифікатор, а шар склеювання повторів, і в бою вони лишилися б
  *   склеєними.
+ * * `v8` — піктограма на початку рядка бюлетеня називає клас.
+ *
+ *   `v7` читав 🛵 лише як маркер значущості й свідомо лишав клас `unknown`: назвати його з
+ *   піктограми тоді вважалося тією самою інференцією, що й клас із попереднього поста. Рішення
+ *   власника 23.09.2026 розводить ці дві речі. Попередній пост — контекст, якого модуль не дочитує й
+ *   далі; піктограма ж — текст самого повідомлення. Повітряні сили (kpszsu) починають рядок
+ *   бюлетеня знаком класу: «🛵 … БпЛА» — ударний БпЛА типу «Шахед», «🏍 Реактивний БпЛА» —
+ *   реактивний (`tests/fixtures/telegram-web-kpszsu.html`), і моніторингові канали пишуть тією самою
+ *   легендою. У корпусі 43 з 46 повідомлень із 🛵 на початку рядка називають клас ще й словом — і
+ *   всі 43 це `uav`. Це легенда джерела, а не здогад.
+ *
+ *   Що змінено ({@link BULLETIN_UAV_LEGEND}): рядок, який починається з 🛵 або 🏍 (після
+ *   необовʼязкових пробілів; будь-який рядок повідомлення; U+FE0F після знака не заважає), дає клас
+ *   `uav` — але лише там, де жодне слово класу не назвало, і лише поруч із розвʼязаним українським
+ *   місцем. Слово переважає завжди: «🛵 КАБи на …» лишається `guided_air_bomb`, а не стає
+ *   `combined`, тож клас, названий словом, — точно той самий, що й у `v7`. Знак деінде в рядку класу
+ *   не називає. 🏍 став структурним маркером у {@link TELEGRAPHIC_TARGETING} поряд із 🛵 і з тим
+ *   самим замком: без розвʼязаного місця піктограма не піднімає нічого, мем ловить
+ *   {@link COMMENTARY_MARKERS}, а рядок із 🏍 відтепер несе індикатор «телеграфне націлювання», як
+ *   рядок із 🛵 — з `v7`. Сам маркер значущості лишився ширшим — де завгодно в тексті, як у `v7`.
+ *   Відбоїв легенда не чіпає: рішення про відкликання ухвалено раніше, ніж її прочитано.
+ *
+ *   Виміряно на тому самому корпусі. Значущість і місця не зрушили: significance P 100 % / R 98.5 %,
+ *   locations P 99.6 % / R 99.2 %, як у `v7`; точність класу 99.3 % → 99.3 %; uav P 100 % / R 100 %
+ *   → P 100 % / R 100 % (TP 100 → 103). Три повідомлення з 🛵 на початку рядка, які рецензент
+ *   розмітив `unknown` за старою конвенцією, переписано на `uav` (заголовок фікстури,
+ *   `corrections`). Без цієї переписки той самий код показав би uav P 97.1 % і точність класу
+ *   97.0 % — не через хибні спрацювання, а через мітки, що описували стару конвенцію. Решта 188
+ *   повідомлень корпусу класифікуються байт у байт як у `v7`.
  */
-export const CLASSIFIER_VERSION = 'v7';
+export const CLASSIFIER_VERSION = 'v8';
 
 export interface LocationLexeme {
   id: string;
@@ -154,11 +183,15 @@ export interface LocationLexeme {
    */
   type?: string;
   /**
-   * Whether the catalogue geocoded this row, i.e. `latitude IS NOT NULL`.
+   * Whether the catalogue marks this row as a hand-seeded first-order place:
+   * `locations.primary_settlement`.
    *
-   * The importer never writes coordinates, so the flag is true for exactly the hand-seeded rows: the
-   * oblasts, the two special cities and the oblast capitals. It is a tie-break between two rows of
-   * the same name and is read for nothing else — see {@link pickAmongTied}.
+   * The flag is true for exactly the hand-seeded rows: the oblasts, the two special cities and the
+   * oblast capitals. The name is historical. Until migration 056 only those rows had coordinates,
+   * so `latitude IS NOT NULL` was the marker. 056 gave OpenStreetMap coordinates to the KATOTTG
+   * cities and hromadas too, so coordinates no longer tell the rows apart; the column does. It is a
+   * tie-break between two rows of the same name and is read for nothing else — see
+   * {@link pickAmongTied}.
    */
   geocoded?: boolean;
   /**
@@ -358,10 +391,12 @@ const TELEGRAPHIC_MOTION = /((?<!\p{L})лет(?:ить|ять|іти)|(?<!\p{L})
  * зброї, ні дієслова-твердження. Це 9.6 % усіх справжніх попереджень у вибірці — і найтерміновіший
  * їх різновид: короткий рядок, який називає місто, куди ціль іде ЗАРАЗ.
  *
- * Зброю в цих каналах встановлює не слово, а контекст самого каналу (емодзі-мопед, попередній пост,
- * сама тема каналу). Ми цього контексту не маємо права дочитувати, тому `threatTypes` порожній:
- * подія піднімається як `unknown` — «Повідомлення про загрозу», — і це чесне прочитання. Той самий
- * вибір і з тієї самої причини вже зроблено для стрілкового бюлетеня вище.
+ * Зброю в цих каналах встановлює не слово, а контекст самого каналу (попередній пост, сама тема
+ * каналу). Цього контексту ми не маємо права дочитувати, тому `threatTypes` порожній: подія
+ * піднімається як `unknown` — «Повідомлення про загрозу», — і це чесне прочитання. Той самий вибір і
+ * з тієї самої причини вже зроблено для стрілкового бюлетеня вище. Піктограма на початку рядка —
+ * інша річ: це не контекст, а легенда самого джерела, і з `v8` клас із неї читає окреме правило,
+ * {@link BULLETIN_UAV_LEGEND}, а не цей індикатор.
  *
  * ================================================================================================
  * Чому кожна гілка безпечна
@@ -384,21 +419,74 @@ const TELEGRAPHIC_MOTION = /((?<!\p{L})лет(?:ить|ять|іти)|(?<!\p{L})
  * розміченому повідомленні й окремо стверджує НУЛЬ хибних спрацювань.
  *
  * ================================================================================================
- * Мопед як структурний маркер бюлетеня
+ * Мопед і мотоцикл як структурні маркери бюлетеня
  * ================================================================================================
  *
- * Остання гілка — емодзі 🛵. У розміченому корпусі воно стоїть у 46 повідомленнях, і ВСІ 46 —
- * справжні попередження: канали цієї родини ставлять його як префікс рядка бюлетеня, так само як
- * сусідній індикатор читає стрілку «→». Саме тому `threatTypes` тут порожній і саме тому воно
- * лишається структурним маркером, а не назвою зброї: у цих каналах мопед означає «шахед», але
- * дочитувати клас із піктограми — це рівно та інференція, яку сусідній коментар про стрілку
- * забороняє. Замок той самий, що й у решти {@link contextIndicators} — розвʼязане українське
- * місце, — а мем із мопедом ловить сторож {@link COMMENTARY_MARKERS} раніше.
+ * Остання гілка — емодзі 🛵 і, з `v8`, 🏍. 🛵 у розміченому корпусі стоїть у 46 повідомленнях, і ВСІ
+ * 46 — справжні попередження: канали цієї родини ставлять його як префікс рядка бюлетеня, так само
+ * як сусідній індикатор читає стрілку «→». 🏍 — другий знак тієї самої легенди Повітряних сил
+ * (реактивний БпЛА); у корпусі його ще немає, тому він отримав рівно той самий замок, що й 🛵, і
+ * нічого понад нього.
+ *
+ * Тут обидва — лише маркер значущості, де б у тексті вони не стояли, і `threatTypes` лишається
+ * порожнім: клас піктограма називає окремо й вужче — лише на початку рядка і лише тоді, коли жодне
+ * слово класу не назвало ({@link BULLETIN_UAV_LEGEND}). Замок той самий, що й у решти
+ * {@link contextIndicators} — розвʼязане українське місце, — а мем із мопедом ловить сторож
+ * {@link COMMENTARY_MARKERS} раніше.
  */
-const TELEGRAPHIC_TARGETING = /((?<!\p{L})[Кк]урс(?:ом)?\s+\p{Lu}|(?<!\p{L})(?:[Зз]нову|[Пп]овторно)\s+на\s+\p{Lu}|(?<!\p{L})\d{1,3}\s*х?\s+на\s+\p{Lu}|(?<!\p{L})[Уу]вага\s+з[іс]?\s+\p{Lu}|🛵)/u;
+const TELEGRAPHIC_TARGETING = /((?<!\p{L})[Кк]урс(?:ом)?\s+\p{Lu}|(?<!\p{L})(?:[Зз]нову|[Пп]овторно)\s+на\s+\p{Lu}|(?<!\p{L})\d{1,3}\s*х?\s+на\s+\p{Lu}|(?<!\p{L})[Уу]вага\s+з[іс]?\s+\p{Lu}|🛵|🏍)/u;
 
 /** Найширша телеграфна гілка: «на <Місто>» або пряме звернення «до вас». Має другий замок. */
 const TELEGRAPHIC_APPROACH = /((?<!\p{L})на\s+\p{Lu}|(?<!\p{L})(?:до|на)\s+вас(?!\p{L}))/u;
+
+/**
+ * Легенда бюлетеня: піктограма на початку рядка, якою джерело саме називає клас (`v8`).
+ *
+ * ================================================================================================
+ * Чому це назва класу, а не здогад
+ * ================================================================================================
+ *
+ * Повітряні сили (kpszsu) починають рядок бюлетеня знаком класу: «🛵 БпЛА в районі н.п. Іванків…»,
+ * «🏍 Реактивний БпЛА курсом на Одесу», «💣Пуски керованих авіаційних бомб…» — див.
+ * `tests/fixtures/telegram-web-kpszsu.html`. 🛵 — ударний БпЛА типу «Шахед», 🏍 — реактивний БпЛА;
+ * для `ThreatType` обидва — `uav`. Моніторингові канали пишуть телеграфні бюлетені тією самою
+ * легендою, і корпус це підтверджує: з 46 повідомлень із 🛵 на початку рядка 43 називають клас ще й
+ * словом, і всі 43 — `uav`; решта три слова не мають («🛵 Курс Бородянка»). Попередній пост і тема
+ * каналу — контекст, якого модуль не дочитує й далі; піктограма ж — текст самого повідомлення, знак,
+ * який джерело поставило замість слова. Рішення власника 23.09.2026.
+ *
+ * ================================================================================================
+ * Чому лише на початку рядка
+ * ================================================================================================
+ *
+ * Легенда позиційна: знак стоїть ПЕРЕД рядком, як умовне позначення перед підписом, і саме це місце
+ * відрізняє його від прикраси. Той самий мопед у кінці речення — «Ціль на Бровари 🛵» — це реакція чи
+ * наголос автора, і читати з нього клас означало б знову вгадувати. Тому клас дає лише рядок, що
+ * ПОЧИНАЄТЬСЯ з піктограми (після необовʼязкових пробілів), причому будь-який рядок, а не лише
+ * перший: веб-транспорт перетворює `<br>` бюлетеня на `\n`, звідси прапорець `m`. Корпус від цього
+ * нічого не втрачає: кожне з 46 його повідомлень із 🛵 ним і починається.
+ *
+ * Маркер значущості в {@link TELEGRAPHIC_TARGETING} свідомо лишився ширшим — де завгодно в тексті,
+ * як у `v7`. Звузити його означало б лише відняти попередження, не купивши жодної виміряної точності
+ * (хибних спрацювань `v7` на корпусі не має); назвати ж клас — сильніше твердження, ніж «щось
+ * летить», і воно вимагає сильнішої підстави.
+ *
+ * ================================================================================================
+ * Чому слово переважає
+ * ================================================================================================
+ *
+ * Легенду читають лише тоді, коли жодне слово класу не назвало: «🛵 КАБи на Бровари» лишається
+ * `guided_air_bomb`, а не стає `combined`. Слово конкретніше за знак, тож повідомлення, клас якого
+ * названо словом, легенда не чіпає взагалі: клас у нього той самий, що й у `v7`. Замок той самий,
+ * що й у {@link contextIndicators}: без розвʼязаного українського місця піктограма не дає нічого, а
+ * мем відсікає {@link COMMENTARY_MARKERS} ще раніше. U+FE0F після 🏍 (так його надсилає клавіатура;
+ * веб-сторінка каналу його опускає) регулярці не заважає: вона дивиться лише на те, що стоїть перед
+ * знаком.
+ */
+const BULLETIN_UAV_LEGEND = /^\s*(?:🛵|🏍)/mu;
+
+/** Імʼя індикатора, яким архів пояснює клас, названий легендою, а не словом. */
+const BULLETIN_UAV_LEGEND_INDICATOR = 'БпЛА за легендою бюлетеня';
 
 /**
  * Indicators that only mean something next to a place inside Ukraine.
@@ -446,9 +534,11 @@ const contextIndicators: Array<{ name: string; pattern: RegExp; threatTypes: Thr
     // The arrow bulletin: "✈️Сумщина: →Кириківка/Тростянець. ✈️Харківщина: →Гути/Богодухів."
     // A region header, an arrow, and the settlements the target is moving towards — with no threat
     // noun anywhere in the message. `threatTypes` is deliberately empty: the arrow states movement,
-    // not what is moving, and the emoji before the region is not evidence of a weapon class. The
-    // event is raised as `unknown` ("Повідомлення про загрозу"), which is the honest reading —
-    // something is heading for these places and the message does not say what.
+    // not what is moving, and the ✈️ before the region is not evidence of a weapon class. (The only
+    // pictograms that are, since `v8`, are 🛵 and 🏍 opening a line — the Air Force's own legend,
+    // read by {@link BULLETIN_UAV_LEGEND} and never by this indicator.) The event is raised as
+    // `unknown` ("Повідомлення про загрозу"), which is the honest reading — something is heading for
+    // these places and the message does not say what.
     name: 'рух цілі за напрямком',
     pattern: /(?:→|➡|⮕|➤|-->|->)\s*\p{L}/u,
     threatTypes: []
@@ -1341,9 +1431,11 @@ function adminCandidates(tokens: PlaceToken[], index: CatalogueIndex): Candidate
  *     contains exactly one of the two Південне, so the message has answered the question itself.
  *     This is the only tie-break that reads the text, and it reads nothing but places already
  *     resolved unambiguously.
- *  3. **Seeded rank.** Coordinates are the catalogue's own marker of a first-order settlement: they
- *     are set on the twenty-five oblasts, the two special cities and the seeded oblast capitals, and
- *     on nothing the KATOTTG importer writes. That keeps a bare "Миколаїв" the oblast capital.
+ *  3. **Seeded rank.** `primary_settlement` (`geocoded` here) is the catalogue's own marker of a
+ *     first-order place: it is set on the twenty-five oblasts, the two special cities and the seeded
+ *     oblast capitals, and on nothing the KATOTTG importer writes. Coordinates were that marker
+ *     until migration 056 gave them to almost every city. The marker keeps a bare "Миколаїв" the
+ *     oblast capital.
  *
  * When none of the three leaves a single row, the span resolves to nothing. "Городок" — two KATOTTG
  * rows, neither seeded, in two oblasts the message does not name — stays refused.
@@ -1521,10 +1613,16 @@ export function classifyMessage(text: string, locations: LocationLexeme[]): Clas
   const matchedContext = found.length
     ? contextIndicators.filter(({ pattern, requires }) => pattern.test(text) && (!requires || requires.test(text)))
     : [];
-  const matchedTypes = [...new Set([
+  const namedTypes = [...new Set([
     ...asserted.flatMap(({ threatTypes }) => threatTypes),
     ...matchedContext.flatMap(({ threatTypes }) => threatTypes)
   ])];
+  // Легенда бюлетеня (`v8`) називає клас лише там, де жодне слово його не назвало, і лише поруч із
+  // розвʼязаним українським місцем. Перша умова означає, що клас, названий словом, легенда не чіпає
+  // взагалі (КАБ не стає `combined`); друга — той самий замок, що й у контекстних індикаторів, тож
+  // піктограма без місця не дає нічого. Див. {@link BULLETIN_UAV_LEGEND}.
+  const namedByLegend = namedTypes.length === 0 && found.length > 0 && BULLETIN_UAV_LEGEND.test(text);
+  const matchedTypes: ThreatType[] = namedByLegend ? ['uav'] : namedTypes;
   const threatType: ThreatType = matchedTypes.length > 1 ? 'combined' : matchedTypes[0] ?? 'unknown';
   // Країна цілком — коли українського місця не названо, а сказане все одно про нас. Третій доданок
   // — та сама загроза з названою точкою пуску, що й у сторожі іноземних місць вище: якщо ми вже
@@ -1558,7 +1656,13 @@ export function classifyMessage(text: string, locations: LocationLexeme[]): Clas
     // indicator or an explicit national warning. Context indicators are excluded by construction:
     // they are only collected when a location was already found.
     nationalScope,
-    indicators: [...assertedIndicators.map(({ name }) => name), ...matchedContext.map(({ name }) => name)],
+    indicators: [
+      ...assertedIndicators.map(({ name }) => name),
+      ...matchedContext.map(({ name }) => name),
+      // Останнім, а не першим: перший індикатор стає `risk_signals.signal_type`, і легенда, яка лише
+      // назвала клас, не має права підмінити собою сигнал, що підняв подію.
+      ...(namedByLegend ? [BULLETIN_UAV_LEGEND_INDICATOR] : [])
+    ],
     directionText: direction,
     // Зона походження — з ТЕКСТУ, не з класу зброї. `detectOriginZone` мовчить, коли джерело не
     // назвало, звідки саме; порожнє значення тут — нормальний і найчастіший результат.

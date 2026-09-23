@@ -657,14 +657,15 @@ post, its subject — and the rules read text, not context.
 They are read as context indicators with an empty `threatTypes`, so the event is raised as `unknown`
 («Повідомлення про загрозу»). Naming a class would mean reading it off a pictogram or off the
 previous message, which is the inference this module is forbidden to make — the same trade the arrow
-bulletin and «ракета без уточнення типу» already made. Like every context indicator, each one fires
-only beside a resolved Ukrainian place, and beyond that each branch carries its own structural lock
-rather than a topic: a capitalised word after a bare «курс» (a case-sensitive regex, which is exactly
-the condition under which the `REPORTED_DIRECTION` comment says that branch could come back), a
-numeral and a preposition before a name, «знову на …», «увага з …», the 🛵 bulletin prefix — 46
-messages in the corpus carry it and all 46 are real warnings — and, for the widest branch («на
-<Місто>»), a second lock requiring motion stated *forward* in time, which is what keeps «через нічну
-атаку на Броварах пошкоджено» out.
+bulletin and «ракета без уточнення типу» already made. (`v8` revises this for one pictogram family
+only — the Air Force's own line-opening 🛵 and 🏍 legend — see below.) Like every context indicator,
+each one fires only beside a resolved Ukrainian place, and beyond that each branch carries its own
+structural lock rather than a topic: a capitalised word after a bare «курс» (a case-sensitive regex,
+which is exactly the condition under which the `REPORTED_DIRECTION` comment says that branch could
+come back), a numeral and a preposition before a name, «знову на …», «увага з …», the 🛵 bulletin
+prefix — 46 messages in the corpus carry it and all 46 are real warnings — and, for the widest branch
+(«на <Місто>»), a second lock requiring motion stated *forward* in time, which is what keeps «через
+нічну атаку на Броварах пошкоджено» out.
 
 Beside them, one guard was narrowed rather than widened: a threat named together with its launch
 point across the border — «Триває загроза балістики з Брянська» — is no longer suppressed by the
@@ -717,6 +718,37 @@ in a sentence that denies both. Closing it needs a rule about the FRAME («ан�
 «передумов немає» beside a forecast horizon), not another indicator, and the archive has enough of
 these bulletins to label a sample first. Recorded here rather than fixed in a change whose whole
 claim is that it only adds recall.
+
+### The bulletin legend names the class (`v8`)
+
+`v7` read 🛵 as a structural marker and deliberately left the class `unknown`, filing a class read off
+a pictogram beside a class read off the previous post: both were inference. The owner's decision of
+2026-09-23 separates the two. The previous post is context and stays unread. The pictogram is part of
+the message itself, and it is the source's own legend: the Air Force (kpszsu) opens every bulletin line
+with one — «🛵 … БпЛА» is a Shahed-type strike drone, «🏍 Реактивний БпЛА» a jet UAV
+(`tests/fixtures/telegram-web-kpszsu.html`) — and the monitoring channels write with the same legend.
+A line that opens with 🛵 or 🏍 therefore reads as `uav`.
+
+The rule is deliberately narrow (`BULLETIN_UAV_LEGEND` in `src/domain/classifier.ts`):
+
+- only a pictogram that opens a line — leading whitespace, any line of the message, a trailing U+FE0F
+  allowed; the same emoji in the middle of a sentence is decoration and names nothing;
+- only where no word named a class, so «🛵 КАБи на Бровари» stays `guided_air_bomb` and never becomes
+  `combined`;
+- only beside a resolved Ukrainian place, the lock every context indicator carries. A bare pictogram,
+  or a meme the `COMMENTARY_MARKERS` guard catches, raises nothing, and 🏍 joins 🛵 as a structural
+  marker under that identical lock.
+
+When the legend decides the class the archive says so: the indicator «БпЛА за легендою бюлетеня» is
+appended last, so the first indicator — the one that becomes `risk_signals.signal_type` — is still
+the signal that raised the event.
+
+Measured on the gold corpus, nothing moves except the class of three 🛵 reports the reviewer had
+labelled `unknown` under the old convention, now relabelled `uav` («🛵 Курс Бородянка»,
+«🛵Житомирщина: знову на Андрушівку - Озерне» and a two-oblast bulletin): significance P 100 % /
+R 98.5 %, locations P 99.6 % / R 99.2 %, class accuracy 99.3 %, `uav` P/R 100 % (TP 100 → 103). The
+other 188 messages classify exactly as in `v7`. No replay over the production archive has been run, so
+how many archived `unknown` events `v8` would re-class is not yet measured.
 
 ### Classification archive
 
@@ -901,10 +933,14 @@ call at all — including narrative, digest, shadow collection and analytical pr
 `codex_settings` and switched from `/ops`; every surface is complete without a model, so a dead session degrades to the
 deterministic text rather than to an error, and model-written prose is always labelled.
 
+### Threat vectors: the history, the track and the extrapolation
+
 The commitment stated at the top of this document and on the map itself — the system shows an
 explicitly reported region, point or direction and never a predicted target, impact or trajectory —
-is unchanged. Threat vectors are two different things wearing one name, and the whole design is about
-keeping them apart.
+is unchanged. Threat vectors are three different things wearing one name, and the whole design is
+about keeping them apart: the public **history** of what sources reported about one event, the public
+**track** — the part of that history that is still current, which is all the map draws — and the
+operator-only **extrapolation**.
 
 **The public chain** is a sequence of *reported observations*: "three sources led this target from
 Sumy through Poltava to Kharkiv over eight minutes". It is derived, never stored: every fact it is
@@ -925,6 +961,8 @@ map legend as "порядок наш; рух не стверджувало жо�
 stay in the payload as stated facts with `drawable: false` — raions carry no KATOTTG coordinate, so
 the chain falls back to the centroid of their ADM2 polygon and publishes that as
 `coordinateSource: 'raion_centroid'`, `coordinatePrecision: 'approximate'`, rendered as a hollow node.
+A hromada's catalogue coordinate (migration 056) is the centre of an area, not a place, and is
+published as `approximate` for the same reason; only a settlement's point is a `point`.
 
 **An arrowhead is drawn only where a source asserted the movement**, and the basis grade decides it —
 the same three rungs, read as a question about honesty rather than about strength:
@@ -951,12 +989,105 @@ is filed under everywhere else; a segment's is `message_classifications.threat_t
 message that produced that leg's destination reported, falling back to the event's when that message
 recorded none. They agree almost always, and the case where they do not — a chain that opened as БпЛА
 and continued as ballistics — is exactly the change a flattened payload would hide. The map draws it
-as one class chip at the newest drawn point of each chain, using the same forty registered
-threat-icon images the territory stacks draw from; unlike the arrowhead the chip yields to MapLibre
-collision, because the class is already stated by the event card and by the territory stack above it.
-Both fields are **additive**: no field of the previous payload was renamed, retyped or removed, so a
-client written against it — including the SSE consumers, which never carried the chain in the first
-place — needs no change.
+as one class chip per track, under the head, using the same registered threat-icon images the
+territory stacks draw from; unlike the arrowhead the chip yields to MapLibre collision, because the
+class is already stated by the event card and by the territory stack above it. Both fields are
+**additive**: no field of the previous payload was renamed, retyped or removed, so a client written
+against it — including the SSE consumers, which never carried the chain in the first place — needs
+no change. The track's own fields (`track`, `ageSeconds`, `visits`, `role`, `loiter`) are additive in
+the same way.
+
+**The track: what is current, not everything that was said.** The chain grows for as long as its
+event lives, and the map used to draw all of it: every classification of a live event was projected
+and nothing aged out, while the event itself stays live as long as any same-class message sharing any
+of its places arrives within half an hour. So a vector showed where a target had been reported thirty,
+twenty and ten minutes ago; a target circling a settlement drew A→B→A as mirrored arcs; a message
+naming an oblast and a town zig-zagged between the two; and a tie between two places of one message
+was broken by the alphabetical order of their ids. `/api/v1/threats/:id/vector` still returns the
+whole chain — it is the history, and the dialog is where there is time to read it. `/api/v1/vectors`
+returns the **track** (`buildReportedTrack` in `src/services/threat-vectors.ts`), cut by rules that
+are the same for every event and windowed by the event's class:
+
+| Class | Horizon | Head stale after |
+| --- | --- | --- |
+| `uav` | 25 min | 12 min |
+| `combined`, `unknown`, `aviation` | 20 min | 10 min |
+| `cruise_missile` | 12 min | 5 min |
+| `mlrs`, `artillery`, `mortar` | 10 min | 5 min |
+| `guided_air_bomb` | 8 min | 4 min |
+| `ballistic_missile` | 6 min | 3 min |
+
+- A report older than the horizon is history. The newest place — the **head** — is never what the
+  window cuts: when even the head is older than the horizon the event has no track on the map at all,
+  and its territory marker is what still shows it. A head older than the head-stale window is
+  published as `status: 'stale'`, because stale data must look stale.
+- One node per place. A return is a `visit` on the node it returns to, and the head moves there, so
+  A→B→A is two nodes and one line — the newest leg, pointing the newest way — not three nodes and two
+  mirrored arcs. The head reads as a **loiter** when it was visited twice within the horizon, or
+  restated three times over at least four minutes with no new place in between.
+- No leg a member of the class could not have flown. The event merge rule (same class, any shared
+  place) glues separate groups onto one event — live data drew «Київ → Кропивницький», 250 km reported
+  116 s apart. Walking back from the head, the track stops at the first leg longer than
+  `CLASS_MAX_KMH` × max(time between the two nodes' latest reports, 10 min) × 1.3 — `uav` 600,
+  `aviation` 1200, every other class 1000, `ballistic_missile` unlimited — and the node after the cut
+  becomes the origin; the older group stays in the dialog's history. The ceilings are a plausibility
+  filter (the fastest member of the class), not a speed estimate. Distances are great-circle between
+  node coordinates; a node without one, an oblast or the country is never measured, and the next
+  measurable node is compared across it, so it neither causes a cut nor hides one.
+- At most four nodes: the head and the three freshest others. Nodes are ordered by their latest
+  report, so the head is the last node and the first is the track's `origin`.
+- No oblast or country node while the track holds anything finer. A place cut out of the middle is
+  bridged by an `observation_sequence` leg between the two reports that remain; a leg whose end is
+  gone is never kept.
+- The head message's stated destination is the `heading`, not a node: «в районі Кагарлика курсом на
+  Київ» puts the head at Кагарлик and says where it is going, instead of drawing the target into Kyiv.
+  A message that named only a destination still makes it the head — it is all that message gave — and
+  so does one whose other half was an oblast the previous rule dropped.
+- Two equally specific places of one message resolve to the one named **last** in its text — the
+  destination of «з A на B» — matched through the same declension table the classifier uses.
+- An ended event keeps its track for five minutes as `status: 'ended'`. An end recorded inside the
+  publication hold is not public yet, and until it is the track reads as live, exactly as
+  `liveThreats` projects the event.
+- The list carries at most forty tracks, newest head first. A lone node is published only when it
+  has a heading or a loiter to show; otherwise it is a place somebody named, which the territory
+  marker already shows.
+
+Nodes and segments carry `ageSeconds`, and the `track` object carries `headAgeSeconds`, both window
+lengths, `headIndex`, `heading`, `status` and `basis`. Every age is measured once per payload against
+its `generatedAt`, which is honest only because the list is memoised for one second — an age is
+never older than the body that carries it — and the dialog describes the same `track` over its full
+history, with `headIndex` pointing into that history. The list reads only events observed within the
+longest horizon: every classification that lands on an event raises `last_observed_at` to its own
+publication time, so an event observed longer ago has no head left to publish. The O(rows) bucketing
+and the single flight are unchanged.
+
+**The model may shape the track, and nothing else.** In `classifier_mode=codex` with the
+`actualization` feature on, the fast model re-reads an event's recent messages and stores in
+`threat_track_actualizations` (migration 055) where the target is now, whether it circles, passed or
+ended, where it is heading, and from which message the current stretch begins. The track uses the
+event's latest row only when its confidence is at least 0.6, it has seen the event's newest
+classification in the current publication slice, and it was written before the slice's cutoff — a row
+written later may have read a held message, and its head or summary would publish what the hold is
+holding. Even then it chooses only among what the chain holds: a head or a loiter must be a node of
+the event's history, a heading a place one of the event's messages named, and an id that maps onto
+neither is ignored while the rules' value stands. «Passed» and «ended» carry through however old the
+head is; any other reading of a current position still turns `stale` with an old head, and the event's
+own end outranks every reading. The track then says `basis: 'model'`, with the model's name,
+confidence and summary. It never creates, ends or merges an event, never touches an alert and is never
+an all-clear; every other case — `rules` mode, the feature off, a low confidence, a row that has not
+seen the newest message, a failed read — is the deterministic track, so a vector never depends on the
+model.
+
+What the map makes of a track (`web/app.js`): lines and nodes take the class family's colour and each
+leg fades with its `ageSeconds` towards its horizon, while arrowheads stay the neutral per-basis ones
+above. The chip under the head carries the age («2 хв», «кружляє · 2 хв», «N хв тому»); only the head
+and the origin are named, the rest of the trail is small dots. One travelling class icon per track,
+on the leg that ends at the head and only while the track is `moving`; a `loitering` track circles its
+`loiter` node instead, and its speed is the class's typical speed compressed for animation, never a
+measured one. The heading is a dashed line with a hollow arrowhead from the head to the named place —
+no node, no label — and is not drawn when that place has no coordinate or the track `passed` or
+`ended`. A `stale` track is grey and still; a `passed` or `ended` one fades whole and does not move.
+An event with a track no longer draws its own direction line from `threat.geometry` beside it.
 
 **The extrapolation** — continue the last leg, name the locations inside the resulting cone, state the
 uncertainty — is an operator tool and is isolated the way the occupation layer is isolated, only more
@@ -1325,6 +1456,11 @@ flowchart LR
   or a risk assessment.
 - A public threat vector contains only reported observations, and every leg names the source, the time
   and how strongly the movement itself was attested. Nothing is continued past the last message.
+- The map draws only the current track of a vector: reports older than the class's horizon are
+  history, a head older than its head-stale window is published as `stale`, and a head older than the
+  horizon removes the track from the map. A model actualization may reshape the track only in
+  `classifier_mode=codex` with the `actualization` feature on, from places the event's messages named,
+  and every failure or unmet condition is the deterministic track; it never touches events or alerts.
 - The extrapolation of a vector is operator-only and structurally unreachable from public code: its own
   tables, its own service, its own plugin, and no import path from any module that builds a public
   response. Every stored projection row is `data_nature = 'calculated'` by constraint.

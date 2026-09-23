@@ -5,7 +5,7 @@ import { ensureMigrated, integrationDatabaseAvailable, resetDatabase, sql } from
 /**
  * Threat vectors, end to end, against a live PostgreSQL.
  *
- * Two things are being proved, and the second is the reason the file exists.
+ * Three things are being proved, and the third is the reason the file exists.
  *
  *  1. **The chain is assembled from what sources actually said.** Three monitoring channels lead one
  *     ballistic threat from Sumy through Poltava to Kharkiv over eight minutes, and the resulting
@@ -13,7 +13,12 @@ import { ensureMigrated, integrationDatabaseAvailable, resetDatabase, sql } from
  *     message stated the move ("повз Полтаву на Харків"), a collapsed node where a channel merely
  *     restated a place, and the corroboration that three independent groups produce.
  *
- *  2. **The operator-only extrapolation cannot be observed from outside.** A projection is computed
+ *  2. **The map draws the current track, the dialog keeps the history.** Eight minutes is longer than
+ *     a ballistic report stays true, so `/api/v1/vectors` draws Poltava → Kharkiv while
+ *     `/api/v1/threats/:id/vector` still names all three places — through the real SQL, which is the
+ *     only place the event's status, its end and a stored model actualization are read together.
+ *
+ *  3. **The operator-only extrapolation cannot be observed from outside.** A projection is computed
  *     and stamped with a marker string, and then every public surface the product has — the
  *     snapshot, the threat list, the threat detail, the history, the location timeline, the public
  *     vector endpoints and a live SSE connection including its replay backfill — is read and searched
@@ -177,6 +182,24 @@ describe.skipIf(!integrationDatabaseAvailable)('threat vectors', () => {
       ).rejects.toThrow();
     });
 
+    it('names settlements and districts in the cone, never a hromada area centre', async () => {
+      const eventId = await seedChain();
+      const { projectEventVector } = await import('../../src/services/vector-projection.js');
+      const first = await projectEventVector(eventId, { horizonMinutes: 15, store: false });
+      if (!first.available) throw new Error(`projection unavailable: ${first.reason}`);
+      // A hromada exactly at the end of the centreline would rank first if it could be a candidate at
+      // all. The `test-` prefix is what `resetDatabase()` sweeps out of the reference catalogue.
+      const [longitude, latitude] = first.projection.geometry.centerline.coordinates[1]!;
+      await sql(
+        `INSERT INTO locations(id,parent_id,type,name_uk,latitude,longitude)
+         VALUES ('test-hromada-on-centreline','ua-63','hromada','Тестова громада',$1,$2)`,
+        [latitude, longitude]
+      );
+      const second = await projectEventVector(eventId, { horizonMinutes: 15, store: false });
+      if (!second.available) throw new Error(`projection unavailable: ${second.reason}`);
+      expect(second.projection.candidates.map((candidate) => candidate.locationType)).not.toContain('hromada');
+    });
+
     it('never writes to the public event, its geometry or the system event log', async () => {
       const eventId = await seedChain();
       const before = await sql<{ geometry: unknown; geometry_semantics: string | null; updated_at: string }>(
@@ -282,6 +305,63 @@ describe.skipIf(!integrationDatabaseAvailable)('threat vectors', () => {
         // without any of the field names above.
         expect(body, `${label} leaked the projected longitude`).not.toContain(projectedPoint[0]!.toFixed(6));
       }
+    });
+
+    it('draws the current track on the map and keeps the whole history in the dialog', async () => {
+      const eventId = await seedChain();
+      const list = (await app.inject({ method: 'GET', url: '/api/v1/vectors' })).json();
+      expect(list.items).toHaveLength(1);
+      const [track] = list.items;
+      // Балістика: six minutes. Sumy eight minutes ago is history, and the map stops drawing it.
+      expect(track.nodes.map((node: { locationId: string }) => node.locationId)).toEqual([POLTAVA_CITY, KHARKIV_CITY]);
+      expect(track.segments.map((segment: { basis: string }) => segment.basis)).toEqual(['reported_transit']);
+      expect(track.track).toMatchObject({
+        status: 'moving', headIndex: 1, heading: null, basis: 'rules', horizonSeconds: 360, staleAfterSeconds: 180
+      });
+      expect(track.nodes[1].role).toBe('head');
+
+      const dialog = (await app.inject({ method: 'GET', url: `/api/v1/threats/${eventId}/vector` })).json();
+      expect(dialog.nodes.map((node: { locationId: string }) => node.locationId))
+        .toEqual([SUMY_CITY, POLTAVA_CITY, KHARKIV_CITY]);
+      expect(dialog.track).toMatchObject({ status: 'moving', headIndex: 2, basis: 'rules' });
+    });
+
+    it('keeps an ended event on the map for five minutes, marked as ended', async () => {
+      const eventId = await seedChain();
+      await sql(`UPDATE threat_events SET status='expired', ended_at=now() - interval '1 minute' WHERE id=$1`, [eventId]);
+      const ended = (await app.inject({ method: 'GET', url: '/api/v1/vectors' })).json();
+      expect(ended.items.map((item: { track: { status: string } }) => item.track.status)).toEqual(['ended']);
+
+      await sql(`UPDATE threat_events SET ended_at=now() - interval '6 minutes' WHERE id=$1`, [eventId]);
+      expect((await app.inject({ method: 'GET', url: '/api/v1/vectors' })).json().items).toEqual([]);
+    });
+
+    it('lets a model actualization shape the track only in codex mode with the feature on', async () => {
+      const eventId = await seedChain();
+      // The reading a fast model would store: it has seen the newest classification, and it says the
+      // target has passed Kharkiv. Written straight into the table the worker writes.
+      await sql(
+        `INSERT INTO threat_track_actualizations
+           (event_id, as_of, model, status, head_location_id, summary, confidence, input_digest)
+         SELECT $1, max(published_at), 'gpt-6-luna', 'passed', $2, 'Минула Харків', 0.75, 'integration'
+           FROM message_classifications WHERE event_id = $1`,
+        [eventId, KHARKIV_CITY]
+      );
+      const read = async () => (await app.inject({ method: 'GET', url: '/api/v1/vectors' })).json().items[0].track;
+
+      // `rules` mode: the row exists and changes nothing.
+      expect(await read()).toMatchObject({ basis: 'rules', status: 'moving', summary: null });
+      // Codex mode alone is not enough either: the feature is its own switch.
+      await sql(`UPDATE codex_settings SET classifier_mode='codex' WHERE singleton`);
+      expect((await read()).basis).toBe('rules');
+
+      await sql(`UPDATE codex_settings SET actualization_enabled=true WHERE singleton`);
+      expect(await read()).toMatchObject({
+        basis: 'model', status: 'passed', summary: 'Минула Харків', model: 'gpt-6-luna', confidence: 0.75
+      });
+      // The dialog describes the same track the map draws.
+      const dialog = (await app.inject({ method: 'GET', url: `/api/v1/threats/${eventId}/vector` })).json();
+      expect(dialog.track).toMatchObject({ basis: 'model', status: 'passed', headIndex: 2 });
     });
 
     it('serves the chain publicly while refusing the extrapolation without operator credentials', async () => {
