@@ -22,6 +22,13 @@ export const envSchema = z.object({
   TELEGRAM_API_ID: z.string().default(''),
   TELEGRAM_API_HASH: z.string().default(''),
   TELEGRAM_SESSION: z.string().default(''),
+  // Як колектор читає публічні канали. `web` — типово з 22.09.2026: публічна сторінка
+  // `https://t.me/s/<username>` без акаунта й без сесії, опитуванням (`src/sources/telegram-web.ts`).
+  // `mtproto` — push-оновлення через користувацьку сесію трьох ключів вище (`src/sources/telegram.ts`).
+  // Сесія колектора померла 02.09.2026 (`AUTH_KEY_UNREGISTERED`), і двадцять діб не надійшло жодного
+  // повідомлення каналу; транспорт без акаунта не має чого втратити таким чином. Обидва одночасно не
+  // працюють ніколи: вибір робиться один раз, на старті процесу.
+  TELEGRAM_TRANSPORT: z.enum(['web', 'mtproto']).default('web'),
   UKRAINE_ALARM_API_TOKEN: z.string().default(''),
   UKRAINE_ALARM_API_URL: z.string().url().default('https://api.ukrainealarm.com/api/v3/alerts'),
   ALERTS_IN_UA_TOKEN: z.string().default(''),
@@ -999,6 +1006,14 @@ export const APP_SETTINGS: Record<keyof AppConfig, SettingMeta> = {
     ui: { kind: 'secret' },
     applyNote: 'Сесія передається в StringSession на старті колектора. Заміна на живому процесі '
       + 'нічого не змінює до перезапуску; після нього збір іде з нового акаунта.'
+  },
+  TELEGRAM_TRANSPORT: {
+    scope: 'db_tunable', group: 'telegram', apply: 'restart', confirm: true, impact: 'collector',
+    ui: { kind: 'select', options: ['web', 'mtproto'] },
+    applyNote: 'Колектор каналів обирається один раз, у src/index.ts на старті процесу. «web» читає '
+      + 'публічні сторінки t.me/s опитуванням і не потребує акаунта; «mtproto» отримує push-оновлення '
+      + 'через сесію TELEGRAM_SESSION і без трьох MTProto-ключів не стартує взагалі. Двох колекторів '
+      + 'одночасно не буває: новий транспорт почне читати канали лише після перезапуску.'
   },
   NIGHTLY_DIGEST_TIME: {
     scope: 'db_tunable', group: 'telegram', apply: 'hot',

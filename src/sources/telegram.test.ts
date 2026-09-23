@@ -107,6 +107,14 @@ vi.mock('../services/operations.js', () => ({
     operations.successes.push(sourceId);
     operations.timeline.push(`success:${sourceId}`);
   },
+  // The heartbeat writes the whole live set in one transaction; the stub records it exactly as the
+  // per-source form did, so every assertion below still counts channels rather than transactions.
+  markSourcesSuccess: async (sourceIds: readonly string[]) => {
+    for (const sourceId of sourceIds) {
+      operations.successes.push(sourceId);
+      operations.timeline.push(`success:${sourceId}`);
+    }
+  },
   markSourceError: async (sourceId: string, error: unknown) => {
     operations.errors.push({ sourceId, message: error instanceof Error ? error.message : String(error) });
     operations.timeline.push(`error:${sourceId}`);
@@ -118,7 +126,8 @@ import { resetAdminNotices, setAdminNoticeBot } from '../bot/admin-notice.js';
 import {
   floodWaitSeconds, noteCollectorUpdate, registerTelegramCollectorMetrics,
   requestTelegramCollectorReload, resetTelegramCollectorStatus, resolveChannelPeers, startTelegramCollector,
-  telegramAdvisoryMedia, telegramCollectorStatus, type ChannelRoute, type TelegramCollectorRuntime
+  telegramAdvisoryMedia, telegramCollectorStatus, type ChannelRoute, type MediaConsumers,
+  type TelegramCollectorRuntime
 } from './telegram.js';
 
 describe('advisory Telegram media', () => {
@@ -254,10 +263,20 @@ let NewMessage: TelegramCollectorRuntime['NewMessage'];
 let EditedMessage: TelegramCollectorRuntime['EditedMessage'];
 let FloodWaitError: new (args: { capture: number }) => Error & { seconds: number };
 
+/**
+ * Хто «прочитає» вкладення, з погляду тестів.
+ *
+ * Типово — ніхто, і це не зручність, а прод-типова конфігурація: `classifier_mode='rules'`, тіньові
+ * перемикачі вимкнені. Справжня відповідь живе в `codex_settings`, тобто в базі, якої цей файл не
+ * має, — тому шов, а не мок модуля.
+ */
+let mediaConsumers: MediaConsumers = { primary: false, detached: false };
+
 async function start(fake: FakeClient, armed: ArmedTimer[] = [], heartbeatMs = 60_000) {
   return startTelegramCollector(silentLog, {
     createRuntime: async () => ({ client: fake.client, NewMessage, EditedMessage }),
     schedule: timerSeam(armed),
+    mediaConsumers: async () => mediaConsumers,
     heartbeatMs
   });
 }
@@ -311,6 +330,7 @@ beforeEach(() => {
   operations.timeline = [];
   configState.TELEGRAM_ADMIN_CHAT_ID = '';
   resetAdminNotices();
+  mediaConsumers = { primary: false, detached: false };
   resetTelegramCollectorStatus();
 });
 
@@ -690,7 +710,8 @@ describe('message delivery', () => {
     } finally { await stop?.(); }
   });
 
-  it('keeps a captionless threat card on the advisory classifier path', async () => {
+  it('keeps a captionless threat card on the advisory classifier path when the model will read it', async () => {
+    mediaConsumers = { primary: true, detached: false };
     const fake = fakeClient();
     const stop = await start(fake);
     try {
@@ -706,7 +727,54 @@ describe('message delivery', () => {
       expect((ingested.classifier[0]?.message as any).rawPayload.media).toEqual([
         { kind: 'image', mimeType: 'image/jpeg', bytes: 3 }
       ]);
+      // Основний класифікатор читає файл ДО рішення, тож він мусить бути на руках, а не в дорозі.
+      expect(ingested.classifier[0]?.options).not.toHaveProperty('pendingMedia');
       expect(ingested.alerts).toEqual([]);
+    } finally { await stop?.(); }
+  });
+
+  it('never downloads an attachment nothing in the process will read', async () => {
+    // Типова конфігурація: правила класифікують, тіньові перемикачі вимкнені. Монітор публікує карти
+    // безперервно, і кожна з них качалася повністю — до восьми мегабайтів — перед класифікацією
+    // тексту, який про неї не знає, щоб одразу стати сміттям.
+    mediaConsumers = { primary: false, detached: false };
+    const fake = fakeClient();
+    const stop = await start(fake);
+    try {
+      const downloadMedia = vi.fn(async () => Buffer.from([0xff, 0xd8, 0xff]));
+      expect(await deliver(fake, 'new', channelMessage(MONITOR_CHANNELS[4] as string, {
+        message: 'Загроза БпЛА для Полтавщини', photo: {}, downloadMedia
+      }))).toBe(true);
+      expect(downloadMedia).not.toHaveBeenCalled();
+      expect(ingested.classifier).toHaveLength(1);
+      expect((ingested.classifier[0]?.message as any).media).toEqual([]);
+    } finally { await stop?.(); }
+  });
+
+  it('hands the text to the classifier without waiting for a file only the shadow path will read', async () => {
+    mediaConsumers = { primary: false, detached: true };
+    const fake = fakeClient();
+    const stop = await start(fake);
+    try {
+      const bytes = Buffer.from([0xff, 0xd8, 0xff]);
+      // Завантаження, яке не завершиться, доки його не відпустять. Якби класифікація чекала на файл,
+      // цей `deliver` не повернувся б — а попередження чекало б на байти, яких ніхто не читає
+      // раніше, ніж воно вже поїхало в бот.
+      let release: (() => void) | null = null;
+      const downloadMedia = vi.fn(() => new Promise<Buffer>((resolve) => { release = () => resolve(bytes); }));
+      expect(await deliver(fake, 'new', channelMessage(MONITOR_CHANNELS[4] as string, {
+        message: 'Загроза БпЛА для Полтавщини', photo: {}, downloadMedia
+      }))).toBe(true);
+      expect(downloadMedia).toHaveBeenCalledTimes(1);
+      expect(ingested.classifier).toHaveLength(1);
+      expect((ingested.classifier[0]?.message as any).media).toEqual([]);
+      // Файл усе одно доїде — до того єдиного місця, яке його чекає.
+      const pending = ingested.classifier[0]?.options.pendingMedia;
+      expect(pending).toBeInstanceOf(Promise);
+      release!();
+      await expect(pending).resolves.toEqual([
+        { kind: 'image', mimeType: 'image/jpeg', bytes, fileName: undefined }
+      ]);
     } finally { await stop?.(); }
   });
 

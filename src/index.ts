@@ -20,6 +20,7 @@ import { startAttackStatsScheduler } from './services/attack-stats.js';
 import { startModelContextScheduler } from './services/model-context.js';
 import { eventHub } from './services/sse.js';
 import { startTelegramCollector } from './sources/telegram.js';
+import { startTelegramWebCollector } from './sources/telegram-web.js';
 
 await migrate();
 // AFTER migrate(), because the table it reads is created by 030; BEFORE buildServer(), because a
@@ -82,7 +83,12 @@ if (settings.degraded) {
   );
 }
 const stopNotifications = startNotificationWorkers(bot, app.log);
-const stopCollector = await startTelegramCollector(app.log);
+// One channel collector per process, chosen here and nowhere else (`TELEGRAM_TRANSPORT`, applied on
+// restart): the public web preview by default, the MTProto session only when the operator asks for
+// it. Both publish the one status `/health/ready` and `/ops` read, so nothing downstream branches.
+const stopCollector = config.TELEGRAM_TRANSPORT === 'web'
+  ? await startTelegramWebCollector(app.log)
+  : await startTelegramCollector(app.log);
 
 if (bot) {
   void bot.start({ onStart: async (info) => {

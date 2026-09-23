@@ -105,6 +105,32 @@ const iconToneGroup = { consequence: 'consequences', confirmed: 'threats', repor
 
 const levelNames = { background: 'фоновий', elevated: 'підвищений', significant: 'значний', high: 'високий', very_high: 'дуже високий' };
 const evidenceNames = { official: 'офіційно', confirmed: 'підтверджено', monitoring: 'моніторинг', unverified: 'не перевірено' };
+// Рівень тривоги словами (CONTEXT.md, «Рівень тривоги»). Колір сам по собі не є твердженням ні для
+// читача екрана, ні для дальтоніка, тож усюди, де рівень видно кольором, поруч мусить стояти слово.
+//
+// Вид загрози підписується ЗАЛЕЖНО від кольору, і це не примха верстки: влада називає ту саму
+// «дронову» загрозу «дроновою небезпекою» на жовтому й «масованою дроновою загрозою» на червоному.
+// Одна таблиця на обидва рівні друкувала б слова, яких оголошення не містило.
+const alertLevelNames = { yellow: 'жовтий рівень', red: 'червоний рівень' };
+const alertKindNames = {
+  yellow: { drones: 'дронова небезпека', missiles: 'ракетна загроза', drones_missiles: 'ракетно-дронова загроза' },
+  red: { drones: 'масована дронова загроза', missiles: 'ракетна загроза', drones_missiles: 'ракетно-дронова загроза' }
+};
+// «жовтий рівень — дронова небезпека», або просто «жовтий рівень», коли виду не назвали. Порожній
+// рядок для тривоги без рівня: вона мусить лишитися рівно тим, чим була до появи рівнів.
+function alertLevelText(level, kind) {
+  const word = alertLevelNames[level];
+  if (!word) return '';
+  const kindWord = alertKindNames[level]?.[kind];
+  return kindWord ? `${word} — ${kindWord}` : word;
+}
+// Рівень словами всередині розмітки. Один будівник на всі поверхні — панель території, картку події
+// й хронологію: рівень, названий у трьох місцях трьома формулюваннями, був би трьома різними
+// рівнями. Порожній рядок для тривоги без рівня лишає розмітку такою, якою вона була.
+function alertLevelChip(level, kind) {
+  const text = alertLevelText(level, kind);
+  return text ? `<span class="alert-level is-${escapeHtml(level)}">${escapeHtml(text)}</span>` : '';
+}
 // Авторство — окрема вісь від доказовості, і саме її бракувало на екрані.
 //
 // «Не перевірено» вище означає рівно одне: незалежного підтвердження ще немає. Але подій із цим
@@ -234,6 +260,17 @@ const VECTOR_CLASS_OFFSET = [0, 30];
 // Хороплет тривог. Заливка регіону, а не точка: офіційний канал оголошує тривогу на цілу територію,
 // а в районів у каталозі KATOTTG узагалі немає координат, тож точка для них неможлива в принципі.
 const alertColor = '#ff4747';
+// Жовтий рівень тривоги (CONTEXT.md, «Рівень тривоги»). Дзеркало --alert-yellow із web/styles.css.
+//
+// Рівень міняє ВІДТІНОК заливки й контуру — і нічого більше. Ні прозорість, ні товщина лінії, ні
+// склад шарів, ні підпис від нього не залежать: тьмяніша жовта пляма читалася б як «менша
+// тривога», а жовтий рівень — це тривога, з якої не зникає вказівка про укриття. Червоному рівню
+// власного кольору не потрібно: він і є той червоний, яким тривога малювалася завжди, тож тривога
+// без рівня й тривога червоного рівня — піксель у піксель та сама картинка.
+const alertYellowColor = '#ffc21f';
+// Та сама роль, що й у threatColor нижче для районного контуру похідного покриття: колір
+// «тривога поруч, контуру в названого місця немає» мусить бути тихішим за дослівно названий.
+const alertYellowMutedColor = '#e3a81a';
 // Дзеркало --threat / --consequence / --analytic із web/styles.css. Карта й інтерфейс мусять
 // називати ту саму річ тим самим кольором. Змінюєш тут — зміни й там.
 // Червоний зарезервовано за офіційною тривогою: жоден інший стан його не бере.
@@ -269,6 +306,14 @@ const ICON_TIER_ZOOM = 6.8;
 //            похідне покриття, — але жоден вираз фарби їх не читає.
 const alertFlag = ['boolean', ['feature-state', 'alert'], false];
 const unmappedFlag = ['boolean', ['feature-state', 'unmapped'], false];
+// alertYellow — та сама тривога, але оголошена жовтим рівнем. Окремого ключа для червоного немає й
+// не буде: червоний — це колір за замовчуванням, тож тривога без рівня і тривога червоного рівня
+// малюються тим самим виразом і тим самим пікселем. Ключ пишеться лише поруч із `alert` або
+// `unmapped` (див. territoryStateOf): рівень описує вже записану тривогу, а не існує сам по собі.
+const alertYellowFlag = ['boolean', ['feature-state', 'alertYellow'], false];
+// Відтінок за рівнем. Один вираз на всі чотири тривожні шари: інакше рівень довелося б повторювати
+// чотири рази й кожне повторення могло б розійтися з рештою.
+const alertHue = (red, yellow) => ['case', alertYellowFlag, yellow, red];
 // Ті самі дві ролі, помножені на три інші сімейства станів. Назви ключів тривоги лишаються
 // історичними (unmapped без префікса) саме тому, що вирази тривожних шарів мусять лишатися
 // впізнаваними при читанні поруч із рештою.
@@ -347,6 +392,14 @@ let connectionLost = false;    // останній запит знімка не 
 // перемальовується від оновлення знімка: без нього прямий вхід на /ops лишив би #app порожнім,
 // бо перший рендер після boot() приходить саме зі знімка.
 let renderedRoute = null;
+// Підпис стану джерел, під яким зараз намальовано /sources. Сторінка читає знімок і тому не має
+// права застигнути, але стан джерел змінюється в рази рідше за кадр потоку — тож перемальовує її
+// зміна підпису, а не сам факт кадру.
+let renderedSourceHealth = null;
+// Каталог рекомендованих каналів. Його формує адміністратор, він не має жодного стосунку ні до
+// знімка, ні до кадру потоку — і саме тому його запит більше не висить на кожному перемальовуванні
+// сторінки джерел. Живе до перезавантаження вкладки, як і будь-який інший довідник у цьому файлі.
+let channelCatalogue = null;
 
 function escapeHtml(value = '') {
   return String(value).replace(/[&<>'"]/g, (char) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', "'": '&#39;', '"': '&quot;' })[char]);
@@ -502,6 +555,19 @@ const CONFIRMING_EVIDENCE = new Set(['official', 'confirmed']);
 // за поріг ІКОНКИ (significant, етап 2) — пунктирний контур це підказка, гліф це заява.
 const ANALYTIC_CONTOUR_FLOOR = new Set(['elevated', 'significant', 'high', 'very_high']);
 
+// Порядок кольорів і правило їх зведення на одній території: НАЙСИЛЬНІШИЙ виграє (червоний >
+// жовтий > без рівня) — те саме правило, яким сервер зводить кілька джерел в одну тривогу, і з тієї
+// самої причини: обережність тут дорожча за консенсус (CONTEXT.md, межі безпеки). Одна територія
+// збирає колір і від себе самої, і від кожного свого названого нащадка без контуру, тож без цього
+// порівняння жовта громада гасила б червоний район навколо себе.
+const ALERT_LEVEL_RANK = { yellow: 1, red: 2 };
+function raiseAlertLevel(levels, id, level) {
+  const rank = ALERT_LEVEL_RANK[level] ?? 0;
+  if (!rank) return;
+  if ((ALERT_LEVEL_RANK[levels.get(id)] ?? 0) >= rank) return;
+  levels.set(id, level);
+}
+
 /**
  * Стан територій за знімком: чотири незалежні сімейства, по три множини в кожному.
  *
@@ -520,13 +586,18 @@ const ANALYTIC_CONTOUR_FLOOR = new Set(['elevated', 'significant', 'high', 'very
 function territoryCoverage() {
   const { parents, types } = locationIndexes();
   const family = () => ({ direct: new Set(), covered: new Set(), unmapped: new Set() });
-  const coverage = { alert: family(), threat: family(), consequence: family(), analytic: family() };
+  // Рівень живе на сімействі тривоги, а не окремим сімейством: це прикмета тривоги, а не власний
+  // стан карти. Тому й пишеться на ті самі id, і зникає разом із ними.
+  const coverage = {
+    alert: { ...family(), levels: new Map() }, threat: family(), consequence: family(), analytic: family()
+  };
 
-  const claim = (fam, id) => {
+  const claim = (fam, id, level) => {
     if (!id) return;
     // Країна — не територія на карті. Див. коментар вище.
     if (id === 'ua' || types.get(id) === 'country') return;
     fam.direct.add(id);
+    if (fam.levels) raiseAlertLevel(fam.levels, id, level);
     const seen = new Set([id]);
     let anchored = regionFeatures.has(id);
     let parent = parents.get(id);
@@ -536,11 +607,12 @@ function territoryCoverage() {
       depth += 1;
       fam.covered.add(parent);
       if (!anchored && regionFeatures.has(parent)) { anchored = true; fam.unmapped.add(parent); }
+      if (fam.levels) raiseAlertLevel(fam.levels, parent, level);
       parent = parents.get(parent);
     }
   };
 
-  for (const alert of snapshot?.alerts ?? []) claim(coverage.alert, alert.location_id);
+  for (const alert of snapshot?.alerts ?? []) claim(coverage.alert, alert.location_id, alert.alert_level);
 
   for (const event of snapshot?.threats ?? []) {
     // Очікувана загроза (міграція 049) не заливає полігон: це сказане джерелом про найближчі години,
@@ -623,11 +695,18 @@ function analyticCoverageOf(state) {
  */
 function territoryCoverageFromStates() {
   const family = () => ({ direct: new Set(), covered: new Set(), unmapped: new Set() });
-  const coverage = { alert: family(), threat: family(), consequence: family(), analytic: family() };
+  // Див. territoryCoverage(): рівень — прикмета сімейства тривоги, а не пʼяте сімейство.
+  const coverage = {
+    alert: { ...family(), levels: new Map() }, threat: family(), consequence: family(), analytic: family()
+  };
 
-  const claim = (fam, id, tone) => {
+  const claim = (fam, id, tone, level) => {
     const anchor = nearestPolygonAncestor(id);
     if (!anchor) return;
+    // Колір пишеться на ту фічу, яка справді засвітиться: територія без контуру віддає свій рівень
+    // тому предку, який світиться замість неї, — інакше з карти зникла б саме та різниця, заради
+    // якої рівень і оголошують.
+    if (fam.levels) raiseAlertLevel(fam.levels, anchor, level);
     if (anchor !== id) { fam.covered.add(anchor); fam.unmapped.add(anchor); return; }
     if (tone === 'direct') { fam.direct.add(id); return; }
     fam.covered.add(id);
@@ -635,7 +714,9 @@ function territoryCoverageFromStates() {
   };
 
   for (const state of snapshotTerritories()) {
-    if (state.alertActive) claim(coverage.alert, state.locationId, strongestCoverage(state.alerts ?? []) ?? state.coverage);
+    if (state.alertActive) {
+      claim(coverage.alert, state.locationId, strongestCoverage(state.alerts ?? []) ?? state.coverage, state.alertLevel);
+    }
     const asserted = (state.threats ?? []).filter((threat) => threat.asserted);
     if (state.threatActive) claim(coverage.threat, state.locationId, strongestCoverage(asserted) ?? state.coverage);
     const consequences = (state.threats ?? []).filter((threat) => threat.consequence);
@@ -672,8 +753,9 @@ function alertLabelCollection(fam) {
 
 // Стан території накладається через feature-state: геометрія областей і районів (понад мегабайт)
 // лишається незмінною, на кожен тік потоку змінюються лише кілька десятків прапорців.
-// removeFeatureState({source}) стирає ВЕСЬ стан джерела, тож усі дванадцять ключів мусять
-// записатися в цьому ж проході — інакше сімейство, записане окремо, буде стерте наступним тіком.
+// setFeatureState ЗЛИВАЄ переданий набір із наявним станом фічі, а не заміщує його, тож усі
+// тринадцять ключів мусять записатися одним проходом поверх щойно очищеної фічі — інакше
+// сімейство, записане окремо, лишалося б світитися й після того, як зникло з покриття.
 function territoryStateOf(id, coverage) {
   const state = {};
   const add = (fam, direct, unmapped, partial) => {
@@ -682,11 +764,25 @@ function territoryStateOf(id, coverage) {
     else if (fam.covered.has(id)) state[partial] = true;
   };
   add(coverage.alert,       'alert',       'unmapped',            'partial');
+  // Рівень описує ВЖЕ записану тривогу, тож ключ ставиться лише поруч із заливкою, яку він фарбує:
+  // «жовтий» на території, яка нічого не світить, був би кольором без тривоги. Значення лишається
+  // булевим — саме на цьому тримається підпис у `territoryStateSignatures`, і зміна рівня міняє
+  // САМ НАБІР ключів, тож дифований прохід бачить її так само, як появу чи зникнення тривоги.
+  if ((state.alert || state.unmapped) && coverage.alert.levels?.get(id) === 'yellow') state.alertYellow = true;
   add(coverage.threat,      'threat',      'threatUnmapped',      'threatPartial');
   add(coverage.consequence, 'consequence', 'consequenceUnmapped', 'consequencePartial');
   add(coverage.analytic,    'analytic',    'analyticUnmapped',    'analyticPartial');
   return state;
 }
+
+// Підписи вже записаних станів, окремий набір на джерело: id → порядок ключів, які на ньому стоять.
+//
+// Попередня редакція починала кожен прохід зі стирання стану ДЖЕРЕЛА ЦІЛКОМ
+// (`removeFeatureState({ source })`) — найдорожчий відомий спосіб нічого не змінити: MapLibre
+// знецінює обчислення фарби для всіх 27 областей і ~136 районів у шістнадцяти шарах, які читають
+// feature-state, і робить це на КОЖЕН тік потоку, навіть коли покриття збіглося ключ у ключ.
+// Підпису досить, бо `territoryStateOf` видає ключі детерміновано, а значення там завжди `true`.
+const territoryStateSignatures = new Map();
 
 function applyTerritoryLayers() {
   if (!mapLayersReady || !map) return;
@@ -701,14 +797,33 @@ function applyTerritoryLayers() {
   }
   for (const [source, ids] of [['ukraine-admin', oblastIds], ['ukraine-raions', raionIds]]) {
     if (!map.getSource(source)) continue;
-    map.removeFeatureState({ source });
+    const previous = territoryStateSignatures.get(source) ?? new Map();
+    const current = new Map();
     for (const id of touched) {
       if (!ids.has(id)) continue;
       const state = territoryStateOf(id, coverage);
-      // Порожній стан не пишемо: removeFeatureState уже лишив фічу чистою, а зайвий виклик на
-      // кожну з 136 районних фіч — це робота, яку не видно на екрані.
-      if (Object.keys(state).length) map.setFeatureState({ source, id }, state);
+      // Порожній стан не пишемо: фіча без жодного ключа й так чиста, а зайвий виклик на кожну зі
+      // 136 районних фіч — це робота, яку не видно на екрані.
+      const signature = Object.keys(state).join('|');
+      if (!signature) continue;
+      current.set(id, signature);
+      const was = previous.get(id);
+      if (was === signature) continue;
+      // Стан фічі ЗЛИВАЄТЬСЯ з наявним, тож ключ, який зник із набору, лишився б на ній назавжди:
+      // скасована тривога світила б область далі. Знімаємо саме ці ключі поіменно.
+      //
+      // І НЕ стиранням фічі цілком. `removeFeatureState({ source, id })` з наступним
+      // `setFeatureState` тієї ж фічі кидає всередині MapLibre (SourceFeatureState.updateState
+      // читає `this.state[sourceLayer][id]`, якого до першого coalesce ще не існує) — спіймано в
+      // браузері на першій же побудові карти: виняток летів із обробника style.load і забирав із
+      // собою все, що стояло в ньому нижче, — ланцюги, стеки іконок і текстовий еквівалент карти.
+      if (was) for (const key of was.split('|')) if (!state[key]) map.removeFeatureState({ source, id }, key);
+      map.setFeatureState({ source, id }, state);
     }
+    // Території, що випали з покриття. Їх одиниці на тік, і саме вони — єдина причина, з якої
+    // стирання взагалі потрібне.
+    for (const id of previous.keys()) if (!current.has(id)) map.removeFeatureState({ source, id });
+    territoryStateSignatures.set(source, current);
   }
   // Підписи лишаються ТІЛЬКИ тривожними: червона назва області для моніторингового повідомлення
   // стверджувала б більше, ніж сказало джерело. Назву території з іншим станом дає панель.
@@ -732,6 +847,10 @@ async function loadRaionBoundaries() {
     raionBoundaries = data;
     indexRegionFeatures();
     map?.getSource('ukraine-raions')?.setData(raionCollection());
+    // Районна геометрія щойно замінилася цілком: підписи, записані до її прибуття, описують стан,
+    // якого в джерелі ще не було видно. Скидаємо їх, щоб наступний прохід переписав райони, а не
+    // вирішив, що вони вже світяться.
+    territoryStateSignatures.delete('ukraine-raions');
     applyTerritoryLayers();
     // Центроїдів районів не існує, поки не приїхав ADM2, тож стеки іконок для них треба
     // перевипустити саме тут: прибуття файлу асинхронне й нефатальне.
@@ -741,7 +860,15 @@ async function loadRaionBoundaries() {
   } catch { /* без районних контурів карта працює на рівні областей */ }
 }
 
-setInterval(() => { $('#clock strong').textContent = kyivTime(); updateFreshness(); }, 1000);
+// Присвоєння textContent замінює текстовий вузол і знецінює розкладку навіть тоді, коли рядок той
+// самий. Годинник показує секунди, тож у нього рядок справді новий на кожному тіку; решта паска
+// збігається з попередньою майже завжди — і саме її рятує порівняння.
+function setText(node, text) {
+  if (!node || node.textContent === text) return;
+  node.textContent = text;
+}
+
+setInterval(() => { setText($('#clock strong'), kyivTime()); updateFreshness(); }, 1000);
 
 function updateFreshness() {
   if (!lastReceived) return;
@@ -752,15 +879,19 @@ function updateFreshness() {
   const backendProblem = backendStatus === 'degraded' || backendStatus === 'unconfigured';
   // «held» стоїть НИЖЧЕ за «delayed» і «stale»: свідома затримка оператора — це не несправність,
   // але справжня несправність поверх неї має лишатися видимою.
+  // Стан паска рахується заново на КОЖНОМУ тіку й пишеться без порівняння — на відміну від трьох
+  // текстових рядків нижче. `src/api/stream-transport.test.ts` пінує саме цей рядок дослівно: він
+  // доводить, що «ЗВʼЯЗОК ПЕРЕРВАНО» переживає тік годинника, бо стан бере `connectionLost`, а не
+  // покладається на один запис із markOffline(). Ціна — один запис атрибута на секунду.
   strip.dataset.state = connectionLost || age > 180 || backendProblem ? 'stale'
     : age > 60 ? 'delayed'
       : held ? 'held' : 'current';
-  $('#system-state').textContent = connectionLost ? 'ЗВʼЯЗОК ПЕРЕРВАНО'
+  setText($('#system-state'), connectionLost ? 'ЗВʼЯЗОК ПЕРЕРВАНО'
     : age > 180 ? 'ДАНІ ЗАСТАРІЛИ'
       : backendStatus === 'degraded' ? 'ОФІЦІЙНІ ДЖЕРЕЛА НЕДОСТУПНІ'
         : backendStatus === 'unconfigured' ? 'ДЖЕРЕЛА НЕ НАЛАШТОВАНІ'
           : age > 60 ? 'МОЖЛИВА ЗАТРИМКА'
-            : held ? `ЗАТРИМКА ${publication?.delaySeconds ?? 15} С` : 'ДАНІ АКТУАЛЬНІ';
+            : held ? `ЗАТРИМКА ${publication?.delaySeconds ?? 15} С` : 'ДАНІ АКТУАЛЬНІ');
   // Три показники, яких вимагає дорожня карта: режим (у #system-state), фактична свіжість
   // («оновлено N с тому») і ЧАС ОСТАННЬОЇ ОПУБЛІКОВАНОЇ ПОДІЇ. Третій без цього рядка не мав би
   // жодного споживача взагалі: він рахувався у зрізі й показувався тільки в /ops.
@@ -783,11 +914,11 @@ function updateFreshness() {
     : '';
   // Обірваний звʼязок не ховає лічильника віку: «останній відомий стан» без «оновлено N с тому»
   // лишав би читача без єдиного числа, яким він міряє, наскільки цьому екрану ще можна вірити.
-  $('#last-update').textContent = connectionLost
+  setText($('#last-update'), connectionLost
     ? `показано останній відомий стан · оновлено ${Math.round(age)} с тому${eventAt}`
     : held
       ? `оновлено ${Math.round(age)} с тому · зріз о ${shortTime(publication.cutoffAt)}${eventAt}${transport}`
-      : `оновлено ${Math.round(age)} с тому${eventAt}${transport}`;
+      : `оновлено ${Math.round(age)} с тому${eventAt}${transport}`);
 }
 
 async function loadSnapshot() {
@@ -996,7 +1127,7 @@ function activePage() {
 function eventCard(item, type) {
   if (type === 'alert') return `<article class="event-card priority" data-location="${escapeHtml(item.location_id)}">
     <div class="event-meta"><span>ОФІЦІЙНА ТРИВОГА</span><time>${shortTime(item.started_at)}</time></div>
-    <h2>${escapeHtml(item.location_name)}</h2><p>Активне офіційне повідомлення. Дотримуйтеся вказівок служб.</p>
+    <h2>${escapeHtml(item.location_name)}</h2>${alertLevelChip(item.alert_level, item.alert_kind)}<p>Активне офіційне повідомлення. Дотримуйтеся вказівок служб.</p>
     <div class="event-foot"><b>ТРИВАЄ</b><span>${timeAgo(item.started_at)}</span></div></article>`;
   if (type === 'assessment') return `<article class="event-card analytical" data-assessment="${escapeHtml(item.id)}" data-location="${escapeHtml(item.location_id)}">
     <div class="event-meta"><span>АНАЛІТИЧНА ОЦІНКА</span><time>${shortTime(item.generated_at)}</time></div>
@@ -1094,6 +1225,32 @@ function vectorArc(from, to) {
 }
 
 /**
+ * Дуги й тривалості проходу, пораховані раз на ланцюг, а не раз на кадр.
+ *
+ * `vectorArc` будує двадцять девʼять точок квадратичної кривої. `runVectorDraw` і `runVectorTravel`
+ * питали її заново для КОЖНОГО відрізка на КОЖНОМУ кадрі, причому рух брав із цих двадцяти девʼяти
+ * точок рівно одну. Дуга залежить лише від двох кінців, а кінці не змінюються, поки не змінилися
+ * самі дані ланцюгів — тому ключем є тотожність відрізка (`vs-<eventId>-<order>`), а чиститься
+ * мапа рівно там, де ці дані замінюються, у `loadVectors`. Стара дуга під перевиданим ланцюгом
+ * була б помилкою ЗМІСТУ, а не швидкості: лінія йшла б повз місця, які назвало джерело. Іншого
+ * місця для інвалідації тут бути не може.
+ *
+ * Тривалість проходу лежить поруч і з тієї самої причини: вона рахується з тих самих двох кінців і
+ * теж перераховувалася на кожному кадрі. Нуль означає «ще не питали»: нульової тривалості не буває,
+ * її знизу тримає VECTOR_TRAVEL_MIN_MS.
+ */
+const vectorArcCache = new Map();
+
+function segmentArc(id, from, to) {
+  let entry = vectorArcCache.get(id);
+  if (entry === undefined) {
+    entry = { points: vectorArc(from, to), duration: 0 };
+    vectorArcCache.set(id, entry);
+  }
+  return entry;
+}
+
+/**
  * Скільки часу лінія промальовується від A до Б, і що ця анімація стверджує.
  *
  * Вона стверджує ПОРЯДОК і НАПРЯМОК: відрізок починається там, де його назвало перше повідомлення,
@@ -1143,7 +1300,7 @@ function vectorSegmentCollection(now = performance.now()) {
       if (!from?.coordinates || !to?.coordinates) continue;
       const id = `vs-${vector.eventId}-${order}`;
       live.add(id);
-      const arc = vectorArc(from.coordinates, to.coordinates);
+      const arc = segmentArc(id, from.coordinates, to.coordinates).points;
       features.push({ type: 'Feature', id,
         geometry: { type: 'LineString', coordinates: partialArc(arc, vectorDrawProgress(id, now)) },
         properties: { eventId: vector.eventId, basis: segment.basis, evidence: segment.evidenceLevel,
@@ -1244,6 +1401,11 @@ const VECTOR_TIME_COMPRESSION = 60;
 /** Межі, поза якими анімація перестає бути анімацією: надто швидко — миготіння, надто повільно — стоїть. */
 const VECTOR_TRAVEL_MIN_MS = 4000;
 const VECTOR_TRAVEL_MAX_MS = 90000;
+// Крок оновлення рухомої точки — 50 мс, тобто двадцять кадрів на секунду. Це НЕ частота, з якою
+// браузер малює карту: `setData` замінює колекцію цілком і віддає її на розбір у воркер, а
+// найкоротша ланка триває чотири секунди — за 1/60 с гліф зсувається менше ніж на піксель. Кадри
+// між вікнами не роблять нічого й тому не перемальовують карту взагалі.
+const VECTOR_TRAVEL_STEP_MS = 50;
 let vectorTravelFrame = null;
 
 /** Відстань між двома точками [довгота, широта] у кілометрах, по великому колу. */
@@ -1285,18 +1447,22 @@ function vectorTravelCollection(now = performance.now()) {
       const from = vector.nodes[segment.from];
       const to = vector.nodes[segment.to];
       if (!from?.coordinates || !to?.coordinates) continue;
-      // Фаза рахується ОКРЕМО для кожного відрізка, бо в кожного своя тривалість. Спільна фаза й
-      // була тим, через що всі точки долали будь-яку відстань за однаковий час.
-      const duration = vectorTravelDurationMs(from.coordinates, to.coordinates,
-        segment.threatType ?? vector.threatType);
-      const phase = (now % duration) / duration;
       // Читаємо час початку промальовування, а не викликаємо `vectorDrawProgress`: той на першому
       // виклику ЗАПИСУЄ час, і тоді порядок двох збірок вирішував би, хто з них почав анімацію.
-      const started = vectorDrawStart.get(`vs-${vector.eventId}-${order}`);
+      const id = `vs-${vector.eventId}-${order}`;
+      const started = vectorDrawStart.get(id);
       if (started === undefined || now - started < VECTOR_DRAW_MS) continue;
-      const arc = vectorArc(from.coordinates, to.coordinates);
+      // Фаза рахується ОКРЕМО для кожного відрізка, бо в кожного своя тривалість. Спільна фаза й
+      // була тим, через що всі точки долали будь-яку відстань за однаковий час.
+      const cached = segmentArc(id, from.coordinates, to.coordinates);
+      if (!cached.duration) {
+        cached.duration = vectorTravelDurationMs(from.coordinates, to.coordinates,
+          segment.threatType ?? vector.threatType);
+      }
+      const duration = cached.duration;
+      const phase = (now % duration) / duration;
       features.push({ type: 'Feature', id: `vt-${vector.eventId}-${order}`,
-        geometry: { type: 'Point', coordinates: arcPointAt(arc, phase) },
+        geometry: { type: 'Point', coordinates: arcPointAt(cached.points, phase) },
         // Летить САМА ІКОНКА КЛАСУ, а не безлика крапка. Ті самі зображення, що вже зареєстровані
         // для стеків територій і для фішки на голові ланцюга; третього конвеєра іконок тут немає.
         // Один рухомий символ відповідає одразу на два питання — «що» і «куди», — і робить це без
@@ -1319,12 +1485,20 @@ function vectorTravelCollection(now = performance.now()) {
 function runVectorTravel() {
   if (vectorTravelFrame !== null) return;
   if (!motionAllowed()) return;
+  // Останній випущений набір і час його випуску. Між вікнами оновлення набір не перераховується,
+  // але умова продовження читає саме його: інакше пропущене вікно читалося б як «рухати нічого».
+  let collection = { type: 'FeatureCollection', features: [] };
+  let published = 0;
   const step = () => {
     vectorTravelFrame = null;
     const source = map?.getSource('threat-vector-travel');
     if (!source) return;
-    const collection = vectorTravelCollection(performance.now());
-    try { source.setData(collection); } catch { return; }
+    const now = performance.now();
+    if (now - published >= VECTOR_TRAVEL_STEP_MS) {
+      published = now;
+      collection = vectorTravelCollection(now);
+      try { source.setData(collection); } catch { return; }
+    }
     // Умова продовження — НЕ «є що рухати зараз», а «є що рухати взагалі».
     //
     // Перша редакція спинялася на порожньому наборі, і цього вистачало, щоб рух не вмикався ніколи:
@@ -1499,6 +1673,9 @@ async function loadVectors() {
     const data = await response.json();
     if (!Array.isArray(data?.items)) throw new Error('vectors malformed');
     vectors = data.items;
+    // Єдине місце, де дані ланцюгів змінюються, — отже єдине, де кеш дуг стає брехнею. Невдала
+    // відповідь його НЕ чистить: там `vectors` лишається тим самим масивом, і дуги під ним теж.
+    vectorArcCache.clear();
   } catch {
     // Пояснювальний шар поверх маркерів, які карта вже малює: лишаємо попередній стан.
   }
@@ -1509,8 +1686,9 @@ function applyVectors() {
   if (mapLayersReady && map?.getSource('threat-vector-segments')) {
     map.getSource('threat-vector-segments').setData(vectorSegmentCollection());
     map.getSource('threat-vector-points')?.setData(vectorNodeCollection());
-    // Голови приходять із ДВОХ джерел даних — /api/v1/vectors і snapshot.threats — тож їх
-    // перевидає саме applyVectors(): і loadVectors(), і updateMap() проходять через нього.
+    // Голови приходять із ДВОХ джерел даних — /api/v1/vectors і snapshot.threats. Обидва приїжджають
+    // одним і тим самим тіком: `loadSnapshot()` читає знімок і одразу замовляє ланцюги, а
+    // `loadVectors()` закінчується цим викликом — тобто єдиним на знімок.
     map.getSource('threat-vector-heads')?.setData(vectorHeadCollection());
     // Щойно з’явився відрізок, якого ще не малювали, `vectorDrawProgress` уже записав йому час
     // початку — лишається крутити кадри, доки він доросте до одиниці. Кадр зупиняється сам, тож
@@ -2022,9 +2200,24 @@ function addThreatIconImages(map) {
   return registered === Object.keys(threatIconPaths).length * iconTones.length;
 }
 
+// Вузли перемикачів шарів, по одному на сімейство іконок.
+//
+// `territoryIconCollection` питає видимість сімейства для КОЖНОЇ іконки КОЖНОЇ території, а
+// питання коштувало `document.querySelector` по всьому документу — до кількох сотень обходів DOM
+// на одну перебудову джерела, і так на кожен тік потоку. Кешується рівно вузол; стан читається
+// живим, бо кнопку могли натиснути між перебудовами. `isConnected` ловить перебудову сторінки
+// карти (#app.replaceChildren): відʼєднаний вузол назавжди лишився б зі станом, якого на екрані
+// вже немає.
+const iconToggleNodes = new Map();
+
 function iconFamilyVisible(tone) {
   const group = iconToneGroup[tone];
-  const toggle = group ? $(`.layer-toggle[data-layer="${group}"]`) : null;
+  if (!group) return true;
+  let toggle = iconToggleNodes.get(group);
+  if (!toggle?.isConnected) {
+    toggle = $(`.layer-toggle[data-layer="${group}"]`);
+    iconToggleNodes.set(group, toggle);
+  }
   return !toggle || toggle.classList.contains('is-active');
 }
 
@@ -2037,7 +2230,13 @@ function lowerFirstUk(value) {
 // текстом. Вісім територій, не більше: далі це вже не оперативна картина, а диктант.
 function territoryAriaSentence(territory, shownIcons, overflow) {
   const parts = [];
-  if (territory.alertActive) parts.push('офіційна тривога');
+  // Рівень іде тим самим рядком, що й тривога, і як її уточнення: для читача екрана колір на
+  // полігоні не існує взагалі, тож слово — його єдиний доступ до різниці між жовтим і червоним.
+  // Тривога без рівня диктується дослівно тим самим рядком, що й до появи рівнів.
+  if (territory.alertActive) {
+    const level = alertLevelText(territory.alertLevel, territory.alertKind);
+    parts.push(level ? `офіційна тривога, ${level}` : 'офіційна тривога');
+  }
   for (const icon of shownIcons) parts.push(lowerFirstUk(icon.labelUk ?? threatIconLabels[icon.threatType] ?? icon.threatType));
   // Те саме число, що й у бейджі. Читач екрана і карта не мають права рахувати по-різному.
   if (overflow > 0) parts.push(`ще ${overflow} тип${pluralUk(overflow, '', 'и', 'ів')}`);
@@ -2188,8 +2387,10 @@ function startThreatWave() {
     const base = 7 + phase * 20;
     const fade = (1 - phase) ** 2 * .5;
     try {
+      // Дві властивості, не три. `circle-opacity` тут завжди дорівнювала НУЛЮ: хвиля — це кільце,
+      // тобто обвід без заливки, і шар отримав цей нуль ще при створенні. Третина всіх записів у
+      // стиль на кожному кадрі була записом константи, якої ніхто не читає.
       map.setPaintProperty('threat-dot-wave', 'circle-radius', base);
-      map.setPaintProperty('threat-dot-wave', 'circle-opacity', 0);
       map.setPaintProperty('threat-dot-wave', 'circle-stroke-opacity', fade);
     } catch { return; }      // стиль перезавантажили просто зараз — наступний attach заведе хвилю знову
     threatWaveFrame = requestAnimationFrame(step);
@@ -2201,6 +2402,19 @@ function stopThreatWave() {
   if (threatWaveFrame === null) return;
   cancelAnimationFrame(threatWaveFrame);
   threatWaveFrame = null;
+}
+
+/**
+ * Вмикає хвилю рівно тоді, коли є що обводити, і гасить її, щойно таких крапок не стало.
+ *
+ * Цикл крутився від створення шарів і до зміни маршруту — тобто на спокійній карті, де активної
+ * загрози немає взагалі, вкладка щосекунди писала шістдесят разів по дві пейнт-властивості в шар
+ * із нуля фіч. Умова тут — ТА САМА, що й фільтр шару (`asserted`), а не просто «є крапки»:
+ * хвиля належить територіям, які джерело НАЗВАЛО, тож транзитна крапка її не заводить.
+ */
+function syncThreatWave(collection) {
+  if (collection.features.some((feature) => feature.properties.asserted)) startThreatWave();
+  else stopThreatWave();
 }
 
 /**
@@ -2239,7 +2453,8 @@ function originZoneCollection() {
 
 function addOriginZoneLayers() {
   if (!iconImagesReady) return;
-  map.addSource('origin-zones', { type: 'geojson', data: originZoneCollection() });
+  const collection = originZoneCollection();
+  map.addSource('origin-zones', { type: 'geojson', data: collection });
   map.addLayer({ id: 'origin-zone-wave', type: 'circle', source: 'origin-zones', paint: {
     'circle-radius': motionAllowed() ? 9 : 19,
     'circle-color': threatColor,
@@ -2257,12 +2472,14 @@ function addOriginZoneLayers() {
     'icon-ignore-placement': true
   } });
   originZoneLayersReady = true;
-  startOriginWave();
+  syncOriginWave(collection);
 }
 
 function updateOriginZones() {
   if (!originZoneLayersReady) return;
-  map.getSource('origin-zones')?.setData(originZoneCollection());
+  const collection = originZoneCollection();
+  map.getSource('origin-zones')?.setData(collection);
+  syncOriginWave(collection);
 }
 
 const ORIGIN_WAVE_PERIOD_MS = 2600;
@@ -2292,8 +2509,16 @@ function stopOriginWave() {
   originWaveFrame = null;
 }
 
+/** Та сама умова, що й у хвилі загрози: зон немає — анімувати нема чого. Фільтра на шарі немає,
+ * тож рахується будь-яка фіча джерела. */
+function syncOriginWave(collection) {
+  if (collection.features.length) startOriginWave();
+  else stopOriginWave();
+}
+
 function addThreatDotLayers() {
-  map.addSource('threat-dots', { type: 'geojson', data: threatDotCollection() });
+  const collection = threatDotCollection();
+  map.addSource('threat-dots', { type: 'geojson', data: collection });
   // Хвиля — ТІЛЬКИ навколо територій, які джерело назвало. Фільтр стоїть на шарі, а не в збірці
   // колекції, щоб крапка існувала для кожної активної загрози, а хвиля — лише для названої: два
   // різні твердження про одну точку лишаються двома різними шарами.
@@ -2319,12 +2544,14 @@ function addThreatDotLayers() {
     'circle-stroke-opacity': .85
   } });
   threatDotLayersReady = true;
-  startThreatWave();
+  syncThreatWave(collection);
 }
 
 function updateThreatDots() {
   if (!threatDotLayersReady) return;
-  map.getSource('threat-dots')?.setData(threatDotCollection());
+  const collection = threatDotCollection();
+  map.getSource('threat-dots')?.setData(collection);
+  syncThreatWave(collection);
 }
 
 function addTerritoryIconLayers() {
@@ -2355,18 +2582,24 @@ function addTerritoryIconLayers() {
 
 function updateTerritoryIcons() {
   if (!mapLayersReady) return;
+  // Одна збірка на перебудову, не дві. Текстовий еквівалент карти читає РІВНО ту саму колекцію,
+  // що й растрові шари, тож будувати її вдруге означало б ще раз обійти всі території, узяти
+  // центроїд кожної й перепитати перемикачі — заради набору, який уже лежить у руці.
+  const collection = territoryIconCollection();
   // Растрові шари іконок можуть не існувати взагалі: canvas 2D або Path2D недоступні, addImage
   // кинув — і addTerritoryIconLayers() тихо вийшов. Це деградація в бік меншої кількості картинки,
   // а не в бік мовчання: текстовий еквівалент карти не має права залежати від того, чи вдалося
   // намалювати бітмапи, інакше читач екрана лишився б із порожнім #map-aria на живій карті.
-  if (iconLayersReady) map.getSource('territory-icons')?.setData(territoryIconCollection());
-  writeMapAria();
+  if (iconLayersReady) map.getSource('territory-icons')?.setData(collection);
+  writeMapAria(collection);
 }
 
-function writeMapAria() {
+// Колекція приходить параметром від `updateTerritoryIcons`, який її щойно зібрав; власна збірка
+// лишається запасним значенням для будь-якого іншого виклику.
+function writeMapAria(collection = territoryIconCollection()) {
   const node = $('#map-aria');
   if (!node) return;
-  const stacked = new Map(territoryIconCollection().features
+  const stacked = new Map(collection.features
     .map((feature) => [feature.properties.locationId, feature.properties.aria]));
   const tier = iconTier ?? 'oblast';
   // Офіційна тривога — це заливка, а не іконка, тож територія під самою лише тривогою не має фічі
@@ -2388,7 +2621,10 @@ function writeMapAria() {
   // Знімок без territories[] не дає жодного рядка, але тривоги в ньому є, і карта для читача
   // екрана не має права мовчати про них.
   const lines = all.length ? all.slice(0, 8) : (snapshot?.alerts ?? []).slice(0, 8)
-    .map((alert) => `${alert.location_name}: офіційна тривога.`);
+    .map((alert) => {
+      const level = alertLevelText(alert.alert_level, alert.alert_kind);
+      return `${alert.location_name}: офіційна тривога${level ? `, ${level}` : ''}.`;
+    });
   const text = lines.length
     ? `${lines.join(' ')}${all.length > 8 ? ` Показано 8 територій із ${all.length}.` : ''}`
     : 'Активних позначок на карті немає.';
@@ -2433,7 +2669,7 @@ function renderThreatLegend() {
       + `<path fill="currentColor" fill-rule="evenodd" d="${threatIconPaths[threatType]}"/></svg>`
       + `</i><span>${escapeHtml(short)}</span></li>`;
   };
-  legend.innerHTML = `<summary><i class="swatch threat"></i><span class="legend-title">Загрози на карті</span><span class="legend-sum">4 стани · 10 типів</span><span class="legend-caret" aria-hidden="true">▾</span></summary>
+  legend.innerHTML = `<summary><i class="swatch threat"></i><span class="legend-title">Загрози на карті</span><span class="legend-sum">4 стани · 2 рівні · 10 типів</span><span class="legend-caret" aria-hidden="true">▾</span></summary>
     <div class="legend-body">
       <ul class="legend-rows legend-states">
         <li><i class="legend-swatch state-alert"></i><span><b>Офіційна тривога</b>щільна червона заливка й контур</span></li>
@@ -2441,6 +2677,14 @@ function renderThreatLegend() {
         <li><i class="legend-swatch state-consequence"></i><span><b>Атака або наслідки</b>штрихування</span></li>
         <li><i class="legend-swatch state-analytic"></i><span><b>Аналітична оцінка</b>сірий пунктир без заливки. Це не тривога</span></li>
       </ul>
+      <ul class="legend-rows legend-states legend-levels">
+        <li><i class="legend-swatch state-alert-yellow"></i><span><b>Жовтий рівень</b>дронова небезпека. Це тривога: заливка така сама щільна, лише жовта</span></li>
+        <li><i class="legend-swatch state-alert"></i><span><b>Червоний рівень</b>масована дронова, ракетна або ракетно-дронова загроза</span></li>
+      </ul>
+      <p class="legend-note">Рівень — це колір, яким влада уточнює ВЖЕ оголошену тривогу. Тривога без
+        рівня показується так само, як показувалася завжди: відсутність кольору не означає, що
+        небезпеки менше, а лише те, що джерело кольору не назвало. Зміна кольору всередині тієї
+        самої тривоги — не нова тривога й не відбій.</p>
       <ul class="legend-rows legend-icons">${Object.keys(threatIconPaths).map(iconRow).join('')}</ul>
       <p class="legend-note">Показано до трьох найважливіших типів; решта — у бейджі +N. Іконка не означає прогнозу цілі, а напрямки не є прогнозом траєкторії.</p>
       <p class="legend-note">Гліфи типів — <a href="https://game-icons.net" rel="noopener noreferrer" target="_blank">game-icons.net</a>,
@@ -2475,6 +2719,10 @@ function ensureMapOverlays() {
     node.id = 'map-legend-text';
     node.className = 'visually-hidden';
     node.textContent = 'Кодування карти. Офіційна тривога — щільна червона заливка й контур. '
+      + 'Жовтий рівень тривоги — така сама щільна заливка, але жовта: це дронова небезпека, '
+      + 'і це тривога. Червоний рівень — масована дронова, ракетна або ракетно-дронова загроза. '
+      + 'Тривога без рівня показується так, як показувалася завжди; відсутність кольору не означає, '
+      + 'що небезпеки менше. '
       + 'Активна загроза — помаранчева заливка, слабша за тривогу. '
       + 'Підтверджена атака або наслідки — штрихування. '
       + 'Аналітична оцінка — сірий пунктирний контур без заливки. Це не тривога. '
@@ -2510,6 +2758,9 @@ function initMap() {
   iconImagesReady = false;
   iconLayersReady = false;
   iconTier = null;
+  // Нова карта — новий стиль і порожній feature-state. Підписи попередньої карти описували б
+  // фічі, на яких уже нічого не стоїть, і перший же прохід вирішив би, що писати нема чого.
+  territoryStateSignatures.clear();
   ensureMapOverlays();
   map = new maplibregl.Map({ container: 'map', style: config.mapStyleUrl, center: [31.2, 48.8], zoom: 5.1, attributionControl: false });
   map.on('styleimagemissing', (event) => {
@@ -2618,12 +2869,14 @@ function initMap() {
     // засвічені районні полігони, а тихі райони лишаються темними. Поки ADM2 у польоті, районних
     // фіч немає, і та сама тривога приходить сюди як `unmapped` (див. claim()) — область світиться,
     // тривога з карти не зникає.
+    // Прозорість НЕ залежить від рівня — лише колір. Жовтий рівень заливає полігон так само щільно,
+    // як червоний: це тривога, а не її послаблена версія, і вказівка про укриття з неї не зникає.
     map.addLayer({ id: 'alert-oblast-fill', type: 'fill', source: 'ukraine-admin', paint: {
-      'fill-color': alertColor,
+      'fill-color': alertHue(alertColor, alertYellowColor),
       'fill-opacity': ['case', alertFlag, .34, unmappedFlag, .24, 0]
     } }, 'ukraine-sovereignty-fill');
     map.addLayer({ id: 'alert-raion-fill', type: 'fill', source: 'ukraine-raions', paint: {
-      'fill-color': alertColor,
+      'fill-color': alertHue(alertColor, alertYellowColor),
       'fill-opacity': ['case', alertFlag, .40, unmappedFlag, .28, 0]
     } }, 'ukraine-sovereignty-fill');
     // ---- підтверджена атака / наслідки ---------------------------------------------------------
@@ -2682,7 +2935,10 @@ function initMap() {
     // зблизька. Обидві державні гілки — alert і unmapped — на обох кінцях інтерполяції однакові,
     // тобто масштаб не змінює нічого з того, що карта стверджує.
     map.addLayer({ id: 'alert-raion-line', type: 'line', source: 'ukraine-raions', paint: {
-      'line-color': ['case', alertFlag, alertColor, unmappedFlag, '#ff7a4d', '#72d6ca'],
+      'line-color': ['case',
+        alertFlag, alertHue(alertColor, alertYellowColor),
+        unmappedFlag, alertHue('#ff7a4d', alertYellowMutedColor),
+        '#72d6ca'],
       'line-width': ['interpolate',['linear'],['zoom'], 4, .35, 9, 1.3],
       'line-opacity': ['interpolate',['linear'],['zoom'],
         6,   ['case', alertFlag, .9, unmappedFlag, .66, 0],
@@ -2694,7 +2950,7 @@ function initMap() {
     // обведена область читається як оголошена цілком, а це саме те твердження, якого джерело
     // не робило. Її межа лишається звичайною бірюзовою лінією ukraine-region-lines.
     map.addLayer({ id: 'alert-oblast-line', type: 'line', source: 'ukraine-admin', paint: {
-      'line-color': alertColor,
+      'line-color': alertHue(alertColor, alertYellowColor),
       'line-width': ['interpolate',['linear'],['zoom'], 4, 1.3, 8, 2.6],
       'line-opacity': ['case', crimeaSovereignty, 0, alertFlag, .85, unmappedFlag, .58, 0]
     } }, 'ukraine-region-lines');
@@ -2833,11 +3089,17 @@ function initMap() {
   $('#fit-ukraine').addEventListener('click', () => map.fitBounds([[21.5,43.2],[41.2,52.5]], { padding: 36, duration: 700 }));
 }
 
+// Ланцюгів тут НЕМАЄ, і це не пропуск. `loadSnapshot()` викликає `renderCurrentRoute()` (звідси
+// приходить цей виклик) і одразу по ньому `loadVectors()`, а той завершується `applyVectors()` —
+// тобто на кожен знімок ланцюги перевидавалися двічі, вісьмома `setData` замість чотирьох, і
+// друга пара перетирала першу тими самими даними. Лишився рівно один шлях: дані ланцюгів
+// приходять своїм запитом і малюються рівно там, де приїхали. Перша побудова карти й повернення
+// на маршрут карти мають власний виклик `applyVectors()` у `style.load`, тож порожньої карти
+// після переходу не буває.
 function updateMap() {
   if (!mapLayersReady) return;
   map.getSource('reported-directions')?.setData(directionCollection());
   applyTerritoryLayers();
-  applyVectors();
   updateTerritoryIcons();
   updateThreatDots();
   updateOriginZones();
@@ -3131,6 +3393,7 @@ function territoryLegacyHtml(locationId) {
   const alertRow = alerts[0];
   const alertBlock = alertRow
     ? `<p class="territory-alert">Офіційна тривога з ${escapeHtml(shortTime(alertRow.alert.started_at))} · ${escapeHtml(timeAgo(alertRow.alert.started_at))}</p>
+       ${alertLevelChip(alertRow.alert.alert_level, alertRow.alert.alert_kind)}
        ${alertRow.alert.location_id === locationId ? '' : `<p class="territory-named">Оголошено для: ${escapeHtml(territoryName(alertRow.alert.location_id))}</p>`}`
     : '';
 
@@ -3280,9 +3543,12 @@ function territoryLiveHtml(territory, locationId) {
   const asserted = (territory.threats ?? []).filter((threat) => threat.asserted);
   const mentioned = (territory.threats ?? []).filter((threat) => !threat.asserted);
   const namedAlert = (territory.alerts ?? [])[0];
+  // Рівень стоїть ОКРЕМИМ рядком під тривогою, а не замість чогось у ній: він уточнює тривогу й не
+  // має права ні витіснити час її початку, ні стати замість вказівки про укриття внизу панелі.
   const alertBlock = territory.alertActive && territory.alertSince
     ? `<p class="territory-alert">Офіційна тривога з ${escapeHtml(shortTime(territory.alertSince))} · ${escapeHtml(timeAgo(territory.alertSince))}
-        ${namedAlert && namedAlert.locationId !== locationId ? `<small>Джерело назвало: ${escapeHtml(namedAlert.locationName)}</small>` : ''}</p>`
+        ${namedAlert && namedAlert.locationId !== locationId ? `<small>Джерело назвало: ${escapeHtml(namedAlert.locationName)}</small>` : ''}</p>
+       ${alertLevelChip(territory.alertLevel, territory.alertKind)}`
     : '';
   const publication = snapshot?.publication ?? null;
   const held = publication?.mode === 'delayed_15s'
@@ -3431,6 +3697,7 @@ function territoryHistoryHtml(data, id) {
   const items = data.items.map((item) => `<article class="territory-entry ${escapeHtml(item.kind)}" data-kind="${escapeHtml(item.kind)}" data-entry-id="${escapeHtml(item.id)}">
     <div><span>${escapeHtml(kindNames[item.kind] ?? item.kind)}</span><time>${new Date(item.happened_at).toLocaleString('uk-UA')}</time></div>
     <h3>${escapeHtml(item.title)}</h3><p>${escapeHtml(item.summary)}</p>
+    ${alertLevelChip(item.alert_level, item.alert_kind)}
     <footer><b>${escapeHtml(threatNames[item.threat_type] ?? item.threat_type)}</b>${item.risk_score != null ? `<strong>${escapeHtml(item.risk_score)}/10 · ${escapeHtml(levelNames[item.risk_level] ?? item.risk_level)}</strong>` : `<strong>${escapeHtml(item.evidence_level ?? item.status)}</strong>`}</footer>
   </article>`).join('') || '<div class="empty-state"><strong>Історія поки порожня</strong><p>Для цієї території ще немає збережених тривог, загроз або аналітичних попереджень.</p></div>';
   return `<div class="territory-summary"><div><strong>${data.counts.alerts}</strong><span>тривоги</span></div><div><strong>${data.counts.threats}</strong><span>загрози</span></div><div><strong>${data.counts.assessments}</strong><span>оцінки</span></div></div>
@@ -4474,10 +4741,15 @@ async function renderAttacks() {
   await load();
 }
 
-async function renderSources() {
+// `reuseCatalogue` ставить лише перемальовування, викликане зміною стану джерел: каталог каналів до
+// цієї зміни не має стосунку, а запит на нього коштував би стільки ж, скільки й сам знімок.
+async function renderSources(reuseCatalogue = false) {
   const root = contentShell('Прозорість', 'Джерела та стан', 'Кожне повідомлення має provenance; перепублікації одного першоджерела не рахуються як незалежні докази.');
   const statuses = { current: 'актуальне', stale: 'дані застаріли', error: 'помилка', unknown: 'очікуємо дані', unconfigured: 'потребує токена', disabled: 'вимкнено' };
-  const channels = await fetch('/api/v1/channels').then((response) => response.json());
+  if (!reuseCatalogue || !channelCatalogue) {
+    channelCatalogue = await fetch('/api/v1/channels').then((response) => response.json());
+  }
+  const channels = channelCatalogue;
   root.innerHTML = `<div class="source-grid">${snapshot.sourceHealth.map((source) => `<article><span class="source-tier">TIER ${escapeHtml(source.tier)}</span><h2>${escapeHtml(source.name)}</h2><p>${source.official ? 'Офіційне джерело' : 'Допоміжне джерело'}${source.last_success_at ? ` · останній успіх ${timeAgo(source.last_success_at)}` : ''}</p><div class="source-status ${escapeHtml(source.status)}">${escapeHtml(statuses[source.status] ?? source.status)}</div>${source.status === 'error' && source.last_error ? `<small>${escapeHtml(source.last_error)}</small>` : ''}</article>`).join('')}</div>
     <section class="channel-section"><header><p>Підписки</p><h2>Рекомендовані Telegram-канали</h2><span>Каталог формує адміністратор. Позначка ✓ означає ручну перевірку запису.</span></header>
     <div class="channel-grid">${channels.items.map((channel) => `<a href="${escapeHtml(channel.url)}" target="_blank" rel="noreferrer"><span>${channel.verified ? '✓ перевірено' : escapeHtml(channel.category)}</span><h3>${escapeHtml(channel.title)}</h3><p>${escapeHtml(channel.description)}</p><footer>@${escapeHtml(channel.username)}${channel.location_name ? ` · ${escapeHtml(channel.location_name)}` : ''}</footer></a>`).join('') || '<p>Каталог поки порожній.</p>'}</div></section>`;
@@ -5649,14 +5921,49 @@ function wireCodexSettingsSection(root, onSaved) {
 // переглянути людині: або правила пропустили нову лексику, або модель помилилася. Дію з цього
 // робить людина — пише патерн і тест; сама сторінка нічого не змінює й нічого не запускає.
 
+// Пʼять осей, а не три. `timing` і `direction` додала міграція 049 разом із режимом
+// `classifier_mode=codex`: «коли» і «куди» — саме те, чого правила прочитати не вміють, і доти
+// розбіжність про них не рахувалася ніде. Без назви тут сторінка друкувала б латиною «timing — 12»
+// посеред українського рядка — через резервну гілку `shadowFieldNames[field] ?? field`.
 const shadowFieldNames = {
   significance: 'значущість',
   threat_type: 'клас загрози',
-  locations: 'локації'
+  locations: 'локації',
+  timing: 'актуальність',
+  direction: 'напрямок'
 };
 
 function shadowFieldName(field) {
   return shadowFieldNames[field] ?? field;
+}
+
+/**
+ * Наскільки відсоток згоди оптимістичний, і чому це окремі два числа.
+ *
+ * Місця звіряє `normalizePlace`, який навмисно зводить «Сумщина» і «Сумська область» до одного
+ * місця: інакше кожне друге повідомлення читалося б як розбіжність через відмінок. Ціна зведення
+ * досі була невидима — вона ховалася всередині одного відсотка. `agreedExact` рахує рядки, де
+ * множини назв збіглися БЕЗ жодного зведення, а `coarseOnly` — це рівно те, що зведення купило.
+ *
+ * Знаменник — `compared`, а не `total`: місця звіряють лише там, де обидві сторони вже погодилися
+ * про клас і значущість, і ділити на все вікно означало б рахувати згоду про місця там, де її
+ * ніхто не питав.
+ */
+function shadowLocationFigure(locations) {
+  if (!locations || !Number(locations.compared)) return '';
+  return `<div><dt>Локації: дослівно</dt>
+    <dd>${Number(locations.agreedExact || 0)} з ${Number(locations.compared)}</dd></div>`;
+}
+
+function shadowLocationNote(locations) {
+  const compared = Number(locations?.compared || 0);
+  if (!compared) return '';
+  const coarseOnly = Number(locations.coarseOnly || 0);
+  const agreed = `${Number(locations.agreedCoarse || 0)} з ${compared}`;
+  return `<p class="legend-note">Згода за локаціями — ${agreed} після зведення назв: «Сумщина» і
+    «Сумська область» тут одне місце. ${coarseOnly
+  ? `${coarseOnly} ${pluralUk(coarseOnly, 'рядок збігся', 'рядки збіглися', 'рядків збіглося')} лише завдяки цьому зведенню — рівно настільки відсоток згоди вище за дослівний збіг.`
+  : 'Жоден рядок не завдячує згодою самому лише зведенню — дослівний збіг такий самий.'}</p>`;
 }
 
 function shadowVerdictLine(label, verdict) {
@@ -5697,11 +6004,13 @@ function opsShadowSection(data, settings) {
     : `<dl class="codex-facts">
         <div><dt>Порівнянь</dt><dd>${data.total}</dd></div>
         <div><dt>Згода</dt><dd>${data.agreementPercent}%</dd></div>
+        ${shadowLocationFigure(data.locations)}
         <div><dt>Розбіжностей</dt><dd>${data.disagreed}</dd></div>
         <div><dt>Вікно</dt><dd>${data.windowHours} год</dd></div>
       </dl>
       <p class="legend-note">Опубліковано аналітичних подій: ${Number(data.promoted || 0)}.</p>
       ${data.byField?.length ? `<p class="legend-note">За осями: ${data.byField.map((row) => `${escapeHtml(shadowFieldName(row.field))} — ${row.count}`).join(', ')}.</p>` : ''}
+      ${shadowLocationNote(data.locations)}
       <div class="ops-channel-list">${data.recentDisagreements.map((row) => `<article>
         <div>
           <span>${escapeHtml(row.fields.map(shadowFieldName).join(', '))}</span>
@@ -6643,6 +6952,34 @@ const OPS_SOURCE_STATUS = {
   unknown: ['очікує', 'off'], unconfigured: ['не налаштовано', 'off'], disabled: ['вимкнено', 'off']
 };
 
+// Що колектор знає про підписку акаунта на канал цього рядка. `unsubscribed` — єдиний стан тут,
+// який не видно більше НІДЕ: маршрут звʼязано, `resolved` його рахує, колектор лишається `ready`,
+// heartbeat щохвилини пише джерелу успіх — і жодне живе повідомлення не приходить.
+const OPS_SOURCE_SUBSCRIPTION = {
+  subscribed: 'підписано',
+  unsubscribed: 'зв’язано, не підписано',
+  unresolved: 'не зв’язано',
+  unknown: 'невідомо'
+};
+
+// Одна прогалина, два різні сенси. Для API-джерел `providerCount` — це назви з ОСТАННЬОГО зрізу
+// провайдера, які не зіставилися з каталогом; для моніторингового каналу — накопичені від старту
+// процесу кандидати в назви, підняті з повідомлень, які правила відхилили як `no_location`.
+// Підписати їх однаково означало б сказати неправду про одне з двох.
+function sourceGapText(source) {
+  const ignored = escapeHtml(String(source.catalogueGaps?.ignoredMessages24h ?? 0));
+  const names = escapeHtml(String(source.catalogueGaps?.providerCount ?? 0));
+  return source.adapterType === 'mtproto_monitor'
+    ? `${ignored} повідомлень із відомою загрозою, але без локації за 24 год · ${names} нерозпізнаних назв із повідомлень, накопичено від старту процесу.`
+    : `${ignored} повідомлень із відомою загрозою, але без локації за 24 год · ${names} назв провайдера не зіставлено.`;
+}
+
+function sourceGapSamplesTitle(source) {
+  return source.adapterType === 'mtproto_monitor'
+    ? 'Кандидати в назви — слова з повідомлень, а не підтверджені топоніми:'
+    : 'Назви, які надіслав провайдер:';
+}
+
 function sourceMoment(value) {
   return value ? `${timeAgo(value)} · ${new Date(value).toLocaleString('uk-UA')}` : 'ще не було';
 }
@@ -6661,11 +6998,13 @@ function opsSourceRow(source) {
   const holding = Number(source.holdingCount ?? 0);
   const latest = source.lastMessageReceivedAt ?? source.lastSuccessAt;
   const search = `${source.name} ${source.id} ${source.telegramUsername ?? ''}`.toLowerCase();
+  const subscription = source.subscription ?? null;
   const detail = [
     `<div><dt>Останній успіх</dt><dd>${escapeHtml(sourceMoment(source.lastSuccessAt))}</dd></div>`,
     `<div><dt>Останнє повідомлення</dt><dd>${escapeHtml(sourceMoment(source.lastMessageReceivedAt))}</dd></div>`,
     `<div><dt>Очікувана давність</dt><dd>${escapeHtml(String(source.staleAfterSeconds))} с</dd></div>`,
-    `<div><dt>Група незалежності</dt><dd>${escapeHtml(source.independenceGroup)}</dd></div>`
+    `<div><dt>Група незалежності</dt><dd>${escapeHtml(source.independenceGroup)}</dd></div>`,
+    subscription ? `<div><dt>Підписка</dt><dd>${escapeHtml(OPS_SOURCE_SUBSCRIPTION[subscription] ?? subscription)}</dd></div>` : ''
   ].join('');
   const holds = (source.holding ?? []).map((item) =>
     `<li><b>${escapeHtml(item.locationName)}</b><span>${escapeHtml(item.alertType)} · від ${escapeHtml(sourceMoment(item.startedAt))}${item.missingSince ? ` · відсутнє у зрізі від ${escapeHtml(sourceMoment(item.missingSince))}` : ''}</span></li>`).join('');
@@ -6674,13 +7013,13 @@ function opsSourceRow(source) {
   return `<article class="source-ledger-row${source.enabled ? '' : ' is-disabled'}" data-source-row
       data-name="${escapeHtml(search)}" data-status="${escapeHtml(source.status)}"
       data-enabled="${source.enabled}" data-official="${source.official}" data-holding="${holding > 0}"
-      data-gaps="${gaps > 0}">
+      data-gaps="${gaps > 0}" data-subscription="${escapeHtml(subscription ?? 'none')}">
     <div class="source-ledger-main">
       <span class="source-ledger-status is-${tone}"><i></i>${escapeHtml(status)}</span>
       <div class="source-ledger-identity">
         <h3>${escapeHtml(source.name)}</h3>
         <p>${escapeHtml(source.id)}${source.telegramUsername ? ` · @${escapeHtml(source.telegramUsername)}` : ''}</p>
-        <div class="source-ledger-tags"><span>Tier ${escapeHtml(source.tier)}</span>${source.official ? '<span class="is-official">офіційне</span>' : ''}<span>${escapeHtml(sourceKind(source))}</span></div>
+        <div class="source-ledger-tags"><span>Tier ${escapeHtml(source.tier)}</span>${source.official ? '<span class="is-official">офіційне</span>' : ''}<span>${escapeHtml(sourceKind(source))}</span>${subscription === 'unsubscribed' ? '<span class="codex-state is-warn">не підписано</span>' : ''}</div>
       </div>
       <div class="source-ledger-freshness"><span>Свіжість</span><b>${escapeHtml(latest ? timeAgo(latest) : 'немає даних')}</b><small>межа ${escapeHtml(String(source.staleAfterSeconds))} с</small></div>
       <div class="source-ledger-signals">
@@ -6694,10 +7033,129 @@ function opsSourceRow(source) {
       <dl>${detail}</dl>
       ${source.lastError ? `<div class="source-ledger-failure"><b>Останній збій · ${escapeHtml(sourceMoment(source.lastErrorAt))}</b><p>${escapeHtml(source.lastError)}</p></div>` : ''}
       ${holding ? `<div class="source-ledger-holds"><b>Стан тривоги, який джерело зараз тримає</b><ul>${holds}</ul></div>` : ''}
-      ${gaps ? `<div class="source-ledger-gaps"><b>Прогалини каталогу</b><p>${escapeHtml(String(source.catalogueGaps?.ignoredMessages24h ?? 0))} повідомлень із відомою загрозою, але без локації за 24 год · ${escapeHtml(String(source.catalogueGaps?.providerCount ?? 0))} назв провайдера не зіставлено.</p>${providerSamples ? `<ul>${providerSamples}</ul>` : ''}</div>` : ''}
+      ${subscription === 'unsubscribed' ? `<div class="source-ledger-gaps"><b>Зв’язано, але акаунт не підписаний</b><p>Telegram надсилає оновлення лише для діалогів, у яких перебуває акаунт колектора. Маршрут зв’язано через пошук за хендлом, тому джерело рахується серед «resolved» і звітує здоровим — але жодного живого повідомлення від нього не буде, і в журнал воно потрапить хіба дозбором на реконекті. Лікується підпискою акаунта на ${escapeHtml(source.telegramUsername ? `@${source.telegramUsername}` : 'канал')}, не кодом і не перемиканням прапорця.</p></div>` : ''}
+      ${gaps ? `<div class="source-ledger-gaps"><b>Прогалини каталогу</b><p>${sourceGapText(source)}</p>${providerSamples ? `<p>${escapeHtml(sourceGapSamplesTitle(source))}</p><ul>${providerSamples}</ul>` : ''}</div>` : ''}
       ${source.lastChange ? `<p class="source-ledger-audit">Остання зміна: ${escapeHtml(sourceMoment(source.lastChange.changedAt))} · ${escapeHtml(source.lastChange.changedBy)} · ${escapeHtml(source.lastChange.reason)}</p>` : ''}
     </details>
   </article>`;
+}
+
+/**
+ * Форма реєстрації моніторингового каналу — те, чого досі не існувало в жодному інтерфейсі.
+ *
+ * До цього кожен новий канал був `INSERT` у міграції плюс перерозгортання, і саме тому каталог не
+ * рухався з `migrations/029`. Форма створює рядок ЛИШЕ з адаптером `mtproto_monitor`: канали
+ * тривог лишаються в міграціях, бо їхній `enabled` тримається на дослівній фікстурі в
+ * `alert-parser.test.ts`, якої форма не має і мати не може.
+ *
+ * Згорнута за замовчуванням: реєстр джерел читають щодня, а канал додають раз на місяць, і
+ * розгорнута форма щоразу відсувала б відомість на екран униз.
+ */
+function opsSourceCreateForm() {
+  return `<details class="ops-fold" data-source-create-fold>
+    <summary><strong>Додати моніторинговий канал</strong></summary>
+    <p class="legend-note">Рядок створюється <b>вимкненим</b>. Спершу підпишіть акаунт колектора на канал, і лише потім увімкніть джерело перемикачем: увімкнений рядок без підписки зв’яжеться через пошук за хендлом, звітуватиме здоровим і не доставить жодного повідомлення. Канали офіційних тривог тут не створюються — їхній запис лишається міграцією з дослівною фікстурою для парсера.</p>
+    <form class="channel-form" data-source-create-form>
+      <label>Ідентифікатор<input required name="id" maxlength="64" pattern="[a-z0-9][a-z0-9-]{2,63}" placeholder="osint-new-channel"></label>
+      <label>Назва<input required name="name" maxlength="120" placeholder="Назва каналу українською"></label>
+      <label>Канал<input required name="telegramUsername" maxlength="120" placeholder="@channel або https://t.me/channel"></label>
+      <label>Рівень<select name="tier"><option value="B">B — може підтверджувати</option><option value="C">C — лише показ</option></select></label>
+      <label>Група незалежності<input required name="independenceGroup" maxlength="64" pattern="[a-z0-9][a-z0-9-]{2,63}" placeholder="osint-new-channel"></label>
+      <label>Публічне посилання<input name="publicUrl" type="url" maxlength="300" placeholder="https://t.me/channel"></label>
+      <label>Очікуваний інтервал, с<input required name="expectedUpdateIntervalSeconds" type="number" min="10" max="3600" value="60"></label>
+      <label>Межа давності, с<input required name="staleAfterSeconds" type="number" min="30" max="86400" value="300"></label>
+      <label class="channel-description">Підстава<textarea required name="reason" minlength="8" maxlength="500" placeholder="Що перевірено в каналі і чому його реєструємо"></textarea></label>
+      <button type="submit" data-source-create-submit>Зареєструвати</button><output data-source-create-status></output>
+    </form>
+    <p class="legend-note" data-source-create-notice hidden></p>
+    <p class="legend-note">Група незалежності — це поле, за яким <b>два різні значення підтверджують подію</b>. Канал, що репостить чуже, мусить дістати групу першоджерела (як <code>osint-vanek-nikolaev</code> має <code>air-force</code>): власна група перетворила б ту саму заяву, пораховану двічі, на підтвердження.</p>
+  </details>`;
+}
+
+const OPS_SOURCE_FIELD_NAMES = {
+  id: 'ідентифікатор', name: 'назва', telegramUsername: 'канал', tier: 'рівень',
+  independenceGroup: 'група незалежності', publicUrl: 'публічне посилання',
+  expectedUpdateIntervalSeconds: 'очікуваний інтервал', staleAfterSeconds: 'межа давності',
+  reason: 'підстава', adapterType: 'тип адаптера'
+};
+
+// Кожна відмова названа тим, що оператор має зробити далі. `monitor_constraint_violated` — це
+// відповідь САМОЇ бази (`sources_mtproto_monitor_check`), і крізь цю форму вона недосяжна; якщо
+// вона колись прозвучить, оператор має побачити, що обмеження спрацювало, а не «щось пішло не так».
+const OPS_SOURCE_CREATE_ERRORS = {
+  invalid_telegram_username: 'Не схоже на хендл каналу. Підійде @channel, t.me/channel або сам хендл: 5–32 символи, перший — латинська літера.',
+  source_exists: 'Джерело з таким ідентифікатором уже є в каталозі.',
+  telegram_username_taken: 'Цей канал уже закріплений за іншим джерелом. Один канал — один рядок.',
+  monitor_constraint_violated: 'База відхилила рядок: обмеження на моніторингові джерела не дозволяє офіційність або рівень A.'
+};
+
+function sourceCreateError(payload) {
+  if (payload?.error === 'invalid_source') {
+    const fields = Object.keys(payload.issues ?? {})
+      .map((field) => OPS_SOURCE_FIELD_NAMES[field] ?? field);
+    return fields.length ? `Перевірте поля: ${fields.join(', ')}.` : 'Перевірте поля форми.';
+  }
+  return OPS_SOURCE_CREATE_ERRORS[payload?.error] ?? 'Не вдалося зареєструвати джерело.';
+}
+
+/**
+ * Перемальовує ЛИШЕ реєстр джерел, як це робить відомість покриття.
+ *
+ * Повний `renderOps()` після реєстрації стер би відповідь сервера — а вона тут не декоративна: у
+ * ній сказано, що рядок вимкнений і що підписка акаунта є окремим кроком поза застосунком. Тому
+ * секція оновлюється сама, форма лишається розгорнутою, і повідомлення стоїть під нею.
+ */
+async function reloadSourcesSection(root, notice = '') {
+  const data = await opsFetch('/ops/api/sources')
+    .then((result) => result.ok ? result.json() : null).catch(() => null);
+  const current = $('#sources-section', root);
+  if (!current || !data) return;
+  current.outerHTML = opsSourcesSection(data);
+  wireSourcesSection(root, data);
+  if (!notice) return;
+  const fold = $('[data-source-create-fold]', root);
+  if (fold) fold.open = true;
+  const slot = $('[data-source-create-notice]', root);
+  if (!slot) return;
+  slot.hidden = false;
+  slot.textContent = notice;
+}
+
+function wireSourceCreateForm(section, root) {
+  const form = $('[data-source-create-form]', section);
+  if (!form) return;
+  const status = $('[data-source-create-status]', form);
+  const submit = $('[data-source-create-submit]', form);
+  form.addEventListener('submit', async (event) => {
+    event.preventDefault();
+    const values = Object.fromEntries(new FormData(form));
+    submit.disabled = true;
+    status.textContent = 'Реєструємо…';
+    // `adapterType` надсилається явно й незмінно: сервер приймає лише цей літерал, і форма мусить
+    // просити рівно те, що може отримати. Порожнє посилання не надсилається взагалі — схема чекає
+    // або коректний URL, або відсутність поля, а не порожній рядок.
+    const result = await opsFetch('/ops/api/sources', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({
+        id: String(values.id ?? '').trim(),
+        name: String(values.name ?? '').trim(),
+        telegramUsername: String(values.telegramUsername ?? '').trim(),
+        adapterType: 'mtproto_monitor',
+        tier: values.tier,
+        independenceGroup: String(values.independenceGroup ?? '').trim(),
+        publicUrl: String(values.publicUrl ?? '').trim() || undefined,
+        expectedUpdateIntervalSeconds: Number(values.expectedUpdateIntervalSeconds),
+        staleAfterSeconds: Number(values.staleAfterSeconds),
+        reason: String(values.reason ?? '').trim()
+      })
+    }).catch(() => null);
+    const payload = await result?.json().catch(() => null);
+    submit.disabled = false;
+    if (result?.ok) {
+      status.textContent = '';
+      return void reloadSourcesSection(root, payload?.notice ?? '');
+    }
+    status.textContent = sourceCreateError(payload);
+  });
 }
 
 function opsSourcesSection(data) {
@@ -6710,10 +7168,12 @@ function opsSourcesSection(data) {
       <span class="${totals.failing ? 'is-bad' : ''}"><b>${escapeHtml(String(totals.failing ?? 0))}</b> зі збоями</span>
       <span class="${totals.holding ? 'is-alert' : ''}"><b>${escapeHtml(String(totals.holding ?? 0))}</b> тримають тривоги</span>
       <span class="${totals.withGaps ? 'is-warn' : ''}"><b>${escapeHtml(String(totals.withGaps ?? 0))}</b> мають прогалини</span>
+      <span class="${totals.unsubscribed ? 'is-warn' : ''}"><b>${escapeHtml(String(totals.unsubscribed ?? 0))}</b> без підписки</span>
     </div>
-    <div class="source-ledger-tools"><label><span>Пошук</span><input type="search" data-source-search placeholder="Назва, id або @username"></label><label><span>Стан</span><select data-source-filter><option value="all">Усі</option><option value="failing">Зі збоями</option><option value="holding">Тримають тривогу</option><option value="gaps">З прогалинами</option><option value="disabled">Вимкнені</option><option value="official">Офіційні</option></select></label></div>
+    <div class="source-ledger-tools"><label><span>Пошук</span><input type="search" data-source-search placeholder="Назва, id або @username"></label><label><span>Стан</span><select data-source-filter><option value="all">Усі</option><option value="failing">Зі збоями</option><option value="unsubscribed">Без підписки</option><option value="holding">Тримають тривогу</option><option value="gaps">З прогалинами</option><option value="disabled">Вимкнені</option><option value="official">Офіційні</option></select></label></div>
     <details class="safety-note ops-fold"><summary><strong>Вимкнення не є відбоєм</strong></summary><p>${escapeHtml(data.notice ?? '')}</p></details>
     <div class="source-ledger-list" data-source-list>${(data.sources ?? []).map(opsSourceRow).join('')}</div>
+    ${opsSourceCreateForm()}
     <dialog class="source-change-dialog" data-source-dialog><form method="dialog" data-source-form>
       <button type="button" class="source-dialog-close" data-source-cancel aria-label="Закрити">×</button>
       <span class="source-dialog-kicker">Зміна контуру збору</span><h3 data-source-dialog-title></h3><p data-source-dialog-copy></p>
@@ -6736,6 +7196,7 @@ function wireSourcesSection(root, data) {
     rows().forEach((row) => {
       const matchFilter = filter === 'all'
         || (filter === 'failing' && ['error', 'stale'].includes(row.dataset.status))
+        || (filter === 'unsubscribed' && row.dataset.subscription === 'unsubscribed')
         || (filter === 'holding' && row.dataset.holding === 'true')
         || (filter === 'gaps' && row.dataset.gaps === 'true')
         || (filter === 'disabled' && row.dataset.enabled === 'false')
@@ -6746,6 +7207,7 @@ function wireSourcesSection(root, data) {
   $('[data-source-search]', section)?.addEventListener('input', apply);
   $('[data-source-filter]', section)?.addEventListener('change', apply);
   $('[data-source-refresh]', section)?.addEventListener('click', () => void renderOps());
+  wireSourceCreateForm(section, root);
 
   const dialog = $('[data-source-dialog]', section);
   const form = $('[data-source-form]', section);
@@ -7067,6 +7529,7 @@ const APP_SETTING_LABELS = {
   TELEGRAM_BOT_USERNAME: 'Username бота',
   TELEGRAM_MODE: 'Режим бота',
   TELEGRAM_ADMIN_CHAT_ID: 'Chat ID адміністратора',
+  TELEGRAM_TRANSPORT: 'Транспорт колектора каналів',
   TELEGRAM_API_ID: 'MTProto api_id',
   TELEGRAM_API_HASH: 'MTProto api_hash',
   TELEGRAM_SESSION: 'Рядок сесії MTProto',
@@ -7999,9 +8462,30 @@ function renderCurrentRoute(options = {}) {
   if (route !== '/ops') { clearInterval(codexPollTimer); clearInterval(deployPollTimer); }
   if (route === '/') renderMapPage();
   else if (route === '/history') void renderHistory();
-  else if (route === '/attacks') void renderAttacks();
-  else if (route === '/analytics') void renderAnalytics();
-  else if (route === '/sources') void renderSources();
+  // Аналіз атак не читає знімка взагалі, а аналітика читає з нього рівно один список —
+  // `snapshot.assessments` для таблиці оцінок. Обидві тягнуть власні ендпоінти й будуються з нуля
+  // через contentShell(), тож кадр потоку перемальовував їх повністю — новий запит на сервер плюс
+  // повна заміна піддерева DOM — заради даних, яких цей кадр не приніс, і заразом скидав вибраний
+  // період і місяць. Оцінка не є ні тривогою, ні загрозою: на ретроспективній сторінці за місяць
+  // вона оновлюється переходом і кнопкою «Показати», і це та сама межа, що й у консолі.
+  //
+  // `attackStatsDirty` лишається єдиним винятком: подію attack_stats.updated шле сервер саме тоді,
+  // коли звіт перерахувався, і читач має побачити його зараз, а не після наступного переходу.
+  else if (route === '/attacks') { if (!fromSnapshot || renderedRoute !== '/attacks' || attackStatsDirty) void renderAttacks(); }
+  else if (route === '/analytics') { if (!fromSnapshot || renderedRoute !== '/analytics') void renderAnalytics(); }
+  // Джерела — виняток, і свідомий: сторінка ПОКАЗУЄ стан джерел, а «дані застаріли» мусить
+  // зʼявлятися саме собою, без переходу (CONTEXT.md: застаріле лишається видимо застарілим).
+  // Тому її не заморожуємо, а зважуємо: підпис здоровʼя — id, статус, час останнього успіху й
+  // останньої помилки — змінюється в рази рідше за кадр потоку, і поки він той самий,
+  // перемальовувати нічого. Каталог каналів у підпис не входить і живе окремо: його тягне
+  // перехід на сторінку, а не знімок.
+  else if (route === '/sources') {
+    const health = (snapshot.sourceHealth ?? []).map((source) =>
+      `${source.id}:${source.status}:${source.last_success_at ?? ''}:${source.last_error_at ?? ''}`).join('|');
+    const navigated = !fromSnapshot || renderedRoute !== '/sources';
+    if (navigated || health !== renderedSourceHealth) void renderSources(!navigated);
+    renderedSourceHealth = health;
+  }
   // Консоль не читає знімок узагалі — вона тягне власні дані сімома запитами під Basic-авторизацією.
   // Перемальовувати її від кадру потоку або від хвилинного паска означало б зносити форму під
   // пальцем оператора: renderOps() починається з contentShell(), тобто з повної заміни #app, і

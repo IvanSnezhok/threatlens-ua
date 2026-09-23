@@ -1,13 +1,36 @@
-import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
+import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { FastifyInstance } from 'fastify';
-import { ensureMigrated, integrationDatabaseAvailable, resetDatabase, sql } from '../helpers/db.js';
+import { config } from '../../src/config.js';
+import type * as TelegramCollector from '../../src/sources/telegram.js';
+import {
+  ensureMigrated, integrationDatabaseAvailable, resetDatabase, restoreSourceFlags, sql
+} from '../helpers/db.js';
 
 const OPS = `Basic ${Buffer.from('operator:change-me').toString('base64')}`;
 const MONITOR = 'osint-eradar';
 const ALERT_CHANNEL = 'air-alert-ua';
 const MIRROR = 'aerial-alerts-mirror';
-const TOUCHED = [MONITOR, ALERT_CHANNEL, MIRROR, 'ukraine-alarm', 'alerts-in-ua'];
-let originalEnabled = new Map<string, boolean>();
+/** Everything the POST cases create, swept by prefix: `sources` is reference data and survives `resetDatabase()`. */
+const CREATED_PREFIX = 'ops-created-';
+const CREATED = `${CREATED_PREFIX}monitor`;
+
+/**
+ * Проксі навколо колектора, щоб «перезавантаження запитано» було ТВЕРДЖЕННЯМ, а не збігом.
+ *
+ * У процесі інтеграційних тестів живого MTProto-колектора немає, тож справжній
+ * `requestTelegramCollectorReload()` повернув би `false` — і відповідь `collectorReloadRequested:
+ * false` однаково влаштувала б і маршрут, який викликає колектор, і маршрут, який забув це зробити.
+ * Лічильник розрізняє їх. `telegramCollectorStatus` лишається справжнім: від нього залежить поле
+ * `subscription`, і підміняти його означало б перевіряти заглушку.
+ */
+const collector = vi.hoisted(() => ({ reloads: 0 }));
+vi.mock('../../src/sources/telegram.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof TelegramCollector>();
+  return {
+    ...actual,
+    requestTelegramCollectorReload: () => { collector.reloads += 1; return true; }
+  };
+});
 
 async function buildApp(): Promise<FastifyInstance> {
   const Fastify = (await import('fastify')).default;
@@ -28,25 +51,50 @@ async function put(app: FastifyInstance, sourceId: string, payload: Record<strin
   });
 }
 
-async function restoreFlags(): Promise<void> {
-  for (const [id, enabled] of originalEnabled) {
-    await sql(`UPDATE sources SET enabled=$2 WHERE id=$1`, [id, enabled]);
-  }
+async function post(app: FastifyInstance, payload: Record<string, unknown>) {
+  return app.inject({
+    method: 'POST', url: '/ops/api/sources', headers: { authorization: OPS }, payload
+  });
+}
+
+/** A body the route accepts, so each refusal case differs from it by exactly one field. */
+function validBody(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    id: CREATED,
+    name: 'Тестовий монітор',
+    telegramUsername: '@ops_created_monitor',
+    adapterType: 'mtproto_monitor',
+    tier: 'B',
+    independenceGroup: 'ops-created-monitor',
+    publicUrl: 'https://t.me/ops_created_monitor',
+    expectedUpdateIntervalSeconds: 60,
+    staleAfterSeconds: 300,
+    reason: 'Перевірено класифікатором на двадцяти повідомленнях',
+    ...overrides
+  };
+}
+
+async function dropCreated(): Promise<void> {
+  await sql(`DELETE FROM source_enabled_audit WHERE source_id LIKE $1`, [`${CREATED_PREFIX}%`]);
+  await sql(`DELETE FROM sources WHERE id LIKE $1`, [`${CREATED_PREFIX}%`]);
 }
 
 describe.skipIf(!integrationDatabaseAvailable)('Ops source management', () => {
-  beforeAll(async () => {
-    await ensureMigrated();
-    const rows = await sql<{ id: string; enabled: boolean }>(
-      `SELECT id,enabled FROM sources WHERE id=ANY($1::text[])`, [TOUCHED]
-    );
-    originalEnabled = new Map(rows.rows.map((row) => [row.id, row.enabled]));
-  });
+  beforeAll(async () => { await ensureMigrated(); });
   beforeEach(async () => {
     await resetDatabase();
-    await restoreFlags();
+    // Два кейси нижче вимикають офіційні канали тривог ГУРТОМ
+    // (`UPDATE … WHERE official=true AND adapter_type=ANY(…)`), щоб перевірити захист «останнього
+    // увімкненого джерела». Між тестами це треба відкотити, інакше наступний кейс стартує з
+    // каталогом, у якому лишилося одне офіційне джерело. Між ФАЙЛАМИ те саме робить
+    // `tests/helpers/setup-env.ts`, і з того ж знімка.
+    await restoreSourceFlags();
+    // `sources` не входить у `VOLATILE_TABLES` — це довідкові дані, які міграції засівають один раз.
+    // Тож рядки, створені POST-кейсами, прибирає цей файл, інакше вони поїхали б у наступний.
+    await dropCreated();
+    collector.reloads = 0;
   });
-  afterAll(async () => { await restoreFlags(); });
+  afterAll(async () => { await dropCreated(); });
 
   it('is private and reports freshness, holding alerts and both kinds of catalogue gap', async () => {
     await sql(`UPDATE sources SET enabled=true,health_status='error',last_error='fixture failure',
@@ -69,6 +117,7 @@ describe.skipIf(!integrationDatabaseAvailable)('Ops source management', () => {
     );
 
     const app = await buildApp();
+    const transport = config.TELEGRAM_TRANSPORT;
     try {
       expect((await app.inject({ method: 'GET', url: '/ops/api/sources' })).statusCode).toBe(401);
       const response = await get(app);
@@ -76,10 +125,10 @@ describe.skipIf(!integrationDatabaseAvailable)('Ops source management', () => {
       const body = response.json();
       expect(body.notice).toContain('не стирає стан тривоги');
       expect(body.sources.length).toBeGreaterThan(50);
-      expect(body.sources.find((source: any) => source.id === MONITOR)).toMatchObject({
-        // No MTProto credentials in the integration process: configuration truth outranks the
-        // stored health word, while the failure remains visible in its own field.
-        status: 'unconfigured', lastError: 'fixture failure',
+      expect(body.sources.find((source: { id: string }) => source.id === MONITOR)).toMatchObject({
+        // The web transport — the default — reads the public preview without an account, so a
+        // Telegram row has no prerequisite and its stored health word stands, failure included.
+        configured: true, status: 'error', lastError: 'fixture failure',
         catalogueGaps: { ignoredMessages24h: 1 }
       });
       const holder = body.sources.find((source: any) => source.id === ALERT_CHANNEL);
@@ -87,7 +136,16 @@ describe.skipIf(!integrationDatabaseAvailable)('Ops source management', () => {
       expect(holder.holding[0]).toMatchObject({ locationId: 'ua-32', alertType: 'air_raid' });
       expect(body.totals.holding).toBeGreaterThanOrEqual(1);
       expect(body.totals.withGaps).toBeGreaterThanOrEqual(1);
+
+      // Under MTProto the three credentials are the prerequisite, and the integration process has
+      // none: configuration truth outranks the stored health word, while the failure remains
+      // visible in its own field.
+      Object.assign(config, { TELEGRAM_TRANSPORT: 'mtproto' });
+      expect((await get(app)).json().sources.find((source: { id: string }) => source.id === MONITOR)).toMatchObject({
+        configured: false, status: 'unconfigured', lastError: 'fixture failure'
+      });
     } finally {
+      Object.assign(config, { TELEGRAM_TRANSPORT: transport });
       await app.close();
     }
   });
@@ -207,5 +265,131 @@ describe.skipIf(!integrationDatabaseAvailable)('Ops source management', () => {
     } finally {
       await app.close();
     }
+  });
+
+  // ----------------------------------------------------------------------------------------------
+  // Onboarding a monitoring channel without a migration
+  // ----------------------------------------------------------------------------------------------
+
+  it('registers a monitoring channel disabled, audits it and asks the collector to reload', async () => {
+    const app = await buildApp();
+    try {
+      expect((await app.inject({
+        method: 'POST', url: '/ops/api/sources', payload: validBody()
+      })).statusCode).toBe(401);
+      expect(collector.reloads).toBe(0);
+
+      // Посилання, а не хендл: оператор копіює канал у тій формі, у якій його бачить.
+      const created = await post(app, validBody({
+        telegramUsername: 'https://t.me/Ops_Created_Monitor'
+      }));
+      expect(created.statusCode).toBe(201);
+      expect(created.json()).toMatchObject({
+        sourceId: CREATED, telegramUsername: 'ops_created_monitor', adapterType: 'mtproto_monitor',
+        official: false, enabled: false, tier: 'B', collectorReloadRequested: true,
+        nextStep: 'subscribe_then_enable'
+      });
+      expect(created.json().notice).toContain('підпишіть акаунт колектора');
+      expect(collector.reloads).toBe(1);
+
+      const stored = await sql<{
+        name: string; adapter_type: string; official: boolean; enabled: boolean; tier: string;
+        telegram_username: string; health_status: string; independence_group: string;
+        stale_after_seconds: number; expected_update_interval_seconds: number; source_type: string;
+        public_url: string;
+      }>(`SELECT name,adapter_type,official,enabled,tier,telegram_username,health_status,
+            independence_group,stale_after_seconds,expected_update_interval_seconds,source_type,
+            public_url FROM sources WHERE id=$1`, [CREATED]);
+      // Повний рядок, а не вибірка: колонки `sources` заповнюються позиційним `INSERT`, і зсув на
+      // одну позицію дає валідний рядок із назвою в полі типу — тобто помилку, яку видно лише тут.
+      expect(stored.rows[0]).toEqual({
+        name: 'Тестовий монітор', adapter_type: 'mtproto_monitor', official: false, enabled: false,
+        tier: 'B', telegram_username: 'ops_created_monitor', health_status: 'unknown',
+        independence_group: 'ops-created-monitor', stale_after_seconds: 300,
+        expected_update_interval_seconds: 60, source_type: 'telegram',
+        public_url: 'https://t.me/ops_created_monitor'
+      });
+
+      const audit = await sql<{ reason: string; previous_enabled: boolean; enabled: boolean }>(
+        `SELECT reason,previous_enabled,enabled FROM source_enabled_audit WHERE source_id=$1`, [CREATED]
+      );
+      expect(audit.rows).toEqual([{
+        reason: 'Перевірено класифікатором на двадцяти повідомленнях',
+        previous_enabled: false, enabled: false
+      }]);
+      const logged = await sql<{ event_type: string }>(
+        `SELECT event_type FROM system_event_log WHERE payload->>'sourceId'=$1`, [CREATED]
+      );
+      expect(logged.rows.map((row) => row.event_type)).toEqual(['source.registered']);
+
+      // Реєстр бачить рядок одразу — без міграції й без перезапуску процесу.
+      const listed = (await get(app)).json().sources
+        .find((source: { id: string }) => source.id === CREATED);
+      expect(listed).toMatchObject({ enabled: false, status: 'disabled', subscription: 'unknown' });
+    } finally {
+      await app.close();
+    }
+  });
+
+  it('refuses a handle another source already claims, and creates nothing', async () => {
+    const app = await buildApp();
+    try {
+      // `osint-eradar` тримає `eRadarrua`; унікальний індекс побудовано на `lower(…)`, тож інший
+      // регістр і форма посилання — це той самий канал.
+      const response = await post(app, validBody({ telegramUsername: 'https://t.me/eRadarrua' }));
+      expect(response.statusCode).toBe(409);
+      expect(response.json()).toMatchObject({
+        error: 'telegram_username_taken', telegramUsername: 'eradarrua'
+      });
+      expect(collector.reloads).toBe(0);
+      expect((await sql(`SELECT 1 FROM sources WHERE id=$1`, [CREATED])).rowCount).toBe(0);
+
+      // Той самий ідентифікатор двічі — друга спроба теж нічого не створює.
+      expect((await post(app, validBody())).statusCode).toBe(201);
+      const repeat = await post(app, validBody({ telegramUsername: '@ops_created_other' }));
+      expect(repeat.statusCode).toBe(409);
+      expect(repeat.json().error).toBe('source_exists');
+      expect(collector.reloads).toBe(1);
+    } finally {
+      await app.close();
+    }
+  });
+
+  it('cannot be talked into alert authority: official, tier A and the alert adapter are refused', async () => {
+    const app = await buildApp();
+    try {
+      for (const body of [
+        validBody({ official: true }),
+        validBody({ tier: 'A' }),
+        validBody({ adapterType: 'mtproto_alert_channel' }),
+        validBody({ telegramUsername: 'https://t.me/s/four' })   // хендл коротший за п'ять символів
+      ]) {
+        const response = await post(app, body);
+        expect(response.statusCode).toBe(400);
+        expect(['invalid_source', 'invalid_telegram_username']).toContain(response.json().error);
+      }
+      expect(collector.reloads).toBe(0);
+      expect((await sql(`SELECT 1 FROM sources WHERE id=$1`, [CREATED])).rowCount).toBe(0);
+    } finally {
+      await app.close();
+    }
+  });
+
+  it('keeps the database as the second lock, so the route is not the only thing saying no', async () => {
+    // Рівно той `INSERT`, що й у маршруті, але з `official=true`. Якщо колись цей тест почне
+    // проходити без помилки, значить `sources_mtproto_monitor_check` зник, і будь-яка майбутня
+    // помилка в маршруті стане джерелом з офіційною владою.
+    await expect(sql(
+      `INSERT INTO sources (id,name,source_type,tier,official,enabled,adapter_type,
+         independence_group,telegram_username,health_status)
+       VALUES ($1,'Обхід','telegram','B',true,false,'mtproto_monitor',$1,'ops_bypass','unknown')`,
+      [`${CREATED_PREFIX}bypass`]
+    )).rejects.toThrow(/sources_mtproto_monitor_check/);
+    await expect(sql(
+      `INSERT INTO sources (id,name,source_type,tier,official,enabled,adapter_type,
+         independence_group,telegram_username,health_status)
+       VALUES ($1,'Обхід','telegram','A',false,false,'mtproto_monitor',$1,'ops_bypass','unknown')`,
+      [`${CREATED_PREFIX}bypass`]
+    )).rejects.toThrow(/sources_mtproto_monitor_check/);
   });
 });

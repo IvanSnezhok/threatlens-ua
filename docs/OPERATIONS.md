@@ -3,10 +3,10 @@
 ## Health
 
 - `/health/live`: process is running. This is what the container healthcheck probes, so nothing below restarts the app. It also carries `commit` and `builtAt` — what image is actually serving, baked in at build time.
-- `/health/ready`: database is reachable, **every migration shipped in this image** is applied, and the MTProto collector is not blocked. The migration check is a set comparison against the image's own `migrations/` directory, not one hard-coded filename: a 503 answers `{"reason":"migrations_pending","required":[…],"applied":[…]}` so the diff is readable. A ready response carries `commit` (the image's `APP_COMMIT`) and `migration` (the newest shipped file) — the deployment runner requires both a 200 and a matching `commit` before it records an update as successful, which is what stops a `compose up` that silently kept the old container from being reported as a success. The response carries a `collector` object in both directions; `503 {"reason":"collector_flood_wait"}` and `collector_failed` are the two states that mean no Telegram channel is being read at all. `disabled` (no MTProto credentials) and `degraded` (handlers live, some handles unbound) stay ready.
-- `/api/v1/sources/health`: configured, current, stale, error and unconfigured source states. MTProto rows additionally carry `collector` — the live handler state, which the database cannot hold.
+- `/health/ready`: database is reachable, **every migration shipped in this image** is applied, and the Telegram channel collector is not blocked — whichever transport this process runs (`collector.transport`: `web` or `mtproto`, see «Колектор каналів: два транспорти» below). The migration check is a set comparison against the image's own `migrations/` directory, not one hard-coded filename: a 503 answers `{"reason":"migrations_pending","required":[…],"applied":[…]}` so the diff is readable. A ready response carries `commit` (the image's `APP_COMMIT`) and `migration` (the newest shipped file) — the deployment runner requires both a 200 and a matching `commit` before it records an update as successful, which is what stops a `compose up` that silently kept the old container from being reported as a success. The response carries a `collector` object in both directions; `503 {"reason":"collector_flood_wait"}` and `collector_failed` are the two states that mean no Telegram channel is being read at all (`collector_starting` is the first seconds after boot: the web collector leaves it once every channel has been asked once, ~10 s for the registry). `disabled` (MTProto chosen without its credentials) and `degraded` (some channels not read) stay ready.
+- `/api/v1/sources/health`: configured, current, stale, error and unconfigured source states. Telegram rows (the `mtproto*` adapter types, whichever transport reads them) additionally carry `collector` — the live collector state, which the database cannot hold. Under the `web` transport a Telegram row needs no credential and is never `unconfigured`.
 - `/ops/api`: Basic-auth protected worker, AI, source and database state.
-- `/ops/api/sources`: the operational source ledger and its guarded enable/disable endpoint.
+- `/ops/api/sources`: the operational source ledger, its guarded enable/disable endpoint, and `POST` — registration of a monitoring channel without a migration. See "Adding a monitoring channel".
 
 The source ledger is the canonical place to answer four different questions without conflating
 them: whether an adapter is fresh, what it last failed on, which official alert states it currently
@@ -172,7 +172,8 @@ upstream — how long before it is red on the map and in a subscriber's Telegram
 
 Alert-STATE collection is split from everything else. Each leg is its own self-rescheduling chain
 (`src/services/leg-scheduler.ts`) with its own interval, its own overlap guard and its own failure
-backoff; nothing about one leg can delay another. Before this split all four legs shared one
+backoff; nothing about one leg's schedule or upstream can delay another (their database writes do
+queue, see below). Before this split all four legs shared one
 fifteen-second `setInterval` and one boolean, so a single hung upstream suppressed the other three
 for as long as it hung.
 
@@ -183,8 +184,20 @@ for as long as it hung.
 | `ukraine-alarm` | `max(ALERT_POLL_INTERVAL_SECONDS, 15)` | **15 s** | Nothing is documented for that API — no rate limit, no cache guidance. An undocumented budget is not a budget to spend against. |
 | `alert-channel-backstop` | 15 s, fixed | — | A sweep over `alert_source_states`, not a request to anybody. It catches a 🟢 that never arrived, bounded by `ALERT_CHANNEL_MAX_ALERT_SECONDS` (a full day); running it faster would change nothing. |
 
-Two properties worth stating because they are easy to assume wrong:
+Three properties worth stating because they are easy to assume wrong:
 
+- **Legs overlap; their alert-state writes do not.** Every transaction that writes
+  `alert_source_states`/`alert_periods` (a snapshot pass, an alert-channel message, the backstop)
+  opens with one advisory lock, `ALERT_STATE_LOCK` in `src/services/ingestion.ts`, so a write waits
+  for whatever writes are queued ahead of it. The time held is the reconcile, not the leg's wall
+  time: ~1.8 ms per `alert_source_states` row the source has ever held when nothing changes, ~4 ms
+  when writing (≈0.25 s for the mirror's 132 rows on 22.09.2026). Without it, two
+  sources re-reconciling shared active periods in opposite orders failed with `deadlock detected`,
+  and two sources raising one new alert a few seconds apart could open two periods for it. The wait
+  is bounded by the pool's 15 s `statement_timeout`. A writer that runs out fails as an ordinary
+  source error (`last_error` «alert state lock not acquired…») and writes nothing. A snapshot leg
+  then retries on its normal backoff; a live alert-channel message is dropped until the next
+  reconnect backfill re-reads it. The lock relies on READ COMMITTED.
 - **The interval is a GAP, not a period.** The next pass is armed when the previous one *finishes*,
   so a poll that takes two seconds at a four-second interval runs every six. That is deliberate: the
   alternative subtracts the elapsed time and therefore fires the next request the instant a slow one
@@ -269,28 +282,37 @@ If a leg is in backoff and the source card says `error`, the source is the probl
 backoff and the source card says `current`, the failure is downstream of the fetch — read
 `threatlens_channel_errors_total{stage=…}` for which stage.
 
-### Instant propagation of an alert start
+### Instant propagation of an urgent warning
 
 An `alert.started` row committed to `system_event_log` used to wait for two one-second pollers: the
-SSE hub and the notification fan-out. Both are now poked directly after the writing transaction
-commits (`src/services/alert-poke.ts`), which removes that wait and nothing else.
+SSE hub and the notification fan-out. Both are poked directly after the writing transaction commits
+(`src/services/alert-poke.ts`), which removes that wait and nothing else.
 
-- **Starts only.** `alert.ended`, `threat.*` and everything else ride the ordinary tick. Starts fast,
-  ends unhurried — the same asymmetry `ALERT_END_DEBOUNCE_SECONDS` already takes.
+- **Two origins, one signal.** An official alert START, and a live threat — a `threat.created` whose
+  timing is `now` and which actually wrote a log row. The second was added because the monitoring
+  path was paying the wait the alert path had already bought its way out of, three times over: hub
+  tick, fan-out tick, delivery tick, each a uniform [0, 1 s]. Measured after the change:
+  `threat.created(now)` → outbox row **14 ms**, → `sendMessage` **10 ms**, against 0–3 000 ms before.
+- **Not everything is urgent.** `alert.ended`, an expected-window threat (`timing ≠ now`, which
+  `CONTEXT.md` says is not a live threat), a de-escalation, a coalesced restatement and a merge that
+  wrote no log row all ride the ordinary tick. Starts fast, ends unhurried — the same asymmetry
+  `ALERT_END_DEBOUNCE_SECONDS` already takes.
 - **The publication hold is untouched.** A poked hub pass runs the same version-bounded SELECT the
   timer would have run, so in `delayed_15s` the fresh row is above the bound and is not emitted. The
   poke removes polling lag; it can never remove the hold. Pinned by
-  `tests/integration/alert-poke.test.ts`.
+  `tests/integration/alert-poke.test.ts` and `tests/integration/threat-poke.test.ts`.
 - **Telegram is unaffected in principle.** The fan-out has never consulted the publication cutoff —
   the documented exemption — so a subscriber was already being told about an alert the public map was
   holding. The poke moves that by at most one second.
 - **Storm-proof by three bounds**: one poke per COMMIT rather than per row (a twenty-five-oblast
-  snapshot is one poke), one pending poke at a time, and both consumers refuse a re-entrant pass and
-  re-arm once instead.
+  snapshot is one poke), one pending poke at a time — an alert start and a live threat committing in
+  the same macrotask are ONE wake-up — and both consumers refuse a re-entrant pass and re-arm once
+  instead.
 
 ```promql
-# Pokes raised. `coalesced` is the second bound working and is not a fault; a coalesced rate that
-# dwarfs `fired` means several writers are committing inside one macrotask turn.
+# Pokes raised, by origin. `fired`/`coalesced` keep their alert-only meaning; `threat_fired` and
+# `threat_coalesced` are the live-threat origin. A coalesced rate that dwarfs the fired one means
+# several writers are committing inside one macrotask turn — the second bound working, not a fault.
 rate(threatlens_alert_pokes_total[5m])
 ```
 
@@ -324,7 +346,85 @@ Two clamps, and knowing about them is the difference between reading the graph a
   A p95 pinned at exactly 300 therefore means «щось дуже старе», not «п'ять хвилин затримки» — look
   at `alert_periods.started_at` for the alerts in that window before treating it as latency.
 
+### Колектор каналів: два транспорти
+
+Канали з реєстру джерел читає один колектор, а транспорт у нього — один із двох,
+`TELEGRAM_TRANSPORT` (`/ops` → «Telegram: бот і збір», `apply: restart`, з підтвердженням):
+
+- **`web`** — типово з 22.09.2026. Публічна сторінка `https://t.me/s/<канал>`: без акаунта, без
+  сесії, без підписки (`src/sources/telegram-web.ts`). Опитування, а не push.
+- **`mtproto`** — push-оновлення через користувацьку сесію (`TELEGRAM_API_ID`, `TELEGRAM_API_HASH`,
+  `TELEGRAM_SESSION`). Без усіх трьох ключів колектор не стартує: `collector.state = disabled`,
+  `detail = credentials_absent`.
+
+Чому типовий — веб: сесія колектора померла 02.09.2026 (`AUTH_KEY_UNREGISTERED`), і двадцять діб жодне
+повідомлення каналу не потрапило в систему — ні подій загроз, ні векторів на карті. Сторінці `t.me/s`
+акаунт не потрібен; усі 54 увімкнені канали віддають її з HTTP 200.
+
+Перемкнути: змінити значення в `/ops` (або в `.env`) і перезапустити процес — `docker compose restart
+app`. Двох колекторів одночасно не буває ніколи. Маршрути (канал тривог → звірка тривог, решта →
+класифікатор), стан у `/health/ready` і `/ops`, перечитування реєстру після змін джерел — однакові для
+обох транспортів; `collector.transport` каже, який із них зараз працює. Під `web` немає кроку «підписати
+акаунт»: розділ нижче, крок 1 «Adding a monitoring channel» і перелік «Channels the collector account
+must join» стосуються лише `mtproto`, а `collector.unsubscribed` завжди порожній.
+
+**Бюджет запитів.** Виміряно 22.09.2026 з цього хоста: 354 запити по 6 за секунду протягом 60 с — усі
+200, жодного 429, p50 0.29 с, p95 0.41 с; `Cache-control: no-store`, ETag немає. Звідси стеля: **6
+запитів/с** рівним інтервалом (без сплесків), **не більше 4 одночасно**, таймаут 10 с. Канал, що
+публікував за останні 30 хв, — «гарячий» і читається кожні 5 с, решта — кожні 30 с: у тиші це 1.8
+запиту/с на весь реєстр. Коли гарячих понад ~25, темп задає вже стеля — кожен канал однаково
+читається щонайменше раз на ~9 с. Нових налаштувань, крім самого транспорту, немає: числа — у коді,
+поруч із виміром, з якого вони взяті.
+
+Як читається канал:
+
+- **Перше читання** — без `after`, найновіші ≤20 повідомлень. У роботу йде лише те, чого ще немає в
+  архіві (`source_messages`): перезапуск не класифікує вдруге вже прочитане, у режимі `codex` це
+  виклик моделі на кожен пост. Якщо архів відстає більш ніж на сторінку, але не більш ніж на 200
+  повідомлень, колектор проходить розрив уперед (`?after=`), по порядку, і стеля віку повідомлення
+  архівує застаріле. Відстав більше — починає з живого краю й пише WARN із кількістю непрочитаного.
+  Для каналу тривог перша сторінка — це вікно реконекту: вона йде в звірку ОДНИМ пакетом (згортка до
+  стану на зараз), обмежена `ALERT_CHANNEL_BACKFILL_SECONDS`, і вимикається
+  `ALERT_CHANNEL_BACKFILL_MESSAGES=0` — так само, як дочитування MTProto.
+- **Далі** — `?after=<останній id>`. Повна сторінка (20) або посилання «новіші» — наступна сторінка
+  одразу, до 10 сторінок за цикл.
+- **Правки.** Раз на хвилину на канал замість звичайного запиту йде запит без `after`; пост, текст
+  якого змінився і який сторінка позначила «edited», обробляється повторно з початковим часом
+  публікації та `editedAt` = момент виявлення (сторінка не каже, коли правили). Бюджету це не додає.
+- **429 або 5xx** — пауза для ВСІХ запитів: `Retry-After`, якщо названо, інакше 30 с із подвоєнням до
+  15 хв. Стан — `flood_wait` (`floodWaitUntil`, `floodWaitSeconds`, `detail: http_429`), і
+  `/health/ready` відповідає 503. Перезапуск не допомагає: обмеження рахує хост, а не процес.
+- **Канал без сторінки** — 404, редирект `t.me/s/…` → `t.me/…` (приватний канал, користувач, бот,
+  хендла не існує), сторінка без жодного повідомлення або з повідомленнями, жодне з яких не
+  прочиталося. Канал іде в `collector.unresolved`, колектор — у `degraded`, рядок джерела отримує
+  `error` з причиною. Повтор — раз на 10 хв для 404/редиректу, звичайним темпом для решти. Сторінка з
+  повідомленнями, у яких парсер не знайшов нічого, — саме так виглядає зміна розмітки Telegram, тому
+  вона голосна, а не «нічого нового».
+- **Свіжість.** Heartbeat раз на хвилину пише `last_success_at` лише тим каналам, сторінку яких
+  прочитано за останні 90 с; під час паузи твердження припиняються самі.
+- **Дозбір** класифікаторних каналів («Catch-up backfill» нижче) читає історію через `?before=` у
+  тому ж бюджеті; під час паузи він не чекає, а падає й повторюється за власним графіком.
+
+```bash
+# Стан і транспорт.
+docker compose exec -T app curl -sS http://localhost:3000/health/ready | jq .collector
+
+# Що колектор робив: старт, перше коло, паузи, канали без сторінки, розриви з архівом.
+docker compose logs app | grep -E 'Telegram web|Telegram channel'
+
+# Чи жива сама сторінка каналу — без акаунта, так само, як її читає колектор.
+curl -sS --compressed "https://t.me/s/<handle>" | grep -o '<time datetime="[^"]*"' | tail -1
+```
+
+**Межі веб-транспорту.** Сторінка показує лише пости з текстом або фото: відео без підпису, опитування
+й стікери не читаються (MTProto їх бачив). З альбому береться перше фото. Сторінку, яку Telegram
+перестав оновлювати, не відрізнити від тихого каналу: колектор читає її успішно й нового не бачить —
+останній рядок команди вище показує, коли канал насправді публікував востаннє.
+
 ### Підписка колектора: чому «resolved» не означає «читається»
+
+Лише для транспорту `mtproto`. Веб-транспорт не має ні акаунта, ні підписки: канал або має публічну
+сторінку і читається, або потрапляє в `unresolved` (див. розділ вище).
 
 `resolveChannelPeers` зв'язує канали у два кроки — скан діалогів, потім `contacts.ResolveUsername`
 для решти. Peer id дають обидва, і `resolved` рахує їх разом. Але оновлення Telegram надсилає лише
@@ -350,6 +450,32 @@ threatlens_telegram_collector_routes{origin="username",kind="alert"} > 0
 писав `resolved: 54, unresolved: []`.
 
 Лікується підпискою акаунта колектора на ці канали — не кодом і не перезапуском.
+
+Відколи в реєстрі джерел є форма реєстрації каналу, цей стан має два власні сигнали — жоден із них
+не вимагає відкривати `/health/ready`:
+
+- **Мітка в `/ops`.** Джерело з непідписаним каналом несе «не підписано» поруч із рівнем і типом,
+  фільтр «Без підписки» лишає на екрані лише такі рядки, а в шапці реєстру стоїть їхня кількість.
+  У відповіді `GET /ops/api/sources` це поле `subscription`: `subscribed`, `unsubscribed`,
+  `unresolved` або `unknown`. `unknown` — чесна відмова відповідати, а не «мабуть, усе гаразд»:
+  вимкнений рядок у прохід резолву не входить узагалі, тож про нього не сказано нічого.
+- **Рядок у Telegram оператору**, якщо задано `TELEGRAM_ADMIN_CHAT_ID`. Причина —
+  `collector_unsubscribed`, і вона окрема від `collector_degraded` навмисно: `degraded` означає
+  «маршрут не звʼязано», а тут маршрут звʼязано і колектор лишається `ready`. Повідомлення називає
+  до восьми каналів; решта йде числом.
+
+```promql
+# Скільки разів оператора повідомили — і скільки проходів не знайшли жодного непідписаного каналу.
+threatlens_admin_notices_total{reason="collector_unsubscribed"}
+```
+
+**Як зняти сигнал.** Підписати акаунт колектора на канал, тоді змусити колектор перечитати реєстр:
+`POST` або `PUT` на `/ops/api/sources` просять перезавантаження реєстру на живому процесі, тож
+перезапуск не потрібен. Простого «Оновити» в реєстрі замало: воно перемальовує сторінку, а не
+перезбирає підписку. Прохід, який нічого не знайде, підніме `outcome="clear"` і переозброїть
+сповіщення — наступна поява непідписаного каналу буде оголошена негайно, без півгодинного
+кулдауну. Набір каналів теж порівнюється: другий непідписаний канал, доданий за пʼять хвилин після
+першого, не буде проковтнутий як повтор.
 
 ### Splitting that number into ours and theirs
 
@@ -533,6 +659,113 @@ and keeps working; the import simply retries.
 psql -c "SELECT status,imported_rows,synced_at FROM reference_dataset_syncs WHERE dataset_id='katottg'"
 psql -c "SELECT type,count(*) FROM locations GROUP BY 1 ORDER BY 1"
 ```
+
+## Рівень тривоги (migration 054)
+
+Differentiated alerting has been in force since 06:00 on 2026-09-06. An alert that is already
+running can now carry a colour — yellow («дронова небезпека») or red («масована дронова», «ракетна»,
+«ракетно-дронова загроза»). The colour is an attribute of a standing alert, never its identity:
+`alert_type` stays `air_raid`, a colour change is an UPDATE of the SAME period, and no all-clear
+happens. The design argument is in `docs/ARCHITECTURE.md`, "The differentiated alert".
+
+**Most alerts have no colour, and that is normal.** `alert_level` and `alert_kind` are NULL on
+`alert_source_states` and `alert_periods` far more often than not, and a level-less alert is
+published, mapped and notified exactly as it was before this feature shipped.
+
+### What you are looking at
+
+```bash
+# The live picture: which standing alerts carry a colour, and when it last moved.
+psql -c "SELECT location_id,alert_level,alert_kind,alert_level_changed_at
+         FROM alert_periods WHERE status='active' ORDER BY alert_level DESC NULLS LAST,location_id"
+
+# Who said what. The period takes the STRONGEST level among the rows that HOLD the alert;
+# when rows at that strongest level disagree about the kind, alert_kind stays NULL on purpose.
+psql -c "SELECT source_id,alert_level,alert_kind,status FROM alert_source_states
+         WHERE location_id=:'loc' AND alert_type='air_raid'"
+
+# Colour changes as they were published, newest first.
+psql -c "SELECT version,created_at,payload FROM system_event_log
+         WHERE event_type='alert.level_changed' ORDER BY version DESC LIMIT 20"
+```
+
+`alert.level_changed` is the new `system_event_log` type, payload
+`{ alertPeriodId, locationId, level, previousLevel, kind, previousKind, changedAt }`. It is not a
+start and not an end; a period that shows an `alert.level_changed` between its `alert.started` and
+its `alert.ended` had ONE alert, not two. `activeAlerts` rows and `TerritoryAlert` carry the same two
+values as `alert_level`/`alert_kind` and `level`/`kind`.
+
+### What a subscriber sees
+
+Four message shapes, and the silhouette is the contract — a reader at 03:00 sorts notifications by
+the first glyph, not by reading them:
+
+| Shape | First line | When |
+|---|---|---|
+| Alert, no colour | `🔴 Повітряна тривога — <місце>` | the majority of alerts; byte-identical to before migration 054 |
+| Alert with a colour | `🔴 Повітряна тривога — <місце>` then `🟡 Жовтий рівень — дронова небезпека` | the colour is a second line, never a different marker |
+| Escalation | `⬆️ Рівень тривоги підвищено — <місце>` then `🟡 Жовтий → 🔴 Червоний: ракетна загроза` | colour up, colour appearing, or the kind gaining missiles |
+| De-escalation / clarification | `🔽 Рівень тривоги знижено — <місце>` / `🔀 Рівень тривоги уточнено — <місце>` | colour down or gone; kind moved sideways |
+
+A yellow alert opens with 🔴 like every other alert, deliberately: yellow IS an alert, and a weaker
+marker would teach readers to ignore it. Neither level-change shape uses 🔴 or ⚪ as its marker,
+neither says «Повітряна тривога», and **neither contains the word «відбій» in any form** — including
+the de-escalation, which keeps the shelter instruction («Тривога триває. Залишайтеся в укритті …»).
+Lowering a colour is not an all-clear and is never worded as one.
+
+The queue type is `alert_level_change`, one row per chat, `alert_period_id` set. Escalations are
+priority 0 and delivery class `protected`, so they are claimed from the head of the queue and arrive
+with a sound, like an alert start; de-escalations and clarifications are priority 4 and class `soft`,
+delivered with `disable_notification`. They are never coalesced — two colour changes in one alert are
+two different statements, not two copies of one state.
+
+Three things are silently NOT sent, by design: a colour change for a chat that was never told about
+that alert (it would be a message from nowhere), a repeat of the pair a chat was already told, and
+any colour change that arrives after the all-clear.
+
+```bash
+# Colour changes that were computed but deliberately not delivered.
+curl -fsS -H "Authorization: Bearer $METRICS_TOKEN" localhost:3000/metrics |
+  grep threatlens_notifications_suppressed_total
+#   reason="alert_ended"            — the change arrived after the period closed
+#   reason="alert_level_unchanged"  — the pair did not actually move; an event-log replay
+```
+
+### «The feed stopped sending levels» vs «there is no level right now»
+
+These two are **indistinguishable in the data**. Both look like `alert_level IS NULL` on every row,
+and no query against `alert_periods` or `alert_source_states` can separate them: NULL means "nobody
+named a colour", and an upstream that dropped the field entirely produces exactly the same NULLs as
+an upstream that is reporting honestly during a quiet, colourless night.
+
+The only thing that tells them apart is **`threatlens_alert_levels_reported{level}`** — a gauge with
+exactly three series (`yellow`, `red`, `unknown`), set on EVERY usable granular-mirror poll, zeros
+included, to the number of HOLDING nodes reporting that colour. Setting it on every poll is what
+gives "nobody is naming a colour" a number of its own instead of leaving it an absence. There is no
+gauge for the alert count, so the cross-check is a query, not a second series.
+
+```promql
+# Not one colour reported anywhere for a full hour. On a quiet night this is simply true; during a
+# raid it is a defect, because a raid is exactly when the authorities declare colours.
+max_over_time(sum(threatlens_alert_levels_reported{level=~"yellow|red"})[1h:1m]) == 0
+
+# The upstream invented a colour outside {yellow, red}. Those values are dropped to NULL and never
+# stored, so this series is the ONLY place they are visible at all. Non-zero means the domain needs
+# a migration to widen the CHECK, not that a node is broken.
+threatlens_alert_levels_reported{level="unknown"} > 0
+```
+
+```bash
+# The other half of the comparison: is anything under alert at all right now?
+psql -c "SELECT count(*) FILTER (WHERE alert_level IS NOT NULL) AS coloured,count(*) AS active
+         FROM alert_periods WHERE status='active'"
+```
+
+Rule of thumb: `sum(threatlens_alert_levels_reported)` flat at zero **across a whole raid**, while
+`alert_periods` shows dozens of active periods, means the feed stopped sending the field — check the
+raw mirror payload directly (`?source=klimenko&raw`, field `alert_level` on each node) before
+touching anything. The same sum moving up and down during the day is the feed working; zero between
+raids is simply the truth.
 
 ## Publication mode (operator only)
 
@@ -889,8 +1122,20 @@ What `codex` changes, message by message (`src/services/codex-classifier.ts`, `s
 - Every failure falls back to the rules and is counted:
   `threatlens_codex_classifier_outcomes_total{outcome=fallback_timeout|fallback_model_failed|
   fallback_unparsable|fallback_rate_limited|fallback_busy|fallback_low_confidence|fallback_no_locations|
-  fallback_disabled}`. `suppressed` is the model confidently (≥ 0.7) saying «not a threat» where the
-  rules saw one; the archive row then reads `ignored_reason='model_not_significant'`.
+  fallback_disabled|fallback_stale_deferred}`. `suppressed` is the model confidently (≥ 0.7) saying
+  «not a threat» where the rules saw one; the archive row then reads
+  `ignored_reason='model_not_significant'`, and the same word now labels the metric
+  (`threatlens_classification_rejections_total{reason="model_not_significant"}`) instead of the
+  indistinguishable `not_an_assertion`.
+- **The live path keeps a reserve of the model budget.** A catch-up sweep replays up to ten sources
+  × three hundred messages through the same classifier and the same budget as live traffic, so a
+  fresh urgent post arriving mid-sweep used to be answered by `fallback_busy` — rules-grade accuracy
+  at exactly the moment the collector came back. A message older than
+  `SOURCE_MESSAGE_MAX_DELIVERY_AGE_MINUTES` may now take a model slot only while at least two of
+  `CODEX_PRIMARY_MAX_CONCURRENT` and half of `CODEX_PRIMARY_MAX_PER_MINUTE` remain for the live
+  path; below that it falls back to the rules and is counted as `fallback_stale_deferred`. It is a
+  reserve, not a ban: a stale message the model reads as `evening`/`within_day` still publishes on
+  its own window, which is why the model stays reachable for it at all.
 - Bounds, all hot in `/ops` → settings: `CODEX_PRIMARY_TIMEOUT_MS` (20 s), `CODEX_PRIMARY_MAX_PER_MINUTE`
   (60; 0 = rules with the mode on paper), `CODEX_PRIMARY_MAX_CONCURRENT` (6), `CODEX_PRIMARY_MIN_CONFIDENCE`
   (0.5). Nothing queues: over budget means the rules, now.
@@ -1049,6 +1294,89 @@ Reading it:
   `sources` row — disable it — not a hope that the measurement will silence it.
 - **A step in a series with an unchanged channel** usually means `TRUST_METHODOLOGY_VERSION` moved;
   every row carries the version it was computed under, so compare like with like.
+
+## Adding a monitoring channel
+
+Until this endpoint existed, every new channel was an `INSERT` in a migration plus a redeploy, and
+that is the whole reason the catalogue had not moved since `migrations/029`. A monitoring row feeds
+`classifyMessage` and has no path to `alert_source_states` or `alert_periods`, so the cost of
+registering one was higher than the cost of getting one wrong. `POST /ops/api/sources` closes that
+gap, and the «Додати моніторинговий канал» fold in the source ledger is the same call from the
+console.
+
+**Only `mtproto_monitor`.** Alert channels stay migration-only, and that is not an inconsistency:
+their `enabled` bit rests on evidence a form cannot carry — the channel's verbatim wording, run
+through `parseAlertChannelMessage` and left as a fixture in `alert-parser.test.ts`. The route
+refuses `official`, `tier: 'A'` and any adapter but the monitor one with a `400`, and the database
+refuses the same three independently: `sources_mtproto_monitor_check` (`migrations/011:31-35`) is
+enforced on every insert, so a future bug in the route cannot manufacture alert authority.
+
+### The procedure, in order
+
+1. **Subscribe the collector account to the channel.** This step is outside the application and no
+   code can do it. Telegram delivers updates only for dialogs the account is in; a row enabled
+   without the subscription binds through `contacts.ResolveUsername`, counts as `resolved`, leaves
+   the collector `ready` and delivers nothing. See "Підписка колектора" above.
+2. **Read the channel before registering it.** The bar for a monitor is empirical: run its recent
+   messages through `classifyMessage(text, catalogue)` as described in "How to re-audit one" below.
+   Registration writes the reason you type into `source_enabled_audit`, so type what you checked.
+3. **Decide `independence_group`, and do not let the form decide it for you.** It has no default on
+   purpose. `count(DISTINCT independence_group)` is what promotes an event to `confirmed`
+   (`src/repositories/events.ts:1010-1031`), so a channel that reposts somebody else must carry the
+   ORIGINAL publisher's group — `osint-vanek-nikolaev` carries `air-force` for exactly this reason
+   (`migrations/011:105-112`). A repost given its own group makes one statement, counted twice, look
+   like corroboration.
+4. **Register it.** The console form, or:
+
+```bash
+curl -sS -u operator:"$OPS_PASSWORD" -X POST http://localhost:3000/ops/api/sources \
+  -H 'Content-Type: application/json' -d '{
+    "id":"osint-new-channel","name":"Назва каналу","telegramUsername":"https://t.me/new_channel",
+    "adapterType":"mtproto_monitor","tier":"B","independenceGroup":"osint-new-channel",
+    "publicUrl":"https://t.me/new_channel","expectedUpdateIntervalSeconds":60,
+    "staleAfterSeconds":300,"reason":"Перевірено класифікатором на двадцяти повідомленнях"}'
+```
+
+5. **Enable it** with the switch in the ledger (`PUT /ops/api/sources/:id`), with its own reason.
+6. **Watch the row.** After the enable, the collector re-reads the registry; the row should show
+   `subscription: subscribed` and start moving `Останнє повідомлення`. A «не підписано» badge means
+   step 1 did not happen for this channel.
+
+### What the route decides for you
+
+| Field | Value | Why it is not a form field |
+|---|---|---|
+| `adapter_type` | `mtproto_monitor` | The only adapter this endpoint creates. |
+| `official` | `false` | Alert authority is a migration decision, backed by a parser fixture. |
+| `source_type` | `telegram` | Implied by the adapter. |
+| `enabled` | `false` | See below. |
+| `health_status` | `unknown` | `markSourceSuccess` never ran for a row nobody collected yet. |
+
+**The row arrives disabled, deliberately.** `enabled=true` on a monitor is the claim "this channel
+publishes operational threat text that resolves to a Ukrainian location", and the only measure of
+that is a classifier run, which nobody performs between typing a name and pressing a button. A tier
+B row is also a row that can corroborate: two distinct A/B groups promote an event to `confirmed`,
+so a channel switched on the second it was first seen could confirm somebody else's claim before
+anyone had read one of its messages. And a row that is off never enters a resolve pass, which is
+what makes step 1 checkable — enable after subscribing, and `collector.unsubscribed` answers
+immediately.
+
+The `201` response says all of this back: `enabled: false`, `nextStep: "subscribe_then_enable"` and
+a `notice`. `collectorReloadRequested: false` in that response is worth reading — it means this
+deployment has no live MTProto collector at all (`TELEGRAM_API_ID`, `TELEGRAM_API_HASH`,
+`TELEGRAM_SESSION`), and the channel will not be read however many switches are flipped.
+
+### Refusals
+
+| Response | Meaning | What to do |
+|---|---|---|
+| `400 invalid_source` | A field failed the schema, or the body carried a field the endpoint does not accept (`official`, an alert adapter, `tier: "A"`). | Fix the named field; the three refused ones are refused by design. |
+| `400 invalid_telegram_username` | Not a Telegram handle after normalisation. `@name`, `t.me/name` and `t.me/s/name` are all accepted and reduced to `name`; 5–32 characters, first a Latin letter. | Check the handle on the channel page. |
+| `409 source_exists` | The `id` is taken. | Pick another id; ids are lower-case and never reused. |
+| `409 telegram_username_taken` | Another row already claims this channel, in any case. The unique index is on `lower(telegram_username)`. | One channel, one row. Find the existing row instead of adding a second. |
+| `409 monitor_constraint_violated` | The database refused the row. Unreachable through this endpoint. | Read the named constraint; something bypassed the route's own checks. |
+
+A refusal writes nothing: no row, no audit line, no collector reload.
 
 ## Enabling a switched-off source
 
@@ -1499,6 +1827,12 @@ Three properties to rely on:
 
 The backup container creates a custom-format archive, validates it with `pg_restore --list`, and writes a SHA-256 sidecar. Retention defaults to 14 days.
 
+Three properties of the schedule matter when the host is busy:
+
+- **The archive is zstd, not zlib.** Measured 22.09.2026 on a restored production database (919 MiB) inside `postgres:18-alpine`: `--compress=zstd:3` costs **1.70 s of CPU and 73.5 MB** against the default zlib's **10.44 s and 128.0 MB** — six times less CPU, 43 % less disk, and 1.03 GB instead of 1.79 GB across the 14-day retention. `pg_restore` reads both, so archives written before this change stay restorable with the same `restore-test.sh`.
+- **It runs at a fixed hour, not "24 h after the container started".** `BACKUP_AT_UTC_HOUR` (default `9` UTC = 12:00 Kyiv) anchors the daily pass to the midday lull instead of letting it drift into a night raid with every restart. A backup directory with no archive in it still dumps immediately, so a fresh deployment is never a day without a copy. A non-daily `BACKUP_INTERVAL_SECONDS` (a staging box, for example) keeps the old "start now, then step" behaviour.
+- **It runs at the back of the queue.** `nice -n 19 ionice -c 3` on both `pg_dump` and `pg_restore --list`: the only process these two compete with is the Postgres that feeds the alert pipeline, the SSE hub and the notification queue, and a dump has no business winning that race.
+
 Perform a real isolated restore test after material schema changes:
 
 ```bash
@@ -1739,6 +2073,30 @@ Production backups must additionally be encrypted and copied to independent obje
 
   A `degraded` collector never silently downgrades an alert channel: an unbound Tier A handle is a
   source that stops holding its alerts, which the aggregate treats as one fewer official source.
+- **MTProto collector `ready`, a source `current`, and nothing arrives from it.** The opposite
+  failure to the one above, and the harder one: the handle IS bound, so it is counted in `resolved`
+  and the heartbeat keeps writing `last_success_at`. The account is simply not in the channel's
+  dialog. `/ops` marks the row «не підписано» and the «Без підписки» filter lists every such row;
+  `GET /ops/api/sources` carries it as `subscription: "unsubscribed"`; `/health/ready` carries the
+  handles as `collector.unsubscribed`; and the counter
+  `threatlens_admin_notices_total{reason="collector_unsubscribed"}` counts the operator lines sent
+  about it. Subscribe the collector account, then make the collector re-read the registry (any
+  `POST`/`PUT` on `/ops/api/sources`).
+  Full reasoning and the measurement behind it: "Підписка колектора" above.
+- **Web collector in `flood_wait` (`collector.transport = web`, `/health/ready` 503 with
+  `reason=collector_flood_wait`, `collector.detail = http_429` or `http_5xx`).** `t.me` refused a
+  preview request and EVERY request is paused until `collector.floodWaitUntil` — the `Retry-After`
+  it named, or 30 s doubling to 15 min. Nothing to do but wait: a restart does not reset a limit the
+  host counts, and the first page read after the pause lifts the state by itself. A pause that keeps
+  escalating to 15 min means the budget itself is too high for this egress IP now; the numbers are in
+  «Колектор каналів: два транспорти» above, next to the measurement they came from.
+- **Web collector `degraded`: `collector.unresolved` names handles with no readable preview.** Open
+  `https://t.me/s/<handle>` yourself. A redirect to `t.me/<handle>` means the channel went private,
+  renamed or never existed — fix or disable the `sources` row, the same three causes as MTProto's
+  «some handles are not bound». A page WITH messages that the collector still calls unreadable
+  (`no_readable_posts` in the source's `last_error`) means Telegram changed the page markup: the
+  parser (`parseChannelPage`, `src/sources/telegram-web.ts`) needs a fresh fixture, and until then
+  `TELEGRAM_TRANSPORT=mtproto` with a live session is the fallback.
 - **Telegram 403:** the user is disabled automatically; queued messages stop.
 - **Telegram 429:** delivery persists the provider `retry_after` as a bot-wide pause in
   `telegram_delivery_governor`. Untouched rows from the claimed batch return to `retry` immediately
@@ -1754,7 +2112,7 @@ Production backups must additionally be encrypted and copied to independent obje
   update the chat did not receive.
 - **AI invalid/timeout:** failure is recorded and deterministic fallback is used.
 - **Unknown provider location:** an unmapped provider location is a catalogue gap, not a source outage. Locations that did resolve are persisted normally, the source stays `current`, and the unmapped names are counted and logged (`unresolvedLocationReports()`) instead of being guessed at. The source is only marked `error` when the response contained alerts and **none** of them could be mapped — the snapshot is then refused whole rather than applied partially.
-- **Reclaimed notifications:** a row left in `sending` for more than 300 seconds is returned to `retry` on the next delivery pass, or marked `failed` once it has used all 8 attempts. The pass logs `reclaimed notifications stuck in sending` with a count; a non-zero count on every pass means delivery is crashing mid-batch.
+- **Reclaimed notifications:** a row left in `sending` for more than 300 seconds is returned to `retry`, or marked `failed` once it has used all 8 attempts. The sweep runs when the notification workers start — the process that just restarted is the one that left those rows behind — and then once a minute, not on every one-second delivery tick: the threshold is five minutes, so a per-tick `UPDATE` was 86 400 writes a day that normally touch nothing. The pass logs `reclaimed notifications stuck in sending` with a count; a non-zero count on every pass means delivery is crashing mid-batch.
 - **Occupation layer stale or empty:** `/api/v1/occupation` never returns 5xx. An empty collection with `stale: true` means the source is switched off, no revision has been stored yet, or the database was unreachable. Check `threatlens_occupation_sync_total` and `threatlens_occupation_unknown_status_keys_total`; a rising unknown-key counter means upstream introduced a status key this build rejects by design, and it needs a code review before it can be rendered.
 - **A threat disappeared from the map and no timer had run out.** It was withdrawn: some source that
   had asserted it published a stand-down and it was the last one holding the event. The audit trail
@@ -1953,12 +2311,25 @@ Production backups must additionally be encrypted and copied to independent obje
   than thirty minutes behind the events it is reading: check `worker_state` for
   `notification-fanout`, the outbox backlog in `/ops/api`, and whether delivery is failing rather
   than the events being stale.
+  The other two `reason` values are **not** incident conditions and need no response:
+  `alert_ended` counts colour changes that arrived after their period closed, and
+  `alert_level_unchanged` counts event-log replays of a colour that did not actually move. Both mean
+  the level fan-out refused to publish something it should refuse to publish; both are expected to
+  be small and non-zero over a long uptime.
 - **Telegram delivery backlog:** watch `threatlens_telegram_delivery_backlog{class}` together with
   `threatlens_telegram_delivery_oldest_seconds{class}`. A growing `protected` series is an incident;
   check `threatlens_telegram_delivery_blocked_seconds` and
   `threatlens_telegram_delivery_governor_decisions_total{decision,class}` to distinguish a provider
   pause from local budget pressure. A growing `analytics`/`soft` backlog while `protected` drains is
   the intended priority order during mass fan-out.
+- **Telegram delivery latency:** `threatlens_notification_delivery_seconds{class}` measures the
+  promise itself — outbox row queued → Telegram confirmed the send — and is the series to read
+  after any change to the fan-out or the delivery worker. Baseline on a week of production data
+  before this instrument existed (same definition, computed by hand over
+  `notification_deliveries(queued_at, sent_at)`): p50 **1.04 s**, p90 1.49 s, max 2.46 s, dominated
+  by the one-second tick rather than by the Telegram call. A `protected` p90 above a few seconds
+  with `threatlens_telegram_delivery_blocked_seconds` at zero means the queue is losing to local
+  work, not to the provider.
 - **A source stuck in `failed` in `source_backfill_state`.** One source failing never stops live
   collection, never stops the other sources' catch-up, and never marks the source unhealthy —
   `last_error` and `consecutive_failures` are the whole signal. The exponential guard backs the retry

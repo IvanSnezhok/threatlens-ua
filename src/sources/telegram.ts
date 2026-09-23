@@ -1,12 +1,13 @@
 import { Counter, Gauge, type Registry } from 'prom-client';
-import { notifyAdmin, type AdminNoticeReason } from '../bot/admin-notice.js';
+import { notifyAdmin, notifyUnsubscribedChannels, type AdminNoticeReason } from '../bot/admin-notice.js';
 import { config } from '../config.js';
 import {
   ALERT_CHANNEL_SOURCE_ID, MONITOR_ADAPTER_TYPE, ingestAlertChannelMessages, loadAlertChannels,
   loadMonitoredTelegramChannels, newestStoredExternalId, processMessage,
   type AlertChannelMessage, type AlertTelegramChannel, type MonitoredTelegramChannel
 } from '../services/ingestion.js';
-import { markSourceError, markSourceSuccess } from '../services/operations.js';
+import { readCodexSettings } from '../services/codex-settings.js';
+import { markSourceError, markSourceSuccess, markSourcesSuccess } from '../services/operations.js';
 import type { MessageMediaAttachment } from '../types.js';
 import {
   startClassifierBackfill, type BackfillPort, type BackfillRawMessage
@@ -24,7 +25,7 @@ import {
 const AIR_FORCE_SOURCE_ID = 'air-force';
 const AIR_FORCE_CHANNEL = 'kpszsu';
 
-interface CollectorLogger { info: Function; warn?: Function; error: Function }
+export interface CollectorLogger { info: Function; warn?: Function; error: Function }
 
 /**
  * What one subscribed username is for.
@@ -256,6 +257,18 @@ export function noteCollectorUpdate(now = Date.now()): void {
   transportRecoveryAttempts = 0;
 }
 
+/**
+ * Re-reads `threatlens_telegram_seconds_since_update` from the last update.
+ *
+ * The MTProto heartbeat does this inline, beside the silence guard it feeds. The web transport
+ * (`./telegram-web.ts`) calls this from its own heartbeat so the gauge keeps counting between posts
+ * instead of freezing at the 0 `noteCollectorUpdate` wrote — a series stuck at zero reads as «just
+ * heard from Telegram» for as long as the process lives.
+ */
+export function refreshCollectorSilenceGauge(now = Date.now()): void {
+  collectorSecondsSinceUpdate.set(secondsSinceLastUpdate(now) ?? -1);
+}
+
 /** Attaches this module's metrics to the one HTTP registry. Idempotent, like its neighbours. */
 export function registerTelegramCollectorMetrics(registry: Registry): void {
   for (const [name, metric] of COLLECTOR_METRICS) {
@@ -279,6 +292,14 @@ export type TelegramCollectorState =
   | 'disabled' | 'starting' | 'ready' | 'degraded' | 'flood_wait' | 'failed';
 
 export interface TelegramCollectorStatus {
+  /**
+   * Which transport produced this status: `web` polls the public `t.me/s/<username>` preview without
+   * an account (`./telegram-web.ts`), `mtproto` is this module's push collector over a user session.
+   * One process runs exactly one of them (`TELEGRAM_TRANSPORT`), so the fields below always describe
+   * that one — and this word says how to read them: under `web`, «resolved» means «a page was read»,
+   * `handlersReady` means «the polling loop runs», and `unsubscribed` is always empty.
+   */
+  transport: 'web' | 'mtproto';
   state: TelegramCollectorState;
   /** ISO 8601 — when this state was entered. */
   since: string;
@@ -307,6 +328,8 @@ export interface TelegramCollectorStatus {
 }
 
 const INITIAL_STATUS: TelegramCollectorStatus = {
+  // This module's own transport. The web collector names itself on every status it publishes.
+  transport: 'mtproto',
   state: 'disabled', since: new Date(0).toISOString(), handlersReady: false, channels: 0,
   resolved: 0, unresolved: [], unsubscribed: [], floodWaitUntil: null, floodWaitSeconds: null,
   detail: null
@@ -336,6 +359,20 @@ export function requestTelegramCollectorReload(): boolean {
   if (!collectorReload) return false;
   collectorReload();
   return true;
+}
+
+/**
+ * Hands this module the running collector's logger and Ops reload hook, for the transport that is
+ * not this module's own.
+ *
+ * `./telegram-web.ts` owns the same status, the same operator notices and the same
+ * `requestTelegramCollectorReload()` the MTProto collector owns — readiness, `/ops` and source health
+ * read one `telegramCollectorStatus()` and must not learn that there are two transports. Passing
+ * `null` for `reload` on stop is what makes a later reload request answer `false` again.
+ */
+export function bindTelegramCollector(log: CollectorLogger, reload: (() => void) | null): void {
+  collectorLog = log;
+  collectorReload = reload;
 }
 
 /**
@@ -392,8 +429,12 @@ const COLLECTOR_NOTICES: Partial<Record<
  * counts and the flood-wait interval and sends nothing. So does the `gainedNothing` branch, which
  * carries a fresh `floodWaitUntil` on an unchanged state. One line per transition, never per tick;
  * `notifyAdmin`'s own per-reason cooldown then bounds a transition that flaps.
+ *
+ * Exported for the web transport (`./telegram-web.ts`), which publishes only when something in the
+ * status actually moved: `since` is restamped on every call, and a poller that called this after
+ * every request would make «when this state was entered» mean «the last request».
  */
-function setCollectorStatus(patch: Partial<TelegramCollectorStatus>): void {
+export function setCollectorStatus(patch: Partial<TelegramCollectorStatus>): void {
   const previous = collectorStatus.state;
   collectorStatus = { ...collectorStatus, ...patch, since: new Date().toISOString() };
   collectorReady.set(collectorStatus.state === 'ready' ? 1 : 0);
@@ -883,13 +924,59 @@ export interface TelegramCollectorDeps {
   /** Arms the single retry timer and returns its canceller. */
   schedule?: (run: () => void, ms: number) => () => void;
   heartbeatMs?: number;
+  /** Хто прочитає вкладення. Шов, бо відповідь живе в базі, а цей файл у тестах її не має. */
+  mediaConsumers?: () => Promise<MediaConsumers>;
+}
+
+/**
+ * Хто в цьому процесі справді прочитає завантажений файл.
+ *
+ * До цього вкладення качалися завжди — до восьми мегабайтів на зображення, до двадцяти пʼяти на
+ * звук, — і єдиним гальмом були байтові стелі. Моніторингові канали публікують карти безперервно, а
+ * типова конфігурація не має ЖОДНОГО споживача: `classifier_mode` типово `rules`, а `shadow`,
+ * `analytical_threats` і `analytical_enrichment` типово вимкнені. Тобто кожна карта качалася
+ * повністю, ставала буфером у памʼяті й відкидалася — перед класифікацією тексту, яка про неї
+ * нічого не знає.
+ *
+ * Споживачі рахуються з тих самих перемикачів, що їх читають самі споживачі, а не з їхньої копії:
+ *
+ *  * `primary` — `classifier_mode='codex'`: `src/services/codex-classifier.ts` кладе зображення в
+ *    запит і транскрибує звук ДО рішення. Тут файл справді стоїть на критичному шляху, бо його
+ *    читає той самий виклик, на який чекає повідомлення;
+ *  * `detached` — `shadow`, `analytical_threats` або `analytical_enrichment`:
+ *    `src/services/shadow-classifier.ts` читає файл ПІСЛЯ рішення й нічого не затримує (три
+ *    перемикачі, бо всі три споживають один вердикт — див. коментар у `shadowClassify`).
+ */
+export interface MediaConsumers {
+  primary: boolean;
+  detached: boolean;
+}
+
+const NO_MEDIA_CONSUMERS: MediaConsumers = { primary: false, detached: false };
+
+/** Помилка читання налаштувань — «ніхто не прочитає»: качати файл наосліп дорожче, ніж не качати. */
+export async function codexMediaConsumers(): Promise<MediaConsumers> {
+  const settings = await readCodexSettings().catch(() => null);
+  if (!settings) return NO_MEDIA_CONSUMERS;
+  return {
+    primary: settings.classifierMode === 'codex',
+    detached: settings.features.shadow || settings.features.analytical_threats
+      || settings.features.analytical_enrichment
+  };
+}
+
+/** Чи є до повідомлення вкладення, яке цей колектор узагалі вміє читати — видно без завантаження. */
+function attachmentKind(message: unknown): MessageMediaAttachment['kind'] | null {
+  if (!message || typeof message !== 'object') return null;
+  const post = message as { photo?: unknown; voice?: unknown; audio?: unknown };
+  if (post.photo) return 'image';
+  return post.voice || post.audio ? 'audio' : null;
 }
 
 /** Downloads at most one supported attachment, with declared and actual byte caps. */
 export async function telegramAdvisoryMedia(message: any): Promise<MessageMediaAttachment[]> {
   const document = message?.document;
-  const kind: MessageMediaAttachment['kind'] | null = message?.photo ? 'image'
-    : (message?.voice || message?.audio) ? 'audio' : null;
+  const kind = attachmentKind(message);
   if (!kind || typeof message?.downloadMedia !== 'function') return [];
   const maxBytes = kind === 'image' ? config.SHADOW_IMAGE_MAX_BYTES : config.SHADOW_AUDIO_MAX_BYTES;
   if (maxBytes <= 0) return [];
@@ -938,6 +1025,7 @@ export async function startTelegramCollector(
   const createRuntime = deps.createRuntime ?? connectDefaultRuntime;
   const schedule = deps.schedule ?? defaultSchedule;
   const heartbeatMs = deps.heartbeatMs ?? HEARTBEAT_INTERVAL_MS;
+  const mediaConsumers = deps.mediaConsumers ?? codexMediaConsumers;
 
   setCollectorStatus({ ...INITIAL_STATUS, state: 'starting', detail: 'connecting' });
   let runtime: TelegramCollectorRuntime;
@@ -1007,7 +1095,29 @@ export async function startTelegramCollector(
         }], log as { warn: Function });
         return;
       }
-      const media = await telegramAdvisoryMedia(message);
+      // Файл — НІКОЛИ не попереду текстового вердикту, якщо його не читає той, на кого вердикт чекає.
+      //
+      // Три стани, і всі три випливають з того, хто справді прочитає байти ({@link MediaConsumers}):
+      //
+      //  * ніхто — не качаємо взагалі. Це типова конфігурація, і саме тут було вісім мегабайтів
+      //    карти, завантажених перед класифікацією тексту, щоб одразу стати сміттям;
+      //  * основний класифікатор — качаємо й чекаємо: зображення їде в той самий запит до моделі,
+      //    на який чекає повідомлення, тож без файлу вердикту просто не буде;
+      //  * лише відʼєднаний шлях — качаємо ПАРАЛЕЛЬНО і не чекаємо. Тінь читає файл після того, як
+      //    подія вже записана й поштовх уже піднято, тож чекати на завантаження перед
+      //    класифікацією означало б платити секунди затримки попередження за другу думку, якої
+      //    ніхто не побачить раніше ранку. Проміс віддається `processMessage`, і вона чекає на нього
+      //    в одному місці — там, де тінь справді планується.
+      //
+      // `rawPayload.media` лишається переліком того, що ми СПРАВДІ маємо на руках у цю мить: у
+      // відʼєднаному стані він порожній, а види вкладень їдуть у `shadow_classifications.media_kinds`
+      // тим самим шляхом, що й раніше.
+      const consumers = attachmentKind(message) ? await mediaConsumers() : NO_MEDIA_CONSUMERS;
+      // `.catch` тут, а не там, де проміс чекають: між створенням і очікуванням стоїть увесь
+      // `processMessage`, і якби він кинув, відхилений проміс лишився б без обробника.
+      const flight = consumers.primary || consumers.detached
+        ? telegramAdvisoryMedia(message).catch(() => [] as MessageMediaAttachment[]) : null;
+      const media = consumers.primary && flight ? await flight : [];
       await processMessage({
         sourceId: route.sourceId,
         externalId: String(message.id),
@@ -1019,7 +1129,10 @@ export async function startTelegramCollector(
           media: media.map((item) => ({ kind: item.kind, mimeType: item.mimeType, bytes: item.bytes.byteLength }))
         },
         media
-      }, { monitor: route.adapterType === MONITOR_ADAPTER_TYPE });
+      }, {
+        monitor: route.adapterType === MONITOR_ADAPTER_TYPE,
+        ...(flight && !consumers.primary ? { pendingMedia: flight } : {})
+      });
     } catch (error) {
       // Only the source the message actually belongs to is marked in error. Attributing a failure
       // to a default source would report an outage on a channel that is working, and — worse for
@@ -1323,9 +1436,13 @@ export async function startTelegramCollector(
         }, 'MTProto collector is subscribed and connected but has received nothing; source freshness withheld');
         return;
       }
-      for (const sourceId of liveSources) {
-        markSourceSuccess(sourceId).catch((error) => log.error({ error, sourceId }, 'MTProto heartbeat failed'));
-      }
+      // ОДНА транзакція на весь пульс, а не одна на канал. П'ятдесят чотири виклики на хвилину були
+      // 216 операторами й 54 захопленнями з дванадцятизв'язкового пулу — щохвилини, назавжди, — аби
+      // записати колонку, чий увесь зміст «ще живий». Перехід `stale|error → current` лишається
+      // точно тим самим: `markSourcesSuccess` читає доріз під тим самим `FOR UPDATE`, тож
+      // `source.recovered` пишеться рівно там, де й раніше.
+      markSourcesSuccess([...liveSources])
+        .catch((error) => log.error({ error, sources: liveSources.size }, 'MTProto heartbeat failed'));
     }, heartbeatMs);
     heartbeat.unref();
 
@@ -1357,6 +1474,21 @@ export async function startTelegramCollector(
       }, 'alert channels are bound but the account is not subscribed: no live update will arrive, '
         + 'and their messages will only be read by the reconnect backfill');
     }
+    // Те саме спостереження, але для ОПЕРАТОРА і для всіх зв'язаних маршрутів, не лише для каналів
+    // тривог. Канал, зв'язаний і не підписаний, у логу лишався рядком, який ніхто не читає, а в
+    // `/ops` виглядав як `ready`: живого повідомлення з нього не прийде жодного, і побачить це лише
+    // той, хто порівняє лічильники за добу. Монітор тут названо теж — саме він є типовим випадком
+    // щойно доданого каналу, на якому забули підписку.
+    //
+    // На КОЖНОМУ проході, включно з порожнім: порожній виклик скидає памʼять оголошень
+    // (`src/bot/admin-notice.ts`), тож наступний непідписаний канал не чекатиме на вистигання
+    // тридцятихвилинної паузи. Ніколи не кидає, тому `void`.
+    void notifyUnsubscribedChannels([...resolution.byPeerId.values()]
+      .filter((route) => resolution.unsubscribed.includes(route.username))
+      .map((route) => ({
+        username: route.username, sourceId: route.sourceId,
+        kind: route.kind === 'alert' ? 'alert' as const : 'classifier' as const
+      })), log);
 
     for (const [peerId, route] of resolution.byPeerId) {
       if (route.kind !== 'alert' || backfilled.has(route.sourceId)) continue;

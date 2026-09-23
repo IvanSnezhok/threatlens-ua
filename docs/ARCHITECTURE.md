@@ -356,6 +356,58 @@ lookup as the API adapters, with its two guarantees intact: LIKE metacharacters 
 ambiguous tier is refused rather than resolved to an arbitrary row. A name that resolves to nothing is
 a catalogue gap, not a source outage — it is counted and logged, never marked as a source error.
 
+### The differentiated alert: the level is an attribute, never an identity
+
+Since 06:00 on 2026-09-06, by government decision, an air-raid alert can carry a colour. Yellow is
+«дронова небезпека»; red is «масована дронова», «ракетна» or «ракетно-дронова загроза». Two nullable
+columns hold it — `alert_level` (`yellow` | `red`) and `alert_kind` (`drones` | `missiles` |
+`drones_missiles`) — on `alert_source_states`, which records what ONE source said, and on
+`alert_periods`, which records what the aggregate concluded, together with
+`alert_periods.alert_level_changed_at` (migration 054).
+
+**NULL is the normal value, not a gap.** In the live mirror reading the migration was written from,
+119 of 153 nodes carried no colour at all. An alert without a level is an ordinary alert and is
+rendered exactly as it was before this feature existed — no extra line, no different marker, byte for
+byte the same Telegram message. Absence of a colour means only that no source named one; it never
+means less danger, and a yellow alert is a full alert: red on the map, standing in the panel,
+notified, shelter instruction intact.
+
+**Why not `alert_type`.** Writing the differentiated kind into `alert_type` is the obvious shortcut
+and it is the one catastrophic option on the table. `alert_type` is part of a period's IDENTITY:
+`alert_periods` is unique on `(location_id, alert_type, started_at)`, and `reconcileAggregateAlert`
+finds the standing period by `(location_id, alert_type)`. A yellow→red transition would therefore be
+a different pair, so the reconciler would OPEN a second period and CLOSE the first — and closing a
+period is «⚪ Відбій тривоги» in Telegram and a cleared territory on the map, published in the middle
+of an alert that had just ESCALATED. A false all-clear is the one failure this product treats as
+unrecoverable, so the colour is kept off every unique constraint, every `ON CONFLICT` and every
+lookup key, and `alert_type` still means exactly what it meant: `air_raid`.
+
+**The on/off decision is untouched.** Whether an alert exists is still
+`bool_or(counts AND holds)` over the source-state rows, with the same API precedence, the same
+liveness discounting and the same `ALERT_END_DEBOUNCE_SECONDS`. The level is computed BESIDE that
+disjunction, from the rows that already hold, and can never make `holds`, `counts` or `would_hold`
+false. It describes an alert that is already on; it cannot turn one on or off.
+
+**Strongest wins.** Across the sources that HOLD the alert, the level is the strongest one anybody
+declared — red beats yellow beats none — because caution is worth more here than consensus: one
+source saying red and another saying yellow makes the period red. The kind is the kind of that
+strongest-level row; when rows at that same strongest level disagree about the kind, `alert_kind` is
+NULL. The system does not invent a kind nobody declared.
+
+**The new event.** A colour that moves inside a standing period is an UPDATE of that period plus a
+new `system_event_log` row, `alert.level_changed`, written in the same transaction, with payload
+`{ alertPeriodId, locationId, level, previousLevel, kind, previousKind, changedAt }`. It is not
+`alert.started` and not `alert.ended`: the period is the same one, no all-clear happened, and the
+reader must not receive a second «🔴 Повітряна тривога». `alert.started` gained `level` and `kind`
+(both nullable); `alert.ended` is unchanged and never names a colour — a message saying the alert is
+over cannot also describe its intensity.
+
+Downstream, `alert.level_changed` becomes its own notification type, `alert_level_change`, fanned
+out only to chats that were already told about that period. Escalations (colour up, colour appearing,
+or the kind gaining missiles) are `protected` and sound like an alert start; de-escalations and
+sideways kind changes are `soft` and silent, and neither is ever worded as an all-clear. The Telegram
+shapes and the operator view are in docs/OPERATIONS.md.
+
 ### Threat de-escalation: who still says a threat is happening
 
 A threat event used to fade on one mechanism only — a 30-minute validity timer that every new
@@ -591,6 +643,81 @@ naming no place. All 116 messages the archive contains with a real weapon sense 
 авіаційних бомб» — kept their class, their locations and their significance unchanged. The gold
 corpus measures identically to `v5` on all three axes.
 
+### The report that names no weapon (`v7`)
+
+The gold corpus said where the remaining recall went, and it said it with one number: **all thirteen**
+missed warnings were rejected for the same reason, `not_an_assertion`, and all thirteen were the same
+shape. «Київщина: 6 на Бровари зі сходу». «Ціль на Київ». «Швидкісна на Київ». «Курс Бородянка».
+«Вишгород, до вас намагаються летіти». «Дніпро увага з Заходу». «🛵Житомирщина: знову на Андрушівку —
+Озерне». Thirteen of the 136 genuinely significant messages in the sample — **9.6 %** — and the most
+urgent kind the monitoring channels write: one short line naming the city a target is heading for
+*now*. The weapon is established by the channel's own context — its bulletin prefix, its previous
+post, its subject — and the rules read text, not context.
+
+They are read as context indicators with an empty `threatTypes`, so the event is raised as `unknown`
+(«Повідомлення про загрозу»). Naming a class would mean reading it off a pictogram or off the
+previous message, which is the inference this module is forbidden to make — the same trade the arrow
+bulletin and «ракета без уточнення типу» already made. Like every context indicator, each one fires
+only beside a resolved Ukrainian place, and beyond that each branch carries its own structural lock
+rather than a topic: a capitalised word after a bare «курс» (a case-sensitive regex, which is exactly
+the condition under which the `REPORTED_DIRECTION` comment says that branch could come back), a
+numeral and a preposition before a name, «знову на …», «увага з …», the 🛵 bulletin prefix — 46
+messages in the corpus carry it and all 46 are real warnings — and, for the widest branch («на
+<Місто>»), a second lock requiring motion stated *forward* in time, which is what keeps «через нічну
+атаку на Броварах пошкоджено» out.
+
+Beside them, one guard was narrowed rather than widened: a threat named together with its launch
+point across the border — «Триває загроза балістики з Брянська» — is no longer suppressed by the
+foreign-place guard. The foreign name there is in the ablative after «з»: it is where the threat is
+coming from, not what the message is about, and suppressing it discarded the earliest warning that
+exists, the one that arrives before launch. The case the guard was written for — «над Курськом
+працює ППО» — has neither a threat word nor an origin preposition and stays suppressed.
+
+Measured on the same corpus: significance **R 90.4 % → 98.5 %** (13 misses → 2), locations
+**R 93.1 % → 99.2 %** (18 → 2), precision unchanged at **100 %** with zero false positives. The one
+price is threat-class accuracy, 100 % → 99.3 %: one newly-found message reads `unknown` where the
+reviewer named `cruise_missile`. A warning with no class beats no warning. The two remaining misses
+are not rule problems — «На Трою» needs a slang alias in the catalogue, and «Окрім дронів біля
+Лозова нічого нема» is a negation the reviewer and the rules read differently.
+
+The `v6 → v7` replay over the production archive (snapshot 01.09.2026, **32 192** messages carrying a
+`v6` verdict, 9 076 of them raised) lost **0** — and that is a property rather than a result, because
+an added indicator can only add significance. It newly raises **2 631**: **1 463** that stand in the
+archive under exactly one refusal — `unrecognized` with `ignored_reason='not_an_assertion'`, and no
+other bucket at all — which are real warnings this system read and threw away; and **1 166** whose
+refusal belonged to the restatement-coalescing layer rather than to the classifier, which in
+production would still coalesce. The window is 22 days (2026-08-10 …
+2026-08-31), so the recovered traffic is of the order of **66 warnings a day**, and the number to
+watch fall is `threatlens_classification_rejections_total{reason="not_an_assertion"}`.
+
+**What that replay does and does not say about precision.** The 100 % figure above is measured on the
+hand-labelled corpus; the 1 463 are not labelled, so no precision number may be claimed for them. Two
+things about them *are* measured. First, the retrospective veto is intact: of the messages `v6`
+archived as `ignored_retrospective`, **zero** are raised by `v7` — the new indicators do not rescue a
+summary of last night from the `v5` protection, and the two rows that do move were archived by the
+MODEL gate (`retrospective_model`), not by the rules. Second, every one of the 1 463 replaces exactly
+one refusal — `not_an_assertion` — which is the class this change targets and not a widening into
+some other refusal. Thirty of them were then read by hand: «🛵 На Славутич», «Ціль на Полтаву»,
+«Сумщина: 2 на Улянівку», «1 на Вишневе з півдня 1 на Бориспіль» — live warnings naming a place, with
+no analytics digest among them. The one borderline read was «Сумщина: 3 на Ворожбу 14:50 - зникли»,
+which raises a threat for a target the same line says has gone; it is the shape a future
+de-escalation rule would take, not a case the indicator can tell apart.
+
+**A false-positive class this measurement surfaced, older than `v7` and still open.** The evening
+forecast bulletin — «Вечірня аналітика, станом на 23:05 08.08.2026. Коротко: передумов до масованого
+комбінованого ракетного удару цієї ночі наразі немає…» — classifies as a **significant** threat over
+five to eight oblasts and cities. It is not a `v7` regression: `v6` raises it too, through
+`активність МіГ-31К` plus `ракета без уточнення типу`, both of which predate this change, and the
+only thing keeping it off a reader's screen is the restatement-coalescing window — a suppression
+layer, not a judgement. The retrospective veto does not mark it at all (`retrospective: undefined`)
+and correctly so: the message is written in the present and about the night ahead, which is exactly
+what that veto is forbidden to touch. So the message says there are no preconditions tonight and the
+classifier reads it as a country-wide warning, because it names a launch platform and a weapon noun
+in a sentence that denies both. Closing it needs a rule about the FRAME («аналітика», «коротко»,
+«передумов немає» beside a forecast horizon), not another indicator, and the archive has enough of
+these bulletins to label a sample first. Recorded here rather than fixed in a change whose whole
+claim is that it only adds recall.
+
 ### Classification archive
 
 `source_messages` keeps the raw text and one `processing_status` word; everything the classifier
@@ -652,6 +779,14 @@ for that change was to show the narrowing cost nothing rather than to score it. 
 the fixture is a labelled sample of one snapshot and a message from outside it has no place in the
 counts the header pins.
 
+`v7` is the first change since `v4` whose whole purpose is recall, and it is the largest single move
+the corpus has recorded: significance **R 90.4 % → 98.5 %**, locations **R 93.1 % → 99.2 %**,
+precision unchanged on both axes and the zero-false-positive assertion still zero. The floors moved
+with it — significance recall 0.90 → 0.97, location recall 0.93 → 0.98 — so the gain is pinned and
+not merely observed. Threat-class accuracy fell 100 % → 99.3 %, which is the honest price of reading
+messages that name no weapon: they raise `unknown`, and one of them had a class the reviewer could
+infer and the rules may not.
+
 The fixture separates two things that used to be one number. `assertsThreat` is the reviewer's
 reading of the text; `significant` additionally requires that the place named exists in the location
 catalogue. Twenty-one of the 191 were correct reports about settlements the catalogue did not hold —
@@ -664,10 +799,13 @@ than names in `outsideCatalogue`, and one message is left in the gap column.
 **Watching it in production.** `threatlens_classifications_total{version,decision}` carries the
 classifier version, so a version bump appears on the dashboard as one series ending and another
 beginning instead of as an unexplained shift in the decision mix.
-`threatlens_classification_rejections_total{source,reason}` splits the two reasons a message raises
+`threatlens_classification_rejections_total{source,reason}` splits the reasons a message raises
 nothing, which are fixed in different files: `no_threat_recognised` concentrated on one channel means
 its vocabulary drifted away from `src/domain/classifier.ts`, `no_location` means the catalogue is
-missing its settlements. `threatlens_threat_to_de_escalation_total{source,version}` counts only the
+missing its settlements — and in `codex` mode `model_not_significant` means the model, not the rules,
+refused it, which is a statement about the model rather than about the channel and would be
+unreadable folded into `not_an_assertion`. `retrospective_model` is its sibling: the grey-band gate
+archived the message. `threatlens_threat_to_de_escalation_total{source,version}` counts only the
 withdrawals that actually ended a live event — the dangerous direction, and the one a rule change
 must never start producing quietly. `threatlens_shadow_attempts_total` and
 `threatlens_shadow_outcomes_total{status,reason}` give shadow coverage as a query
@@ -1027,12 +1165,56 @@ flowchart LR
   Outbox --> Telegram[Telegram delivery]
 ```
 
+### The channel collector: two transports, one routing table
+
+The public Telegram channels in the source registry are read by one collector per process, over one
+of two transports chosen at start by `TELEGRAM_TRANSPORT`:
+
+- **`web`** (default since 2026-09-22, `src/sources/telegram-web.ts`) polls the public preview
+  `https://t.me/s/<username>`. No account, no session, no subscription. It exists because the other
+  transport's single point of failure materialised: the collector's user session died on 2026-09-02
+  (`AUTH_KEY_UNREGISTERED`) and not one channel message was ingested for twenty days.
+- **`mtproto`** (`src/sources/telegram.ts`) receives pushed updates over a user session. Kept
+  selectable: it sees media the preview does not render and learns of a post without polling for it.
+
+Everything that decides WHAT happens to a message is shared, not per transport: `resolveChannelRoutes`
+(an alert channel reaches `ingestAlertChannelMessages` and nothing else, a classifier channel reaches
+`processMessage` and nothing else), the single `telegramCollectorStatus()` that `/health/ready`, `/ops`
+and source health read (`collector.transport` names the producer), the Ops reload hook, the rule for
+who downloads media, and the `BackfillPort` below. Only how bytes arrive differs, and with it two jobs
+the push transport never had to do by hand:
+
+- **A cursor per channel.** The first page is read without `after` (the newest ≤20 posts) and only
+  what the archive does not already hold is delivered, so a restart does not re-classify what was
+  read; a gap to the archive of at most 200 messages is walked forward in order. After that
+  `?after=<last id>`, with a full page (or the page's own «newer» link) read again at once, at most
+  ten pages per cycle. For an alert channel the first page is the reconnect window and is ingested as
+  ONE batch, bounded by `ALERT_CHANNEL_BACKFILL_*` like the MTProto window; every later page is one
+  batch too, which for the usual single post is exactly the MTProto live call.
+- **Edit detection.** The preview has no «edited since» query, so the newest page is re-read once a
+  minute per channel — replacing, not adding to, that channel's poll — and a known post whose text
+  digest moved AND which the page marks «edited» is re-processed with its original publication time,
+  the `EditedMessage` semantics.
+
+The request budget is a measurement, not a guess: 354 requests at six per second for sixty seconds
+from the production host, all 200, p95 0.41 s. So six per second, evenly spaced, at most four in
+flight; channels that published in the last half hour polled every 5 s, the rest every 30 s. A 429 or
+5xx pauses every request (`Retry-After`, else 30 s doubling to 15 min) and reads as `flood_wait`. A
+handle with no readable preview — 404, a redirect off `t.me/s`, or a page whose messages the parser
+cannot read, which is what a markup change looks like — is `unresolved`, never «nothing new».
+Freshness is claimed per channel, only for a page read in the last 90 s.
+
 ### Catch-up backfill for classifier sources
 
 After a restart or a long disconnect the collector resumes at the live edge of every channel: whatever
 was published while the process was down is never read. `src/services/source-backfill.ts` closes that
 gap for the classifier sources — the OSINT monitors and the Air Force channel — and it is a second,
-separate loop from the alert-channel reconnect read in `src/sources/telegram.ts`. The separation is
+separate loop from the alert-channel reconnect read of either transport. Both transports implement its
+port: MTProto pages `getMessages`, the web transport pages `?before=` through the same request budget
+and backoff as its live polls. Under `web` the first live page lands the newest posts at once, and the
+sweep measures its gap from the archive's newest message — so after an outage wider than the
+200-message forward walk, the stretch between the old archive edge and that first page is read by
+neither; the collector logs it as a WARN with the count instead of pretending it is closed. The separation is
 structural: the service consumes a `BackfillPort` whose `routes()` yields classifier routes only, it
 imports nothing from `teleproto` or the collector, and every database statement it runs is additionally
 scoped to `adapter_type IN ('mtproto','mtproto_monitor')`. `ALERT_CHANNEL_BACKFILL_*` is untouched.

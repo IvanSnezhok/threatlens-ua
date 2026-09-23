@@ -1,7 +1,7 @@
-import { createHash } from 'node:crypto';
 import { readdirSync } from 'node:fs';
 import { resolve } from 'node:path';
-import Fastify, { type FastifyReply, type FastifyRequest } from 'fastify';
+import Fastify, { LogController, type FastifyRequest } from 'fastify';
+import { stdSerializers } from 'pino';
 import rateLimit from '@fastify/rate-limit';
 import fastifyStatic from '@fastify/static';
 import { Registry, collectDefaultMetrics, Counter, Gauge, Histogram } from 'prom-client';
@@ -10,6 +10,7 @@ import { pool } from '../db/pool.js';
 import { composeTerritoryStates } from '../domain/territory-state.js';
 import { activeAlerts, assessmentDetails, currentAssessments, liveThreats, locationTimeline, relatedLocationsCte, territoryAncestry, threatDetails } from '../repositories/events.js';
 import { createEventRelay, eventHub, publishedEnvelope, type SystemEvent } from '../services/sse.js';
+import { deliverableRun } from '../services/event-log-cursor.js';
 import { activeOriginZones } from '../services/origin-activity.js';
 import { delaySecondsFor, observeSseDeliveryLag, publicationSlice, registerPublicationMetrics, sliceMeta } from '../services/publication.js';
 import { registerAnalyticsSchedulerMetrics } from '../services/analytics-scheduler.js';
@@ -29,6 +30,7 @@ import { telegramDeliveryGovernorStatus } from '../bot/delivery-governor.js';
 import { resolveRuntimeSettings } from '../services/runtime-settings.js';
 import { registerAlertChannelMetrics } from '../services/ingestion.js';
 import { registerTelegramCollectorMetrics, telegramCollectorStatus } from '../sources/telegram.js';
+import { cacheControlOverride, cachedBody, sendCached, strongEtag } from './http-cache.js';
 import { hasValidOpsAuth, opsUnauthorized, safeEqual } from './ops-auth.js';
 import analyticsRoutes from './analytics-routes.js';
 import attackAnalyticsRoutes from './attack-analytics-routes.js';
@@ -66,17 +68,20 @@ const locationIdPattern = /^[a-z0-9-]{1,64}$/i;
  * This used to be a map of five source ids. The catalogue is now dozens of rows and grows by
  * migration alone, so an id list would silently classify every new source as configured and the ops
  * page would report sources as healthy-but-idle that nothing is even subscribed to. What decides
- * the answer is the adapter's prerequisite: every MTProto adapter needs the one set of API
- * credentials, each polled API needs its own token, and the demo source follows its flag.
+ * the answer is the adapter's prerequisite: every Telegram adapter needs the one set of MTProto
+ * credentials under `TELEGRAM_TRANSPORT=mtproto` and nothing at all under `web` (the public preview
+ * is read without an account), each polled API needs its own token, and the demo source follows its
+ * flag.
  */
 function sourceIsConfigured(row: { id: string; adapter_type: string | null; enabled: boolean }): boolean {
   if (!row.enabled) return false;
-  const mtproto = Boolean(config.TELEGRAM_API_ID && config.TELEGRAM_API_HASH && config.TELEGRAM_SESSION);
+  const telegram = config.TELEGRAM_TRANSPORT === 'web'
+    || Boolean(config.TELEGRAM_API_ID && config.TELEGRAM_API_HASH && config.TELEGRAM_SESSION);
   switch (row.adapter_type) {
     case 'mtproto':
     case 'mtproto_alert_channel':
     case 'mtproto_monitor':
-      return mtproto;
+      return telegram;
     case 'ukraine_alarm': return Boolean(config.UKRAINE_ALARM_API_TOKEN);
     case 'alerts_in_ua': return Boolean(config.ALERTS_IN_UA_TOKEN);
     case 'demo': return config.DEMO_SOURCE_ENABLED;
@@ -85,107 +90,8 @@ function sourceIsConfigured(row: { id: string; adapter_type: string | null; enab
   }
 }
 
-/** Adapter types the MTProto collector, and only the MTProto collector, is responsible for. */
+/** Adapter types the Telegram channel collector — either transport — and only it is responsible for. */
 const MTPROTO_ADAPTERS = new Set(['mtproto', 'mtproto_alert_channel', 'mtproto_monitor']);
-
-// ------------------------------------------------------------------------------------------------
-// HTTP caching for the public read routes declared in this file
-// ------------------------------------------------------------------------------------------------
-
-/**
- * Per-reply override for the server-wide `Cache-Control: no-store`.
- *
- * `occupation-routes.ts` and `attack-analytics-routes.ts` solve the same problem with a child `onSend`
- * hook, because they are encapsulated plugins and a child hook runs after the inherited one. The two
- * routes below are declared directly on the root instance, where that trick is unavailable — a root
- * hook has nothing to run after. So the root hook itself reads the override, and every route that
- * does not set it keeps `no-store`, byte for byte as before.
- */
-const CACHE_CONTROL = Symbol('cacheControl');
-
-function setCacheControl(reply: FastifyReply, value: string): void {
-  (reply as unknown as Record<symbol, string>)[CACHE_CONTROL] = value;
-}
-
-/** RFC 9110 §8.8.3.2 weak comparison — the only comparison `If-None-Match` is defined to use. */
-function etagMatches(header: string, etag: string): boolean {
-  if (header.trim() === '*') return true;
-  const normalize = (value: string) => value.trim().replace(/^W\//, '');
-  const wanted = normalize(etag);
-  return header.split(',').some((candidate) => normalize(candidate) === wanted);
-}
-
-function ifNoneMatch(request: FastifyRequest, etag: string): boolean {
-  const header = request.headers['if-none-match'];
-  const value = Array.isArray(header) ? header[0] : header;
-  return Boolean(value) && etagMatches(value, etag);
-}
-
-/**
- * A body already committed to bytes, with everything a conditional GET needs.
- *
- * The SERIALISED body is what is held, never the row objects: both routes below answer with
- * megabytes, and caching the rows would still pay `JSON.stringify` per request and would still let
- * the old-space high-water mark grow with every coinciding request.
- *
- * A `Buffer`, not a string, and that is the difference between the memo bounding memory and merely
- * bounding CPU. `socket.write(string)` ENCODES, so a cached string is copied to fresh bytes once per
- * reader; `socket.write(buffer)` queues the buffer by reference, so every reader of a burst shares
- * the one allocation. Measured with `scripts/memory-benchmark.ts` against a 31 000-row catalogue
- * (3.84 MiB body): 100 coinciding readers took the old-space high-water mark to 815 MiB as strings
- * — past `--max-old-space-size=640` and fatal — against 39 MiB as a buffer. The route was safe for
- * many concurrent readers in statements long before it was safe in bytes.
- */
-interface CachedBody {
-  body: Buffer;
-  /** Strong validator: the bytes are hashed, so equality really is byte equality. */
-  etag: string;
-  expiresAt: number;
-  cacheControl: string;
-}
-
-function strongEtag(body: Buffer): string {
-  return `"${createHash('sha1').update(body).digest('base64url')}"`;
-}
-
-/**
- * A memo that is also a single flight.
- *
- * The single flight is the half that matters for «безпечно для багатьох одночасних читачів»: without
- * it, N readers arriving inside one computation each run the whole computation, so a refresh burst
- * multiplies the pool load by N exactly when the pool is least able to absorb it. With it, at most
- * one computation is ever in the air and the N−1 late arrivals await the same promise — which is
- * sound here because both bodies are pure functions of database state read at a single instant, and
- * the publication cutoff is monotonic (`GREATEST(now() - delay, mode_changed_at)`), so a shared
- * answer is always an EARLIER valid slice, never a later one. Serving something slightly older can
- * never publish held material; only serving something newer could, and nothing here can.
- *
- * A rejected load is not cached and does not stick: the flight is cleared in `finally`, so the next
- * request retries rather than inheriting a failure for the length of the TTL.
- */
-function cachedBody(load: () => Promise<CachedBody>): () => Promise<CachedBody> {
-  let cached: CachedBody | null = null;
-  let inFlight: Promise<CachedBody> | null = null;
-  return () => {
-    if (cached && Date.now() < cached.expiresAt) return Promise.resolve(cached);
-    if (inFlight) return inFlight;
-    const flight = load().then((view) => { cached = view; return view; });
-    inFlight = flight;
-    // `catch` before `finally` so this bookkeeping chain can never surface as an unhandled rejection;
-    // the rejection itself still reaches every caller through `flight`.
-    void flight.catch(() => undefined).finally(() => { if (inFlight === flight) inFlight = null; });
-    return flight;
-  };
-}
-
-/** 304 when the client already holds these bytes, the bytes themselves otherwise. */
-function sendCached(request: FastifyRequest, reply: FastifyReply, view: CachedBody) {
-  setCacheControl(reply, view.cacheControl);
-  reply.header('ETag', view.etag);
-  reply.header('Vary', 'Accept-Encoding');
-  if (ifNoneMatch(request, view.etag)) return reply.code(304).send();
-  return reply.type('application/json; charset=utf-8').send(view.body);
-}
 
 /**
  * One serialisation per live event, not one per connection.
@@ -194,17 +100,56 @@ function sendCached(request: FastifyRequest, reply: FastifyReply, view: CachedBo
  * `JSON.stringify` 500 times over the same object for the same bytes — per event, at up to one tick
  * a second. Keyed on the envelope identity, so the entry dies with the event and a reconnect
  * backfill (whose envelopes are built per connection) simply misses and pays what it always paid.
+ *
+ * A `Buffer`, and for the same reason the cached bodies in `./http-cache.ts` are buffers:
+ * `socket.write(string)` utf8-ENCODES into a fresh allocation on every call, so a memoised STRING
+ * still cost one encode and one copy per open stream per event — 500 of each at the stream ceiling,
+ * for bytes that were already identical. A buffer is queued by reference, so the frame is built
+ * once and every stream writes that one allocation.
  */
-const liveFrames = new WeakMap<SystemEvent, string>();
+const liveFrames = new WeakMap<SystemEvent, Buffer>();
 
-function sseFrame(event: SystemEvent): string {
+function sseFrame(event: SystemEvent): Buffer {
   let frame = liveFrames.get(event);
   if (frame === undefined) {
-    frame = `id: ${event.version}\nevent: ${event.eventType}\ndata: ${JSON.stringify(event)}\n\n`;
+    frame = Buffer.from(`id: ${event.version}\nevent: ${event.eventType}\ndata: ${JSON.stringify(event)}\n\n`);
     liveFrames.set(event, frame);
   }
   return frame;
 }
+
+/**
+ * Кадр підтримки звʼязку — один на процес, бо він щоразу однаковий.
+ *
+ * У ньому стояв `Date.now()`, і саме мітка робила кожен кадр окремим рядком, окремим кодуванням у
+ * utf8 і окремою аллокацією: на межі у 500 стрімів це 33 кадри за секунду, кожен зібраний з нуля.
+ * Мітка при цьому нічого не стверджувала — це SSE-коментар, він не доходить до жодного обробника
+ * EventSource, а вік даних клієнт рахує з `publishedAt` справжніх кадрів. Тут важить лише те, що
+ * байти пройшли крізь проксі й сокет живий.
+ */
+const SSE_HEARTBEAT = Buffer.from(': heartbeat\n\n');
+
+/**
+ * How slow a response has to be before it is worth a line of its own.
+ *
+ * Fastify logs `incoming request` and `request completed` for EVERY request, synchronously, to an
+ * fd nothing in this deployment rotates — and the map refetches the snapshot on every SSE event, so
+ * an alert turns that into hundreds of synchronous writes a second on the hot path. Both lines are
+ * switched off by the `logController` below; what they carried in aggregate is exactly what
+ * `threatlens_http_requests_total` and `threatlens_http_duration_seconds` already carry, in bounded
+ * space. Half a second is roughly ten times the snapshot under load, so a line here means an event
+ * rather than a normal day.
+ */
+const SLOW_REQUEST_MS = 500;
+
+/**
+ * The monotonic instant a request entered the server, stamped by the `onRequest` hook.
+ *
+ * A local intersection rather than a `declare module 'fastify'` augmentation: the field lives
+ * between two hooks of this one server and nowhere else, and widening the framework's own request
+ * type project-wide would advertise it to every module that touches a request.
+ */
+type TimedRequest = FastifyRequest & { startedAt: number };
 
 /**
  * Ceiling on the snapshot memo, enforced here rather than trusted to callers.
@@ -304,11 +249,13 @@ export async function buildServer(options: BuildServerOptions = {}) {
   registerTelegramCollectorMetrics(registry);
   registerDeploymentMetrics(registry);
   registerBackfillMetrics(registry);
-  // `threatlens_analytical_outcomes_total{outcome}` — what became of the events the model was
-  // allowed to publish — and `threatlens_analytical_outcomes_pending`, the backlog that separates
-  // «promotion is switched off, so there is nothing to score» from «the evaluator stopped running
-  // and the precision on /ops has been frozen since». Without this line the only calibration
-  // evidence for `ANALYTICAL_THREAT_MIN_CONFIDENCE` lives behind an operator's manual refresh.
+  // `threatlens_analytical_outcomes_total{population,outcome}` — what became of the events a model
+  // verdict created, split by the floor that let each one out (promotion vs codex-primary) — and
+  // `threatlens_analytical_outcomes_pending{population}`, the backlog that separates «the mode is
+  // switched off, so there is nothing to score» from «the evaluator stopped running and the
+  // precision on /ops has been frozen since». Without this line the only calibration evidence for
+  // `ANALYTICAL_THREAT_MIN_CONFIDENCE` and `CODEX_PRIMARY_MIN_CONFIDENCE` lives behind an
+  // operator's manual refresh.
   registerAnalyticalOutcomeMetrics(registry);
   // `threatlens_app_settings_read_failures_total` (a boot that fell back to `.env`) and
   // `threatlens_app_settings_overrides` (how many settings the database is currently deciding).
@@ -348,15 +295,54 @@ export async function buildServer(options: BuildServerOptions = {}) {
   // мовчали канали, чи мовчимо ми.
   registerAttackDebriefMetrics(registry);
 
-  const app = Fastify({ logger: { level: config.NODE_ENV === 'development' ? 'debug' : 'info' }, trustProxy: true });
+  const app = Fastify({
+    logger: {
+      level: config.NODE_ENV === 'development' ? 'debug' : 'info',
+      // `error` is this codebase's key for a caught error — `log.error({ error }, …)` at forty-odd
+      // call sites, and the key the deployer's own logger already unpacks by hand. pino serializes
+      // only `err` out of the box, and an `Error` has no enumerable own properties, so every one of
+      // those lines printed `"error":{}`: 22.09.2026 the alerts.in.ua leg failed on every poll with
+      // the reason visible only in `sources.last_error`. Registering the stock `err` serializer
+      // under the house key fixes all of them at once; it returns a non-Error value unchanged, so
+      // the call sites that already log `String(error)` are unaffected. Merged with Fastify's own
+      // `req`/`res`/`err` serializers, and inherited by `request.log` children.
+      serializers: { error: stdSerializers.err }
+    },
+    trustProxy: true,
+    // Two synchronous writes to fd 1 per request, replaced by the one line the `onResponse` hook
+    // below writes when something actually happened. See {@link SLOW_REQUEST_MS}.
+    //
+    // Through `logController` rather than the top-level `disableRequestLogging`: Fastify 5 emits
+    // FSTDEP023 for the latter and drops it in 6, and a deprecation warning on every boot is its
+    // own kind of log noise.
+    logController: new LogController({ disableRequestLogging: true })
+  });
   await app.register(rateLimit, { max: 300, timeWindow: '1 minute' });
-  await app.register(fastifyStatic, { root: resolve(process.cwd(), 'public'), prefix: '/' });
+  // `preCompressed`: `scripts/precompress-static.mjs` writes `.br`/`.gz` siblings for
+  // `public/assets/app.js` (1.4 MiB) and `app.css`, and the `Dockerfile` runs it after the web
+  // build, so the image ships them. With this on, a client that sent `Accept-Encoding: br` gets the
+  // sibling by `stat` and `sendfile`, and Caddy's site-wide `encode` sees an already-encoded
+  // response and passes it through instead of gzipping a megabyte per cold request (~13.5 ms of
+  // Caddy CPU each, measured for the same-sized raion layer). Without the option the siblings would
+  // sit on disk unread; without the siblings the option is inert, so neither half works alone.
+  await app.register(fastifyStatic, { root: resolve(process.cwd(), 'public'), prefix: '/', preCompressed: true });
 
-  app.addHook('onRequest', async (request) => { (request as any).startedAt = performance.now(); });
+  app.addHook('onRequest', async (request) => { (request as TimedRequest).startedAt = performance.now(); });
   app.addHook('onResponse', async (request, reply) => {
     const route = request.routeOptions.url ?? 'unknown';
+    const durationMs = performance.now() - (request as TimedRequest).startedAt;
     httpRequests.inc({ method: request.method, route, status: reply.statusCode });
-    httpDuration.observe({ route }, (performance.now() - (request as any).startedAt) / 1000);
+    httpDuration.observe({ route }, durationMs / 1000);
+    // Machines poll `/health/*` and `/metrics` on a fixed cadence, and a `not_ready` 503 during a
+    // rollout is an expected steady state rather than an incident — logging those would let a probe
+    // write a line per poll for as long as a migration takes. Their aggregate is
+    // `threatlens_http_requests_total{route,status}`, which exists for exactly this reading.
+    if (route.startsWith('/health/') || route === '/metrics') return;
+    if (reply.statusCode < 400 && durationMs < SLOW_REQUEST_MS) return;
+    request.log.warn(
+      { method: request.method, url: request.url, route, status: reply.statusCode, durationMs: Math.round(durationMs) },
+      'request'
+    );
   });
   app.addHook('onSend', async (_request, reply, payload) => {
     reply.header('X-Content-Type-Options', 'nosniff');
@@ -364,7 +350,7 @@ export async function buildServer(options: BuildServerOptions = {}) {
     reply.header('Permissions-Policy', 'geolocation=(), microphone=(), camera=()');
     // The override is honoured whatever the content type is, because a 304 carries none — and a 304
     // that inherited `no-store` would tell the client to throw away the very bytes it just revalidated.
-    const override = (reply as unknown as Record<symbol, string | undefined>)[CACHE_CONTROL];
+    const override = cacheControlOverride(reply);
     if (override) reply.header('Cache-Control', override);
     else if (reply.getHeader('content-type')?.toString().includes('application/json')) reply.header('Cache-Control', 'no-store');
     return payload;
@@ -737,6 +723,24 @@ export async function buildServer(options: BuildServerOptions = {}) {
   // інтервалом і буфером запису. 500 × 512 КіБ обмежує найгірший випадок завислих стрімів 256 МіБ.
   const SSE_MAX_STREAMS = 500;
   let openSseStreams = 0;
+  /**
+   * Один тікер на процес замість одного на зʼєднання.
+   *
+   * Кадр у heartbeat один і той самий — константний Buffer вище, — а стріми живуть годинами, тож
+   * пʼятсот окремих `setInterval` давали пʼятсот таймерів у черзі подій заради пʼятисот записів по
+   * тринадцять байтів кожні пʼятнадцять секунд. Таймер тут один, а множина тримає саме `writeFrame`
+   * кожного відкритого стріму: вона ж і є реєстром живих писачів, і вихід із неї стається в тому
+   * самому `cleanup`, що знімає слухача хаба.
+   *
+   * Розкиду фаз більше немає — усі пʼятсот записів припадають на один тік. Це 6.5 КіБ раз на
+   * пʼятнадцять секунд: менше, ніж один кадр події, заради якої стрім існує.
+   */
+  const sseHeartbeatWriters = new Set<(frame: Buffer) => void>();
+  const sseHeartbeat = setInterval(() => {
+    for (const write of sseHeartbeatWriters) write(SSE_HEARTBEAT);
+  }, 15_000);
+  sseHeartbeat.unref();
+  app.addHook('onClose', async () => { clearInterval(sseHeartbeat); sseHeartbeatWriters.clear(); });
   app.get<{ Querystring: { since?: string } }>('/api/v1/stream', async (request, reply) => {
     if (openSseStreams >= SSE_MAX_STREAMS) {
       return reply.code(503).header('Retry-After', '30').send({ error: 'stream_capacity' });
@@ -755,7 +759,7 @@ export async function buildServer(options: BuildServerOptions = {}) {
     // `slice.cutoffVersion`, so this cannot leak past the cutoff.
     const lastEventId = Math.max(0, Number(request.headers['last-event-id'] ?? request.query.since ?? 0) || 0);
     let closed = false;
-    const writeFrame = (frame: string) => {
+    const writeFrame = (frame: string | Buffer) => {
       if (closed) return;
       reply.raw.write(frame);
       // `write()` повертає false задовго до реальної небезпеки; рветься зʼєднання лише коли сокет
@@ -781,11 +785,11 @@ export async function buildServer(options: BuildServerOptions = {}) {
     // stream, so the bytes are built once per event instead of once per event per connection.
     const relay = createEventRelay(lastEventId, (event) => { writeFrame(sseFrame(event)); });
     const send = (event: SystemEvent) => relay.buffer(event);
-    const heartbeat = setInterval(() => writeFrame(`: heartbeat ${Date.now()}\n\n`), 15_000);
+    sseHeartbeatWriters.add(writeFrame);
     eventHub.on('event', send);
     const cleanup = () => {
       if (closed) return;
-      closed = true; clearInterval(heartbeat); eventHub.off('event', send);
+      closed = true; sseHeartbeatWriters.delete(writeFrame); eventHub.off('event', send);
       openSseStreams -= 1; sseConnections.dec();
     };
     request.raw.on('close', cleanup);
@@ -803,12 +807,21 @@ export async function buildServer(options: BuildServerOptions = {}) {
     })}\n\n`);
     try {
       if (lastEventId) {
-        const missed = await pool.query(
+        const missed = await pool.query<{ version: string; event_type: string; payload: unknown; created_at: Date }>(
           `SELECT version,event_type,payload,created_at FROM system_event_log
            WHERE version > $1 AND version <= $2 ORDER BY version LIMIT 500`, [lastEventId, slice.cutoffVersion]
         );
         const releasedAt = new Date();
-        for (const row of missed.rows) {
+        // The SAME contiguous-run rule the hub applies to the live feed, and for the same reason:
+        // `version` is assigned on INSERT and the row appears on COMMIT, so a long write
+        // transaction (`persistOfficialAlertSnapshot`) commits a LOW version after a short
+        // transaction has already committed a higher one. Iterating `missed.rows` raw delivered the
+        // visible high version, and `createEventRelay` only ever moves forward — so the low version,
+        // appearing a second later but still below `slice.cutoffVersion`, was below this client's
+        // cursor and was skipped for it PERMANENTLY. That is the alert.started this connection would
+        // never receive. Stopping before the gap costs at most `EVENT_LOG_GAP_GRACE_MS` of
+        // staleness, and the versions past it arrive on the live feed the relay is already buffering.
+        for (const row of deliverableRun(missed.rows, lastEventId, releasedAt.getTime(), 'sse_backfill')) {
           observeSseDeliveryLag('backfill', (releasedAt.getTime() - row.created_at.getTime()) / 1000);
           relay.deliver(publishedEnvelope(row, slice.mode, releasedAt));
         }
