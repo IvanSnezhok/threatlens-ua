@@ -6,7 +6,7 @@ import {
   CLASSIFIER_VERSION, significanceRejection, type LocationLexeme
 } from '../domain/classifier.js';
 import { THREAT_LABELS, resolveModelPlace } from '../domain/model-place.js';
-import { describeAge, momentIn } from '../domain/threat-timing.js';
+import { describeAge, momentIn, type ThreatTiming } from '../domain/threat-timing.js';
 import { cachedLocationLexemes, ingestThreat } from '../repositories/events.js';
 import { THREAT_TYPES, type ClassifiedMessage, type NormalizedMessage } from '../types.js';
 import {
@@ -112,13 +112,53 @@ const TEXT_LIMIT = 2000;
 // Agreement
 // ------------------------------------------------------------------------------------------------
 
-export type DisagreementField = 'threat_type' | 'locations' | 'significance';
+/**
+ * Осі, на яких два вердикти можуть розійтися.
+ *
+ * П'ять, а не три. `significance`, `threat_type` і `locations` були тут від міграції 020, бо тоді
+ * модель більшого й не казала. Міграція 039 додала в `model_analysis` `directionText` і
+ * `threatState`, міграція 049 — `timing` і `probability`, і рівно ці поля є тим, заради чого існує
+ * режим `classifier_mode=codex`: «коли» і «куди» — це те, що правила прочитати не вміють. Доти їх
+ * не порівнювало НІЩО, тож відсоток згоди з `/ops/shadow-classifier` був згодою про клас і
+ * значущість, а читався як загальна точність моделі.
+ *
+ * `probability` навмисно не тут: у правил немає поля, з яким її порівнювати — вони не оцінюють
+ * ймовірності взагалі (міграція 049: «NULL — правила не оцінюють ймовірності»), тож будь-яке число
+ * моделі було б розбіжністю з порожнечею. Його калібрують за наслідками
+ * (`./analytical-outcomes.ts`), а не за незгодою з тим, хто про це не висловлюється.
+ */
+export type DisagreementField = 'threat_type' | 'locations' | 'significance' | 'timing' | 'direction';
 
 export interface DeterministicVerdict {
   threatType: string;
   /** Location *names*, not ids: the model never sees the catalogue and cannot return an id. */
   locationNames: string[];
   significant: boolean;
+  /**
+   * Завжди `now`, і це не спрощення, а правило домену: «Подія правил — завжди «зараз»»
+   * (`CONTEXT.md` §Актуальність загрози). Поле існує, щоб порівняння було симетричним і щоб правило
+   * було написане там, де на нього дивляться, а не малося на увазі всередині умови.
+   */
+  timing: ThreatTiming;
+  /** Напрямок, який ПРОЧИТАЛИ правила; `null` — не прочитали жодного. */
+  directionText: string | null;
+}
+
+/**
+ * Модельний бік звірки — рівно ті поля, які порівнюються, і жодного зайвого.
+ *
+ * Структурний тип, а не `ShadowVerdict`, бо {@link disagreementFields} викликають двоє: тінь
+ * (`./shadow-classifier.ts`, вердикт без `timing` — її запит про час не питає) і основний
+ * класифікатор (`./codex-classifier.ts`, вердикт із `timing`). Необов'язковість `timing` — це і є
+ * різниця між ними, виражена в типі: вердикт, який про час не висловлювався, не має права дати
+ * розбіжність про час.
+ */
+export interface ComparedVerdict {
+  threatType: string;
+  locations: string[];
+  significant: boolean;
+  timing?: ThreatTiming;
+  directionText?: string | null;
 }
 
 /**
@@ -167,10 +207,30 @@ function samePlaces(left: string[], right: string[]): boolean {
  * Which axes the two verdicts disagree on. Empty means agreement.
  *
  * Significance is compared first in the report because it is the axis that decides whether anybody
- * is told anything at all; the other two only shape a message that is already going out.
+ * is told anything at all; the others only shape a message that is already going out.
+ *
+ * ## Актуальність
+ *
+ * Правила завжди кажуть «зараз» (див. {@link DeterministicVerdict.timing}), тож ця вісь ловить рівно
+ * один випадок — модель прочитала в повідомленні очікувану загрозу там, де правила підняли живу.
+ * Це не дрібниця оформлення: «увечері очікується» не заливає територію на карті й іде тихим
+ * повідомленням без заклику в укриття (`CONTEXT.md`), тобто різниця між двома вердиктами тут —
+ * різниця між двома різними речами, які скажуть читачеві. Вердикт без `timing` (тінь про час не
+ * питають) не порівнюється: мовчання — не незгода.
+ *
+ * ## Напрямок
+ *
+ * Порівнюється НАЯВНІСТЬ, а не текст. Обидві сторони пишуть напрямок словами — правила витягують
+ * «курсом на Київщину» регулярним виразом, модель переказує те саме своїми («рухається в напрямку
+ * Києва»), — і порівняння рядків дало б розбіжність майже на кожному повідомленні з напрямком,
+ * тобто перетворило б цю вісь на шум і поховало б під ним решту. Відповідь, яку це число має дати,
+ * інша й вужча: чи побачила одна сторона повідомлений рух там, де друга не побачила нічого. Саме
+ * вона й лагодиться — новим шаблоном у правилах, — і саме вона видима як `direction` у `byField`.
+ * Самі два формулювання лежать поруч у списку для читання (`recentDisagreements.model.directionText`),
+ * тож протилежні напрямки при двох непорожніх текстах бачить людина, а не лічильник.
  */
 export function disagreementFields(
-  deterministic: DeterministicVerdict, model: ShadowVerdict
+  deterministic: DeterministicVerdict, model: ComparedVerdict
 ): DisagreementField[] {
   const fields: DisagreementField[] = [];
   if (deterministic.significant !== model.significant) fields.push('significance');
@@ -180,6 +240,8 @@ export function disagreementFields(
   // them as an extra disagreement would double-count the significance one.
   if (deterministic.significant === model.significant
       && !samePlaces(deterministic.locationNames, model.locations)) fields.push('locations');
+  if (model.timing !== undefined && deterministic.timing !== model.timing) fields.push('timing');
+  if (Boolean(deterministic.directionText) !== Boolean(model.directionText)) fields.push('direction');
   return fields;
 }
 
@@ -188,7 +250,9 @@ export function deterministicVerdict(classified: ClassifiedMessage): Determinist
   return {
     threatType: classified.threatType,
     locationNames: classified.locations.map((location) => location.name),
-    significant: significanceRejection(classified) === null
+    significant: significanceRejection(classified) === null,
+    timing: 'now',
+    directionText: classified.directionText ?? null
   };
 }
 
@@ -819,8 +883,39 @@ export interface ShadowAgreementReport {
   agreed: number;
   disagreed: number;
   promoted: number;
-  /** Null rather than zero when nothing was compared: "0% agreement" and "no data" are opposites. */
+  /**
+   * Null rather than zero when nothing was compared: "0% agreement" and "no data" are opposites.
+   *
+   * Рахується з `agrees`, який обчислюється НА ЗАПИСІ, тож у вікні, що накриває цю зміну, живуть
+   * рядки двох поколінь: старі звірені за трьома осями, нові — за п'ятьма ({@link
+   * DisagreementField}). Відсоток тому просяде, і просяде він правильно: те, що осідало в «згоді»
+   * лише через те, що напрямок і актуальність не порівнювало ніщо, тепер видно. Перераховувати
+   * старі рядки нема з чого — вердикт моделі в `model_analysis` є, а те, що прочитали правила про
+   * напрямок, у таблиці не збережено, — і переписувати `agrees` заднім числом означало б змінювати
+   * архів під нову мірку. Вікно за замовчуванням — доба, тож покоління змінюється за добу.
+   */
   agreementPercent: number | null;
+  /**
+   * Наскільки згода про місця тримається на грубому зведенні назв — і наскільки на самих назвах.
+   *
+   * {@link normalizePlace} свідомо грубий і в спірному випадку віддає перевагу ЗГОДІ: він зводить
+   * «Сумщину» й «Сумську область» до однієї основи, а заразом і дещо, що зводити не мав. Ціна цього
+   * вибору досі була невидима — вона ховалася всередині одного відсотка згоди. Ці два числа кладуть
+   * її на стіл: `agreedExact` рахує рядки, де множини назв збіглися БЕЗ жодного зведення, а різниця
+   * між ним і `agreedCoarse` — це рівно те, що купив грубий порівнювач. Росте різниця — росте
+   * оптимізм звіту, і це видно замість того, щоб бути схованим.
+   *
+   * Знаменником є `compared`, а не `total`: місця звіряють лише там, де обидві сторони погодилися
+   * про значущість (див. {@link disagreementFields}), тож рядки, де вони не погодилися, у це
+   * співвідношення не входять взагалі.
+   */
+  locations: {
+    compared: number;
+    agreedCoarse: number;
+    agreedExact: number;
+    /** `agreedCoarse − agreedExact`: згода, яка існує лише завдяки зведенню назв. */
+    coarseOnly: number;
+  };
   byField: Array<{ field: string; count: number }>;
   recentDisagreements: Array<{
     id: string;
@@ -840,9 +935,29 @@ export interface ShadowAgreementReport {
 }
 
 export async function shadowAgreement(windowHours = 24, examples = 10): Promise<ShadowAgreementReport> {
-  const totals = await pool.query<{ total: number; agreed: number; promoted: number }>(
+  const totals = await pool.query<{
+    total: number; agreed: number; promoted: number;
+    locations_compared: number; locations_coarse: number; locations_exact: number;
+  }>(
+    // Один прохід тим самим вікном індексу `shadow_classifications_time_idx`, а не четвертий
+    // рейс: усі шість чисел — це `FILTER` над тим самим набором рядків.
+    //
+    // `agreedExact` рахується В SQL із колонок, які й так зберігаються (`deterministic_locations`,
+    // `model_locations` — text[] від міграції 020), тому воно чесно відповідає і про рядки,
+    // написані до цієї зміни. Нічого нового не пишеться: порівняння обчислюване, а не збережене.
+    // `@>` в обидва боки — це рівність множин: порядок і повтори тут значення не мають, як і в
+    // `samePlaces`, тож єдина різниця між двома числами — саме зведення назв, а не спосіб рахувати.
     `SELECT count(*)::int AS total, count(*) FILTER (WHERE agrees)::int AS agreed,
-            count(*) FILTER (WHERE analytical_event_id IS NOT NULL)::int AS promoted
+            count(*) FILTER (WHERE analytical_event_id IS NOT NULL)::int AS promoted,
+            count(*) FILTER (WHERE deterministic_significant = model_significant)::int
+              AS locations_compared,
+            count(*) FILTER (WHERE deterministic_significant = model_significant
+                               AND NOT ('locations' = ANY(disagreement_fields)))::int
+              AS locations_coarse,
+            count(*) FILTER (WHERE deterministic_significant = model_significant
+                               AND deterministic_locations @> model_locations
+                               AND model_locations @> deterministic_locations)::int
+              AS locations_exact
        FROM shadow_classifications
       WHERE published_at > now() - ($1 || ' hours')::interval`,
     [String(windowHours)]
@@ -867,6 +982,8 @@ export async function shadowAgreement(windowHours = 24, examples = 10): Promise<
 
   const total = totals.rows[0]?.total ?? 0;
   const agreed = totals.rows[0]?.agreed ?? 0;
+  const locationsCoarse = totals.rows[0]?.locations_coarse ?? 0;
+  const locationsExact = totals.rows[0]?.locations_exact ?? 0;
   return {
     windowHours,
     total,
@@ -874,6 +991,12 @@ export async function shadowAgreement(windowHours = 24, examples = 10): Promise<
     disagreed: total - agreed,
     promoted: totals.rows[0]?.promoted ?? 0,
     agreementPercent: total ? Math.round((agreed / total) * 1000) / 10 : null,
+    locations: {
+      compared: totals.rows[0]?.locations_compared ?? 0,
+      agreedCoarse: locationsCoarse,
+      agreedExact: locationsExact,
+      coarseOnly: locationsCoarse - locationsExact
+    },
     byField: fields.rows,
     recentDisagreements: recent.rows.map((row) => {
       const parsed = shadowVerdictSchema.safeParse(row.model_analysis);

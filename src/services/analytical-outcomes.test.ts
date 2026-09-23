@@ -1,8 +1,10 @@
 import { describe, expect, it } from 'vitest';
+import { config } from '../config.js';
 import {
   CONFIRMATION_WINDOW_MINUTES,
   OUTCOME_GRACE_MINUTES,
   PRECISION_THRESHOLDS,
+  PRIMARY_PRECISION_THRESHOLDS,
   decideOutcome,
   type OutcomeEvidence
 } from './analytical-outcomes.js';
@@ -110,12 +112,23 @@ describe('methodology constants', () => {
     expect(30 + OUTCOME_GRACE_MINUTES).toBe(CONFIRMATION_WINDOW_MINUTES);
   });
 
-  it('brackets the shipped confidence floor', () => {
-    // The reading is a comparison, so the default (0.9, `src/config.ts:271`) has to sit between two
+  it('brackets the shipped promotion floor', () => {
+    // The reading is a comparison, so the default (0.9, `src/config.ts`) has to sit between two
     // neighbours. A threshold list that drifted above or below it would answer a question the
     // operator is not asking.
     expect(PRECISION_THRESHOLDS).toContain(0.9);
     expect(Math.min(...PRECISION_THRESHOLDS)).toBeLessThan(0.9);
     expect(Math.max(...PRECISION_THRESHOLDS)).toBeGreaterThan(0.9);
+  });
+
+  it('brackets the primary floor with its own list, not with the promotion one', () => {
+    // `CODEX_PRIMARY_MIN_CONFIDENCE` ships at 0.5 and gates the mode the owner actually chose. Every
+    // verdict it lets through sits below the promotion bracket by construction, so reporting this
+    // population against `PRECISION_THRESHOLDS` would drop the whole population into one bucket and
+    // answer nothing — which is the state this module was in before it measured the primary mode.
+    expect(PRIMARY_PRECISION_THRESHOLDS).toContain(config.CODEX_PRIMARY_MIN_CONFIDENCE);
+    expect(Math.min(...PRIMARY_PRECISION_THRESHOLDS)).toBeLessThan(config.CODEX_PRIMARY_MIN_CONFIDENCE);
+    expect(Math.max(...PRIMARY_PRECISION_THRESHOLDS)).toBeGreaterThan(config.CODEX_PRIMARY_MIN_CONFIDENCE);
+    expect(Math.max(...PRIMARY_PRECISION_THRESHOLDS)).toBeLessThan(Math.min(...PRECISION_THRESHOLDS));
   });
 });

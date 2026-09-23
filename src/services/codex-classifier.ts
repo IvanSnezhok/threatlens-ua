@@ -9,6 +9,7 @@ import { THREAT_LABELS, resolveModelPlace } from '../domain/model-place.js';
 import {
   THREAT_TIMINGS, describeAge, expectedWindow, momentIn, type ThreatTiming
 } from '../domain/threat-timing.js';
+import { withinDeliveryAge } from '../repositories/events.js';
 import { THREAT_TYPES, type ClassifiedMessage, type NormalizedMessage, type ThreatType } from '../types.js';
 import { codexChat, type CodexChatRequest, type CodexChatResult } from './codex-client.js';
 import { imageDataUrl, transcribeAudio } from './media-enrichment.js';
@@ -90,7 +91,16 @@ export const SUPPRESSION_MIN_CONFIDENCE = 0.7;
 export type PrimaryOutcomeLabel =
   | 'classified' | 'suppressed' | 'fallback_disabled' | 'fallback_busy' | 'fallback_rate_limited'
   | 'fallback_timeout' | 'fallback_model_failed' | 'fallback_unparsable' | 'fallback_low_confidence'
-  | 'fallback_no_locations' | 'fallback_empty';
+  | 'fallback_no_locations' | 'fallback_empty'
+  /**
+   * Повідомлення, старше за стелю доставки, якому бюджет моделі віддали б за рахунок живого.
+   *
+   * Окреме значення, а не мовчання й не `fallback_rate_limited`: «модель була зайнята» і «ми самі
+   * не пустили дозбір до моделі, щоб він не зʼїв бюджет свіжого попередження» — два різні факти, і
+   * другий є рішенням цього модуля, за яке він має відзвітувати. Різниця між його часткою і часткою
+   * `fallback_rate_limited` — це і є відповідь на питання «чи вистачає бюджету живому шляху».
+   */
+  | 'fallback_stale_deferred';
 
 export const codexPrimaryOutcomes = new Counter({
   name: 'threatlens_codex_classifier_outcomes_total',
@@ -118,10 +128,37 @@ export function registerCodexClassifierMetrics(registry: Registry): void {
 let minuteWindow: number[] = [];
 let inFlight = 0;
 
-function withinMinuteBudget(now: number): boolean {
+/**
+ * Бюджет, недоторканний для застарілих повідомлень.
+ *
+ * Бюджет моделі глобальний, а навантаження на нього — ні. Після реконекту MTProto віддає пачку
+ * пропущених апдейтів, а `startClassifierBackfill` домітає історію каналів: сотні повідомлень
+ * поспіль, кожне з яких чекає на вердикт. Свіже термінове повідомлення, що прилітає посеред такого
+ * замітання, діставало `fallback_busy` чи `fallback_rate_limited` — тобто точність правил у той
+ * єдиний момент, заради якого модель і вмикали.
+ *
+ * Тому застаріле повідомлення (старше за `SOURCE_MESSAGE_MAX_DELIVERY_AGE_MINUTES`, прочитане через
+ * `withinDeliveryAge` — ту саму функцію, яку читає `ingestThreat`, а не власну копію) класифікується
+ * моделлю лише з тієї частини бюджету, що
+ * лишилася понад резерв. Не «ніколи»: старе повідомлення з очікуваною загрозою — «увечері
+ * очікується» на годину пізніше — публікується за власним вікном, а не за віком (`CONTEXT.md`;
+ * `src/repositories/events.ts` рахує `staleForDelivery` через `expectedUntil`), і жорсткий пропуск
+ * моделі перетворив би таке попередження на архівний рядок. Резерв прибирає голодування живого
+ * шляху, нічого при цьому не відбираючи.
+ */
+const LIVE_RESERVE_CONCURRENT = 2;
+const LIVE_RESERVE_MINUTE_SHARE = 0.5;
+
+/**
+ * `stale` просить лише ту частину бюджету, що лишається понад резерв живого шляху. Резерв — частка,
+ * а не число: оператор, який опустив `CODEX_PRIMARY_MAX_PER_MINUTE` до десяти, не мав на увазі, що
+ * дозбір забере девʼять із них.
+ */
+function withinMinuteBudget(now: number, stale = false): boolean {
   const limit = config.CODEX_PRIMARY_MAX_PER_MINUTE;
+  const reserve = stale ? Math.floor(limit * LIVE_RESERVE_MINUTE_SHARE) : 0;
   minuteWindow = minuteWindow.filter((at) => now - at < 60_000);
-  if (limit <= 0 || minuteWindow.length >= limit) return false;
+  if (limit <= 0 || minuteWindow.length >= limit - reserve) return false;
   minuteWindow.push(now);
   return true;
 }
@@ -308,7 +345,28 @@ export function classificationFromVerdict(
     directionText: verdict.directionText ?? rules.directionText,
     originZone: rules.originZone ?? null,
     title: THREAT_EVENT_TITLES[threatType],
-    summary: excerpt || `Загроза ${label} для ${placeNames}.`
+    summary: excerpt || `Загроза ${label} для ${placeNames}.`,
+    // Ретроспективна оцінка ПРАВИЛ їде на класифікацію моделі — інакше сірої смуги в режимі `codex`
+    // не існує взагалі. `src/services/ingestion.ts` вмикає ретроспективний гейт за
+    // `classified.retrospective?.verdict === 'suspect'`, а класифікація, зібрана тут, цього поля не
+    // мала: захист від дефекту v5 (роздум про минулу ніч, опублікований як жива комбінована загроза
+    // над Києвом) лишався однією фразою промпта й нічим більше.
+    //
+    // Перенос односпрямований за побудовою — `src/domain/classifier.ts:1434-1438`: вето стоїть
+    // ОСТАННІМ і застосовується лише до класифікації, яка інакше опублікувалася б, тож єдиний його
+    // можливий наслідок — відняти публікацію. Воно не може ні створити твердження, ні розширити
+    // його, ні перетворити відбій назад на загрозу. Саме тому це безпечно віддати гейтові.
+    //
+    // `vetoed` приходить сюди як `suspect`, і це не помʼякшення, а відповідь на питання «чиє це
+    // вето». Правила рахували його проти СВОЄЇ класифікації, а та в режимі `codex` відкинута: подією
+    // стає вердикт моделі. Пропустити `vetoed` дослівно означало б, що `significanceRejection`
+    // уб'є вердикт основного класифікатора регуляркою, ДО гейта, — тобто гейт не арбітрує нічого.
+    // Як `suspect` маркери правил лишаються в архіві, гейт (коли ввімкнений) ставить моделі своє
+    // вузьке питання і може заархівувати повідомлення, а вимкнений гейт лишає поведінку такою, якою
+    // вона була. Відняти публікацію обидва шляхи можуть; додати — жоден.
+    ...(rules.retrospective ? {
+      retrospective: { verdict: 'suspect' as const, markers: rules.retrospective.markers }
+    } : {})
   };
   return { classified, resolvedLocations: resolved.size };
 }
@@ -376,8 +434,14 @@ export async function classifyWithCodex(
   if (options.enabled === false) return fallback('fallback_disabled');
   const text = input.message.text.trim();
   if (!text && !input.message.media?.length) return fallback('fallback_empty');
-  if (inFlight >= config.CODEX_PRIMARY_MAX_CONCURRENT) return fallback('fallback_busy');
-  if (!withinMinuteBudget(startedAt.getTime())) return fallback('fallback_rate_limited');
+  // Застаріле — не «не варте моделі», а «не варте ЧУЖОГО бюджету». Стеля читається з того самого
+  // місця, що й у `ingestThreat`, тож розійтися вони не можуть; резерв описано вище.
+  const stale = !withinDeliveryAge(input.message.publishedAt, startedAt);
+  const concurrencyCeiling = config.CODEX_PRIMARY_MAX_CONCURRENT - (stale ? LIVE_RESERVE_CONCURRENT : 0);
+  if (inFlight >= concurrencyCeiling) return fallback(stale ? 'fallback_stale_deferred' : 'fallback_busy');
+  if (!withinMinuteBudget(startedAt.getTime(), stale)) {
+    return fallback(stale ? 'fallback_stale_deferred' : 'fallback_rate_limited');
+  }
 
   inFlight += 1;
   try {

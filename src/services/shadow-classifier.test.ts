@@ -85,10 +85,13 @@ describe('normalizePlace', () => {
 });
 
 describe('disagreementFields', () => {
-  const deterministic = { threatType: 'uav', locationNames: ['Одеса'], significant: true };
+  const deterministic = {
+    threatType: 'uav', locationNames: ['Одеса'], significant: true,
+    timing: 'now' as const, directionText: null
+  };
   const said = (overrides: Partial<ShadowVerdict> = {}) => verdict({ locations: ['Одеса'], ...overrides });
 
-  it('reports agreement when all three axes match', () => {
+  it('reports agreement when every compared axis matches', () => {
     expect(disagreementFields(deterministic, said())).toEqual([]);
   });
 
@@ -120,17 +123,50 @@ describe('disagreementFields', () => {
   it('names locations when both agree the message matters but not about where', () => {
     expect(disagreementFields(deterministic, said({ locations: ['Київ'] }))).toEqual(['locations']);
   });
+
+  it('називає актуальність, коли модель прочитала очікувану загрозу, а правила — живу', () => {
+    // Правила іншого й не вміють: подія правил — завжди «зараз». Різниця тут — це різниця між
+    // залитою територією на карті й тихим «увечері очікується», тож вона мусить бути в звіті.
+    expect(disagreementFields(deterministic, { ...said(), timing: 'evening' })).toEqual(['timing']);
+  });
+
+  it('мовчить про актуальність, коли вердикт про час не висловлювався', () => {
+    // Тіньовий запит часу не питає; порожнеча — не незгода.
+    expect(disagreementFields(deterministic, said())).toEqual([]);
+  });
+
+  it('називає напрямок, коли одна сторона побачила рух, а друга — ні', () => {
+    expect(disagreementFields(deterministic, said({ directionText: 'курсом на Миколаїв' })))
+      .toEqual(['direction']);
+    expect(disagreementFields(
+      { ...deterministic, directionText: 'курсом на Миколаїв' }, said()
+    )).toEqual(['direction']);
+  });
+
+  it('не називає напрямок, коли обидві сторони його прочитали — хай і різними словами', () => {
+    // Формулювання не порівнюється: правила дають витяг регулярним виразом, модель переказує
+    // своїми словами, і рядкова рівність зробила б із цієї осі суцільний шум.
+    expect(disagreementFields(
+      { ...deterministic, directionText: 'курсом на Одещину' },
+      said({ directionText: 'рухається в напрямку Одеси' })
+    )).toEqual([]);
+  });
 });
 
 describe('deterministicVerdict', () => {
-  it('reads the three axes off a live classification', () => {
+  it('reads the compared axes off a live classification', () => {
     expect(deterministicVerdict(classify('Ударні БпЛА у напрямку Києва'))).toEqual({
-      threatType: 'uav', locationNames: ['Київ'], significant: true
+      threatType: 'uav', locationNames: ['Київ'], significant: true, timing: 'now',
+      directionText: 'у напрямку Києва'
     });
   });
 
   it('marks a message that names no place as insignificant', () => {
     expect(deterministicVerdict(classify('Шахед')).significant).toBe(false);
+  });
+
+  it('завжди каже «зараз» — подія правил не буває очікуваною', () => {
+    expect(deterministicVerdict(classify('Ракетна небезпека для Києва')).timing).toBe('now');
   });
 });
 
@@ -225,7 +261,9 @@ describe('reserveAnalyticalPromotion', () => {
 
 describe('shadowClassify', () => {
   it('records agreement when the model reaches the same verdict', async () => {
-    const chat = chatReturning(verdict());
+    // «у напрямку Києва» правила читають як напрямок, тож вердикт, який доходить до ТОГО САМОГО,
+    // мусить назвати його теж — інакше це вже розбіжність про напрямок, і правильно, що видно.
+    const chat = chatReturning(verdict({ directionText: 'у напрямку Києва' }));
     const outcome = await shadowClassify(input('Ударні БпЛА у напрямку Києва'), { chat: chat as never });
     expect(outcome).toMatchObject({ status: 'recorded', agrees: true, fields: [] });
     expect(chat).toHaveBeenCalledOnce();
@@ -326,9 +364,19 @@ describe('shadowClassify', () => {
   });
 
   it('records a disagreement and the axis it is on', async () => {
-    const chat = chatReturning(verdict({ threatType: 'ballistic_missile' }));
+    const chat = chatReturning(verdict({
+      threatType: 'ballistic_missile', directionText: 'у напрямку Києва'
+    }));
     const outcome = await shadowClassify(input('Ударні БпЛА у напрямку Києва'), { chat: chat as never });
     expect(outcome).toMatchObject({ status: 'recorded', agrees: false, fields: ['threat_type'] });
+  });
+
+  it('називає напрямок як окрему вісь, коли правила прочитали рух, а модель — ні', async () => {
+    // Та сама ознака, заради якої існує режим `classifier_mode=codex`: «куди». Доти, поки її не
+    // порівнювало ніщо, повідомлення з пропущеним напрямком рахувалося повною згодою.
+    const chat = chatReturning(verdict());
+    const outcome = await shadowClassify(input('Ударні БпЛА у напрямку Києва'), { chat: chat as never });
+    expect(outcome).toMatchObject({ status: 'recorded', agrees: false, fields: ['direction'] });
   });
 
   it('records and returns the analytical event created by the bounded promotion', async () => {
@@ -500,7 +548,10 @@ describe('shadowClassify', () => {
 
   it('reports a failed write as a skip rather than breaking the caller', async () => {
     query.mockRejectedValueOnce(new Error('relation does not exist'));
-    const outcome = await shadowClassify(input('Ударні БпЛА у напрямку Києва'), { chat: chatReturning(verdict()) as never });
+    const outcome = await shadowClassify(
+      input('Ударні БпЛА у напрямку Києва'),
+      { chat: chatReturning(verdict({ directionText: 'у напрямку Києва' })) as never }
+    );
     expect(outcome).toMatchObject({ status: 'skipped', reason: 'write_failed', agrees: true });
   });
 

@@ -14,7 +14,9 @@ import { withdrawAnalyticalEvent } from '../repositories/events.js';
 import {
   CONFIRMATION_WINDOW_MINUTES,
   OUTCOME_GRACE_MINUTES,
+  OUTCOME_PRIMARY_LOOKBACK_HOURS,
   PRECISION_THRESHOLDS,
+  PRIMARY_PRECISION_THRESHOLDS,
   analyticalPrecision
 } from '../services/analytical-outcomes.js';
 
@@ -217,21 +219,28 @@ const opsCodexRoutes: FastifyPluginAsync = async (app) => {
   });
 
   /**
-   * What became of the promotions, and therefore where `ANALYTICAL_THREAT_MIN_CONFIDENCE` belongs.
+   * What became of the model's verdicts, and therefore where each of the two floors belongs.
    *
    * `/ops/shadow-classifier` above answers «how often do the rules and the model disagree»; this
-   * route answers the only question that follows once the model is allowed to publish those
+   * route answers the only question that follows once the model is allowed to act on those
    * disagreements — «and how often was it right». The precision is reported at three thresholds
    * around the shipped default rather than at the one in force, because the decision an operator is
-   * making is a comparison: raising the floor buys precision and costs promotions, and both numbers
-   * have to be on the screen at once for that trade to be visible.
+   * making is a comparison: raising the floor buys precision and costs events, and both numbers have
+   * to be on the screen at once for that trade to be visible.
    *
-   * `currentThreshold` rides along so the row an operator is standing on is identifiable without
-   * cross-referencing the settings page, and the methodology rides along for the same reason it does
-   * in `./ops-source-trust-routes.ts`: a precision figure without its windows and its exclusions is a
-   * number that can only be believed or disbelieved.
+   * Two populations, never merged. A promotion is gated on `ANALYTICAL_THREAT_MIN_CONFIDENCE` (0.9)
+   * and a codex-primary verdict on `CODEX_PRIMARY_MIN_CONFIDENCE` (0.5), so the payload reports them
+   * as separate entries under `populations`, each carrying its own label, its own floor, the NAME of
+   * the setting that floor lives in, and its own threshold brackets. There is no top-level precision
+   * figure to misread: an operator who sees «63%» always sees which floor it was measured against
+   * beside it, because acting on the wrong one means moving a setting the number never described.
    *
-   * Nothing here writes anything. Moving the threshold is a human editing a setting; this route
+   * Each population's `currentThreshold` rides along so the row an operator is standing on is
+   * identifiable without cross-referencing the settings page, and the methodology rides along for
+   * the same reason it does in `./ops-source-trust-routes.ts`: a precision figure without its
+   * windows and its exclusions is a number that can only be believed or disbelieved.
+   *
+   * Nothing here writes anything. Moving either threshold is a human editing a setting; this route
    * deliberately offers no way to do it, because a page that both measures the model and adjusts the
    * model's authority is one accidental click away from a feedback loop `CONTEXT.md` forbids.
    *
@@ -252,17 +261,25 @@ const opsCodexRoutes: FastifyPluginAsync = async (app) => {
     return {
       ...report,
       methodology: {
-        thresholds: PRECISION_THRESHOLDS,
+        thresholds: {
+          promotion: PRECISION_THRESHOLDS,
+          codex_primary: PRIMARY_PRECISION_THRESHOLDS
+        },
         graceMinutes: OUTCOME_GRACE_MINUTES,
         confirmationWindowMinutes: CONFIRMATION_WINDOW_MINUTES,
-        notice: 'Точність рахується лише за промоціями, вікно чинності яких уже минуло. '
-          + '«Підтверджено офіційно» означає, що офіційна тривога ПОЧАЛАСЬ над тією ж територією '
-          + 'після публікації моделі; промоції, зроблені під час уже активної тривоги, підтвердити '
-          + 'у такий спосіб неможливо — вони показані окремо як «undecidable» і не входять у '
-          + 'знаменник. «Підтверджено незалежно» — це твердження іншої групи незалежності про той '
-          + 'самий тип загрози; збіг двох моделей підтвердженням не рахується. Поріг '
-          + 'ANALYTICAL_THREAT_MIN_CONFIDENCE не змінюється автоматично: ця сторінка лише показує, '
-          + 'куди його варто рухати.'
+        primaryLookbackHours: OUTCOME_PRIMARY_LOOKBACK_HOURS,
+        notice: 'Точність рахується лише за подіями, вікно чинності яких уже минуло, і ОКРЕМО за '
+          + 'двома популяціями: «промоція» — модель опублікувала те, що правила відхилили (поріг '
+          + 'ANALYTICAL_THREAT_MIN_CONFIDENCE), «основний класифікатор» — у режимі classifier_mode='
+          + 'codex вердикт моделі створив подію з доказовістю джерела (поріг '
+          + 'CODEX_PRIMARY_MIN_CONFIDENCE). Числа двох популяцій не складаються й не порівнюються '
+          + 'між собою: це два різні пороги. «Підтверджено офіційно» означає, що офіційна тривога '
+          + 'ПОЧАЛАСЬ над тією ж територією після публікації; події, створені під час уже активної '
+          + 'тривоги, підтвердити у такий спосіб неможливо — вони показані окремо як «undecidable» '
+          + 'і не входять у знаменник. «Підтверджено незалежно» — це твердження іншої групи '
+          + 'незалежності про той самий тип загрози; збіг двох моделей підтвердженням не '
+          + 'рахується. Жоден із порогів не змінюється автоматично: ця сторінка лише показує, куди '
+          + 'їх варто рухати.'
       }
     };
   });

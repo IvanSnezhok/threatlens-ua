@@ -2,9 +2,10 @@ import { Counter, Gauge, type Registry } from 'prom-client';
 import { config } from '../config.js';
 import { pool } from '../db/pool.js';
 import { relatedLocationsCte } from '../repositories/events.js';
+import { CODEX_CLASSIFIER_VERSION } from './codex-classifier.js';
 
 /**
- * Did the model's published guesses turn out to be true?
+ * Did the model's verdicts turn out to be true?
  *
  * ## Why this module exists
  *
@@ -17,12 +18,33 @@ import { relatedLocationsCte } from '../repositories/events.js';
  * being live and that is the end of it — nothing records whether an official alert followed, whether
  * an independent human source said the same thing, or whether nobody ever corroborated it.
  *
- * Which means `config.ANALYTICAL_THREAT_MIN_CONFIDENCE` (`src/config.ts:271`, default 0.9) is not a
+ * Which means `config.ANALYTICAL_THREAT_MIN_CONFIDENCE` (`src/config.ts`, default 0.9) is not a
  * calibrated threshold. It is a guess, and an operator deciding whether to publish model analytics
  * to a public map and to a Telegram channel has no evidence to move it with. This module produces
- * that evidence: one row in `analytical_outcomes` (migration 043) per promoted event, written once,
- * after its window closed, and read by `/ops/analytical-outcomes` as precision per candidate
+ * that evidence: one row in `analytical_outcomes` (migration 043) per model-authored event, written
+ * once, after its window closed, and read by `/ops/analytical-outcomes` as precision per candidate
  * threshold.
+ *
+ * ## Two populations, never one number
+ *
+ * There are two ways a model verdict becomes an event, they are gated on two different floors, and
+ * for a long time only one of them was measured here:
+ *
+ *   * **promotion** — the case above. `ANALYTICAL_THREAT_MIN_CONFIDENCE`, default 0.9, feature off
+ *     by default.
+ *   * **codex_primary** — `classifier_mode=codex` (ADR 0002, owner's decision of 18.08.2026): the
+ *     model is the primary classifier, it reads a source message and its verdict creates the event
+ *     with the SOURCE's evidence. `CODEX_PRIMARY_MIN_CONFIDENCE`, default 0.5.
+ *
+ * The second had no evidence behind it at all, because the candidate predicate keyed on
+ * `analytical_event_id` — a column only the promotion path writes. The floor that decides whether a
+ * model verdict becomes a real warning in the mode the owner actually chose was the one nobody could
+ * defend. Both are scored now, through the same evidence queries and the same
+ * {@link decideOutcome}; see {@link READY_CODEX_PRIMARY} for how a primary event is found.
+ *
+ * They are never added together. Every number this module emits — the metric, the report, the
+ * reading list — carries the population, because a precision figure only means anything beside the
+ * floor it was measured against, and 0.5 and 0.9 are not the same question.
  *
  * ## What "confirmed" is allowed to mean, and what it deliberately is not
  *
@@ -53,19 +75,24 @@ import { relatedLocationsCte } from '../repositories/events.js';
  * query in this file writes to `threat_events`, `threat_event_locations`, `threat_assertions`,
  * `alert_periods`, `alert_source_states`, `risk_signals` or `notification_outbox`; the only table it
  * inserts into is its own. A precision figure is a reading for a human who then edits an environment
- * variable by hand — nothing in this module moves `ANALYTICAL_THREAT_MIN_CONFIDENCE`, and nothing
- * re-publishes, retracts or re-labels an event on the strength of its own verdict. An automatic
- * feedback loop from "the model was right last week" to "the model may publish more" is exactly the
- * kind of drift `CONTEXT.md` forbids, and it is absent by construction rather than by policy.
+ * variable by hand — nothing in this module moves `ANALYTICAL_THREAT_MIN_CONFIDENCE` or
+ * `CODEX_PRIMARY_MIN_CONFIDENCE`, and nothing re-publishes, retracts or re-labels an event on the
+ * strength of its own verdict. An automatic feedback loop from "the model was right last week" to
+ * "the model may decide more" is exactly the kind of drift `CONTEXT.md` forbids, and it is absent by
+ * construction rather than by policy. Widening the measurement to the primary population did not
+ * widen that: see the boundary restated at {@link READY_CODEX_PRIMARY}, where the widening happens.
  *
- * The measurement is also invisible while the feature is off, without needing a switch of its own:
- * the candidate query is driven from `idx_shadow_classifications_analytical_event`, which is partial
- * on `analytical_event_id IS NOT NULL`, and that index is empty in an installation that has never
- * turned promotion on. A pass then reads nothing and writes nothing.
+ * The measurement stays proportional to what an installation actually switched on, without needing a
+ * switch of its own. The promotion half is driven from `idx_shadow_classifications_analytical_event`,
+ * partial on `analytical_event_id IS NOT NULL` and therefore empty where promotion was never turned
+ * on; the primary half is a bounded time range on
+ * `message_classifications_version_time_idx (classifier_version, published_at DESC)` and matches
+ * nothing at all while `classifier_mode` is `rules`, because no row carries that version. A pass on
+ * a default installation reads two empty index ranges and writes nothing.
  */
 
 // ------------------------------------------------------------------------------------------------
-// Constants — the whole methodology in five numbers
+// Constants — the methodology, in numbers
 // ------------------------------------------------------------------------------------------------
 
 /**
@@ -102,7 +129,7 @@ export const CONFIRMATION_WINDOW_MINUTES = 45;
 export const OUTCOME_BATCH_SIZE = 200;
 
 /**
- * The thresholds `/ops` reports precision for.
+ * The thresholds `/ops` reports promotion precision for.
  *
  * Three points around the shipped default of 0.9, which is what makes the reading actionable: the
  * question an operator has is not «what is the precision» but «would moving the floor up buy enough
@@ -110,6 +137,53 @@ export const OUTCOME_BATCH_SIZE = 200;
  * values beside the current one.
  */
 export const PRECISION_THRESHOLDS = [0.85, 0.9, 0.95] as const;
+
+/**
+ * The same three points, placed around the OTHER floor — `CODEX_PRIMARY_MIN_CONFIDENCE`, default
+ * 0.5 (`src/config.ts`).
+ *
+ * A second list and not a shared one, because the two floors are nowhere near each other and a
+ * bracket is only a reading when it brackets. Every codex-primary verdict sits below 0.85 by
+ * construction — that is what a floor of 0.5 means — so reporting this population against
+ * {@link PRECISION_THRESHOLDS} would put every row in the lowest bucket and answer nothing. The
+ * question here is the mirror of the one above: would raising the primary floor to 0.6 buy enough
+ * precision to be worth the events it would hand back to the rules.
+ */
+export const PRIMARY_PRECISION_THRESHOLDS = [0.4, 0.5, 0.6] as const;
+
+/**
+ * How far back a codex-primary event may be picked up, in hours.
+ *
+ * The promotion branch needs no such bound: it is driven from
+ * `idx_shadow_classifications_analytical_event`, a partial index holding only promoted rows, so an
+ * unbounded backlog scan is still a handful of index entries. The primary branch is driven from
+ * `message_classifications`, which takes a row for EVERY message the pipeline ever saw, and its
+ * usable index is `message_classifications_version_time_idx (classifier_version, published_at DESC)`
+ * — a time range. Without an upper age the pass would walk the whole archive of codex decisions
+ * every ten minutes to find the handful whose window just closed.
+ *
+ * Two days rather than two hours so that a process down for a night still scores that night when it
+ * comes back; and not more, because a precision figure assembled from a week-old backlog is not the
+ * reading this page exists for. Events older than this are never scored and are never counted as
+ * pending either — the bound is in the shared predicate, so the gauge and the batch agree about what
+ * work exists, which is the one property a backlog number has to have.
+ */
+export const OUTCOME_PRIMARY_LOOKBACK_HOURS = 48;
+
+/**
+ * Which floor a scored row was published under, and therefore which number it may be read as.
+ *
+ * `promotion` — `promoteAnalyticalThreat` (`./shadow-classifier.ts`) published an unverified event
+ * the deterministic rules had declined, gated on `ANALYTICAL_THREAT_MIN_CONFIDENCE`.
+ * `codex_primary` — in the owner-chosen `classifier_mode=codex` the model READ a source message and
+ * its verdict created the event with the source's own evidence (ADR 0002), gated on
+ * `CODEX_PRIMARY_MIN_CONFIDENCE`.
+ *
+ * They are two different claims measured against two different floors, and every number this module
+ * produces carries the label — in the metric, in the report and in the reading list — because a
+ * precision figure read against the wrong floor is worse than no figure at all.
+ */
+export type OutcomePopulation = 'promotion' | 'codex_primary';
 
 /** How often the scheduler evaluates. A third of the validity window; see {@link startAnalyticalOutcomeScheduler}. */
 const OUTCOME_INTERVAL_MS = 10 * 60_000;
@@ -197,35 +271,45 @@ export function decideOutcome(evidence: OutcomeEvidence): OutcomeDecision {
 // ------------------------------------------------------------------------------------------------
 
 /**
- * The share of promotions that were corroborated, as a counter to divide rather than as a gauge.
+ * The share of scored model verdicts that were corroborated, as a counter to divide rather than as
+ * a gauge.
  *
  * Same reasoning as `threatlens_shadow_outcomes_total` in `./shadow-classifier.ts`: a ratio computed
  * inside the process cannot be aggregated across replicas or survive a restart, while a counter
  * divided at query time can. The share this module exists to expose is
  *
- *     sum(threatlens_analytical_outcomes_total{outcome=~"confirmed_.*"})
- *       / sum(threatlens_analytical_outcomes_total)
+ *     sum by (population) (threatlens_analytical_outcomes_total{outcome=~"confirmed_.*"})
+ *       / sum by (population) (threatlens_analytical_outcomes_total)
  *
  * and the two `confirmed_*` series stay separate so that an installation whose precision rests
  * entirely on OSINT echo is distinguishable from one the state's own alerts keep agreeing with.
+ *
+ * `population` is on the series and not left to a dashboard, and `by (population)` in the expression
+ * above is not decoration: a promotion is gated on 0.9 and a codex-primary verdict on 0.5, so an
+ * unlabelled sum would divide one floor's successes by both floors' attempts and call the result
+ * precision. Two values, fixed at compile time ({@link OutcomePopulation}) — six series with the
+ * outcome label, and no way for the cardinality to grow from data.
  */
 const analyticalOutcomes = new Counter({
   name: 'threatlens_analytical_outcomes_total',
-  help: 'Evaluated model promotions by what corroborated them, or that nothing did',
-  labelNames: ['outcome'],
+  help: 'Evaluated model verdicts by population and by what corroborated them, or that nothing did',
+  labelNames: ['population', 'outcome'],
   registers: []
 });
 
 /**
- * Promotions whose window has closed and that nobody has scored yet.
+ * Scored-eligible events past their window that nobody has evaluated yet, by population.
  *
  * A gauge and not a counter because it is a backlog, and the only number that distinguishes «the
  * feature is off, so there is nothing to measure» from «the scheduler died and the precision figure
- * on the ops page has been frozen for a day». Both look identical on the counters above.
+ * on the ops page has been frozen for a day». Both look identical on the counters above. Labelled
+ * for the same reason the counter is: the two populations are produced by two different switches,
+ * and a backlog that belongs entirely to one of them is a different incident.
  */
 const analyticalOutcomesPending = new Gauge({
   name: 'threatlens_analytical_outcomes_pending',
-  help: 'Promoted model events past their validity window that have not been evaluated yet',
+  help: 'Model-authored events past their validity window that have not been evaluated yet',
+  labelNames: ['population'],
   registers: []
 });
 
@@ -251,16 +335,17 @@ export function registerAnalyticalOutcomeMetrics(registry: Registry): void {
 /** Test seam: the metrics are process-global and a suite asserting on them needs a clean slate. */
 export function resetAnalyticalOutcomeMetrics(): void {
   analyticalOutcomes.reset();
-  analyticalOutcomesPending.set(0);
+  analyticalOutcomesPending.reset();
 }
 
 // ------------------------------------------------------------------------------------------------
 // Evaluation
 // ------------------------------------------------------------------------------------------------
 
-export interface PromotionRow {
+export interface OutcomeCandidate {
   event_id: string;
-  shadow_id: string;
+  /** Audit root of the verdict; null when the message it belonged to has been purged. */
+  shadow_id: string | null;
   model: string;
   confidence: string;
   threat_type: string;
@@ -268,6 +353,7 @@ export interface PromotionRow {
   valid_until: Date;
   independence_group: string;
   location_ids: string[];
+  population: OutcomePopulation;
 }
 
 /**
@@ -282,56 +368,157 @@ export interface PromotionRow {
  * output of this module is bucketed by that column, so a row that cannot be bucketed cannot
  * calibrate anything, and counting it as pending work would be counting work no pass will ever do.
  */
-const READY_FOR_EVALUATION = `sc.analytical_event_id IS NOT NULL
+const READY_PROMOTION = `sc.analytical_event_id IS NOT NULL
   AND sc.model_confidence IS NOT NULL
   AND o.event_id IS NULL
   AND e.valid_until <= now() - ($1 || ' minutes')::interval`;
 
 /**
- * The promotions this pass will score.
+ * The same question asked of the OTHER population — and the reason this module stopped being a
+ * promotion-only measurement.
  *
- * Driven FROM `shadow_classifications` and not from a scan of `threat_events`, for the same reason
- * migration 041's backfill is: the promoted rows are reachable through
+ * ## What was unmeasured
+ *
+ * {@link READY_PROMOTION} requires `sc.analytical_event_id IS NOT NULL`, and that column is written
+ * in exactly one place: the promotion path in `./shadow-classifier.ts`. The codex-primary comparison
+ * row (`recordComparison` in `./codex-classifier.ts`) never sets it, because in that mode the model
+ * did not promote anything — it READ a source message, and the event carries the source's own
+ * evidence. The consequence was a hole exactly where the stakes are highest:
+ * `ANALYTICAL_THREAT_MIN_CONFIDENCE` (0.9), which gates a feature that ships OFF, had a measured
+ * precision readout, while `CODEX_PRIMARY_MIN_CONFIDENCE` (0.5) — the floor that decides whether the
+ * model's verdict becomes a real event in the mode the owner chose (ADR 0002) — had no evidence
+ * behind it at all.
+ *
+ * ## How a primary event is found, and why not through the same column
+ *
+ * Through `message_classifications`, which already records the link this module needs and records it
+ * for the right reason: `event_id` is the event the decision produced, `created_event` says the
+ * decision CREATED it rather than merging into one that existed, `classifier_version` is
+ * `CODEX_CLASSIFIER_VERSION` exactly when the model built the classification, and `model_confidence`
+ * (migration 049) is the number being calibrated. `created_event` is also what keeps the population
+ * one-row-per-event without a DISTINCT: an event has exactly one creating message, and every later
+ * message that merged into it describes corroboration rather than the decision under test.
+ *
+ * The `published_at` bound is what makes the plan bounded —
+ * `message_classifications_version_time_idx (classifier_version, published_at DESC)` turns the
+ * branch into a time range over model decisions instead of a scan of every classified message; see
+ * {@link OUTCOME_PRIMARY_LOOKBACK_HOURS}.
+ *
+ * ## The boundary, restated where it is widened
+ *
+ * Widening what is MEASURED widens nothing else. This predicate feeds the same read-only pipeline:
+ * one row in this module's own table, per event, after its window closed. No statement in this file
+ * writes to `threat_events`, `threat_event_locations`, `threat_assertions`, `alert_periods`,
+ * `alert_source_states`, `risk_signals` or `notification_outbox`, and nothing here moves
+ * `CODEX_PRIMARY_MIN_CONFIDENCE` any more than it moves `ANALYTICAL_THREAT_MIN_CONFIDENCE`. The
+ * floor is an environment variable a human edits after reading the page. An automatic path from «the
+ * model was right last week» to «the model may decide more» is the drift `CONTEXT.md` forbids, and
+ * it is absent by construction here too: this module's only output is a row, a metric and a number
+ * on a page, and in the primary mode the model's failures still fall back to the rules rather than
+ * to anything this file knows.
+ */
+// $1 grace minutes, $2 classifier version, $3 lookback hours — the same three positions in both
+// statements below, so the gauge and the batch share the predicate text verbatim.
+const READY_CODEX_PRIMARY = `mc.classifier_version = $2
+  AND mc.created_event
+  AND mc.model_confidence IS NOT NULL
+  AND mc.published_at > now() - ($3 || ' hours')::interval
+  AND o.event_id IS NULL
+  AND e.valid_until <= now() - ($1 || ' minutes')::interval`;
+
+/** Everything both branches select, so the two halves of the UNION cannot drift apart in shape. */
+const CANDIDATE_LOCATIONS = `COALESCE((SELECT array_agg(el.location_id)
+                        FROM threat_event_locations el WHERE el.event_id = e.id), '{}')`;
+
+/**
+ * The events this pass will score, from both populations, oldest window first.
+ *
+ * The promotion half is driven FROM `shadow_classifications` and not from a scan of `threat_events`,
+ * for the same reason migration 041's backfill is: the promoted rows are reachable through
  * `idx_shadow_classifications_analytical_event`, which is partial on `analytical_event_id IS NOT
  * NULL`, so the plan starts from a handful of rows instead of from every event the installation has
  * ever published. `LEFT JOIN … IS NULL` against this module's own table is what makes a pass
  * idempotent: an event scored yesterday is not a candidate today.
  *
- * `independence_group` comes along because the independence test needs it and only the promoting
- * message knows it: the promotion asserts under its source's own group (`assertThreat` in
+ * `independence_group` comes along because the independence test needs it and only the authoring
+ * message knows it: the event asserts under its source's own group (`assertThreat` in
  * `src/repositories/events.ts`), so «another group» can only be expressed relative to this value.
- * Oldest first, so a backlog drains in the order the events happened.
+ *
+ * The primary half reaches its audit root through a LATERAL rather than a plain join: a message can
+ * carry a shadow row per `classifier_version`, and a second row would duplicate the candidate — one
+ * event scored twice, the second write silently refused by the primary key and the backlog gauge
+ * disagreeing with the batch forever. Newest first, and `LEFT` because the row is nullable by
+ * design: `recordComparison` is best-effort and a purged message takes its verdict with it, while
+ * the measurement must survive (migration 043).
+ *
+ * `ORDER BY` and `LIMIT` sit outside the UNION so the bound is on the pass and not on each half; a
+ * night of primary decisions cannot starve a promotion whose window closed earlier.
  */
-async function pendingPromotions(limit: number): Promise<PromotionRow[]> {
-  const result = await pool.query<PromotionRow>(
-    `SELECT e.id AS event_id, sc.id AS shadow_id, sc.model, sc.model_confidence AS confidence,
-            e.threat_type, e.started_at AS published_at, e.valid_until, s.independence_group,
-            COALESCE((SELECT array_agg(el.location_id)
-                        FROM threat_event_locations el WHERE el.event_id = e.id), '{}') AS location_ids
-       FROM shadow_classifications sc
-       JOIN threat_events e ON e.id = sc.analytical_event_id
-       JOIN source_messages sm ON sm.id = sc.source_message_id
-       JOIN sources s ON s.id = sm.source_id
-       LEFT JOIN analytical_outcomes o ON o.event_id = e.id
-      WHERE ${READY_FOR_EVALUATION}
-      ORDER BY e.valid_until ASC
-      LIMIT $2`,
-    [String(OUTCOME_GRACE_MINUTES), limit]
+async function pendingCandidates(limit: number): Promise<OutcomeCandidate[]> {
+  const result = await pool.query<OutcomeCandidate>(
+    `SELECT * FROM (
+       SELECT e.id AS event_id, sc.id AS shadow_id, sc.model, sc.model_confidence AS confidence,
+              e.threat_type, e.started_at AS published_at, e.valid_until, s.independence_group,
+              'promotion'::text AS population, ${CANDIDATE_LOCATIONS} AS location_ids
+         FROM shadow_classifications sc
+         JOIN threat_events e ON e.id = sc.analytical_event_id
+         JOIN source_messages sm ON sm.id = sc.source_message_id
+         JOIN sources s ON s.id = sm.source_id
+         LEFT JOIN analytical_outcomes o ON o.event_id = e.id
+        WHERE ${READY_PROMOTION}
+       UNION ALL
+       SELECT e.id AS event_id, sc.id AS shadow_id, mc.model, mc.model_confidence AS confidence,
+              e.threat_type, e.started_at AS published_at, e.valid_until, s.independence_group,
+              'codex_primary'::text AS population, ${CANDIDATE_LOCATIONS} AS location_ids
+         FROM message_classifications mc
+         JOIN threat_events e ON e.id = mc.event_id
+         JOIN sources s ON s.id = mc.source_id
+         LEFT JOIN LATERAL (
+           SELECT id FROM shadow_classifications
+            WHERE source_message_id = mc.source_message_id
+            ORDER BY created_at DESC LIMIT 1
+         ) sc ON true
+         LEFT JOIN analytical_outcomes o ON o.event_id = e.id
+        WHERE ${READY_CODEX_PRIMARY}
+     ) candidates
+     ORDER BY valid_until ASC
+     LIMIT $4`,
+    [String(OUTCOME_GRACE_MINUTES), CODEX_CLASSIFIER_VERSION,
+      String(OUTCOME_PRIMARY_LOOKBACK_HOURS), limit]
   );
   return result.rows;
 }
 
-/** The backlog behind {@link analyticalOutcomesPending}; see {@link READY_FOR_EVALUATION}. */
-export async function pendingEvaluationCount(): Promise<number> {
-  const result = await pool.query<{ count: number }>(
-    `SELECT count(*)::int AS count
+/** The backlog behind {@link analyticalOutcomesPending}, per population. */
+export type PendingByPopulation = Record<OutcomePopulation, number>;
+
+/**
+ * The backlog behind {@link analyticalOutcomesPending}; see {@link READY_PROMOTION} and
+ * {@link READY_CODEX_PRIMARY}.
+ *
+ * One statement with the same two halves as {@link pendingCandidates} and the same predicates, so
+ * the gauge counts exactly the work a pass would pick up. Split by population because the two are
+ * switched on independently: a backlog that is entirely primary means the classifier mode is busy
+ * and the scheduler is behind, while a backlog that is entirely promotion means something else.
+ */
+export async function pendingEvaluationCount(): Promise<PendingByPopulation> {
+  const result = await pool.query<{ population: OutcomePopulation; count: number }>(
+    `SELECT 'promotion'::text AS population, count(*)::int AS count
        FROM shadow_classifications sc
        JOIN threat_events e ON e.id = sc.analytical_event_id
        LEFT JOIN analytical_outcomes o ON o.event_id = e.id
-      WHERE ${READY_FOR_EVALUATION}`,
-    [String(OUTCOME_GRACE_MINUTES)]
+      WHERE ${READY_PROMOTION}
+      UNION ALL
+     SELECT 'codex_primary'::text AS population, count(*)::int AS count
+       FROM message_classifications mc
+       JOIN threat_events e ON e.id = mc.event_id
+       LEFT JOIN analytical_outcomes o ON o.event_id = e.id
+      WHERE ${READY_CODEX_PRIMARY}`,
+    [String(OUTCOME_GRACE_MINUTES), CODEX_CLASSIFIER_VERSION, String(OUTCOME_PRIMARY_LOOKBACK_HOURS)]
   );
-  return result.rows[0]?.count ?? 0;
+  const pending: PendingByPopulation = { promotion: 0, codex_primary: 0 };
+  for (const row of result.rows) pending[row.population] = row.count;
+  return pending;
 }
 
 /**
@@ -445,16 +632,16 @@ async function independentCorroboration(
     : null;
 }
 
-/** Everything the decision needs about one promotion, gathered under one window. */
-export async function gatherEvidence(promotion: PromotionRow): Promise<OutcomeEvidence> {
-  const publishedAt = new Date(promotion.published_at);
+/** Everything the decision needs about one candidate, gathered under one window. */
+export async function gatherEvidence(candidate: OutcomeCandidate): Promise<OutcomeEvidence> {
+  const publishedAt = new Date(candidate.published_at);
   const until = new Date(publishedAt.getTime() + CONFIRMATION_WINDOW_MINUTES * 60_000);
   const [official, independent, alertActiveAtPublication] = await Promise.all([
-    officialCorroboration(promotion.location_ids, publishedAt, until),
+    officialCorroboration(candidate.location_ids, publishedAt, until),
     independentCorroboration(
-      promotion.location_ids, promotion.threat_type, promotion.independence_group, publishedAt, until
+      candidate.location_ids, candidate.threat_type, candidate.independence_group, publishedAt, until
     ),
-    alertActiveAt(promotion.location_ids, publishedAt)
+    alertActiveAt(candidate.location_ids, publishedAt)
   ]);
   return { official, independent, alertActiveAtPublication };
 }
@@ -464,44 +651,61 @@ export interface EvaluationSummary {
   confirmedOfficial: number;
   confirmedIndependent: number;
   unconfirmed: number;
-  pending: number;
+  /** Scored rows per population, so a pass that touched only one of the two says so. */
+  byPopulation: Record<OutcomePopulation, number>;
+  pending: PendingByPopulation;
 }
 
 /**
- * Scores every promotion whose window has closed, up to the batch bound.
+ * Scores every model-authored event whose window has closed, up to the batch bound.
  *
  * `ON CONFLICT (event_id) DO NOTHING` and counting only what the INSERT actually wrote: two
  * processes evaluating the same backlog — a replica and a `docker compose exec`, say — must not each
  * add a point to the same series. That is also why the metric is incremented from the write result
  * rather than from the decision.
+ *
+ * The population never reaches the INSERT. `analytical_outcomes` has no column for it and does not
+ * need one: the event itself already carries the distinction on two columns migration 049 defined
+ * for exactly this purpose — `classified_by='codex'` means the model built the classification, and
+ * the row is joined back by primary key wherever the split is read ({@link analyticalPrecision}).
+ * Storing a third copy would be a third thing that can disagree with the other two, and it would
+ * need a migration this change does not otherwise require.
  */
 export async function evaluateAnalyticalOutcomes(limit = OUTCOME_BATCH_SIZE): Promise<EvaluationSummary> {
-  const promotions = await pendingPromotions(limit);
+  const candidates = await pendingCandidates(limit);
   const summary: EvaluationSummary = {
-    evaluated: 0, confirmedOfficial: 0, confirmedIndependent: 0, unconfirmed: 0, pending: 0
+    evaluated: 0,
+    confirmedOfficial: 0,
+    confirmedIndependent: 0,
+    unconfirmed: 0,
+    byPopulation: { promotion: 0, codex_primary: 0 },
+    pending: { promotion: 0, codex_primary: 0 }
   };
-  for (const promotion of promotions) {
-    const decision = decideOutcome(await gatherEvidence(promotion));
+  for (const candidate of candidates) {
+    const decision = decideOutcome(await gatherEvidence(candidate));
     const written = await pool.query(
       `INSERT INTO analytical_outcomes(event_id,shadow_classification_id,model,confidence,threat_type,
          published_at,valid_until,outcome,confirmed_at,confirmed_location_id,confirmed_by,
          alert_active_at_publication)
        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
        ON CONFLICT (event_id) DO NOTHING`,
-      [promotion.event_id, promotion.shadow_id, promotion.model, promotion.confidence,
-        promotion.threat_type, promotion.published_at, promotion.valid_until, decision.outcome,
+      [candidate.event_id, candidate.shadow_id, candidate.model, candidate.confidence,
+        candidate.threat_type, candidate.published_at, candidate.valid_until, decision.outcome,
         decision.confirmedAt, decision.confirmedLocationId, decision.confirmedBy,
         decision.alertActiveAtPublication]
     );
     if (!written.rowCount) continue;
-    analyticalOutcomes.inc({ outcome: decision.outcome });
+    analyticalOutcomes.inc({ population: candidate.population, outcome: decision.outcome });
     summary.evaluated += 1;
+    summary.byPopulation[candidate.population] += 1;
     if (decision.outcome === 'confirmed_official') summary.confirmedOfficial += 1;
     else if (decision.outcome === 'confirmed_independent') summary.confirmedIndependent += 1;
     else summary.unconfirmed += 1;
   }
   summary.pending = await pendingEvaluationCount();
-  analyticalOutcomesPending.set(summary.pending);
+  for (const [population, count] of Object.entries(summary.pending)) {
+    analyticalOutcomesPending.set({ population }, count);
+  }
   return summary;
 }
 
@@ -511,7 +715,8 @@ export async function evaluateAnalyticalOutcomes(limit = OUTCOME_BATCH_SIZE): Pr
 
 export interface ThresholdPrecision {
   threshold: number;
-  promotions: number;
+  /** Scored events at or above this threshold, within this population and window. */
+  scored: number;
   confirmedOfficial: number;
   confirmedIndependent: number;
   unconfirmed: number;
@@ -523,7 +728,32 @@ export interface ThresholdPrecision {
   medianLeadSeconds: number | null;
 }
 
-export interface UnconfirmedPromotion {
+/**
+ * One population's whole reading, labelled so it cannot be read as the other one's.
+ *
+ * `label` and `floorSetting` are part of the payload rather than of a prose note beside it because
+ * the mistake being prevented is silent: 63% precision at 0.5 (a primary floor) and 63% precision at
+ * 0.9 (a promotion floor) are the same digits about two different decisions, and an operator moving
+ * the wrong environment variable would be acting on a number that never described it. Every consumer
+ * — `/ops/analytical-outcomes`, a screenshot in an incident channel — carries the name of the
+ * setting with the figure.
+ */
+export interface PopulationPrecision {
+  population: OutcomePopulation;
+  /** Human-readable name of what was measured, in the interface language. */
+  label: string;
+  /** The configuration key this population's floor lives under; never written by this module. */
+  floorSetting: string;
+  /** The floor in force right now, which is the row an operator is standing on. */
+  currentThreshold: number;
+  /** Scored events of this population inside the window, at any confidence. */
+  evaluated: number;
+  /** Events of this population past their window that no pass has scored yet. */
+  pending: number;
+  thresholds: ThresholdPrecision[];
+}
+
+export interface UnconfirmedOutcome {
   eventId: string;
   shadowId: string | null;
   publishedAt: string;
@@ -534,29 +764,79 @@ export interface UnconfirmedPromotion {
   title: string;
   text: string | null;
   alertActiveAtPublication: boolean;
+  /** Which floor let this one out; the same distinction the populations above carry. */
+  population: OutcomePopulation;
 }
 
 export interface AnalyticalPrecisionReport {
   windowDays: number;
+  /** Every scored row in the window, both populations — the denominator of «how much evidence». */
   evaluated: number;
+  /** Unscored backlog, both populations. */
   pending: number;
-  currentThreshold: number;
-  thresholds: ThresholdPrecision[];
-  recentUnconfirmed: UnconfirmedPromotion[];
+  /**
+   * The two readings, never merged into one.
+   *
+   * There is deliberately no top-level `thresholds` or `currentThreshold` any more. Those fields
+   * were the promotion reading in a place that did not say so, and the moment a second population
+   * existed they became the one thing this page must not produce: a precision figure whose floor is
+   * ambiguous.
+   */
+  populations: PopulationPrecision[];
+  recentUnconfirmed: UnconfirmedOutcome[];
 }
 
 /**
- * Precision per candidate threshold, which is the whole point of this module.
+ * The population a scored row belongs to, expressed in SQL over columns the event already carries.
  *
- * Aggregated in SQL over `unnest(thresholds)`, so each threshold is one pass of the same windowed
- * index range (`idx_analytical_outcomes_precision`) rather than one round trip per threshold. The
- * LEFT JOIN keeps a threshold in the answer when nothing reaches it: «0.95 has no promotions yet» is
+ * `threat_events.classified_by='codex'` means the model built the classification from a source
+ * message — the primary mode — and anything else is a promotion, which is the only other way a row
+ * gets into `analytical_outcomes` at all. Migration 049 defines these as two axes precisely so this
+ * question has an answer on the event: «`origin='model'` — промоція; `classified_by='codex'` — модель
+ * прочитала повідомлення джерела».
+ *
+ * Derived from the EVENT and not from `shadow_classifications`, because the event is the one row
+ * guaranteed to exist for as long as the outcome does (`event_id` is the primary key and cascades
+ * with it), while a verdict is nullable by design — a purged source message takes it away, and a
+ * population that went NULL after retention would silently move rows between two precision figures.
+ */
+const POPULATION_SQL = `CASE WHEN e.classified_by = 'codex' THEN 'codex_primary' ELSE 'promotion' END`;
+
+const POPULATION_LABELS: Record<OutcomePopulation, { label: string; floorSetting: string }> = {
+  promotion: {
+    label: 'Промоція моделі (правила відмовили)',
+    floorSetting: 'ANALYTICAL_THREAT_MIN_CONFIDENCE'
+  },
+  codex_primary: {
+    label: 'Основний класифікатор Codex (вердикт створив подію)',
+    floorSetting: 'CODEX_PRIMARY_MIN_CONFIDENCE'
+  }
+};
+
+/** The thresholds each population is reported against; see {@link PRIMARY_PRECISION_THRESHOLDS}. */
+const POPULATION_THRESHOLDS: Record<OutcomePopulation, readonly number[]> = {
+  promotion: PRECISION_THRESHOLDS,
+  codex_primary: PRIMARY_PRECISION_THRESHOLDS
+};
+
+/**
+ * Precision per candidate threshold, per population — which is the whole point of this module.
+ *
+ * Aggregated in SQL over `unnest(populations, thresholds)`, so every (population, threshold) pair is
+ * one pass of the same windowed index range (`idx_analytical_outcomes_precision`) rather than one
+ * round trip each. Two parallel arrays and not a cross product, because the two populations are
+ * bracketed around two different floors and share no threshold: pairing them in TypeScript keeps
+ * that fact in one place instead of spreading it across a CASE inside the statement.
+ *
+ * The LEFT JOIN keeps a pair in the answer when nothing reaches it: «0.95 has no promotions yet» is
  * an answer an operator needs — it says the higher floor would silence the feature entirely — and a
- * missing row would read as a rendering bug instead.
+ * missing row would read as a rendering bug instead. For the same reason the population itself is
+ * always present: a report with no `codex_primary` entry would read as «not measured» where the
+ * truth is «measured, nothing happened».
  *
- * `precisionPercent` divides by the DECIDABLE rows, not by all of them. A promotion published while
- * the oblast was already under an official alert cannot be confirmed officially by construction (see
- * the module note), so leaving those in the denominator would drag the figure down by an amount that
+ * `precisionPercent` divides by the DECIDABLE rows, not by all of them. An event published while the
+ * oblast was already under an official alert cannot be confirmed officially by construction (see the
+ * module note), so leaving those in the denominator would drag the figure down by an amount that
  * depends on how many alerts there were that week rather than on how good the model is. They are
  * reported beside it as `undecidable` so the operator can see how much of the window was
  * unmeasurable instead of having it silently discounted.
@@ -564,36 +844,48 @@ export interface AnalyticalPrecisionReport {
 export async function analyticalPrecision(
   windowDays = 30, failures = 10
 ): Promise<AnalyticalPrecisionReport> {
+  const pairs = (Object.keys(POPULATION_THRESHOLDS) as OutcomePopulation[])
+    .flatMap((population) => POPULATION_THRESHOLDS[population].map((threshold) => ({ population, threshold })));
   const [buckets, recent, evaluated, pending] = await Promise.all([
     pool.query<{
-      threshold: string; promotions: number; confirmed_official: number; confirmed_independent: number;
-      unconfirmed: number; undecidable: number; median_lead_seconds: string | null;
+      population: OutcomePopulation; threshold: string; scored: number; confirmed_official: number;
+      confirmed_independent: number; unconfirmed: number; undecidable: number;
+      median_lead_seconds: string | null;
     }>(
-      `SELECT t.threshold,
-              count(o.event_id)::int AS promotions,
-              count(*) FILTER (WHERE o.outcome = 'confirmed_official')::int AS confirmed_official,
-              count(*) FILTER (WHERE o.outcome = 'confirmed_independent')::int AS confirmed_independent,
-              count(*) FILTER (WHERE o.outcome = 'unconfirmed')::int AS unconfirmed,
-              count(*) FILTER (WHERE o.outcome = 'unconfirmed' AND o.alert_active_at_publication)::int
+      `WITH scored AS (
+         SELECT o.confidence, o.outcome, o.alert_active_at_publication, o.confirmed_at, o.published_at,
+                ${POPULATION_SQL} AS population
+           FROM analytical_outcomes o
+           JOIN threat_events e ON e.id = o.event_id
+          WHERE o.published_at > now() - ($1 || ' days')::interval
+       )
+       SELECT t.population, t.threshold,
+              count(s.confidence)::int AS scored,
+              count(*) FILTER (WHERE s.outcome = 'confirmed_official')::int AS confirmed_official,
+              count(*) FILTER (WHERE s.outcome = 'confirmed_independent')::int AS confirmed_independent,
+              count(*) FILTER (WHERE s.outcome = 'unconfirmed')::int AS unconfirmed,
+              count(*) FILTER (WHERE s.outcome = 'unconfirmed' AND s.alert_active_at_publication)::int
                 AS undecidable,
               percentile_cont(0.5) WITHIN GROUP (
-                ORDER BY EXTRACT(EPOCH FROM (o.confirmed_at - o.published_at))
+                ORDER BY EXTRACT(EPOCH FROM (s.confirmed_at - s.published_at))
               ) AS median_lead_seconds
-         FROM unnest($2::numeric[]) AS t(threshold)
-         LEFT JOIN analytical_outcomes o
-           ON o.confidence >= t.threshold
-          AND o.published_at > now() - ($1 || ' days')::interval
-        GROUP BY t.threshold
-        ORDER BY t.threshold ASC`,
-      [String(windowDays), PRECISION_THRESHOLDS.map((threshold) => String(threshold))]
+         FROM unnest($2::text[], $3::numeric[]) AS t(population, threshold)
+         LEFT JOIN scored s
+           ON s.population = t.population
+          AND s.confidence >= t.threshold
+        GROUP BY t.population, t.threshold
+        ORDER BY t.population, t.threshold ASC`,
+      [String(windowDays), pairs.map((pair) => pair.population),
+        pairs.map((pair) => String(pair.threshold))]
     ),
     pool.query<{
       event_id: string; shadow_classification_id: string | null; published_at: Date; confidence: string;
       model: string; threat_type: string; title: string; message_text: string | null;
-      alert_active_at_publication: boolean; location_ids: string[];
+      alert_active_at_publication: boolean; location_ids: string[]; population: OutcomePopulation;
     }>(
       `SELECT o.event_id, o.shadow_classification_id, o.published_at, o.confidence, o.model,
               o.threat_type, o.alert_active_at_publication, e.title, sc.message_text,
+              ${POPULATION_SQL} AS population,
               COALESCE((SELECT array_agg(el.location_id)
                           FROM threat_event_locations el WHERE el.event_id = o.event_id), '{}') AS location_ids
          FROM analytical_outcomes o
@@ -605,40 +897,54 @@ export async function analyticalPrecision(
         LIMIT $2`,
       [String(windowDays), failures]
     ),
-    // Every scored promotion in the window, whatever its confidence — the denominator of «how much
+    // Every scored row in the window, whatever its confidence — the denominator of «how much
     // evidence is this page built on». Asked separately rather than read off the lowest threshold
-    // bucket, which would silently exclude any promotion made while the floor was below 0.85 and
-    // would start disagreeing with itself the day somebody edits `PRECISION_THRESHOLDS`.
-    pool.query<{ count: number }>(
-      `SELECT count(*)::int AS count FROM analytical_outcomes
-        WHERE published_at > now() - ($1 || ' days')::interval`,
+    // bucket, which would silently exclude any event decided while the floor was below the lowest
+    // bracket and would start disagreeing with itself the day somebody edits either threshold list.
+    pool.query<{ population: OutcomePopulation; count: number }>(
+      `SELECT ${POPULATION_SQL} AS population, count(*)::int AS count
+         FROM analytical_outcomes o
+         JOIN threat_events e ON e.id = o.event_id
+        WHERE o.published_at > now() - ($1 || ' days')::interval
+        GROUP BY 1`,
       [String(windowDays)]
     ),
     pendingEvaluationCount()
   ]);
 
-  const thresholds = buckets.rows.map((row) => {
-    const confirmed = row.confirmed_official + row.confirmed_independent;
-    const decidable = row.promotions - row.undecidable;
-    return {
-      threshold: Number(row.threshold),
-      promotions: row.promotions,
-      confirmedOfficial: row.confirmed_official,
-      confirmedIndependent: row.confirmed_independent,
-      unconfirmed: row.unconfirmed,
-      undecidable: row.undecidable,
-      precisionPercent: decidable > 0 ? Math.round((confirmed / decidable) * 1000) / 10 : null,
-      medianLeadSeconds: row.median_lead_seconds == null
-        ? null : Math.round(Number(row.median_lead_seconds))
-    };
-  });
+  const evaluatedBy: Record<OutcomePopulation, number> = { promotion: 0, codex_primary: 0 };
+  for (const row of evaluated.rows) evaluatedBy[row.population] = row.count;
+
+  const populations = (Object.keys(POPULATION_THRESHOLDS) as OutcomePopulation[]).map((population) => ({
+    population,
+    ...POPULATION_LABELS[population],
+    currentThreshold: population === 'promotion'
+      ? config.ANALYTICAL_THREAT_MIN_CONFIDENCE
+      : config.CODEX_PRIMARY_MIN_CONFIDENCE,
+    evaluated: evaluatedBy[population],
+    pending: pending[population],
+    thresholds: buckets.rows.filter((row) => row.population === population).map((row) => {
+      const confirmed = row.confirmed_official + row.confirmed_independent;
+      const decidable = row.scored - row.undecidable;
+      return {
+        threshold: Number(row.threshold),
+        scored: row.scored,
+        confirmedOfficial: row.confirmed_official,
+        confirmedIndependent: row.confirmed_independent,
+        unconfirmed: row.unconfirmed,
+        undecidable: row.undecidable,
+        precisionPercent: decidable > 0 ? Math.round((confirmed / decidable) * 1000) / 10 : null,
+        medianLeadSeconds: row.median_lead_seconds == null
+          ? null : Math.round(Number(row.median_lead_seconds))
+      };
+    })
+  }));
 
   return {
     windowDays,
-    evaluated: evaluated.rows[0]?.count ?? 0,
-    pending,
-    currentThreshold: config.ANALYTICAL_THREAT_MIN_CONFIDENCE,
-    thresholds,
+    evaluated: evaluatedBy.promotion + evaluatedBy.codex_primary,
+    pending: pending.promotion + pending.codex_primary,
+    populations,
     recentUnconfirmed: recent.rows.map((row) => ({
       eventId: row.event_id,
       shadowId: row.shadow_classification_id,
@@ -649,7 +955,8 @@ export async function analyticalPrecision(
       locationIds: row.location_ids ?? [],
       title: row.title,
       text: row.message_text,
-      alertActiveAtPublication: row.alert_active_at_publication
+      alertActiveAtPublication: row.alert_active_at_publication,
+      population: row.population
     }))
   };
 }
