@@ -422,7 +422,11 @@ describe.skipIf(!integrationDatabaseAvailable)('outbox delivery and stuck-messag
       const first = await seedOutbox({ chatId: 8204, eventId, status: 'pending', attempts: 0, priority: 3 });
       const untouched = await seedOutbox({ chatId: 8204, eventId, status: 'pending', attempts: 0, priority: 4 });
       const limited = fakeBot(() => { throw telegramError(429, 1); });
-      await runDelivery(limited, async () => (await statusOf(first)).status === 'retry', 'the aggregate pause to be stored');
+      // The pause and the release of untouched claims commit in ONE transaction
+      // (`recordProviderBackoff`), after the 429 row itself was already marked `retry`. Waiting on the
+      // 429 row raced that transaction on a slow runner; waiting on the released claim does not.
+      await runDelivery(limited, async () => (await statusOf(untouched)).status === 'retry', 'the aggregate pause to be stored');
+      expect(await statusOf(first)).toMatchObject({ status: 'retry' });
 
       expect(await statusOf(untouched)).toEqual({ status: 'retry', attempts: 0 });
       const blocked = await sql<{ blocked: boolean }>(
