@@ -50,7 +50,8 @@ const MIGRATION_FILES = [
   '046_origin_zone.sql', '047_codex_speed.sql', '048_attack_stats.sql', '049_codex_primary.sql', '050_alert_granularity.sql', '051_hromada_rows.sql',
   '052_downtime_digest.sql',
   '053_hot_path_indexes.sql',
-  '054_alert_level.sql'
+  '054_alert_level.sql',
+  '055_track_actualization.sql'
 ];
 
 /**
@@ -244,19 +245,30 @@ describe.skipIf(!integrationDatabaseAvailable)('migration runner against live Po
       `SELECT narrative_enabled,digest_enabled,attacks_enabled,shadow_enabled,
               analytical_threats_enabled,analytical_enrichment_enabled,retrospective_gate_enabled,
               tactics_enabled,attack_research_enabled,movement_summary_enabled,attack_stats_enabled,
-              risk_enabled
+              risk_enabled,actualization_enabled
          FROM codex_settings WHERE singleton`
     );
     expect(row.rowCount).toBe(1);
     // `attack_stats_enabled` (048) is the second switch whose text lands on the public attacks page,
     // and the first that publishes a probability: an upgrade must find it off. `risk_enabled` (049)
-    // hands the six-hour index to the model: off too.
+    // hands the six-hour index to the model: off too. `actualization_enabled` (055) lets the model
+    // shape the public track: off as well.
     expect(Object.values(row.rows[0]!))
-      .toEqual([false, false, false, false, false, false, false, false, false, false, false, false]);
+      .toEqual([false, false, false, false, false, false, false, false, false, false, false, false, false]);
     // And the classifier MODE (049) is the rules: an upgrade must not wake up with a model writing
-    // events. Checked as a value, not as a column existing.
-    const mode = await sql<{ classifier_mode: string }>(`SELECT classifier_mode FROM codex_settings WHERE singleton`);
-    expect(mode.rows[0]!.classifier_mode).toBe('rules');
+    // events. Checked as a value, not as a column existing. The fast model (055) is NULL — «as the
+    // main one» — so an upgrade keeps calling the model it called before.
+    const mode = await sql<{ classifier_mode: string; fast_model: string | null }>(
+      `SELECT classifier_mode, fast_model FROM codex_settings WHERE singleton`
+    );
+    expect(mode.rows[0]).toEqual({ classifier_mode: 'rules', fast_model: null });
+  });
+
+  it('no longer admits the service tier the backend answers with 400', async () => {
+    // 20.08–23.09.2026 every Codex call was a 400 because the row said `flex`. The console no longer
+    // offers it; the constraint is the second lock, so a hand-written UPDATE cannot bring it back.
+    await expect(sql(`UPDATE codex_settings SET service_tier='flex' WHERE singleton`))
+      .rejects.toThrow(/codex_settings_service_tier_check/);
   });
 
   it('keeps contextual/media evidence and analytical event provenance on the shadow table', async () => {

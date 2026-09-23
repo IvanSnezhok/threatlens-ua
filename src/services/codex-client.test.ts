@@ -203,6 +203,65 @@ describe('failures, none of which throw', () => {
     });
     expect(JSON.parse(body).model).toBe('o5-mini');
   });
+
+  it('keeps the sentence the endpoint said, which is what names the fix', async () => {
+    // 20.08–23.09.2026: every call answered this, and the audit log only ever said «400».
+    const result = await codexChat(request, {
+      credentials, settings, audit,
+      fetchImpl: async () => jsonResponse({ detail: 'Unsupported service_tier: flex' }, 400)
+    });
+    expect(result).toMatchObject({ ok: false, reason: 'endpoint_error', detail: 'Codex відповів 400: Unsupported service_tier: flex' });
+    expect(runs[0]!.error).toContain('Unsupported service_tier: flex');
+  });
+
+  it('reads the OpenAI-shaped error message, and falls back to a bounded slice of the text', async () => {
+    const shaped = await codexChat(request, {
+      credentials, settings, audit,
+      fetchImpl: async () => jsonResponse({ error: { message: 'model gpt-6 is not supported' } }, 400)
+    });
+    expect(shaped.ok ? null : shaped.detail).toBe('Codex відповів 400: model gpt-6 is not supported');
+
+    const page = await codexChat(request, {
+      credentials, settings, audit,
+      fetchImpl: async () => new Response(`<html>${'x'.repeat(2000)}</html>`, { status: 502 })
+    });
+    expect(page.ok ? null : page.detail).toMatch(/^Codex відповів 502: <html>x+$/u);
+    expect(page.ok ? 0 : page.detail.length).toBe('Codex відповів 502: '.length + 300);
+  });
+
+  it('cuts the credential out of a refusal that echoes it back', async () => {
+    const result = await codexChat(request, {
+      credentials, settings, audit,
+      fetchImpl: async () => jsonResponse({ detail: `bad request for Bearer ${TOKEN} on acct-42` }, 400)
+    });
+    expect(JSON.stringify(result)).not.toContain(TOKEN);
+    expect(JSON.stringify(runs)).not.toContain(TOKEN);
+    expect(JSON.stringify(result)).not.toContain('acct-42');
+  });
+});
+
+describe('the two models', () => {
+  const tiered = async () => ({
+    ...(await settings()), effectiveFastModel: 'gpt-6-luna' as string | null
+  });
+  const modelSent = async (extra: Record<string, unknown>) => {
+    let body = '';
+    await codexChat({ ...request, ...extra }, {
+      credentials, settings: tiered, audit,
+      fetchImpl: async (_input, init) => { body = String(init?.body); return completion('{}'); }
+    });
+    return JSON.parse(body).model as string;
+  };
+
+  it('sends the main model unless the surface says it is on the hot path', async () => {
+    expect(await modelSent({})).toBe('gpt-5.2');
+    expect(await modelSent({ tier: 'fast' })).toBe('gpt-6-luna');
+    expect(runs.map((run) => run.model)).toEqual(['gpt-5.2', 'gpt-6-luna']);
+  });
+
+  it('lets an explicit model win over the tier', async () => {
+    expect(await modelSent({ tier: 'fast', model: 'o5-mini' })).toBe('o5-mini');
+  });
 });
 
 describe('the model catalogue', () => {

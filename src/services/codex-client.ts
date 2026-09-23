@@ -42,9 +42,17 @@ export function abortSignalFor(timeoutMs: number | null | undefined): AbortSigna
  *
  * The access token is read here, put into an `Authorization` header, and forgotten. It is not in
  * the `ai_runs` row — `input` carries the prompt, never the headers — it is not in the returned
- * failure reason, and it is not in anything the routes serialise. Failure reasons are therefore
- * deliberately coarse: `endpoint 401`, not the response body, because a body is attacker-influenced
- * text that ends up in an operator's browser and in a database column that is read back out.
+ * failure reason, and it is not in anything the routes serialise.
+ *
+ * What the endpoint SAID when it refused IS kept, and that is a reversal. Failure reasons used to be
+ * deliberately coarse — `Codex відповів 400`, never the body — because a body is text from outside
+ * the process that ends up in an operator's browser and in a column read back out. From 20.08.2026
+ * every call answered `{"detail":"Unsupported service_tier: flex"}`, and for a month the audit log
+ * said only «400»: the one sentence that named the fix was thrown away on every call. So the body is
+ * now kept, bounded — JSON `detail` or `error.message` when the endpoint gives one, the text
+ * otherwise, whitespace collapsed, cut to 300 characters — and scrubbed of the credential we sent,
+ * in case an endpoint echoes it back. The console renders it through `escapeHtml`, and `ai_runs.error`
+ * is capped at 800 characters on write, so neither reader can be made to grow by it.
  *
  * ================================================================================================
  * Nothing here throws
@@ -110,7 +118,9 @@ export interface CodexChatRequest {
   surface: 'narrative' | 'digest' | 'attacks' | 'shadow' | 'risk' | 'retrospective_gate'
     | 'tactics' | 'attack_research' | 'movement_summary' | 'attack_stats'
     // Міграція 049: модель як основний класифікатор повідомлень і стискання контексту локації.
-    | 'classifier' | 'context_compaction';
+    | 'classifier' | 'context_compaction'
+    // Міграція 055: актуалізація треку загрози швидкою моделлю.
+    | 'actualization';
   /** Recorded as `ai_runs.classifier_version` when the caller knows which rules produced its input. */
   classifierVersion?: string;
   system: string;
@@ -119,7 +129,17 @@ export interface CodexChatRequest {
   images?: CodexImageInput[];
   /** Ask for a JSON object back. Callers that parse the reply should always set this. */
   json?: boolean;
+  /** An explicit model id. Wins over {@link CodexChatRequest.tier}. */
   model?: string;
+  /**
+   * Which of the operator's two models answers (migration 055). `'main'` (the default) is
+   * `codex_settings.model`; `'fast'` is `codex_settings.fast_model`, or the main one while that is
+   * unset. A caller states what KIND of surface it is — hot path or heavy prose — and never which
+   * model, so the console can move a whole tier with one choice. Surfaces that pass `'fast'`: the
+   * primary classifier, the shadow, the retrospective gate, the movement summary and the track
+   * actualization — everything a message or a map waits on.
+   */
+  tier?: 'main' | 'fast';
   /**
    * The call's own budget. `undefined` takes the shared `AI_TIMEOUT_MS`; a positive number is the
    * surface's ceiling (`AI_NARRATIVE_TIMEOUT_MS` is the precedent); **`null` means no `AbortSignal`
@@ -199,8 +219,12 @@ export interface AiRunRecord {
  * The insert is best-effort by design: the narrative that was just written is correct whether or not
  * its audit row lands, and failing the call because the log failed would turn a bookkeeping problem
  * into an outage on a path whose whole purpose is to degrade quietly.
+ *
+ * Exported for the one row a transport cannot write: a caller that REFUSED an answer the model did
+ * give (`validationStatus: 'rejected'`). Writing it through the same statement keeps a surface's
+ * transport row and its verdict row in one shape instead of two inserts that drift.
  */
-async function writeAiRun(row: AiRunRecord): Promise<void> {
+export async function writeAiRun(row: AiRunRecord): Promise<void> {
   await pool.query(
     `INSERT INTO ai_runs(model,prompt_version,input,output,status,error,duration_ms,
                          surface,classifier_version,validation_status,fallback_reason)
@@ -309,6 +333,39 @@ function authHeaders(session: CodexCredentials | null): Record<string, string> |
   return headers;
 }
 
+/** How much of a refusal body an operator gets. A sentence, not a transcript. */
+const REFUSAL_DETAIL_CHARS = 300;
+
+/**
+ * What the endpoint said when it answered non-2xx — the one sentence that names the fix.
+ *
+ * JSON `detail` (the Codex backend's shape: `{"detail":"Unsupported service_tier: flex"}`) or
+ * `error.message` (the OpenAI-compatible shape) when present, the raw text otherwise. The credential
+ * values we sent are cut out BEFORE truncation, so an endpoint that echoes a header back cannot leak
+ * even a prefix of it past the cut. Never throws: a body that cannot be read is an empty detail, and
+ * the status code alone still goes into the reason.
+ */
+async function refusalDetail(response: Response, secrets: readonly (string | undefined)[]): Promise<string> {
+  let raw: string;
+  try {
+    raw = await response.text();
+  } catch {
+    return '';
+  }
+  let said: string = raw;
+  try {
+    const body = JSON.parse(raw) as { detail?: unknown; error?: { message?: unknown } | null };
+    const message = body?.error?.message;
+    if (body?.detail != null) said = typeof body.detail === 'string' ? body.detail : JSON.stringify(body.detail);
+    else if (typeof message === 'string') said = message;
+  } catch {
+    // Not JSON — a gateway page or plain text. The text itself is the detail.
+  }
+  let detail = said.replace(/\s+/gu, ' ').trim();
+  for (const secret of secrets) if (secret) detail = detail.split(secret).join('[прибрано]');
+  return detail.slice(0, REFUSAL_DETAIL_CHARS);
+}
+
 /**
  * One chat completion, audited whatever happens.
  *
@@ -346,7 +403,8 @@ export async function codexChat(request: CodexChatRequest, deps: CodexClientDeps
   // чергу, — а ці двоє потрібні й тоді, коли викликач назвав модель сам: інакше `/ops` міняв би
   // effort, а половина шляхів його б не бачила.
   const settings = await (deps.settings ?? resolveCodexSettings)();
-  const model = (request.model?.trim() || settings.effectiveModel) ?? '';
+  const tierModel = request.tier === 'fast' ? settings.effectiveFastModel : settings.effectiveModel;
+  const model = (request.model?.trim() || tierModel) ?? '';
   if (!model) return fail('model_not_selected', 'Модель не обрано ні в /ops, ні в CODEX_MODEL', null);
 
   const session = await (deps.credentials ?? codexCredentials)().catch(() => null);
@@ -437,7 +495,12 @@ export async function codexChat(request: CodexChatRequest, deps: CodexClientDeps
     return fail('session_expired', `Codex відхилив облікові дані (${response.status})`, model);
   }
   if (!response.ok) {
-    return fail('endpoint_error', `Codex відповів ${response.status}`, model);
+    // Тіло відмови — і є відповідь на «чому»: `Unsupported service_tier: flex` місяць лежав тут і
+    // викидався. Облікові дані, які ми надіслали, вирізаються з нього до обрізання.
+    const said = await refusalDetail(response, [
+      headers.Authorization?.replace(/^Bearer /u, ''), headers['ChatGPT-Account-Id']
+    ]);
+    return fail('endpoint_error', `Codex відповів ${response.status}${said ? `: ${said}` : ''}`, model);
   }
 
   let content: string | undefined;
@@ -491,7 +554,7 @@ export interface CodexModelCatalogue {
 export async function listCodexModels(deps: CodexClientDeps = {}): Promise<CodexModelCatalogue> {
   const settings = await (deps.settings ?? resolveCodexSettings)();
   const fallback = (error: string | null): CodexModelCatalogue => ({
-    models: mergeModelCatalogue([], settings.model, config.CODEX_MODEL),
+    models: mergeModelCatalogue([], settings.model, config.CODEX_MODEL, settings.fastModel),
     source: 'fallback',
     error
   });
@@ -515,7 +578,7 @@ export async function listCodexModels(deps: CodexClientDeps = {}): Promise<Codex
       .map((item) => item?.id)
       .filter((id): id is string => typeof id === 'string' && id.length > 0);
     if (!ids.length) return fallback('перелік моделей порожній');
-    return { models: mergeModelCatalogue(ids, settings.model, config.CODEX_MODEL), source: 'api', error: null };
+    return { models: mergeModelCatalogue(ids, settings.model, config.CODEX_MODEL, settings.fastModel), source: 'api', error: null };
   } catch (error) {
     return fallback(String(error).slice(0, 200));
   }

@@ -162,3 +162,48 @@ describe('ingestThreat: event origin', () => {
     expect(queries.some((query) => /INSERT INTO threat_events\(/.test(query.text))).toBe(false);
   });
 });
+
+/**
+ * «Повз A на B» withdraws this source's standing assertions about A — when the RULES read it.
+ *
+ * Since migration 055 the primary model's verdict carries the same transit shape, so that the
+ * archive and the vector chain read «звідки → куди» as one reported movement. The shape must not
+ * carry the authority with it: an all-clear is the rules' alone (migration 049, CONTEXT.md), and a
+ * model that could withdraw could take a human channel's live warning off the map.
+ */
+describe('ingestThreat: transit withdrawal belongs to the rules', () => {
+  beforeEach(() => {
+    queries.length = 0;
+    client.query.mockReset();
+    client.query.mockImplementation(record);
+  });
+
+  const transit = (): ClassifiedMessage => classified({
+    intent: 'redirect',
+    threatType: 'ballistic_missile',
+    signalThreatTypes: ['ballistic_missile'],
+    locations: [{ id: 'ua-city-boryspil', name: 'Бориспіль', relationType: 'reported_direction' }],
+    retraction: {
+      threatTypes: ['ballistic_missile'], locations: [{ id: 'ua-city-brovary', name: 'Бровари' }], coverage: 'located'
+    }
+  });
+  const withdrawals = () => queries.filter((query) => /UPDATE threat_assertions\s+SET withdrawn_at/.test(query.text));
+
+  it('withdraws the passed place when the rules read the transit', async () => {
+    await ingestThreat(message(), transit());
+    expect(withdrawals()).toHaveLength(1);
+    expect(withdrawals()[0]!.params).toContainEqual(['ua-city-brovary']);
+  });
+
+  it('withdraws nothing when the primary model built the same shape', async () => {
+    const at = new Date();
+    await ingestThreat(message(), transit(), {
+      assessment: {
+        model: 'gpt-6-luna', classifierVersion: 'codex-primary-v1', timing: 'now', probability: 0.8,
+        expectedFrom: at, expectedUntil: new Date(at.getTime() + 30 * 60_000), note: null
+      }
+    });
+    expect(eventInsert()).toBeDefined();
+    expect(withdrawals()).toEqual([]);
+  });
+});

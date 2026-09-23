@@ -102,10 +102,12 @@ const opsCodexRoutes: FastifyPluginAsync = async (app) => {
   /**
    * PUT, not PATCH, because the console sends the whole form — but the body is validated as a patch
    * so that a curl that only wants to switch one feature off does not have to restate the model. An
-   * empty or absent `model` means "defer to CODEX_MODEL", which is a real choice and not a mistake.
+   * empty or absent `model` means "defer to CODEX_MODEL", which is a real choice and not a mistake;
+   * an empty `fastModel` means «as the main model» in the same way (migration 055).
    */
   const settingsBody = z.object({
     model: z.string().max(120).nullish(),
+    fastModel: z.string().max(120).nullish(),
     // Швидкість виклику: глибина міркування й черга обслуговування (міграція 047). Значення поза
     // словником не приймається тут, а не мовчки виправляється далі — оператор має побачити 400, а
     // не дізнатися про хибний вибір із поведінки моделі під час події.
@@ -153,7 +155,12 @@ const opsCodexRoutes: FastifyPluginAsync = async (app) => {
       attack_stats: z.boolean(),
       // Risk assessment through Codex instead of the AI_* endpoint (migration 049): same index, same
       // clamp, one more reader of the per-location context. Off by default.
-      risk: z.boolean()
+      risk: z.boolean(),
+      // Track actualization by the fast model (migration 055), off by default. It may only shape the
+      // drawn track out of places the event's own messages named — never an event, an alert or an
+      // all-clear — and the public map applies it only in `classifier_mode=codex`
+      // (`src/services/track-actualization.ts`).
+      actualization: z.boolean()
     }).partial().optional()
   });
 

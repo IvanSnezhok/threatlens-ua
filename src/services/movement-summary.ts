@@ -191,6 +191,8 @@ export async function summariseMovement(
     const result = await (deps.chat ?? codexChat)({
       promptVersion: 'movement-summary-v1',
       surface: 'movement_summary',
+      // Переказ їде в сповіщення про живу загрозу: текст, що приходить пізно, не вартий нічого.
+      tier: 'fast',
       system: SYSTEM,
       user: JSON.stringify({ facts }),
       json: true,

@@ -663,7 +663,8 @@ export interface IngestThreatOptions {
    * ймовірність і вікно очікування з її вердикту. На відміну від `modelPromotion` це НЕ знижує
    * доказовості й не вимикає злиття: твердження лишається твердженням джерела, модель лише прочитала
    * його. Подія позначається `classified_by='codex'`, а `origin` лишається `deterministic` — див.
-   * коментар до колонки в міграції 049.
+   * коментар до колонки в міграції 049. Відкликання за транзитом («повз A на B») вимикає так само,
+   * як і `modelPromotion`: відбої — лише від правил, навіть коли вердикт моделі має форму транзиту.
    */
   assessment?: {
     model: string;
@@ -1066,8 +1067,14 @@ export async function ingestThreat(
     // reads both spans out of one sentence, so a name that appears on both sides would otherwise be
     // asserted and retracted by the same message — and withdrawal is the dangerous direction to
     // resolve that tie in.
+    //
+    // Only a RULES transit withdraws. A classification the primary model built (`options.assessment`)
+    // carries the same shape since migration 055 — origins in `retraction`, so the archive and the
+    // vector chain read «звідки → куди» as `reported_transit` — but the model does not issue
+    // all-clears (migration 049, CONTEXT.md): its «пройдене» stays history in the archive, and the
+    // passed place's standing assertions end on their own clock, exactly as in codex mode before.
     let withdrawal = NO_WITHDRAWAL;
-    if (!options.modelPromotion && classified.retraction && classified.intent === 'redirect') {
+    if (!options.modelPromotion && !options.assessment && classified.retraction && classified.intent === 'redirect') {
       const approaching = new Set(classified.locations
         .filter((location) => location.relationType === 'reported_direction')
         .map((location) => location.id));

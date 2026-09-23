@@ -304,6 +304,8 @@ export async function retrospectiveGate(
   const call = chat({
     promptVersion: 'retrospective-gate-v1',
     surface: 'retrospective_gate',
+    // Повідомлення стоїть перед `ingestThreat`, доки ворота думають: гаряча поверхня.
+    tier: 'fast',
     classifierVersion: CLASSIFIER_VERSION,
     system: SYSTEM_PROMPT,
     user: prompt,

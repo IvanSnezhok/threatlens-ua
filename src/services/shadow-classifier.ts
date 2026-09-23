@@ -720,6 +720,8 @@ export async function shadowClassify(input: ShadowInput, options: ShadowOptions 
   const result = await chat({
     promptVersion: 'shadow-classifier-v2',
     surface: 'shadow',
+    // Той самий гарячий шлях, що й основний класифікатор: тінь звіряють із ним, тож і модель та сама.
+    tier: 'fast',
     classifierVersion: CLASSIFIER_VERSION,
     system: SYSTEM_PROMPT,
     user: prompt,

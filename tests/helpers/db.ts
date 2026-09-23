@@ -48,7 +48,7 @@ export async function count(table: string, where = 'true', params: unknown[] = [
 const VOLATILE_TABLES = [
   'source_enabled_audit', 'telegram_delivery_decisions', 'notification_deliveries', 'notification_outbox', 'notification_state', 'nightly_digest_runs',
   'risk_assessment_signals', 'risk_assessments', 'risk_signals',
-  'event_updates', 'event_evidence', 'threat_event_locations', 'threat_events',
+  'event_updates', 'event_evidence', 'threat_event_locations', 'threat_track_actualizations', 'threat_events',
   'alert_source_states', 'alert_periods',
   'source_message_revisions', 'source_messages',
   'subscriptions', 'telegram_users',
@@ -159,11 +159,12 @@ export async function resetDatabase(): Promise<void> {
   // those files would start calling `codexChat` on surfaces they never opted into. The row is
   // seeded-or-absent by migration 018 rather than truncated, because «no row» already means «all
   // switches off» and truncating would be resetting a row that is not supposed to exist.
-  await sql(`UPDATE codex_settings SET model=NULL, narrative_enabled=false, digest_enabled=false,
+  await sql(`UPDATE codex_settings SET model=NULL, fast_model=NULL, narrative_enabled=false, digest_enabled=false,
              attacks_enabled=false, shadow_enabled=false, analytical_threats_enabled=false,
              retrospective_gate_enabled=false,
              tactics_enabled=false, attack_research_enabled=false, movement_summary_enabled=false,
-             attack_stats_enabled=false, classifier_mode='rules', risk_enabled=false, updated_at=now()
+             attack_stats_enabled=false, classifier_mode='rules', risk_enabled=false,
+             actualization_enabled=false, updated_at=now()
              WHERE singleton`);
   await sql(`UPDATE telegram_delivery_governor SET tokens=25,last_refill_at=now(),blocked_until=NULL,updated_at=now()
              WHERE singleton`);

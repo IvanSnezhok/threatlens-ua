@@ -79,6 +79,50 @@ describe('classificationFromVerdict', () => {
     expect(built.classified.locations).toEqual([{ id: 'ua-city-kremenchuk', name: 'Кременчук', relationType: 'reported_direction' }]);
   });
 
+  it('writes the model’s origins in the rules’ own transit shape, so the chain reads «звідки → куди»', () => {
+    // `planStep` (./threat-vectors.ts) малює `reported_transit` лише з `redirect`, у якого є
+    // відкликане місце й місце з `reported_direction`, — тієї форми, яку правила дають «повз A на B».
+    // Вердикт моделі на те саме речення мусить лягти в ту саму форму, інакше рух не намалюється ніколи.
+    const text = 'Шахеди повз Кременчук на Київ.';
+    const rules = classifyMessage(text, lexemes);
+    expect(rules.intent).toBe('redirect');
+    const built = classificationFromVerdict(verdict({
+      threatState: 'redirected', locations: ['Кременчук', 'Київ'], originLocations: ['Кременчук'], destinationLocations: ['Київ']
+    }), rules, lexemes, text);
+    const directions = (classified: typeof rules) => classified.locations
+      .filter((location) => location.relationType === 'reported_direction').map((location) => location.id);
+
+    expect(built.classified.intent).toBe(rules.intent);
+    expect(built.classified.retraction?.locations.map((location) => location.id))
+      .toEqual(rules.retraction?.locations.map((location) => location.id));
+    expect(built.classified.retraction).toMatchObject({ threatTypes: ['uav'], coverage: 'located' });
+    expect(directions(built.classified)).toEqual(directions(rules));
+    // Місце «звідки» — історія, а не місце, для якого модель стверджує загрозу: зняти таке твердження
+    // не було б кому, бо вердикт моделі не відкликає нічого.
+    expect(built.classified.locations.map((location) => location.id)).toEqual(['ua-80']);
+  });
+
+  it('reads a named course with both ends as transit, dropping an origin the catalogue cannot place', () => {
+    const rules = classifyMessage('Шахеди на Полтавщині.', lexemes);
+    const built = classificationFromVerdict(verdict({
+      threatState: 'asserted', directionText: 'з Кременчука на Київ',
+      originLocations: ['Атлантида', 'Кременчук'], destinationLocations: ['Київ']
+    }), rules, lexemes, 'Шахеди з Кременчука на Київ.');
+    expect(built.classified.intent).toBe('redirect');
+    expect(built.classified.retraction?.locations).toEqual([{ id: 'ua-city-kremenchuk', name: 'Кременчук' }]);
+    expect(built.classified.locations).toEqual([{ id: 'ua-80', name: 'Київ', relationType: 'reported_direction' }]);
+  });
+
+  it('is no transit when no place it came from resolves', () => {
+    const rules = classifyMessage('Шахеди на Полтавщині.', lexemes);
+    const built = classificationFromVerdict(verdict({
+      threatState: 'redirected', originLocations: ['Атлантида'], destinationLocations: ['Кременчук']
+    }), rules, lexemes, 'курс на Кременчук');
+    expect(built.classified.intent).toBe('threat');
+    expect(built.classified.retraction).toBeUndefined();
+    expect(built.classified.locations).toEqual([{ id: 'ua-city-kremenchuk', name: 'Кременчук', relationType: 'reported_direction' }]);
+  });
+
   it('falls back to the rules’ geography when no model name resolves', () => {
     const rules = classifyMessage('Шахеди на Полтавщині.', lexemes);
     const built = classificationFromVerdict(verdict({ locations: ['Село Невідоме'] }), rules, lexemes, 'Шахеди на Полтавщині.');

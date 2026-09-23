@@ -2,7 +2,20 @@ import { config } from '../config.js';
 import { pool } from '../db/pool.js';
 
 /**
- * What the operator chose in `/ops`: one model and its independently controlled call sites.
+ * What the operator chose in `/ops`: two models and their independently controlled call sites.
+ *
+ * ================================================================================================
+ * Why two models (migration 055)
+ * ================================================================================================
+ *
+ * `model` is the main one and keeps the heavy surfaces — the narrative, the digest, the attack
+ * statistics and research, the tactics, the risk index — where a paragraph that takes six seconds is
+ * still worth waiting for. `fastModel` serves the hot path, where a message waits on the answer
+ * before it can reach the map: the primary classifier, the shadow, the retrospective gate, the
+ * movement summary and the track actualization. A caller says which one it is with
+ * `CodexChatRequest.tier`, never by naming a model, so an operator swapping either model in the
+ * console moves every surface of that tier at once. `fastModel` null means «as the main one»: an
+ * installation that upgraded into 055 keeps calling exactly the model it called before.
  *
  * ================================================================================================
  * Why this is separate from `codex-auth.ts`
@@ -81,7 +94,12 @@ export const CODEX_FEATURES = [
   // Оцінка ризику по локаціях моделлю Codex (міграція 049) — замість окремого AI_*-ендпоінта або
   // правил, з контекстом локації в запиті. Та сама межа, що й у AI_*: індекс, не ймовірність; числа
   // затискає `clampAssessment`. Вимкнено за замовчуванням.
-  'risk'
+  'risk',
+  // Актуалізація треку загрози швидкою моделлю (міграція 055): де ціль зараз, куди прямує, чи
+  // кружляє, минула чи зникла. Право — лише форма намальованого треку з місць, які назвали джерела:
+  // подій, тривог і відбоїв вона не торкається, а на публічну карту потрапляє лише в режимі `codex`
+  // (див. `src/services/track-actualization.ts`). Вимкнено за замовчуванням.
+  'actualization'
 ] as const;
 export type CodexFeature = (typeof CODEX_FEATURES)[number];
 
@@ -103,8 +121,12 @@ export type CodexEffort = (typeof CODEX_EFFORTS)[number];
  * Поле ВЕРХНЬОГО рівня в тілі запиту, на відміну від `reasoning`. Для сповіщень про загрозу воно
  * важливіше за глибину: текст, який приходить після того, як загроза минула, не вартий нічого, хоч
  * би як добре був написаний.
+ *
+ * `flex` тут був і прибраний міграцією 055: бекенд відповідає на нього `400 Unsupported
+ * service_tier: flex` для кожної моделі, яку ми міряли, і з 20.08.2026 рядок із ним місяць віддавав
+ * кожне повідомлення правилам. Значення, яке гарантовано ламає кожен виклик, не є вибором.
  */
-export const CODEX_SERVICE_TIERS = ['priority', 'default', 'flex'] as const;
+export const CODEX_SERVICE_TIERS = ['priority', 'default'] as const;
 export type CodexServiceTier = (typeof CODEX_SERVICE_TIERS)[number];
 
 /**
@@ -122,6 +144,8 @@ export type ClassifierMode = (typeof CLASSIFIER_MODES)[number];
 export interface CodexSettings {
   /** The operator's explicit choice, or null when they have deferred to `CODEX_MODEL`. */
   model: string | null;
+  /** The hot-path model (migration 055), or null for «as the main one». */
+  fastModel: string | null;
   effort: CodexEffort;
   serviceTier: CodexServiceTier;
   classifierMode: ClassifierMode;
@@ -133,6 +157,8 @@ export interface ResolvedCodexSettings extends CodexSettings {
   /** What a call will actually send. Null means no model is selected anywhere and none can run. */
   effectiveModel: string | null;
   modelSource: 'stored' | 'env' | 'none';
+  /** What a `tier: 'fast'` call will send: `fastModel ?? effectiveModel`. */
+  effectiveFastModel: string | null;
 }
 
 /**
@@ -143,10 +169,11 @@ export interface ResolvedCodexSettings extends CodexSettings {
  * answers replaces this list entirely. The list exists so that a console opened while the session
  * is expired still offers something to pick, rather than an empty dropdown that reads as a bug.
  */
-export const FALLBACK_CODEX_MODELS = ['gpt-5.6-luna', 'gpt-5.2', 'gpt-5.2-codex', 'o5', 'o5-mini'] as const;
+export const FALLBACK_CODEX_MODELS = ['gpt-6-luna', 'gpt-5.6-luna', 'gpt-5.2', 'gpt-5.2-codex', 'o5', 'o5-mini'] as const;
 
 interface SettingsRow {
   model: string | null;
+  fast_model: string | null;
   reasoning_effort: string;
   service_tier: string;
   narrative_enabled: boolean;
@@ -162,18 +189,20 @@ interface SettingsRow {
   attack_stats_enabled: boolean;
   classifier_mode: string;
   risk_enabled: boolean;
+  actualization_enabled: boolean;
   updated_at: Date;
 }
 
 const DEFAULTS: CodexSettings = {
   model: null,
+  fastModel: null,
   effort: 'medium',
   serviceTier: 'priority',
   classifierMode: 'rules',
   features: {
     narrative: false, digest: false, attacks: false, shadow: false, analytical_threats: false,
     analytical_enrichment: false, retrospective_gate: false, tactics: false, attack_research: false,
-    movement_summary: false, attack_stats: false, risk: false
+    movement_summary: false, attack_stats: false, risk: false, actualization: false
   },
   updatedAt: null
 };
@@ -181,6 +210,7 @@ const DEFAULTS: CodexSettings = {
 function fromRow(row: SettingsRow): CodexSettings {
   return {
     model: row.model && row.model.trim() ? row.model.trim() : null,
+    fastModel: row.fast_model && row.fast_model.trim() ? row.fast_model.trim() : null,
     // Значення з-поза словника читається як замовчування, а не кидає: CHECK у міграції не пускає
     // такого рядка, але база може бути старішою за код під час викочування.
     effort: (CODEX_EFFORTS as readonly string[]).includes(row.reasoning_effort)
@@ -202,7 +232,8 @@ function fromRow(row: SettingsRow): CodexSettings {
       attack_research: row.attack_research_enabled,
       movement_summary: row.movement_summary_enabled,
       attack_stats: row.attack_stats_enabled,
-      risk: row.risk_enabled
+      risk: row.risk_enabled,
+      actualization: row.actualization_enabled
     },
     updatedAt: row.updated_at.toISOString()
   };
@@ -211,22 +242,26 @@ function fromRow(row: SettingsRow): CodexSettings {
 /** Pure: what the stored row plus the environment mean together. Exported so tests need no database. */
 export function resolveSettings(stored: CodexSettings): ResolvedCodexSettings {
   const envModel = config.CODEX_MODEL.trim();
-  if (stored.model) return { ...stored, effectiveModel: stored.model, modelSource: 'stored' };
-  if (envModel) return { ...stored, effectiveModel: envModel, modelSource: 'env' };
-  return { ...stored, effectiveModel: null, modelSource: 'none' };
+  const main: Pick<ResolvedCodexSettings, 'effectiveModel' | 'modelSource'> = stored.model
+    ? { effectiveModel: stored.model, modelSource: 'stored' }
+    : envModel ? { effectiveModel: envModel, modelSource: 'env' } : { effectiveModel: null, modelSource: 'none' };
+  // Швидка модель без власного вибору — це основна, а не «жодна»: гаряча поверхня, яка
+  // `model_not_selected`-ила б лише тому, що оператор не заповнив друге поле, втратила б модель там,
+  // де до міграції 055 вона була.
+  return { ...stored, ...main, effectiveFastModel: stored.fastModel ?? main.effectiveModel };
 }
 
 /**
  * The catalogue an operator may choose from.
  *
- * Three sources are merged rather than one winning: what the service reported, what the environment
- * pins, and what is currently selected. The last two matter because a model that is *in use* must
- * never disappear from the dropdown — an operator who opens the console while `/models` is
+ * Four sources are merged rather than one winning: what the service reported, what the environment
+ * pins, and the two models currently selected. The last three matter because a model that is *in
+ * use* must never disappear from the dropdown — an operator who opens the console while `/models` is
  * unreachable would otherwise see their own choice missing and conclude it had been lost.
  * Order is preserved and duplicates dropped, so the service's own ordering survives.
  */
 export function mergeModelCatalogue(
-  apiModels: readonly string[], storedModel: string | null, envModel: string
+  apiModels: readonly string[], storedModel: string | null, envModel: string, storedFastModel: string | null = null
 ): string[] {
   const merged: string[] = [];
   const seen = new Set<string>();
@@ -240,11 +275,13 @@ export function mergeModelCatalogue(
   if (!apiModels.length) FALLBACK_CODEX_MODELS.forEach(push);
   push(envModel);
   push(storedModel);
+  push(storedFastModel);
   return merged;
 }
 
 export interface CodexSettingsPatch {
   model?: string | null;
+  fastModel?: string | null;
   effort?: string | null;
   serviceTier?: string | null;
   classifierMode?: string | null;
@@ -257,16 +294,18 @@ export interface CodexSettingsPatch {
  * A patch is partial by design — the console sends the whole form, but the API is also reachable by
  * hand, and "switch off the digest" should not require restating the model. An empty string for
  * `model` means the same as null: the operator cleared the field, which is the explicit choice to
- * defer to `CODEX_MODEL`.
+ * defer to `CODEX_MODEL`. The same holds for `fastModel`, where the deferral is to the main model.
  */
 export function applySettingsPatch(current: CodexSettings, patch: CodexSettingsPatch): CodexSettings {
   const model = patch.model === undefined ? current.model : (patch.model?.trim() || null);
+  const fastModel = patch.fastModel === undefined ? current.fastModel : (patch.fastModel?.trim() || null);
   // Невідоме значення лишає поточне, а не падає на замовчування: форма, надіслана старим клієнтом
   // або рукою, не має тихо перемкнути швидкість виклику на щось інше, ніж оператор бачив на екрані.
   const pick = <T extends string>(value: string | null | undefined, allowed: readonly T[], fallback: T): T =>
     (value != null && (allowed as readonly string[]).includes(value)) ? value as T : fallback;
   return {
     model,
+    fastModel,
     effort: pick(patch.effort, CODEX_EFFORTS, current.effort),
     serviceTier: pick(patch.serviceTier, CODEX_SERVICE_TIERS, current.serviceTier),
     classifierMode: pick(patch.classifierMode, CLASSIFIER_MODES, current.classifierMode),
@@ -282,20 +321,23 @@ export function applySettingsPatch(current: CodexSettings, patch: CodexSettingsP
       attack_research: patch.features?.attack_research ?? current.features.attack_research,
       movement_summary: patch.features?.movement_summary ?? current.features.movement_summary,
       attack_stats: patch.features?.attack_stats ?? current.features.attack_stats,
-      risk: patch.features?.risk ?? current.features.risk
+      risk: patch.features?.risk ?? current.features.risk,
+      actualization: patch.features?.actualization ?? current.features.actualization
     },
     updatedAt: current.updatedAt
   };
 }
 
+/** One projection for both the read and the save, so a column added to one cannot miss the other. */
+const SETTINGS_COLUMNS = `model,fast_model,reasoning_effort,service_tier,
+  narrative_enabled,digest_enabled,attacks_enabled,shadow_enabled,analytical_threats_enabled,
+  analytical_enrichment_enabled,retrospective_gate_enabled,tactics_enabled,attack_research_enabled,movement_summary_enabled,
+  attack_stats_enabled,classifier_mode,risk_enabled,actualization_enabled,
+  updated_at`;
+
 export async function readCodexSettings(): Promise<CodexSettings> {
   const result = await pool.query<SettingsRow>(
-    `SELECT model,reasoning_effort,service_tier,
-            narrative_enabled,digest_enabled,attacks_enabled,shadow_enabled,analytical_threats_enabled,
-            analytical_enrichment_enabled,retrospective_gate_enabled,tactics_enabled,attack_research_enabled,movement_summary_enabled,
-            attack_stats_enabled,classifier_mode,risk_enabled,
-            updated_at
-       FROM codex_settings WHERE singleton`
+    `SELECT ${SETTINGS_COLUMNS} FROM codex_settings WHERE singleton`
   );
   const row = result.rows[0];
   return row ? fromRow(row) : DEFAULTS;
@@ -314,10 +356,10 @@ export async function saveCodexSettings(patch: CodexSettingsPatch): Promise<Code
                                 narrative_enabled,digest_enabled,attacks_enabled,
                                 shadow_enabled,analytical_threats_enabled,analytical_enrichment_enabled,
                                 retrospective_gate_enabled,tactics_enabled,attack_research_enabled,movement_summary_enabled,
-                                attack_stats_enabled,classifier_mode,risk_enabled,updated_at)
-     VALUES (true,$1,$11,$12,$2,$3,$4,$5,$6,$7,$8,$9,$10,$13,$14,$15,$16,now())
+                                attack_stats_enabled,classifier_mode,risk_enabled,fast_model,actualization_enabled,updated_at)
+     VALUES (true,$1,$11,$12,$2,$3,$4,$5,$6,$7,$8,$9,$10,$13,$14,$15,$16,$17,$18,now())
      ON CONFLICT (singleton) DO UPDATE SET
-       model=EXCLUDED.model,
+       model=EXCLUDED.model, fast_model=EXCLUDED.fast_model,
        reasoning_effort=EXCLUDED.reasoning_effort, service_tier=EXCLUDED.service_tier,
        narrative_enabled=EXCLUDED.narrative_enabled,
        digest_enabled=EXCLUDED.digest_enabled, attacks_enabled=EXCLUDED.attacks_enabled,
@@ -329,17 +371,14 @@ export async function saveCodexSettings(patch: CodexSettingsPatch): Promise<Code
        attack_research_enabled=EXCLUDED.attack_research_enabled,
        movement_summary_enabled=EXCLUDED.movement_summary_enabled,
        attack_stats_enabled=EXCLUDED.attack_stats_enabled,
-       classifier_mode=EXCLUDED.classifier_mode, risk_enabled=EXCLUDED.risk_enabled, updated_at=now()
-     RETURNING model,reasoning_effort,service_tier,
-               narrative_enabled,digest_enabled,attacks_enabled,shadow_enabled,analytical_threats_enabled,
-               analytical_enrichment_enabled,retrospective_gate_enabled,tactics_enabled,attack_research_enabled,movement_summary_enabled,
-               attack_stats_enabled,classifier_mode,risk_enabled,
-               updated_at`,
+       classifier_mode=EXCLUDED.classifier_mode, risk_enabled=EXCLUDED.risk_enabled,
+       actualization_enabled=EXCLUDED.actualization_enabled, updated_at=now()
+     RETURNING ${SETTINGS_COLUMNS}`,
     [next.model, next.features.narrative, next.features.digest, next.features.attacks,
       next.features.shadow, next.features.analytical_threats, next.features.analytical_enrichment,
       next.features.retrospective_gate, next.features.tactics, next.features.attack_research,
       next.effort, next.serviceTier, next.features.movement_summary, next.features.attack_stats,
-      next.classifierMode, next.features.risk]
+      next.classifierMode, next.features.risk, next.fastModel, next.features.actualization]
   );
   return fromRow(result.rows[0]!);
 }

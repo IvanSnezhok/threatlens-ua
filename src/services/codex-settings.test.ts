@@ -16,9 +16,11 @@ import {
 
 const stored: CodexSettings = {
   model: null,
+  fastModel: null,
   features: {
     narrative: false, digest: false, attacks: false, shadow: false, analytical_threats: false,
-    analytical_enrichment: false, retrospective_gate: false, tactics: false, attack_research: false, movement_summary: false, attack_stats: false, risk: false
+    analytical_enrichment: false, retrospective_gate: false, tactics: false, attack_research: false, movement_summary: false, attack_stats: false, risk: false,
+    actualization: false
   },
   updatedAt: '2026-08-08T00:00:00.000Z'
 };
@@ -35,6 +37,16 @@ describe('resolving the effective model', () => {
     const resolved = resolveSettings(stored);
     expect(resolved.effectiveModel).toBeNull();
     expect(resolved.modelSource).toBe('none');
+  });
+
+  it('gives the hot path its own model when one was chosen, and the main one otherwise', () => {
+    // Migration 055. Null is «as the main one», never «none»: a hot-path surface must not go quiet
+    // with `model_not_selected` because the operator left the second field empty.
+    const main = resolveSettings({ ...stored, model: 'gpt-5.6-luna' });
+    expect([main.effectiveModel, main.effectiveFastModel]).toEqual(['gpt-5.6-luna', 'gpt-5.6-luna']);
+    const both = resolveSettings({ ...stored, model: 'gpt-5.6-luna', fastModel: 'gpt-6-luna' });
+    expect([both.effectiveModel, both.effectiveFastModel]).toEqual(['gpt-5.6-luna', 'gpt-6-luna']);
+    expect(resolveSettings(stored).effectiveFastModel).toBeNull();
   });
 });
 
@@ -55,6 +67,10 @@ describe('the model catalogue', () => {
     expect(merged).toContain('pinned-by-env');
   });
 
+  it('keeps the selected fast model in the list too', () => {
+    expect(mergeModelCatalogue(['gpt-5.2'], 'gpt-5.2', '', 'gpt-6-luna')).toEqual(['gpt-5.2', 'gpt-6-luna']);
+  });
+
   it('lists each model once even when three sources name it', () => {
     const merged = mergeModelCatalogue(['gpt-5.2', 'gpt-5.2'], 'gpt-5.2', 'gpt-5.2');
     expect(merged.filter((model) => model === 'gpt-5.2')).toHaveLength(1);
@@ -72,14 +88,16 @@ describe('applying a patch', () => {
       model: 'o5',
       features: {
         narrative: true, digest: true, attacks: false, shadow: true, analytical_threats: true,
-        analytical_enrichment: false, retrospective_gate: true, tactics: true, attack_research: false, movement_summary: false, attack_stats: false, risk: false
+        analytical_enrichment: false, retrospective_gate: true, tactics: true, attack_research: false, movement_summary: false, attack_stats: false, risk: false,
+        actualization: false
       }
     };
     const next = applySettingsPatch(current, { features: { digest: false } });
     expect(next.model).toBe('o5');
     expect(next.features).toEqual({
       narrative: true, digest: false, attacks: false, shadow: true, analytical_threats: true,
-      analytical_enrichment: false, retrospective_gate: true, tactics: true, attack_research: false, movement_summary: false, attack_stats: false, risk: false
+      analytical_enrichment: false, retrospective_gate: true, tactics: true, attack_research: false, movement_summary: false, attack_stats: false, risk: false,
+      actualization: false
     });
   });
 
@@ -93,11 +111,17 @@ describe('applying a patch', () => {
     expect(applySettingsPatch({ ...stored, model: 'o5' }, { model: null }).model).toBeNull();
   });
 
+  it('reads a cleared fast model as «as the main one», and leaves an absent one alone', () => {
+    expect(applySettingsPatch({ ...stored, fastModel: 'gpt-6-luna' }, { fastModel: '  ' }).fastModel).toBeNull();
+    expect(applySettingsPatch({ ...stored, fastModel: 'gpt-6-luna' }, { model: 'o5' }).fastModel).toBe('gpt-6-luna');
+  });
+
   it('switches a feature on without touching the others', () => {
     const next = applySettingsPatch(stored, { features: { attacks: true } });
     expect(next.features).toEqual({
       narrative: false, digest: false, attacks: true, shadow: false, analytical_threats: false,
-      analytical_enrichment: false, retrospective_gate: false, tactics: false, attack_research: false, movement_summary: false, attack_stats: false, risk: false
+      analytical_enrichment: false, retrospective_gate: false, tactics: false, attack_research: false, movement_summary: false, attack_stats: false, risk: false,
+      actualization: false
     });
   });
 

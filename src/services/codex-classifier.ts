@@ -5,7 +5,7 @@ import { pool } from '../db/pool.js';
 import {
   CLASSIFIER_VERSION, THREAT_EVENT_TITLES, significanceRejection, type LocationLexeme
 } from '../domain/classifier.js';
-import { THREAT_LABELS, resolveModelPlace } from '../domain/model-place.js';
+import { THREAT_LABELS, resolveModelPlace, type ResolvedModelPlace } from '../domain/model-place.js';
 import {
   THREAT_TIMINGS, describeAge, expectedWindow, momentIn, type ThreatTiming
 } from '../domain/threat-timing.js';
@@ -311,23 +311,47 @@ function parseIso(value: string | null): Date | null {
 /**
  * Класифікація з вердикту: клас, стан і час — від моделі; географія — через каталог; заголовок і
  * зведення — тими самими словами, що й у правил.
+ *
+ * Транзит. Коли модель каже, що ціль рухається (`redirected` або названий курс), і називає ОБИДВА
+ * кінці, звідки й куди, класифікація набуває тієї самої форми, що й «повз A на B» у правил
+ * (`src/domain/classifier.ts`): намір `redirect`, місця «звідки» — у `retraction`, «куди» — з
+ * `reported_direction`. Без цього `originLocations` мовчки відкидалися, і ланцюг вектора
+ * (`planStep` у `./threat-vectors.ts`) бачив лише кінець руху — відрізок «A→B» як `reported_transit`
+ * не міг скластися ніколи. «Звідки» проходить той самий каталог, що й решта назв; невпізнане
+ * відкидається мовчки, а без жодного впізнаного «звідки» транзиту немає.
+ *
+ * Місця «звідки» лягають ЛИШЕ в `retraction`, а не ще й у `locations`, як у правил: правила потім
+ * знімають там твердження цього джерела, а вердикт моделі цього права не має (`ingestThreat` не
+ * відкликає нічого за класифікацією з `assessment`, міграція 049: відбої — лише від правил). Покласти
+ * «звідки» в `locations` означало б, що модель СТВЕРДЖУЄ загрозу там, звідки ціль, за її ж словами,
+ * пішла, — і ніхто цього твердження не зняв би.
  */
 export function classificationFromVerdict(
   verdict: CodexVerdict, rules: ClassifiedMessage, lexemes: LocationLexeme[], sourceText: string
 ): { classified: ClassifiedMessage; resolvedLocations: number } {
-  const redirected = verdict.threatState === 'redirected';
-  const names = redirected && verdict.destinationLocations.length ? verdict.destinationLocations : verdict.locations;
-  const resolved = new Map<string, { id: string; name: string }>();
-  if (verdict.threatType !== 'unknown') {
+  const resolveAll = (names: readonly string[]): Map<string, ResolvedModelPlace> => {
+    const places = new Map<string, ResolvedModelPlace>();
+    if (verdict.threatType === 'unknown') return places;
     for (const name of names) {
       const place = resolveModelPlace(name, verdict.threatType, lexemes);
-      if (place) resolved.set(place.id, place);
+      if (place) places.set(place.id, place);
     }
-  }
+    return places;
+  };
+  const redirected = verdict.threatState === 'redirected';
+  const moving = redirected || Boolean(verdict.directionText?.trim());
+  const origins = resolveAll(moving ? verdict.originLocations : []);
+  const destinations = resolveAll(redirected || origins.size ? verdict.destinationLocations : []);
+  // Місце, назване обома кінцями, — напрямок, а не пройдене: так само вирішує `ingestThreat` для
+  // правил, бо «пройдене» — це той бік, помилка в який коштує попередження.
+  for (const id of destinations.keys()) origins.delete(id);
+  const transit = origins.size > 0 && destinations.size > 0;
+  const toward = transit || (redirected && verdict.destinationLocations.length > 0);
+  const resolved = toward ? destinations : resolveAll(verdict.locations);
   // Каталог не прочитав жодної назви моделі, а правила місце бачили — географія правил, клас моделі.
   const locations = resolved.size
     ? [...resolved.values()].map((place) => ({
-        ...place, relationType: redirected ? 'reported_direction' as const : 'explicit_threat' as const
+        ...place, relationType: toward ? 'reported_direction' as const : 'explicit_threat' as const
       }))
     : rules.locations.map((location) => ({ id: location.id, name: location.name, relationType: location.relationType }));
   const threatType = verdict.threatType;
@@ -335,7 +359,7 @@ export function classificationFromVerdict(
   const placeNames = verdict.nationalScope ? 'вся Україна' : locations.map((location) => location.name).join(', ');
   const excerpt = sourceText.replace(/\s+/gu, ' ').trim().slice(0, 500);
   const classified: ClassifiedMessage = {
-    intent: 'threat',
+    intent: transit ? 'redirect' : 'threat',
     threatType,
     signalThreatTypes: threatType === 'unknown' ? ['unknown'] : [threatType],
     locations,
@@ -346,6 +370,13 @@ export function classificationFromVerdict(
     originZone: rules.originZone ?? null,
     title: THREAT_EVENT_TITLES[threatType],
     summary: excerpt || `Загроза ${label} для ${placeNames}.`,
+    ...(transit ? {
+      retraction: {
+        threatTypes: [threatType],
+        locations: [...origins.values()].map(({ id, name }) => ({ id, name })),
+        coverage: 'located' as const
+      }
+    } : {}),
     // Ретроспективна оцінка ПРАВИЛ їде на класифікацію моделі — інакше сірої смуги в режимі `codex`
     // не існує взагалі. `src/services/ingestion.ts` вмикає ретроспективний гейт за
     // `classified.retrospective?.verdict === 'suspect'`, а класифікація, зібрана тут, цього поля не
@@ -497,6 +528,8 @@ export async function classifyWithCodex(
     const result = await chat({
       promptVersion: CODEX_CLASSIFIER_PROMPT_VERSION,
       surface: 'classifier',
+      // Повідомлення чекає на цей вердикт, перш ніж потрапити на карту: гаряча поверхня.
+      tier: 'fast',
       classifierVersion: CODEX_CLASSIFIER_VERSION,
       system: SYSTEM_PROMPT,
       user,
