@@ -408,6 +408,83 @@ or the kind gaining missiles) are `protected` and sound like an alert start; de-
 sideways kind changes are `soft` and silent, and neither is ever worded as an all-clear. The Telegram
 shapes and the operator view are in docs/OPERATIONS.md.
 
+### Threat event merging: one group, not one shared name
+
+`ingestThreat` used to attach a message to any live event of the same `threat_type` that shared any
+place with it, if the event had been seen in the last 30 minutes. One oblast named by two groups glued
+them into one event; one event ran Славутич → Чорнобиль → Київ → Кропивницький (Київ → Кропивницький is
+250 km, reported 116 s apart); and one group split into `uav`, `unknown` and `combined` events,
+because the class had to match word for word. The rule is now a pure function, `chooseMergeTarget` in
+`src/domain/event-merge.ts`, and a message joins a live event only when all of these hold:
+
+1. **The classes are compatible**: the same class; or `unknown` on one side and a concrete class on
+   the other; or `combined` with `uav`, `cruise_missile`, `ballistic_missile` or `unknown`. A join only
+   ever refines the class and never narrows it: an `unknown` event takes the message's class, and a
+   single class that a `combined` message joins becomes `combined` — hiding the missiles such a message
+   names would be the unsafe direction. A refinement rewrites `threat_type` and the class title,
+   leaves an `event_updates` row with reason `threat_type_refined` («уточнено клас загрози» in the
+   event dialog), and reaches subscribers through the existing `threat_type_changed` notification
+   decision. A message outside its own validity window may still join but never changes the class,
+   for the same reason it attaches no district.
+2. **The event is fresh for its class**: its `last_observed_at` lies within the class horizon of the
+   message's own publication time, in either direction — the track's windows
+   (`TRACK_WINDOW_MINUTES`, now in `src/domain/threat-motion.ts`): 25 min for `uav`; 20 for
+   `combined`, `unknown` and `aviation`; 12 for `cruise_missile`; 10 for `mlrs`, `artillery` and
+   `mortar`; 8 for `guided_air_bomb`; 6 for `ballistic_missile`. Measuring from the publication rather
+   than from `now()` asks whether the event was current when the message was written, so a message
+   replayed an hour late no longer joins whatever is live now. An expected event (`timing <> 'now'`)
+   whose window is still open keeps the old rule exactly — the same class and any shared place — because
+   its news is the window, not the last mention.
+3. **The place is the same, or reachable**. A message is judged by its **position**: where it puts the
+   target, chosen by `reportPositions` exactly as the track chooses its nodes (the anchor and the
+   heading, the passed place of «повз A на B», the last-named of equally specific places). That
+   position must either be one of the event's current positions at city, hromada or raion level — the
+   positions of its classifications inside its class window — or be reachable from the event's
+   **head**, the position of its newest classification, within
+   `CLASS_MAX_KMH × max(Δt, 10 min) × 1.3` — the ceilings that cut the track, taking the stricter of
+   the two classes, because one target that both reports describe must fit both. Fire does not travel
+   between oblasts, so the classes that do not fly have a fixed reach whatever the time between the
+   reports — 40 km for `mlrs`, `artillery` and `mortar`, 70 km (glide range) for `guided_air_bomb` —
+   and a `combined` report widens a `cruise_missile` or `ballistic_missile` event only within 150 km
+   of its head (`mergeReachKm`, `COMBINED_WIDEN_MAX_KM`; the track keeps its own ceilings).
+   Coordinates are the
+   catalogue point, or the ADM2 centroid for a raion (`placePoint`); a place with neither matches by
+   identity only. An oblast or the country never counts as a shared place, unless the message and the
+   event both name nothing finer.
+4. **Several candidates**: the nearest head wins, then the most recently observed event.
+
+A message naming several groups («6 на Бровари, 3 на Бориспіль») is not split: it joins at most one
+event — the one its position belongs to — and still attaches every place it names. The positions and
+the head are read from the classification archive, the same rows the track is built from, so an event
+and its track agree on where the target is. The archive row is written just after the ingest
+transaction commits (13 ms at the median in production, 66 ms at worst over a day); an event with no
+archived classification in its window — inside that gap, or a model promotion, which does not write
+the archive — stands on its `threat_event_locations` instead.
+
+**Cost.** Two statements, both indexed and bounded, and the second one only when there is a candidate.
+The candidate query has two branches, each on its own index and under `LIMIT 40`: live events of the
+compatible classes whose `last_observed_at` falls in the longest compatible horizon around the
+message (`threat_events_live_idx`, with each class's own horizon as a residual filter), and open
+expected events of the same class (`threat_events_expected_idx`). The places query reads those events'
+classifications within the same window (`message_classifications_event_time_idx`), their attached
+places and the message's own catalogue rows in one round trip. Distances are computed in TypeScript
+over those few dozen rows. On a copy of production at the busiest minute of 2026-09-22 (18:55 UTC, 21
+live events), `EXPLAIN ANALYZE` gave 0.24 ms for the candidate query (18 candidates, 30 shared
+buffers) and 2.2 ms for the places query (90 rows).
+
+**Measured** before rule 3 gained its fixed reaches, so these counts predate them. Replaying the 980 classifications that reached `ingestThreat` in the 24 hours to
+2026-09-23 10:05 UTC through both rules: 223 events under the old rule (the live system made 225) and
+279 under the new one, of which 135 reached the map against 117 — the rest are opened by messages read
+more than an hour late, which now stay in the archive instead of joining a live event. Consecutive
+reports inside one event that no member of its class could have flown between fell from 204 to 8; the
+widest event went from 823 km to 424 km, the longest from 13 hours to 3, the largest from 370 messages
+to 135; 14 `unknown` events were refined to a concrete class; no message ever had more than 14
+candidates.
+
+The track's plausibility break stays as the safety net for whatever still reaches an event without
+that measurement: an expected event, a place with no coordinates, a return to an older current
+position, an event glued before this rule.
+
 ### Threat de-escalation: who still says a threat is happening
 
 A threat event used to fade on one mechanism only — a 30-minute validity timer that every new
@@ -999,8 +1076,8 @@ the same way.
 
 **The track: what is current, not everything that was said.** The chain grows for as long as its
 event lives, and the map used to draw all of it: every classification of a live event was projected
-and nothing aged out, while the event itself stays live as long as any same-class message sharing any
-of its places arrives within half an hour. So a vector showed where a target had been reported thirty,
+and nothing aged out, while the event itself stayed live as long as any same-class message sharing any
+of its places arrived within half an hour. So a vector showed where a target had been reported thirty,
 twenty and ten minutes ago; a target circling a settlement drew A→B→A as mirrored arcs; a message
 naming an oblast and a town zig-zagged between the two; and a tie between two places of one message
 was broken by the alphabetical order of their ids. `/api/v1/threats/:id/vector` still returns the
@@ -1025,15 +1102,18 @@ are the same for every event and windowed by the event's class:
   A→B→A is two nodes and one line — the newest leg, pointing the newest way — not three nodes and two
   mirrored arcs. The head reads as a **loiter** when it was visited twice within the horizon, or
   restated three times over at least four minutes with no new place in between.
-- No leg a member of the class could not have flown. The event merge rule (same class, any shared
-  place) glues separate groups onto one event — live data drew «Київ → Кропивницький», 250 km reported
-  116 s apart. Walking back from the head, the track stops at the first leg longer than
-  `CLASS_MAX_KMH` × max(time between the two nodes' latest reports, 10 min) × 1.3 — `uav` 600,
-  `aviation` 1200, every other class 1000, `ballistic_missile` unlimited — and the node after the cut
-  becomes the origin; the older group stays in the dialog's history. The ceilings are a plausibility
-  filter (the fastest member of the class), not a speed estimate. Distances are great-circle between
-  node coordinates; a node without one, an oblast or the country is never measured, and the next
-  measurable node is compared across it, so it neither causes a cut nor hides one.
+- No leg a member of the class could not have flown. The event merge (see «Threat event merging»
+  above) already refuses a message its class could not have reached from the event's head; this rule
+  is the safety net for what still reaches one event unmeasured — an expected event, a place with no
+  coordinates, an event glued before the merge rule changed, where live data drew «Київ →
+  Кропивницький», 250 km reported 116 s apart. Walking back from the head, the track stops at the first
+  leg longer than `CLASS_MAX_KMH` × max(time between the two nodes' latest reports, 10 min) × 1.3 —
+  `uav` 600, `aviation` 1200, every other class 1000, `ballistic_missile` unlimited — and the node
+  after the cut becomes the origin; the older group stays in the dialog's history. The ceilings are a
+  plausibility filter (the fastest member of the class), not a speed estimate, and they live in
+  `src/domain/threat-motion.ts` beside the windows, shared with the merge. Distances are great-circle
+  between node coordinates; a node without one, an oblast or the country is never measured, and the
+  next measurable node is compared across it, so it neither causes a cut nor hides one.
 - At most four nodes: the head and the three freshest others. Nodes are ordered by their latest
   report, so the head is the last node and the first is the track's `origin`.
 - No oblast or country node while the track holds anything finer. A place cut out of the middle is
@@ -1420,6 +1500,13 @@ flowchart LR
 - Reposts from the same `independence_group` count as one source.
 - Two independent Tier A/B groups may promote an event to `confirmed`.
 - Evidence never downgrades when a weaker message is merged into an event.
+- A message joins a live event only when their classes are compatible, the event was seen within its
+  class horizon of the message, and the message's position is one of the event's current positions or
+  is reachable from its head; a shared oblast alone never joins two groups, and one message joins at
+  most one event. A join only ever refines the event's class — `unknown` to a concrete class, a single
+  class to `combined` — and never narrows it, and a message outside its validity window changes no
+  class. An expected event with an open window keeps the older rule: the same class and any shared
+  place.
 - A source withdraws only its own assertions. A threat event ends as `withdrawn` when its last
   holding assertion is taken back, and its validity is never shortened below what the remaining
   sources still support. A source that never asserted cannot withdraw anything. A withdrawal is also

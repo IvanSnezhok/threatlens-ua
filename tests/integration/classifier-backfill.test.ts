@@ -385,14 +385,20 @@ describe.skipIf(!integrationDatabaseAvailable)('classifier catch-up backfill', (
     });
 
     it('does not attach a stale message\'s district or evidence promotion to a live event', async () => {
-      // The dangerous merge: a live threat over Полтавщина, and an hour-old post from a SECOND
-      // monitor naming Полтавщина and Харківщина. Attaching the new district would grow the polygon
-      // and `decideThreatNotification` would read it as `geography_changed`; the second independent
+      // The dangerous merge: a live threat over Полтавщина, and a replayed post from a SECOND monitor
+      // naming Полтавщина and Харківщина. Attaching the new district would grow the polygon and
+      // `decideThreatNotification` would read it as `geography_changed`; the second independent
       // group would promote the event to `confirmed` and send that as an escalation. Neither may
-      // happen from a message that stopped applying an hour ago.
+      // happen from a message that has stopped applying.
+      //
+      // The two timestamps are chosen for the merge rule. A message joins an event only inside the
+      // event's class horizon measured from the message's own publication (25 minutes for drones),
+      // so an hour-old post no longer reaches an event observed now at all — it opens its own
+      // expired event. The dangerous case is the stale post that still falls inside that window:
+      // thirty-two minutes old, twenty-two minutes before the live report.
       await seedUser(6002);
       await seedSubscription({ chatId: 6002, locationId: POLTAVA_OBLAST });
-      const live = await ingest(ERADAR, 'Шахед курсом на Полтавщину.', new Date(), 'live-1');
+      const live = await ingest(ERADAR, 'Шахед курсом на Полтавщину.', new Date(Date.now() - 10 * MINUTE), 'live-1');
       await runFanout();
       const eventId = (live as { id: string }).id;
       const before = await eventRow(eventId);
@@ -401,7 +407,7 @@ describe.skipIf(!integrationDatabaseAvailable)('classifier catch-up backfill', (
 
       await ingest(
         WAR_MONITOR, 'Шахед курсом на Полтавщину та Харківщину.',
-        new Date(Date.now() - 90 * MINUTE), 'stale-merge-1', { monitor: true, historical: true }
+        new Date(Date.now() - 32 * MINUTE), 'stale-merge-1', { monitor: true, historical: true }
       );
       await runFanout();
 

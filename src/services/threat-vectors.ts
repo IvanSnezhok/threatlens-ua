@@ -1,7 +1,9 @@
-import { readFileSync } from 'node:fs';
-import { resolve } from 'node:path';
 import { pool } from '../db/pool.js';
-import { nameTokens, sameLexeme, tokenize, type PlaceToken } from '../domain/place-morphology.js';
+import { tokenize, type PlaceToken } from '../domain/place-morphology.js';
+import {
+  COARSE_TYPES, TRACK_WINDOW_MINUTES, classMaxKmh, greatCircleKm, placePoint, plausibleKm, reportPositions,
+  trackWindow
+} from '../domain/threat-motion.js';
 import type { EvidenceLevel } from '../types.js';
 import { actualizationApplies, latestActualizations, type TrackActualization } from './track-actualization.js';
 
@@ -82,11 +84,14 @@ import { actualizationApplies, latestActualizations, type TrackActualization } f
  *   * One node per place. A→B→A is two places and a return, not three places and two mirrored arcs;
  *     the node counts its `visits`, the head moves to the revisited place, and a return is a loiter —
  *     as is a head restated three times over four minutes with no new place in between.
- *   * No leg a member of the class could not have flown. The event merge rule glues every same-class
- *     message that shares a place onto one event, so two groups a region apart can share a track
- *     («Київ → Кропивницький», 250 km in 116 s). Walking back from the head, the track stops at the
- *     first leg longer than the class's fastest member covers in the time between the two reports
- *     ({@link CLASS_MAX_KMH}); the older group is history.
+ *   * No leg a member of the class could not have flown. The event merge rule
+ *     (`src/domain/event-merge.ts`) already refuses a message its class could not have reached from
+ *     the event's head, so what is left for this rule is what still reaches one event without being
+ *     measured: an expected event that merges by place alone, a place with no coordinate, an event
+ *     glued before that rule existed («Київ → Кропивницький», 250 km in 116 s). Walking back from the
+ *     head, the track stops at the first leg longer than the class's fastest member covers in the
+ *     time between the two reports (`CLASS_MAX_KMH` in `src/domain/threat-motion.ts`); the older group
+ *     is history.
  *   * At most four nodes: the head and the three freshest others.
  *   * No oblast (or country) node while the track holds anything finer.
  *   * The head message's stated destination is the `heading`, not a node. «В районі Кагарлика
@@ -298,63 +303,9 @@ export interface VectorChainRow {
 // Track windows
 // ------------------------------------------------------------------------------------------------
 
-/**
- * How long a report stays part of the track (`horizon`), and how long the head stays fresh
- * (`stale`), per class, in minutes.
- *
- * The numbers follow how fast each class makes a report untrue. A Shahed flies at walking pace next
- * to anything else here and is reported every few minutes over a flight of hours; a ballistic
- * missile is over in minutes, so a six-minute-old ballistic report describes a target that has
- * already arrived. `unknown` and `combined` take the middle of the table, because a window chosen for
- * the fastest possible class would cut a slow target's track while it is still flying, and one chosen
- * for the slowest would keep a fast target's history on the map long after it stopped being true.
- */
-export const TRACK_WINDOW_MINUTES: Readonly<Record<string, { horizon: number; stale: number }>> = {
-  uav: { horizon: 25, stale: 12 },
-  combined: { horizon: 20, stale: 10 },
-  unknown: { horizon: 20, stale: 10 },
-  aviation: { horizon: 20, stale: 10 },
-  cruise_missile: { horizon: 12, stale: 5 },
-  guided_air_bomb: { horizon: 8, stale: 4 },
-  ballistic_missile: { horizon: 6, stale: 3 },
-  mlrs: { horizon: 10, stale: 5 },
-  artillery: { horizon: 10, stale: 5 },
-  mortar: { horizon: 10, stale: 5 }
-};
-
-/** The event's class decides the window; a class the table does not know reads as `unknown`. */
-export function trackWindow(threatType: string): { horizonSeconds: number; staleAfterSeconds: number } {
-  const window = TRACK_WINDOW_MINUTES[threatType] ?? TRACK_WINDOW_MINUTES.unknown!;
-  return { horizonSeconds: window.horizon * 60, staleAfterSeconds: window.stale * 60 };
-}
-
-/**
- * The fastest any member of each class flies, in km/h — a PLAUSIBILITY FILTER, not a speed estimate.
- *
- * The event merge rule joins every same-class message that shares a place with the event, so two
- * groups a region apart can land on one event, and its track drew «Київ → Кропивницький» — 250 km
- * reported 116 s apart. A leg stays in the track only if some member of the class could have flown it:
- * the ceiling × the time between the two reports, never less than {@link PLAUSIBLE_LAG_FLOOR_HOURS}
- * because channels lag each other by minutes, × {@link PLAUSIBLE_MARGIN}. Each ceiling is the fastest
- * member of its class, not a typical one — jet Shaheds for `uav` — so a genuinely fast leg is never
- * cut; `ballistic_missile` has none, because no distance in the country is beyond it. Like the
- * animation speed (CONTEXT.md, «Межі безпеки»), none of these numbers is a speed of any real target:
- * they decide only where a drawn track stops, and they reach no text, no API field and no risk score.
- */
-const CLASS_MAX_KMH: Readonly<Record<string, number>> = {
-  uav: 600,
-  cruise_missile: 1000,
-  guided_air_bomb: 1000,
-  aviation: 1200,
-  combined: 1000,
-  unknown: 1000,
-  mlrs: 1000,
-  artillery: 1000,
-  mortar: 1000,
-  ballistic_missile: Number.POSITIVE_INFINITY
-};
-const PLAUSIBLE_LAG_FLOOR_HOURS = 10 / 60;
-const PLAUSIBLE_MARGIN = 1.3;
+// The per-class windows (`TRACK_WINDOW_MINUTES`) and the plausibility ceilings live in
+// `src/domain/threat-motion.ts`. The event merge reads the same numbers, and an event and its track
+// must agree on what «the same target» means.
 
 /** Longest horizon of any class: no event whose last observation is older has a track to publish. */
 const LONGEST_HORIZON_SECONDS = Math.max(...Object.values(TRACK_WINDOW_MINUTES).map((window) => window.horizon)) * 60;
@@ -375,88 +326,6 @@ const LOITER_MIN_SPAN_MS = 4 * 60_000;
 /** The statuses `liveThreats` also treats as ended. */
 const ENDED_EVENT_STATUSES: Readonly<Record<string, true>> = { expired: true, withdrawn: true, corrected: true };
 
-/** An oblast or the country: the places a track drops as soon as it holds anything finer. */
-const COARSE_TYPES: Readonly<Record<string, true>> = { oblast: true, country: true };
-
-// ------------------------------------------------------------------------------------------------
-// Coordinates
-// ------------------------------------------------------------------------------------------------
-
-const ADM2_PATH = 'public/data/ukraine-adm2.geojson';
-let raionCentroidIndex: Map<string, [number, number]> | null = null;
-
-function ringCentroid(ring: number[][]): [number, number] | null {
-  let x = 0, y = 0, area = 0;
-  for (let i = 0, j = ring.length - 1; i < ring.length; j = i++) {
-    const current = ring[i], previous = ring[j];
-    if (!current || !previous) continue;
-    const cross = (previous[0]! * current[1]!) - (current[0]! * previous[1]!);
-    area += cross;
-    x += (previous[0]! + current[0]!) * cross;
-    y += (previous[1]! + current[1]!) * cross;
-  }
-  if (area) return [x / (3 * area), y / (3 * area)];
-  const first = ring[0];
-  return first && first.length >= 2 ? [first[0]!, first[1]!] : null;
-}
-
-/** Centroid of the largest outer ring — the same rule the map already uses to place region labels. */
-function largestRingCentroid(geometry: { type?: string; coordinates?: unknown }): [number, number] | null {
-  const polygons: number[][][][] = geometry?.type === 'MultiPolygon'
-    ? geometry.coordinates as number[][][][]
-    : geometry?.type === 'Polygon' ? [geometry.coordinates as number[][][]] : [];
-  let best: number[][] | null = null;
-  let largest = 0;
-  for (const polygon of polygons) {
-    const outer = polygon?.[0];
-    if (!Array.isArray(outer) || outer.length < 4) continue;
-    let area = 0;
-    for (let i = 0, j = outer.length - 1; i < outer.length; j = i++) {
-      const current = outer[i], previous = outer[j];
-      if (!current || !previous) continue;
-      area += (previous[0]! * current[1]!) - (current[0]! * previous[1]!);
-    }
-    if (Math.abs(area) > largest) { largest = Math.abs(area); best = outer; }
-  }
-  return best ? ringCentroid(best) : null;
-}
-
-/**
- * Raion centroids, read once from the ADM2 polygons the map already serves.
- *
- * KATOTTG carries no geometry for raions, so `locations.latitude/longitude` is null for all 136 of
- * them and a chain that passes through a raion would otherwise break in the middle. The centroid is
- * an approximation and is never silently promoted to a coordinate: it arrives with
- * `coordinateSource: 'raion_centroid'` and `coordinatePrecision: 'approximate'`.
- *
- * A missing or malformed file degrades to an empty index rather than an exception — the chain is
- * still correct as text, it simply has fewer drawable segments.
- */
-export function raionCentroids(): Map<string, [number, number]> {
-  if (raionCentroidIndex) return raionCentroidIndex;
-  const index = new Map<string, [number, number]>();
-  try {
-    const raw = JSON.parse(readFileSync(resolve(process.cwd(), ADM2_PATH), 'utf8')) as {
-      features?: Array<{ properties?: { locationId?: string }; geometry?: { type?: string; coordinates?: unknown } }>;
-    };
-    for (const feature of raw.features ?? []) {
-      const id = feature?.properties?.locationId;
-      if (!id || !feature.geometry) continue;
-      const point = largestRingCentroid(feature.geometry);
-      if (point && Number.isFinite(point[0]) && Number.isFinite(point[1])) index.set(id, point);
-    }
-  } catch {
-    // The layer is optional geometry, not a data source. Chains stay readable without it.
-  }
-  raionCentroidIndex = index;
-  return index;
-}
-
-/** Test seam: the index is cached for the process lifetime because the file never changes at runtime. */
-export function resetRaionCentroidCache(): void {
-  raionCentroidIndex = null;
-}
-
 // ------------------------------------------------------------------------------------------------
 // Chain assembly
 // ------------------------------------------------------------------------------------------------
@@ -465,64 +334,6 @@ export function resetRaionCentroidCache(): void {
 export function evidenceForSource(tier: string, official: boolean): EvidenceLevel {
   if (official) return 'official';
   return tier === 'B' ? 'monitoring' : 'unverified';
-}
-
-/**
- * How specific a place is. A message that names both "Київська область" and "Бориспіль" has told us
- * about Бориспіль; anchoring the chain on the oblast would throw that away and draw a line to the
- * middle of a region nobody pointed at.
- */
-const TYPE_SPECIFICITY: Readonly<Record<string, number>> = {
-  city: 0, special_city: 1, hromada: 2, raion: 3, oblast: 4, country: 5
-};
-
-/**
- * Offset in the lower-cased message of the LAST place where `name` is named, or -1.
- *
- * Matched word by word in any case through the classifier's own declension table, so «з Борисполя на
- * Бровари» finds Бориспіль at its genitive. A place the text names only through an alias («Троя» for
- * Київ) is not found and loses the tie to any place that is, which is the right direction to fail:
- * the found one is certainly in the sentence.
- */
-function lastMention(tokens: readonly PlaceToken[], name: string): number {
-  const keys = nameTokens(name);
-  if (!keys.length) return -1;
-  for (let start = tokens.length - keys.length; start >= 0; start -= 1) {
-    let matches = true;
-    for (let offset = 0; offset < keys.length && matches; offset += 1) {
-      matches = sameLexeme(keys[offset]!, tokens[start + offset]!.key);
-    }
-    if (matches) return tokens[start]!.start;
-  }
-  return -1;
-}
-
-/**
- * The most specific of `rows`, and among equally specific places the one the message names LAST.
- *
- * The rows arrive ordered by `location_id`, and the first of a tie used to win — so «з Борисполя на
- * Бровари» anchored on Бориспіль because `boryspil` sorts before `brovary`, and the chain pointed the
- * wrong way. A Ukrainian report names where the target is going after where it comes from, so the
- * last-named place is the destination, which is the newer fact about the target. Only a tie pays for
- * reading the text; the id order stays as the last resort when no candidate is found in it.
- */
-function mostSpecific(rows: readonly VectorChainRow[], text: () => readonly PlaceToken[]): VectorChainRow | null {
-  let best: VectorChainRow | null = null;
-  let bestRank = Infinity;
-  let tied = false;
-  for (const row of rows) {
-    const rank = TYPE_SPECIFICITY[row.location_type] ?? 9;
-    if (rank < bestRank) { best = row; bestRank = rank; tied = false; } else if (rank === bestRank) tied = true;
-  }
-  if (!best || !tied) return best;
-  const tokens = text();
-  let bestAt = lastMention(tokens, best.name_uk);
-  for (const row of rows) {
-    if (row === best || (TYPE_SPECIFICITY[row.location_type] ?? 9) !== bestRank) continue;
-    const at = lastMention(tokens, row.name_uk);
-    if (at > bestAt) { best = row; bestAt = at; }
-  }
-  return best;
 }
 
 function toIso(value: Date | string): string {
@@ -560,34 +371,9 @@ function planStep(rows: VectorChainRow[]): ChainStep | null {
   if (!head) return null;
   let tokens: PlaceToken[] | null = null;
   const text = () => tokens ??= tokenize((head.raw_text || head.direction_text || '').toLocaleLowerCase('uk-UA'));
-  const asserted = rows.filter((row) => row.role === 'asserted');
-  const retracted = rows.filter((row) => row.role === 'retracted');
-  const directions = asserted.filter((row) => row.relation_type === 'reported_direction');
-  const anchors = asserted.filter((row) => row.relation_type !== 'reported_direction');
-  const isRedirect = head.decision === 'redirect' || head.intent === 'redirect';
-
-  let positions: VectorChainRow[];
-  let pairBasis: VectorSegmentBasis = 'observation_sequence';
-  const transitOrigin = mostSpecific(retracted, text);
-  const destination = mostSpecific(directions, text);
-  const anchor = mostSpecific(anchors, text);
-
-  if (isRedirect && transitOrigin && destination) {
-    // "повз A на B": one publisher vouched for both ends of the move in one sentence.
-    positions = [transitOrigin, destination];
-    pairBasis = 'reported_transit';
-  } else if (anchor && destination) {
-    // The message named a place and a heading out of it. A heading is not an arrival.
-    positions = [anchor, destination];
-    pairBasis = 'reported_direction';
-  } else if (destination) {
-    positions = [destination];
-  } else if (anchor) {
-    positions = [anchor];
-  } else if (transitOrigin) {
-    // A retraction with nothing asserted moves no chain forward; it is still where the target was.
-    positions = [transitOrigin];
-  } else return null;
+  const plan = reportPositions(rows, head.decision === 'redirect' || head.intent === 'redirect', text);
+  if (!plan) return null;
+  const { positions, basis: pairBasis } = plan;
 
   const chosen = new Set(positions.map((row) => row.location_id));
   return {
@@ -602,17 +388,15 @@ function planStep(rows: VectorChainRow[]): ChainStep | null {
 }
 
 function resolveCoordinates(row: VectorChainRow): Pick<ReportedVectorNode, 'coordinates' | 'coordinateSource' | 'coordinatePrecision'> {
-  const latitude = row.latitude == null ? null : Number(row.latitude);
-  const longitude = row.longitude == null ? null : Number(row.longitude);
-  if (latitude != null && longitude != null && Number.isFinite(latitude) && Number.isFinite(longitude)) {
+  const located = placePoint(row.location_id, row.latitude, row.longitude);
+  if (located?.source === 'catalogue') {
     // A hromada's catalogue point is the centre of an area, or the settlement that governs it when that
     // centre falls outside the raion — never where anything was. Published as a point, it would claim a
     // precision nobody reported, exactly what `raion_centroid` below refuses to do.
     const precision: CoordinatePrecision = row.location_type === 'hromada' ? 'approximate' : 'point';
-    return { coordinates: [longitude, latitude], coordinateSource: 'catalogue', coordinatePrecision: precision };
+    return { coordinates: located.point, coordinateSource: 'catalogue', coordinatePrecision: precision };
   }
-  const centroid = raionCentroids().get(row.location_id);
-  if (centroid) return { coordinates: centroid, coordinateSource: 'raion_centroid', coordinatePrecision: 'approximate' };
+  if (located) return { coordinates: located.point, coordinateSource: 'raion_centroid', coordinatePrecision: 'approximate' };
   // Raions whose polygon is missing from the ADM2 file, and places the catalogue has no coordinate for.
   // The node is still published: "a source named this place at this time" is a fact whether or not it
   // can be drawn.
@@ -920,25 +704,12 @@ function measurable(node: ReportedVectorNode): node is MeasuredNode {
 }
 
 /**
- * Great-circle distance in km between two [longitude, latitude] points. A copy rather than
- * `distanceKm` from `./vector-projection.ts`: that module is operator-only and imports this one, and
- * the import arrow may not point back (`src/api/vector-isolation.test.ts`).
- */
-function greatCircleKm(from: [number, number], to: [number, number]): number {
-  const radians = Math.PI / 180;
-  const dLat = (to[1] - from[1]) * radians;
-  const dLon = (to[0] - from[0]) * radians;
-  const a = Math.sin(dLat / 2) ** 2
-    + Math.cos(from[1] * radians) * Math.cos(to[1] * radians) * Math.sin(dLon / 2) ** 2;
-  return 2 * 6371.0088 * Math.asin(Math.min(1, Math.sqrt(a)));
-}
-
-/**
  * How far the track reaches from the head in one direction — `-1` towards older nodes, `1` towards
  * newer ones, which only a model's head can have — before the first leg no member of the class could
  * have flown in the time between its two latest reports. Every measurable node is compared with the
  * nearest measurable one on the head's side, so a place that cannot be measured neither causes a cut
- * nor hides one. What lies past the cut is another group the event's merge rule glued on.
+ * nor hides one. What lies past the cut is another group that reached the event without being
+ * measured on the way in.
  */
 function plausibleReach(nodes: readonly ReportedVectorNode[], headAt: number, direction: -1 | 1, maxKmh: number): number {
   let reach = headAt;
@@ -947,11 +718,8 @@ function plausibleReach(nodes: readonly ReportedVectorNode[], headAt: number, di
     const node = nodes[index]!;
     if (measurable(node)) {
       if (anchor) {
-        const hours = Math.max(
-          Math.abs(Date.parse(anchor.lastReportedAt) - Date.parse(node.lastReportedAt)) / 3_600_000,
-          PLAUSIBLE_LAG_FLOOR_HOURS
-        );
-        if (greatCircleKm(anchor.coordinates, node.coordinates) > maxKmh * hours * PLAUSIBLE_MARGIN) break;
+        const elapsedMs = Date.parse(anchor.lastReportedAt) - Date.parse(node.lastReportedAt);
+        if (greatCircleKm(anchor.coordinates, node.coordinates) > plausibleKm(maxKmh, elapsedMs)) break;
       }
       anchor = node;
     }
@@ -1025,7 +793,7 @@ function composeTrack(chain: Chain, context: TrackContext, nowMs: number): Compo
   // the reports made in that order — which is what the break below measures.
   let assembly = orderByLastReport(assemble(positions, chain.eventThreatType, true));
   const headAt = assembly.nodeOf.get(head)!;
-  const maxKmh = CLASS_MAX_KMH[chain.eventThreatType] ?? CLASS_MAX_KMH.unknown!;
+  const maxKmh = classMaxKmh(chain.eventThreatType);
   const first = plausibleReach(assembly.nodes, headAt, -1, maxKmh);
   const last = plausibleReach(assembly.nodes, headAt, 1, maxKmh);
   // A model loiter on the far side of a break belongs to the other group: ignored, like any id the

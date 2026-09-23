@@ -1,9 +1,9 @@
 import { z } from 'zod';
 import { config } from '../config.js';
 import { CLASSIFIER_VERSION } from '../domain/classifier.js';
+import { raionCentroids } from '../domain/threat-motion.js';
 import { pool } from '../db/pool.js';
 import {
-  raionCentroids,
   reportedVectorForEvent,
   type ReportedVector,
   type ReportedVectorSegment,

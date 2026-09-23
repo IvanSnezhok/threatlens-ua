@@ -7,8 +7,9 @@ const actualizations = vi.hoisted(() => ({ actualizationApplies: vi.fn(), latest
 vi.mock('../db/pool.js', () => ({ pool: database }));
 vi.mock('./track-actualization.js', () => actualizations);
 
+import { raionCentroids } from '../domain/threat-motion.js';
 import {
-  buildReportedTrack, buildReportedTracks, buildReportedVector, raionCentroids, reportedVectorsForLiveEvents,
+  buildReportedTrack, buildReportedTracks, buildReportedVector, reportedVectorsForLiveEvents,
   type TrackContext, type VectorChainRow
 } from './threat-vectors.js';
 

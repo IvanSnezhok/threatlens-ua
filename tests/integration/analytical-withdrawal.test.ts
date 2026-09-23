@@ -30,8 +30,9 @@ let sequence = 0;
 
 /**
  * One ingested message, deterministic or promoted. The location is a parameter for the same reason
- * `threat-origin.test.ts` makes it one: `ingestThreat` merges into any live event of the same class
- * over the same place inside thirty minutes, so two independent events need two places.
+ * `threat-origin.test.ts` makes it one: `ingestThreat` merges a message naming the same oblast into a
+ * live event of a compatible class inside its class window, so two independent events need two
+ * oblasts.
  */
 async function ingest(options: { model?: boolean; locationId?: string } = {}) {
   const { ingestThreat } = await import('../../src/repositories/events.js');

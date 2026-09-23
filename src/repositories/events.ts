@@ -3,6 +3,8 @@ import type { PoolClient } from 'pg';
 import { nearerTiming, type ThreatTiming } from '../domain/threat-timing.js';
 import { config } from '../config.js';
 import { CLASSIFIER_VERSION } from '../domain/classifier.js';
+import { chooseMergeTarget, mergePlaces, mergeableEventTypes, type MergeRow } from '../domain/event-merge.js';
+import { placePoint, trackWindow } from '../domain/threat-motion.js';
 import type { TerritoryNode } from '../domain/territory-state.js';
 import { pool } from '../db/pool.js';
 import type { ClassifiedMessage, EvidenceLevel, LiveEvent, NormalizedMessage, ThreatOrigin } from '../types.js';
@@ -679,6 +681,179 @@ export interface IngestThreatOptions {
   };
 }
 
+// ------------------------------------------------------------------------------------------------
+// Merge: which live event a message joins
+// ------------------------------------------------------------------------------------------------
+
+/** Скільки подій щонайбільше читає кожна з двох гілок пошуку кандидатів на злиття. */
+const MERGE_CANDIDATE_LIMIT = 40;
+
+/**
+ * Кандидати на злиття: живі події сумісних класів, які востаннє бачили в межах горизонту їхнього
+ * класу від часу повідомлення, і очікувані події того самого класу з відкритим вікном.
+ *
+ * Дві гілки, кожна на власному індексі й під власним LIMIT. Перша стоїть на
+ * `threat_events_live_idx (status, last_observed_at DESC)`: найдовший горизонт серед сумісних класів
+ * задає діапазон індексу, а горизонт класу кожної події (`$2[array_position($1, threat_type)]`) —
+ * залишковий фільтр кількох рядків, які цей діапазон пропустив. Друга — на
+ * `threat_events_expected_idx (expected_until) WHERE timing <> 'now'`: очікувана подія живе вікном, а
+ * не останньою згадкою, тож горизонт її не зрізає. Відстаней SQL не рахує: це робить
+ * `src/domain/event-merge.ts` над кількома десятками рядків.
+ *
+ * Горизонт міряється від часу публікації повідомлення, в обидва боки, а не від `now()`: запізніле
+ * повідомлення питає, чи була подія свіжою тоді, коли про неї писали.
+ */
+const MERGE_CANDIDATES_SQL = `
+  (SELECT e.id, e.threat_type, e.evidence_level, e.status, e.timing, e.last_observed_at,
+          (e.timing <> 'now' AND e.expected_until > now()) AS expected_open
+     FROM threat_events e
+    WHERE e.status IN ('observed','confirmed','active')
+      AND e.last_observed_at > $3::timestamptz - make_interval(secs => $4)
+      AND e.last_observed_at < $3::timestamptz + make_interval(secs => $4)
+      AND e.threat_type = ANY($1::text[])
+      AND abs(extract(epoch FROM e.last_observed_at - $3::timestamptz))
+          <= ($2::int[])[array_position($1::text[], e.threat_type)]
+    ORDER BY e.last_observed_at DESC LIMIT $6)
+  UNION
+  (SELECT e.id, e.threat_type, e.evidence_level, e.status, e.timing, e.last_observed_at, true
+     FROM threat_events e
+    WHERE e.timing <> 'now' AND e.expected_until > now()
+      AND e.status IN ('observed','confirmed','active')
+      AND e.threat_type = $5
+    ORDER BY e.last_observed_at DESC LIMIT $6)`;
+
+/**
+ * Місця кандидатів і самого повідомлення, одним запитом.
+ *
+ *  * `report` — класифікації події з архіву (`message_classifications_event_time_idx`), тобто те, з
+ *    чого складається її трек: з них беруться поточні позиції й голова, тим самим `reportPositions`,
+ *    що й у треку, — тому й роль, зв'язок, назва та текст повідомлення;
+ *  * `attached` — усі місця, до яких подію прив'язано (первинний ключ `threat_event_locations`): за
+ *    ними зливається очікувана подія, і ними ж подія стоїть, поки архів її повідомлення ще не
+ *    дописав — він пишеться після COMMIT, за кілька десятків мілісекунд;
+ *  * `message` — тип, назва й точка місць самого повідомлення.
+ *
+ * Порядок — роль, потім ідентифікатор, як у ланцюжку треку: коли два однаково конкретні місця не
+ * розрізняє й текст, перемагає перше, і злиття мусить обрати те саме, що обере трек.
+ */
+const MERGE_PLACES_SQL = `
+  SELECT 'report' AS kind, mc.event_id, mc.id AS report_id, mc.published_at AS reported_at,
+         (mc.decision = 'redirect' OR mc.intent = 'redirect') AS redirect,
+         COALESCE(NULLIF(sm.raw_text, ''), mc.direction_text, '') AS text,
+         mcl.role, mcl.relation_type, l.id AS location_id, l.type, l.name_uk, l.latitude, l.longitude
+    FROM message_classifications mc
+    JOIN message_classification_locations mcl ON mcl.classification_id = mc.id
+    JOIN locations l ON l.id = mcl.location_id
+    LEFT JOIN source_messages sm ON sm.id = mc.source_message_id
+   WHERE mc.event_id = ANY($1::uuid[]) AND mc.published_at > $2::timestamptz
+  UNION ALL
+  SELECT 'attached', el.event_id, NULL, NULL, false, '', 'asserted', el.relation_type,
+         l.id, l.type, l.name_uk, l.latitude, l.longitude
+    FROM threat_event_locations el JOIN locations l ON l.id = el.location_id
+   WHERE el.event_id = ANY($1::uuid[])
+  UNION ALL
+  SELECT 'message', NULL, NULL, NULL, false, '', NULL, NULL, l.id, l.type, l.name_uk, l.latitude, l.longitude
+    FROM locations l WHERE l.id = ANY($3::text[])
+  ORDER BY role, location_id`;
+
+interface MergeTarget {
+  id: string;
+  threatType: string;
+  /** Клас події після злиття — `joinedThreatType` із `src/domain/event-merge.ts`. */
+  joinedThreatType: string;
+  evidenceLevel: EvidenceLevel;
+  status: string;
+  timing: ThreatTiming;
+}
+
+/**
+ * Жива подія, до якої приєднується повідомлення, або `null`, і тоді воно створює нову. Рішення
+ * ухвалює {@link chooseMergeTarget}; тут лише два обмежені запити і перетворення їхніх рядків.
+ */
+async function findMergeTarget(
+  client: PoolClient,
+  input: {
+    threatType: string; publishedAt: Date; text: string; redirect: boolean;
+    places: ReadonlyArray<{ id: string; role: 'asserted' | 'retracted'; relationType: string | null }>;
+  }
+): Promise<MergeTarget | null> {
+  const types = mergeableEventTypes(input.threatType);
+  const horizons = types.map((type) => trackWindow(type).horizonSeconds);
+  const longest = Math.max(...horizons);
+  const candidates = await client.query<{
+    id: string; threat_type: string; evidence_level: EvidenceLevel; status: string;
+    timing: ThreatTiming | null; last_observed_at: Date; expected_open: boolean;
+  }>(MERGE_CANDIDATES_SQL, [types, horizons, input.publishedAt, longest, input.threatType, MERGE_CANDIDATE_LIMIT]);
+  if (!candidates.rowCount) return null;
+
+  const places = await client.query<{
+    kind: 'report' | 'attached' | 'message'; event_id: string | null; report_id: string | null;
+    reported_at: Date | null; redirect: boolean; text: string; role: string | null; relation_type: string | null;
+    location_id: string; type: string; name_uk: string; latitude: number | string | null; longitude: number | string | null;
+  }>(MERGE_PLACES_SQL, [
+    candidates.rows.map((row) => row.id),
+    new Date(input.publishedAt.getTime() - longest * 1000),
+    input.places.map((place) => place.id)
+  ]);
+  const catalogue = new Map<string, { type: string; name: string; point: [number, number] | null }>();
+  const attached = new Map<string, MergeRow[]>();
+  const reports = new Map<string, Map<string, { atMs: number; redirect: boolean; text: string; rows: MergeRow[] }>>();
+  for (const row of places.rows) {
+    const point = placePoint(row.location_id, row.latitude, row.longitude)?.point ?? null;
+    if (row.kind === 'message') {
+      catalogue.set(row.location_id, { type: row.type, name: row.name_uk, point });
+      continue;
+    }
+    const place: MergeRow = {
+      location_id: row.location_id, location_type: row.type, name_uk: row.name_uk, point,
+      role: row.role ?? 'asserted', relation_type: row.relation_type
+    };
+    if (row.kind === 'attached') {
+      const list = attached.get(row.event_id!);
+      if (list) list.push(place); else attached.set(row.event_id!, [place]);
+      continue;
+    }
+    const byReport = reports.get(row.event_id!) ?? new Map<string, { atMs: number; redirect: boolean; text: string; rows: MergeRow[] }>();
+    reports.set(row.event_id!, byReport);
+    const report = byReport.get(row.report_id!);
+    if (report) report.rows.push(place);
+    else byReport.set(row.report_id!, { atMs: row.reported_at!.getTime(), redirect: row.redirect, text: row.text, rows: [place] });
+  }
+  // Місця самого повідомлення — у тому самому порядку (роль, потім ідентифікатор, як їх упорядкував
+  // запит), бо так їх потім прочитає трек з архіву. Місце, якого каталог не повернув, лишається
+  // ідентифікатором без точки: воно ще може збігтися назвою, але відстані до нього немає.
+  const rank = new Map([...catalogue.keys()].map((id, index) => [id, index]));
+  const own: MergeRow[] = [...input.places]
+    .sort((left, right) => left.role.localeCompare(right.role)
+      || (rank.get(left.id) ?? rank.size) - (rank.get(right.id) ?? rank.size))
+    .map((place) => {
+      const known = catalogue.get(place.id);
+      return {
+        location_id: place.id, location_type: known?.type ?? '', name_uk: known?.name ?? place.id,
+        point: known?.point ?? null, role: place.role, relation_type: place.relationType
+      };
+    });
+  const decision = chooseMergeTarget(
+    { threatType: input.threatType, atMs: input.publishedAt.getTime(), ...mergePlaces(own, input.redirect, input.text) },
+    candidates.rows.map((row) => ({
+      id: row.id,
+      threatType: row.threat_type,
+      lastObservedAtMs: row.last_observed_at.getTime(),
+      expectedOpen: row.expected_open,
+      attached: mergePlaces(attached.get(row.id) ?? [], false, ''),
+      reports: [...(reports.get(row.id)?.values() ?? [])].map((report) => ({
+        atMs: report.atMs, ...mergePlaces(report.rows, report.redirect, report.text)
+      }))
+    }))
+  );
+  const chosen = decision && candidates.rows.find((row) => row.id === decision.eventId);
+  if (!decision || !chosen) return null;
+  return {
+    id: chosen.id, threatType: chosen.threat_type, joinedThreatType: decision.threatType,
+    evidenceLevel: chosen.evidence_level, status: chosen.status, timing: chosen.timing ?? 'now'
+  };
+}
+
 export async function ingestThreat(
   message: NormalizedMessage, classified: ClassifiedMessage, options: IngestThreatOptions = {}
 ): Promise<IngestThreatResult> {
@@ -823,36 +998,51 @@ export async function ingestThreat(
     }
     const locationIds = eventLocations.map((location) => location.id);
 
-    // Очікувана подія (timing <> now) приймає нові повідомлення впродовж усього свого вікна, а не лише
-    // тридцять хвилин від останньої згадки: «увечері очікується» о 15:00 і «все ще очікується» о 17:00 —
-    // одна подія, а не дві.
-    const existing = locationIds.length ? await client.query<{ id: string; evidence_level: EvidenceLevel; status: string; timing: ThreatTiming }>(
-      `SELECT e.id,e.evidence_level,e.status,e.timing FROM threat_events e
-       JOIN threat_event_locations el ON el.event_id=e.id
-       WHERE e.threat_type=$1 AND el.location_id=ANY($2::text[])
-         AND e.status IN ('observed','confirmed','active')
-         AND (e.last_observed_at > now() - interval '30 minutes'
-              OR (e.timing <> 'now' AND e.expected_until > now()))
-       ORDER BY e.last_observed_at DESC LIMIT 1`,
-      [classified.threatType, locationIds]
-    ) : { rows: [], rowCount: 0 } as never;
+    // Злиття (CONTEXT.md, «Подія загрози»; правило — `src/domain/event-merge.ts`): повідомлення
+    // приєднується до живої події, лише коли клас сумісний, подія свіжа для свого класу, а місце те
+    // саме або досяжне з голови події. Очікувана подія (timing <> now) з відкритим вікном зливається
+    // як і раніше — той самий клас і спільне місце впродовж усього вікна: «увечері очікується» о 15:00
+    // і «все ще очікується» о 17:00 — одна подія, а не дві.
+    const redirect = !classified.nationalScope && classified.intent === 'redirect';
+    const existing = locationIds.length
+      ? await findMergeTarget(client, {
+          threatType: classified.threatType,
+          publishedAt: message.publishedAt,
+          text: message.text,
+          redirect,
+          places: [
+            ...eventLocations.map((location) => ({
+              id: location.id, role: 'asserted' as const, relationType: location.relationType
+            })),
+            // «Повз A на B»: A — де група зараз, хоча до події це місце не прив'язується.
+            ...(redirect ? classified.retraction?.locations ?? [] : []).map((location) => ({
+              id: location.id, role: 'retracted' as const, relationType: null
+            }))
+          ]
+        })
+      : null;
 
     // Analytical promotion is a gap-filler, never a way to rewrite or widen an event that already
     // exists. In particular, one overlapping model destination must not attach its other guessed
     // destinations to an official event and trigger an `evidence_raised`/geography notification.
-    if (options.modelPromotion && existing.rowCount && existing.rows[0]) {
+    if (options.modelPromotion && existing) {
       await client.query('COMMIT');
       return {
-        id: existing.rows[0].id, version: await systemVersion(), created: false,
+        id: existing.id, version: await systemVersion(), created: false,
         sourceMessageId, withdrawal: NO_WITHDRAWAL, published: false
       };
     }
 
     let eventId: string;
     let created = false;
-    if (existing.rowCount && existing.rows[0]) {
-      eventId = existing.rows[0].id;
-      const nextEvidence = strongestEvidence(existing.rows[0].evidence_level, evidenceLevel);
+    if (existing) {
+      eventId = existing.id;
+      const nextEvidence = strongestEvidence(existing.evidenceLevel, evidenceLevel);
+      const nextStatus = nextEvidence === 'official' ? 'active' : existing.status;
+      // Клас уточнює лише повідомлення, яке ще має право щось змінювати на живій події: застаріле
+      // (`outsideWindow`) не прив'язує до неї району, і з тієї самої причини не міняє їй класу — зміна
+      // класу дійде до читача як «змінився характер загрози».
+      const nextThreatType = outsideWindow ? existing.threatType : existing.joinedThreatType;
       // Every column that describes WHEN the event was last seen moves forwards only, and the two
       // columns of prose are rewritten only by a message at least as new as the one they came from.
       //
@@ -880,7 +1070,7 @@ export async function ingestThreat(
       // Ймовірність — більша; вікно — ширше; `valid_until` — далі. Нова оцінка без `assessment`
       // (повідомлення, яке класифікували правила) лишає існуючу актуальність, але рахується як «зараз»
       // для вікна чинності, як і завжди.
-      const existingTiming: ThreatTiming = existing.rows[0].timing ?? 'now';
+      const existingTiming: ThreatTiming = existing.timing;
       const mergedTiming: ThreatTiming = options.assessment
         ? nearerTiming(options.assessment.timing, existingTiming)
         : 'now';
@@ -898,7 +1088,9 @@ export async function ingestThreat(
            probability=CASE WHEN $9::numeric IS NULL THEN probability ELSE GREATEST(COALESCE(probability,0),$9::numeric) END,
            expected_from=CASE WHEN $10::timestamptz IS NULL THEN expected_from ELSE LEAST(COALESCE(expected_from,$10::timestamptz),$10::timestamptz) END,
            expected_until=CASE WHEN $8::timestamptz IS NULL THEN expected_until ELSE GREATEST(COALESCE(expected_until,$8::timestamptz),$8::timestamptz) END,
-           assessment_note=COALESCE($11,assessment_note)
+           assessment_note=COALESCE($11,assessment_note),
+           title=CASE WHEN threat_type <> $12 THEN $13 ELSE title END,
+           threat_type=$12
          WHERE id=$1`,
         [eventId, classified.summary, message.publishedAt, nextEvidence,
           classified.directionText ?? null, Boolean(options.modelPromotion),
@@ -906,14 +1098,24 @@ export async function ingestThreat(
           options.assessment && options.assessment.timing !== 'now' ? options.assessment.expectedUntil : null,
           options.assessment?.probability ?? null,
           options.assessment ? options.assessment.expectedFrom : null,
-          options.assessment?.note ?? null]
+          options.assessment?.note ?? null,
+          nextThreatType, classified.title]
       );
-      if (existing.rows[0].evidence_level !== nextEvidence) {
+      if (existing.evidenceLevel !== nextEvidence) {
         await client.query(
           `INSERT INTO event_updates(event_id,previous_status,new_status,previous_evidence_level,new_evidence_level,reason)
            VALUES ($1,$2,$3,$4,$5,'stronger_evidence_received')`,
-          [eventId, existing.rows[0].status, nextEvidence === 'official' ? 'active' : existing.rows[0].status,
-            existing.rows[0].evidence_level, nextEvidence]
+          [eventId, existing.status, nextStatus, existing.evidenceLevel, nextEvidence]
+        );
+      }
+      // Уточнений клас — така сама зміна в історії події, як і доказовість: вікно події показує її
+      // рядком «уточнено клас загрози». Стан і доказовість у цьому рядку ті, що після злиття: клас
+      // їх не змінює.
+      if (nextThreatType !== existing.threatType) {
+        await client.query(
+          `INSERT INTO event_updates(event_id,previous_status,new_status,previous_evidence_level,new_evidence_level,reason)
+           VALUES ($1,$2,$2,$3,$3,'threat_type_refined')`,
+          [eventId, nextStatus, nextEvidence]
         );
       }
     } else {

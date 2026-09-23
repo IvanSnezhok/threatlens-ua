@@ -27,9 +27,10 @@ let baseUrl: string;
 let sequence = 0;
 
 /**
- * The location is a parameter because merging is: `ingestThreat` joins a message into any live event
- * of the same class over the same place inside thirty minutes. Two cases below need two separate
- * events and one needs the merge, and the only honest way to ask for either is to choose the place.
+ * The location is a parameter because merging is: `ingestThreat` joins a message that names only the
+ * same oblast into a live event of a compatible class inside the class window, and never one that
+ * names another oblast. Two cases below need two separate events and one needs the merge, and the
+ * only honest way to ask for either is to choose the place.
  */
 async function ingest(options: { model?: boolean; locationId?: string } = {}) {
   const { ingestThreat } = await import('../../src/repositories/events.js');

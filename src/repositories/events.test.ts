@@ -143,13 +143,30 @@ describe('ingestThreat: event origin', () => {
   });
 
   it('does not touch origin when a message merges into an existing event', async () => {
-    // The merge branch is reached by answering the "is there a live event here already" SELECT with
-    // a row. A human message joining an event the model created must raise corroboration without
-    // quietly relabelling the event as rule-authored — the disclosure has to survive the merge.
+    // The merge branch is reached by answering the candidate search with a live event over the same
+    // oblast the message names — the one case the merge rule joins through an oblast. A human message
+    // joining an event the model created must raise corroboration without quietly relabelling the
+    // event as rule-authored — the disclosure has to survive the merge.
+    const oblast = { type: 'oblast', latitude: null, longitude: null, report_id: null, reported_at: null };
     client.query.mockImplementation(async (text: string, params: unknown[] = []) => {
       queries.push({ text, params });
-      if (/FROM threat_events e\s+JOIN threat_event_locations/.test(text)) {
-        return { rows: [{ id: 'event-1', evidence_level: 'unverified', status: 'observed' }], rowCount: 1 };
+      if (/FROM threat_events e\s+WHERE e\.status IN/.test(text)) {
+        return {
+          rows: [{
+            id: 'event-1', threat_type: 'uav', evidence_level: 'unverified', status: 'observed', timing: 'now',
+            last_observed_at: new Date(), expected_open: false
+          }],
+          rowCount: 1
+        };
+      }
+      if (/SELECT 'report' AS kind/.test(text)) {
+        return {
+          rows: [
+            { ...oblast, kind: 'attached', event_id: 'event-1', location_id: 'ua-53' },
+            { ...oblast, kind: 'message', event_id: null, location_id: 'ua-53' }
+          ],
+          rowCount: 2
+        };
       }
       return respond(text);
     });
