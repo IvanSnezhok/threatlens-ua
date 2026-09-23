@@ -228,11 +228,14 @@ describe('classifier against the hand-labelled gold corpus', () => {
     expect(precision(significance)).toBeGreaterThanOrEqual(0.99);
   });
 
-  it('keeps significance recall at or above the v4 measurement', () => {
-    // Deliberately still the `v4` floor. The retrospective veto can only remove significance, so the
-    // question this asks is "did it remove any of the messages the reviewer said were real", and the
-    // answer has to stay no.
-    expect(recall(significance)).toBeGreaterThanOrEqual(0.90);
+  it('keeps significance recall at or above the v7 measurement', () => {
+    // Підлогу піднято з 0.90 (`v4`) до 0.97: `v7` прочитав телеграфні репорти, у яких зброю не
+    // названо жодним словом, і пропусків стало 2 замість 13 — 98.5 % проти 90.4 %. Підлога нижча за
+    // виміряне на півтора відсотка, тобто рівно на одне повідомлення: корпус має 136 справді
+    // значущих, і третій пропуск цю перевірку валить. Знижувати її назад — рішення, яке треба
+    // обґрунтувати в рев'ю, бо кожен пропущений відсоток тут — це попередження, якого хтось не
+    // отримав.
+    expect(recall(significance)).toBeGreaterThanOrEqual(0.97);
   });
 
   it('keeps threat-type accuracy at or above the v4 measurement', () => {
@@ -254,11 +257,12 @@ describe('classifier against the hand-labelled gold corpus', () => {
     expect(recall(ballistic.counts)).toBeGreaterThanOrEqual(0.98);
   });
 
-  it('keeps location precision and recall at or above the v5 measurement', () => {
-    // The axis `v4` existed for, raised again by `v5`: 0.89/0.89 in `v3`, 0.97/0.93 in `v4`, and
-    // 0.996/0.931 now that the two vetoed summaries no longer assert the six places they named.
+  it('keeps location precision and recall at or above the v7 measurement', () => {
+    // Вісь, заради якої існував `v4`, піднята ще двічі: 0.89/0.89 у `v3`, 0.97/0.93 у `v4`,
+    // 0.996/0.931 у `v5` — і 0.996/0.992 у `v7`, бо тринадцять телеграфних репортів, яких
+    // класифікатор не читав узагалі, несли з собою тринадцять названих місць.
     expect(precision(locations)).toBeGreaterThanOrEqual(0.99);
-    expect(recall(locations)).toBeGreaterThanOrEqual(0.93);
+    expect(recall(locations)).toBeGreaterThanOrEqual(0.98);
   });
 
   it('never publishes a threat the reviewer read as a withdrawal or as noise', () => {

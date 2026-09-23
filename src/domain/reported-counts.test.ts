@@ -54,6 +54,56 @@ describe('числа, названі джерелом', () => {
     ]);
   });
 
+  it('читає телеграфні форми, якими канали пишуть БпЛА', () => {
+    // «3х» — найкоротше, що взагалі пишуть, і саме в цій формі канал називає реактивні.
+    expect(reportedCounts('3х реакт з Чернігівщини на Київщину')).toEqual([
+      { count: 3, threatType: 'uav', label: 'ударні БпЛА' }
+    ]);
+    expect(reportedCounts('5 Гербер курсом на Ніжин')).toEqual([
+      { count: 5, threatType: 'uav', label: 'ударні БпЛА' }
+    ]);
+    expect(reportedCounts('2 мопеди над Сумщиною')).toEqual([
+      { count: 2, threatType: 'uav', label: 'ударні БпЛА' }
+    ]);
+    expect(reportedCounts('6 шахідів на Полтавщину')).toEqual([
+      { count: 6, threatType: 'uav', label: 'ударні БпЛА' }
+    ]);
+  });
+
+  it('читає КАБи в усіх відмінках, а не лише в називному', () => {
+    // Саме ці форми канал і пише: «2 КАБів», «КАБами», «ФАБ-500». До цього проходив лише «4 КАБи».
+    expect(reportedCounts('4 КАБи на Харківщину')).toEqual([
+      { count: 4, threatType: 'guided_air_bomb', label: 'КАБи' }
+    ]);
+    expect(reportedCounts('повідомляють про 2 КАБів у напрямку міста')).toEqual([
+      { count: 2, threatType: 'guided_air_bomb', label: 'КАБи' }
+    ]);
+    expect(reportedCounts('удар 3 КАБами по околиці')).toEqual([
+      { count: 3, threatType: 'guided_air_bomb', label: 'КАБи' }
+    ]);
+    expect(reportedCounts('6 ФАБ-500 за ніч')).toEqual([
+      { count: 6, threatType: 'guided_air_bomb', label: 'КАБи' }
+    ]);
+  });
+
+  it('не читає індекс виробу як кількість', () => {
+    // «ФАБ-250» — назва боєприпаса. Без пробілу перед дефісом це модель, а не «слово — число»;
+    // інакше один КАБ у пості перетворився б на двісті пʼятдесят.
+    expect(reportedCounts('ФАБ-250 по Куп\'янську')).toEqual([]);
+    expect(reportedCounts('Х-101 у повітряному просторі')).toEqual([]);
+    // Роздільник із пробілом лишається роздільником.
+    expect(reportedCounts('КАБи - 3')).toEqual([
+      { count: 3, threatType: 'guided_air_bomb', label: 'КАБи' }
+    ]);
+  });
+
+  it('не плутає основу з чужим словом, що з неї починається', () => {
+    // «реакт» обрізано так, щоб «реактор» лишався реактором: пост про ЗАЕС не є трьома БпЛА.
+    expect(reportedCounts('3 реактори зупинено')).toEqual([]);
+    expect(reportedCounts('2 кабелі пошкоджено')).toEqual([]);
+    expect(reportedCounts('4 фабрики')).toEqual([]);
+  });
+
   it('зводить різні написання того самого класу в один рядок', () => {
     const peaks = peakReportedCounts(['10 шахедів', '12 БпЛА']);
     expect(peaks).toEqual([{ count: 12, threatType: 'uav', label: 'ударні БпЛА' }]);

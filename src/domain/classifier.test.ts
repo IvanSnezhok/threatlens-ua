@@ -254,6 +254,84 @@ describe('classifyMessage on telegraphic and conversational styles', () => {
 });
 
 /**
+ * `v7`: репорт, у якому зброю не названо жодним словом.
+ *
+ * Кожен текст нижче — дослівно з розміченого корпусу, і кожен із них `v6` мовчки відкидав як
+ * `not_an_assertion`. Разом вони були 9.6 % усіх справжніх попереджень у вибірці. Клас у всіх
+ * `unknown` навмисно: зброю в цих каналах встановлює контекст каналу, а не текст, і дочитувати її —
+ * саме та інференція, якої модуль не робить.
+ */
+describe('classifyMessage on telegraphic targeting with no weapon named', () => {
+  const telegraphic = [
+    { text: 'Київщина: 6 на Бровари зі сходу', place: 'test-brovary', why: 'число, прийменник і назва' },
+    { text: 'Ціль на Київ', place: 'ua-80', why: 'ціль плюс напрямок на місто' },
+    { text: 'Швидкісна на Київ', place: 'ua-80', why: 'швидкісна ціль без названого класу' },
+    { text: '🛵 Курс Бородянка', place: 'test-brovary', why: 'курс без прийменника перед великою літерою' },
+    { text: 'Вишгород, до вас намагаються летіти', place: 'test-brovary', why: 'звернення до міста плюс рух' },
+    { text: 'Дніпро увага з Заходу/Південного Заходу.', place: 'test-brovary', why: 'звідки саме йде ціль' },
+    { text: '🛵Житомирщина: знову на Андрушівку - Озерне', place: 'test-brovary', why: 'повторний захід у короткій формі' }
+  ];
+
+  it.each(telegraphic)('reads «$text» as a threat ($why)', ({ text, place }) => {
+    // Назви, яких немає в локальному каталозі цього файла, підставляються на «Бровари»: механізм,
+    // що перевіряється, — це індикатор плюс розвʼязане місце, а який саме рядок каталогу збігся,
+    // відповідає резолвер і його власні тести.
+    const withKnownPlace = text.replace(/Бородянка|Вишгород|Дніпро|Андрушівку - Озерне/u, 'Бровари');
+    const result = classify(withKnownPlace);
+    expect(significanceRejection(result)).toBeNull();
+    expect(result.intent).toBe('threat');
+    expect(result.locations.map((location) => location.id)).toContain(place);
+  });
+
+  it('never names a weapon class the message did not name', () => {
+    // Порожній `threatTypes` у цих індикаторів — не недогляд: подія чесно каже «Повідомлення про
+    // загрозу». Клас узявся б лише з попереднього поста або з піктограми, а це і є та інференція,
+    // яку робити заборонено.
+    expect(classify('Ціль на Бровари').threatType).toBe('unknown');
+    expect(classify('🛵 Курс Бровари').threatType).toBe('unknown');
+  });
+
+  it('never lets the bulletin emoji raise anything on its own', () => {
+    // Обидва замки на 🛵, по одному на кожен спосіб помилитися. Перший: без розвʼязаного місця
+    // контекстні індикатори не збираються взагалі, тож мопед без назви — це повідомлення про
+    // нікуди, і воно не стає ні подією, ні тривогою по всій країні. Другий: мем із мопедом ловить
+    // сторож `COMMENTARY_MARKERS` до того, як справа дійде до індикаторів.
+    const bare = classify('🛵');
+    expect(isSignificant(bare)).toBe(false);
+    expect(bare.nationalScope).toBe(false);
+    expect(isSignificant(classify('🛵 мем про мопеди у Броварах 😂'))).toBe(false);
+  });
+
+  it('keeps a currency report out, which is what the capitalisation lock is for', () => {
+    // `Курс долара` і `курси англійської` — дві форми, заради яких гілка «курс без прийменника»
+    // свого часу не була написана взагалі. Регулярка без прапорця `i` розрізняє їх структурно.
+    expect(isSignificant(classify('Курс долара у Броварах знову виріс'))).toBe(false);
+    expect(isSignificant(classify('Курси англійської у Броварах, запис відкрито'))).toBe(false);
+  });
+
+  it('does not read a past-tense damage report as a target on its way', () => {
+    // Найширша гілка («на <Місто>») має другий замок — рух УПЕРЕД. Підсумок про пошкодження має
+    // «атаку» й «на Броварах», але жодного руху в теперішньому часі.
+    expect(isSignificant(classify('Через нічну атаку на Броварах пошкоджено два будинки'))).toBe(false);
+  });
+
+  it('reads a threat named together with its launch point across the border', () => {
+    // «з Брянська» — точка пуску, а не ціль: сторож іноземних місць гасив найраніше попередження,
+    // яке взагалі буває. Обсяг — країна, бо українського місця повідомлення не називає.
+    const result = classify('📡 Триває загроза балістики з Брянська + загроза Цирконів з Курська');
+    expect(result.nationalScope).toBe(true);
+    expect(result.threatType).toBe('ballistic_missile');
+    expect(isSignificant(result)).toBe(true);
+  });
+
+  it('still refuses a report about the far side that claims nothing about us', () => {
+    // Випадок, заради якого сторож написаний, лишається закритим: ні слова про загрозу, ні
+    // прийменника походження перед чужою назвою.
+    expect(isSignificant(classify('Над Курськом працює ворожа ППО'))).toBe(false);
+  });
+});
+
+/**
  * Withdrawal is its own class, not an absence of classification.
  *
  * A threat currently only ever fades on its 30-minute validity timer. These messages are the only

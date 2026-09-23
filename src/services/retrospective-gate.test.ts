@@ -1,7 +1,7 @@
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import { classifyMessage } from '../domain/classifier.js';
+import { classifyMessage, CLASSIFIER_VERSION } from '../domain/classifier.js';
 import type { ClassifiedMessage } from '../types.js';
 import {
   resetRetrospectiveGateMetrics, resetRetrospectiveGateRateLimit, retrospectiveGate,
@@ -97,7 +97,10 @@ describe('the one thing the model is allowed to do', () => {
     expect(request.surface).toBe('retrospective_gate');
     expect(request.promptVersion).toBe('retrospective-gate-v1');
     expect(request.json).toBe(true);
-    expect(request.classifierVersion).toBe('v6');
+    // Константа, а не літерал: ряд `ai_runs` має нести ВЕРСІЮ ПРАВИЛ, які викликали ворота, і саме
+    // це тут і перевіряється. Зашитий рядок змушував би правити цей тест на кожному підйомі версії
+    // й не стверджував би нічого понад «хтось вписав те саме число двічі».
+    expect(request.classifierVersion).toBe(CLASSIFIER_VERSION);
     // The whole message, not the classifier's 500-character summary: the essays this layer exists
     // for say what they are in their last paragraph as often as in their first.
     expect(request.user).toBe(SUSPECT_TEXT);
