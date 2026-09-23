@@ -4,6 +4,11 @@ dist/
 public/assets/app.js
 public/assets/app.css
 public/assets/*.map
+# Стиснуті близнюки збірки. Їх пише `npm run build:static` усередині образу поруч із тим самим
+# бандлом, який їх і породив; у чекауті вони були б копією, що старіє з першою ж перезбіркою —
+# рівно та неспроможність, через яку Caddy віддає з диска лише `/data/*` і шрифти.
+public/assets/*.br
+public/assets/*.gz
 coverage/
 data/*.session
 data/postgres/

@@ -8,7 +8,18 @@ COPY tsconfig.json ./
 COPY src ./src
 COPY web ./web
 COPY public ./public
-RUN npm run build
+# Only the one script the build actually runs. The rest of `scripts/` is operator tooling
+# (benchmarks, replays, backups) and has no business in a build layer.
+COPY scripts/precompress-static.mjs ./scripts/precompress-static.mjs
+# `build` produces `public/assets/app.js` (1.4 MiB) and `app.css`; `build:static` writes their `.br`
+# and `.gz` siblings right next to them, in the same layer, so the two can never disagree. The app
+# registers `@fastify/static` with `preCompressed: true`, so a browser that sent
+# `Accept-Encoding: br` is answered with a `stat` and a `sendfile` of `app.js.br` (~303 KiB) — and
+# Caddy's site-wide `encode`, which has no cache and would otherwise gzip the megabyte on every cold
+# request, passes an already-encoded response through untouched. The bundle is gitignored, so this
+# is the ONLY place those siblings can be produced; the `public/data` siblings the same script
+# rewrites are committed and identical, and Caddy serves those from its own bind mount.
+RUN npm run build && npm run build:static
 
 FROM node:22-alpine AS runtime
 WORKDIR /app

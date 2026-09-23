@@ -1,5 +1,8 @@
-import { describe, expect, it } from 'vitest';
-import { EVENT_LOG_GAP_GRACE_MS, deliverableRun } from './event-log-cursor.js';
+import { Registry } from 'prom-client';
+import { beforeEach, describe, expect, it } from 'vitest';
+import {
+  EVENT_LOG_GAP_GRACE_MS, deliverableRun, eventLogGapBlockedAge, eventLogGapCrossed, eventLogGapStalls
+} from './event-log-cursor.js';
 
 const NOW = new Date('2026-08-14T18:00:00.000Z').getTime();
 
@@ -62,5 +65,74 @@ describe('deliverableRun', () => {
 
   it('порожній вхід дає порожній вихід', () => {
     expect(deliverableRun([], 10, NOW)).toEqual([]);
+  });
+});
+
+/**
+ * Стадія затримки, якої досі не було видно.
+ *
+ * Саме рішення перевірено вище; тут перевіряється, що воно себе називає: скільки разів читач стояв,
+ * наскільки свіжий був рядок, що його тримав, і хто саме з читачів це був. Під час
+ * загальнонаціональної тривоги це єдиний спосіб відрізнити «сповіщення ще не пішло, бо транзакція
+ * знімка не закомічена» від «сповіщення не пішло, бо щось зламалося».
+ */
+describe('метрики розриву', () => {
+  const registry = new Registry();
+  registry.registerMetric(eventLogGapStalls);
+  registry.registerMetric(eventLogGapBlockedAge);
+  registry.registerMetric(eventLogGapCrossed);
+
+  async function series(
+    name: string
+  ): Promise<Array<{ metricName?: string; labels: Record<string, string>; value: number }>> {
+    const metric = (await registry.getMetricsAsJSON()).find((item) => item.name === name);
+    return ((metric?.values ?? []) as Array<{ metricName?: string; labels: Record<string, string>; value: number }>);
+  }
+
+  beforeEach(() => {
+    eventLogGapStalls.reset();
+    eventLogGapBlockedAge.reset();
+    eventLogGapCrossed.reset();
+  });
+
+  it('рахує стояння один раз на прохід і називає читача', async () => {
+    // Два стримані рядки — один прохід, на якому читач стояв, а не два.
+    deliverableRun([row(12), row(13)], 10, NOW, 'notifications');
+    expect(await series('threatlens_event_log_gap_stalls_total')).toEqual([
+      { labels: { reader: 'notifications' }, value: 1 }
+    ]);
+  });
+
+  it('мовчить, коли відрізок безперервний', async () => {
+    deliverableRun([row(11), row(12)], 10, NOW, 'sse_live');
+    expect(await series('threatlens_event_log_gap_stalls_total')).toEqual([]);
+    expect(await series('threatlens_event_log_gap_crossed_total')).toEqual([]);
+  });
+
+  it('записує вік рядка, що стримав — тобто наскільки близько до межі', async () => {
+    deliverableRun([row(12, 30_000)], 10, NOW, 'notifications');
+    const values = await series('threatlens_event_log_gap_blocked_age_seconds');
+    const sum = values.find((item) => item.metricName?.endsWith('_sum'));
+    const count = values.find((item) => item.metricName?.endsWith('_count'));
+    expect(sum).toEqual({ metricName: 'threatlens_event_log_gap_blocked_age_seconds_sum',
+      labels: { reader: 'notifications' }, value: 30 });
+    expect(count?.value).toBe(1);
+  });
+
+  it('розрізняє «чекаємо» і «здалися»', async () => {
+    // Пільговий час вичерпано: версія 11 згоріла разом із відкоченою транзакцією, читач її
+    // перестрибує — і це інша подія, ніж стояння, бо чекати на неї більше нема сенсу.
+    deliverableRun([row(12, EVENT_LOG_GAP_GRACE_MS + 1)], 10, NOW, 'sse_backfill');
+    expect(await series('threatlens_event_log_gap_stalls_total')).toEqual([]);
+    expect(await series('threatlens_event_log_gap_crossed_total')).toEqual([
+      { labels: { reader: 'sse_backfill' }, value: 1 }
+    ]);
+  });
+
+  it('виклик без мітки рахується, а не зникає', async () => {
+    deliverableRun([row(12)], 10, NOW);
+    expect(await series('threatlens_event_log_gap_stalls_total')).toEqual([
+      { labels: { reader: 'unlabelled' }, value: 1 }
+    ]);
   });
 });

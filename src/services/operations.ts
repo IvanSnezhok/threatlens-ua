@@ -1,30 +1,70 @@
 import { pool } from '../db/pool.js';
 
-export async function markSourceSuccess(sourceId: string): Promise<void> {
+/**
+ * Marks a batch of sources fresh in ONE transaction, and reports which of them were not fresh
+ * before.
+ *
+ * ## Why the batch exists
+ *
+ * The MTProto heartbeat (`src/sources/telegram.ts`) used to call the single-source form in a loop
+ * over every live channel. At fifty-four channels and a one-minute heartbeat that is 54 × (connect
+ * + BEGIN + SELECT … FOR UPDATE + UPDATE + COMMIT) — 216 statements and 54 pool checkouts per
+ * minute, fired concurrently into a twelve-connection pool, forever, to write a column whose whole
+ * content is «still alive». The batch says the same thing in three statements and one checkout, and
+ * the fifty-four row locks are taken in one ordered pass instead of fifty-four interleaved ones.
+ *
+ * ## Why the pre-image is read the way it is
+ *
+ * `source.recovered` is a TRANSITION, not a state: it must be appended exactly when a row was
+ * `stale` or `error` and is now `current`, and never on the fifty-nine following heartbeats that
+ * find it already `current`. `UPDATE … RETURNING` returns the NEW row, so the old status has to be
+ * captured before the write — the sub-select in `FROM` does that, and its `FOR UPDATE` is the same
+ * lock the single-source path always took, so two collectors heartbeating the same source still
+ * serialise rather than both claiming the recovery. `ORDER BY id` inside it is what keeps two
+ * overlapping batches from deadlocking on the same rows in opposite orders.
+ *
+ * A source id with no row is reported rather than swallowed — the same diagnostic the single-source
+ * form raised — but only AFTER the rows that do exist have been committed: one channel deleted from
+ * the registry must not cost the other fifty-three their freshness.
+ */
+export async function markSourcesSuccess(sourceIds: readonly string[]): Promise<void> {
+  const ids = [...new Set(sourceIds)];
+  if (!ids.length) return;
   const client = await pool.connect();
+  let missing: string[];
   try {
     await client.query('BEGIN');
-    const current = await client.query<{ health_status: string }>(
-      `SELECT health_status FROM sources WHERE id=$1 FOR UPDATE`, [sourceId]
+    const updated = await client.query<{ id: string; previous_status: string }>(
+      `UPDATE sources SET last_success_at=now(),last_error=NULL,health_status='current'
+         FROM (SELECT id,health_status FROM sources WHERE id = ANY($1::text[]) ORDER BY id FOR UPDATE) pre
+        WHERE sources.id = pre.id
+       RETURNING sources.id, pre.health_status AS previous_status`,
+      [ids]
     );
-    if (!current.rowCount) throw new Error(`Unknown source: ${sourceId}`);
-    await client.query(
-      `UPDATE sources SET last_success_at=now(),last_error=NULL,health_status='current' WHERE id=$1`,
-      [sourceId]
-    );
-    if (current.rows[0]!.health_status === 'stale' || current.rows[0]!.health_status === 'error') {
+    const recovered = updated.rows
+      .filter((row) => row.previous_status === 'stale' || row.previous_status === 'error')
+      .map((row) => row.id);
+    if (recovered.length) {
       await client.query(
-        `INSERT INTO system_event_log(event_type,payload) VALUES ('source.recovered',$1)`,
-        [JSON.stringify({ sourceId })]
+        `INSERT INTO system_event_log(event_type,payload)
+         SELECT 'source.recovered', jsonb_build_object('sourceId', id) FROM unnest($1::text[]) AS id`,
+        [recovered]
       );
     }
     await client.query('COMMIT');
+    const seen = new Set(updated.rows.map((row) => row.id));
+    missing = ids.filter((id) => !seen.has(id));
   } catch (error) {
     await client.query('ROLLBACK');
     throw error;
   } finally {
     client.release();
   }
+  if (missing.length) throw new Error(`Unknown source${missing.length > 1 ? 's' : ''}: ${missing.join(', ')}`);
+}
+
+export async function markSourceSuccess(sourceId: string): Promise<void> {
+  await markSourcesSuccess([sourceId]);
 }
 
 export async function markSourceError(sourceId: string, error: unknown): Promise<void> {

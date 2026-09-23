@@ -104,6 +104,14 @@ class EventHub extends EventEmitter {
   /** Detaches this hub from the instant-propagation signal. Set by `start`, called by `stop`. */
   private detachPoke?: () => void;
 
+  constructor() {
+    super();
+    // Up to SSE_MAX_STREAMS (500) browser streams each attach one 'event' listener, plus the
+    // schedulers' 'internal-event' listeners. Node's default ceiling of 10 warns long before the
+    // hub reaches its real size; the hub is the fan-out point, not a leak.
+    this.setMaxListeners(1024);
+  }
+
   /** Cleared to `null`, never to `0`: `null` is what makes the next tick re-derive the cursor under
    *  the mode in force. Reached through the exported {@link resetEventHubCursor}. */
   clearCursors() {
@@ -227,7 +235,11 @@ class EventHub extends EventEmitter {
         // cursor before a row still HELD; it cannot stop it before a row still INVISIBLE, because no
         // bound computed from visible rows can see one. Taking only the contiguous run does, and it
         // is the same rule the notification fan-out now applies to its durable cursor.
-        for (const row of deliverableRun(result.rows, cursor, releasedAt.getTime())) {
+        // Четвертий аргумент — ім'я читача у метриці зупинок на розриві версій. Хаб має ДВА курсори,
+        // і зупиняються вони незалежно: опублікований потік тримає ще й стеля публікації, а
+        // внутрішній — ні. Спільна мітка злила б їх в один ряд і лишила б питання «хто саме стоїть»
+        // без відповіді.
+        for (const row of deliverableRun(result.rows, cursor, releasedAt.getTime(), 'sse_live')) {
           this.lastVersion = Number(row.version);
           const envelope = publishedEnvelope(row, mode, releasedAt);
           observeSseDeliveryLag('live', (releasedAt.getTime() - row.created_at.getTime()) / 1000);
@@ -247,7 +259,7 @@ class EventHub extends EventEmitter {
         );
         // Unbounded in TIME, not in ORDER. This feed skips the publication hold on purpose; skipping
         // a row whose transaction had not committed yet was never part of that intent.
-        for (const row of deliverableRun(internal.rows, internalCursor, releasedAt.getTime())) {
+        for (const row of deliverableRun(internal.rows, internalCursor, releasedAt.getTime(), 'sse_internal')) {
           this.internalVersion = Number(row.version);
           this.emit('internal-event', publishedEnvelope(row, mode, releasedAt));
         }

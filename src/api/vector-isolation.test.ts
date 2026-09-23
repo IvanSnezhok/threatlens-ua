@@ -1198,12 +1198,19 @@ describe('territory icon stacks', () => {
 });
 
 describe('map live region', () => {
-  const ariaSource = lazy(() => `function writeMapAria() ${bodyOf('writeMapAria')}`);
+  const ariaSource = lazy(() => [
+    // Справжні таблиці слів, а не заглушка: рівень тривоги для читача екрана існує ТІЛЬКИ словом,
+    // тож формулювання — це і є поверхня, яку тут перевіряють.
+    constDeclaration('alertLevelNames'),
+    constDeclaration('alertKindNames'),
+    `function alertLevelText(level, kind) ${bodyOf('alertLevelText')}`,
+    `function writeMapAria(collection = territoryIconCollection()) ${bodyOf('writeMapAria')}`
+  ].join('\n'));
 
   function write(options: {
     territories: unknown[];
     stacks?: { properties: { locationId: string; aria: string } }[];
-    alerts?: { location_name: string }[];
+    alerts?: { location_name: string; alert_level?: string; alert_kind?: string }[];
     tier?: string;
   }): string {
     const node = { textContent: '' };
@@ -1271,6 +1278,21 @@ describe('map live region', () => {
     const text = write({ territories: [], alerts: [{ location_name: 'Львівська область' }] });
     expect(text).toBe('Львівська область: офіційна тривога.');
   });
+
+  /**
+   * Рівень тривоги на карті існує кольором полігона. Для читача екрана карта — порожній `<canvas>`,
+   * а для дальтоніка жовтий і червоний можуть бути одним відтінком, тож єдиний доступ обох до
+   * різниці, заради якої рівень і оголошують, — це слово в цьому рядку.
+   */
+  it('says the colour in words, and says nothing extra when there is no colour', () => {
+    expect(write({ territories: [], alerts: [
+      { location_name: 'Київська область', alert_level: 'yellow', alert_kind: 'drones' },
+      { location_name: 'Донецька область', alert_level: 'red', alert_kind: 'drones' },
+      { location_name: 'Сумська область' }
+    ] })).toBe('Київська область: офіційна тривога, жовтий рівень — дронова небезпека.'
+      + ' Донецька область: офіційна тривога, червоний рівень — масована дронова загроза.'
+      + ' Сумська область: офіційна тривога.');
+  });
 });
 
 describe('map text survives a failed icon pipeline', () => {
@@ -1307,24 +1329,32 @@ describe('map text survives a failed icon pipeline', () => {
 describe('snapshot refresh and the operations console', () => {
   const source = lazy(() => `function renderCurrentRoute(options = {}) ${bodyOf('renderCurrentRoute')}`);
   const parameters = ['snapshot', 'activePage', 'map', 'mapLayersReady', 'codexPollTimer', 'deployPollTimer',
-    'renderedRoute',
+    'renderedRoute', 'renderedSourceHealth', 'attackStatsDirty',
     'renderMapPage', 'renderHistory', 'renderAttacks', 'renderAnalytics', 'renderSources', 'renderOps',
     'renderOpsSettings', 'renderAbout'];
 
+  interface HealthRow { id: string; status: string; last_success_at: string | null; last_error_at: string | null }
+  interface RouterSnapshot { version: number; sourceHealth?: HealthRow[] }
+
   /**
-   * `renderedRoute`, `map` and `mapLayersReady` are module-level `let`s that the function assigns
-   * to. Injected as parameters they become closure variables of one compiled instance, so the
-   * assignments survive between calls exactly as they do in the bundle — which is the whole point:
-   * the first render and the hundredth have to behave differently.
+   * `renderedRoute`, `renderedSourceHealth`, `map` and `mapLayersReady` are module-level `let`s that
+   * the function assigns to. Injected as parameters they become closure variables of one compiled
+   * instance, so the assignments survive between calls exactly as they do in the bundle — which is
+   * the whole point: the first render and the hundredth have to behave differently.
+   *
+   * `snapshot` is passed by reference for the same reason: mutating it between calls is how a test
+   * reproduces the one thing `/sources` must still react to — source health that moved.
    */
-  function router(route: string): { render: (options?: unknown) => void; calls: string[] } {
+  function router(route: string, snapshot: RouterSnapshot = { version: 1 }, attackStatsDirty = false):
+  { render: (options?: unknown) => void; calls: string[] } {
     const calls: string[] = [];
     const stub = (name: string) => () => { calls.push(name); };
     const render = compileSlice<(options?: unknown) => void>(source(), 'renderCurrentRoute', parameters)(
-      // snapshot, activePage, map, mapLayersReady, codexPollTimer, deployPollTimer, renderedRoute…
+      // snapshot, activePage, map, mapLayersReady, codexPollTimer, deployPollTimer, renderedRoute,
+      // renderedSourceHealth, attackStatsDirty…
       // The deployment card polls `/ops/api/deploy` on its own three-second timer, and leaving `/ops`
       // has to stop it: the node it repaints does not exist on any other route.
-      { version: 1 }, () => route, null, false, null, null, null,
+      snapshot, () => route, null, false, null, null, null, null, attackStatsDirty,
       stub('map'), stub('history'), stub('attacks'), stub('analytics'), stub('sources'), stub('ops'),
       stub('settings'), stub('about')
     );
@@ -1362,14 +1392,76 @@ describe('snapshot refresh and the operations console', () => {
     expect(calls).toEqual(['ops', 'ops']);
   });
 
-  it('leaves every other route repainting on every snapshot', () => {
-    for (const [route, rendered] of [['/', 'map'], ['/history', 'history'], ['/attacks', 'attacks'],
-      ['/analytics', 'analytics'], ['/sources', 'sources'], ['/about', 'about']]) {
+  it('leaves the map, the journal and the methodology repainting on every snapshot', () => {
+    // These three either ARE the snapshot (the map), or are cheap enough that a repaint costs one
+    // fetch of their own and nothing the reader can lose.
+    for (const [route, rendered] of [['/', 'map'], ['/history', 'history'], ['/about', 'about']]) {
       const { render, calls } = router(route!);
       render({ fromSnapshot: true });
       render({ fromSnapshot: true });
       expect(calls, `route ${route}`).toEqual([rendered, rendered]);
     }
+  });
+
+  /**
+   * The three pages that fetch their own data, and what a stream frame used to cost them.
+   *
+   * `/attacks` never reads the snapshot at all and `/analytics` reads exactly one list from it
+   * (`snapshot.assessments`); both open with `contentShell(…)`, i.e. a full `#app` wipe, and both
+   * re-request their own endpoint on the way. So every frame — up to one per event, on every open
+   * tab — threw away a rebuilt DOM subtree and bought a round trip for data the frame did not
+   * carry, and reset the chosen period and month while doing it.
+   */
+  it('stops repainting the pages a stream frame brings no data for', () => {
+    for (const [route, rendered] of [['/attacks', 'attacks'], ['/analytics', 'analytics'],
+      ['/sources', 'sources']]) {
+      const { render, calls } = router(route!, {
+        version: 1,
+        sourceHealth: [{ id: 'ukraine-alert', status: 'current', last_success_at: 'T1', last_error_at: null }]
+      });
+      render({ fromSnapshot: true });
+      render({ fromSnapshot: true });
+      expect(calls, `route ${route}`).toEqual([rendered]);
+    }
+  });
+
+  /**
+   * `/sources` is the deliberate exception, and it is a safety boundary rather than a preference.
+   *
+   * The page IS the report on source freshness, and CONTEXT.md requires stale data to stay visibly
+   * stale: a page frozen the way `/ops` is frozen would keep printing «актуальне» straight through
+   * an outage, because nothing else on that screen would contradict it. So it stays snapshot-driven
+   * and is weighed instead of frozen — the signature is id, status, last success and last error, and
+   * the moment any of the four moves the page is rebuilt on that very frame.
+   */
+  it('repaints the sources page the moment source health moves', () => {
+    const snapshot: RouterSnapshot = {
+      version: 1,
+      sourceHealth: [{ id: 'ukraine-alert', status: 'current', last_success_at: 'T1', last_error_at: null }]
+    };
+    const { render, calls } = router('/sources', snapshot);
+    render({ fromSnapshot: true });
+    render({ fromSnapshot: true });
+    expect(calls).toEqual(['sources']);
+
+    snapshot.sourceHealth = [{ id: 'ukraine-alert', status: 'stale', last_success_at: 'T1', last_error_at: null }];
+    render({ fromSnapshot: true });
+    expect(calls).toEqual(['sources', 'sources']);
+
+    // A later successful poll moves `last_success_at` and nothing else. That is still news: it is
+    // the number the page prints as «останній успіх N тому».
+    snapshot.sourceHealth = [{ id: 'ukraine-alert', status: 'stale', last_success_at: 'T2', last_error_at: null }];
+    render({ fromSnapshot: true });
+    expect(calls).toEqual(['sources', 'sources', 'sources']);
+  });
+
+  it('still redraws the attacks page when a finished report says so', () => {
+    // `attack_stats.updated` is the server saying the report it holds is a different report now.
+    // The guard above must not swallow that one: the reader opened the page for exactly this.
+    const { render, calls } = router('/attacks', { version: 1 }, true);
+    render({ fromSnapshot: true });
+    render({ fromSnapshot: true });
+    expect(calls).toEqual(['attacks', 'attacks']);
   });
 
   /**
@@ -1435,7 +1527,7 @@ describe('snapshot refresh and the operations console', () => {
     const source_ = `function renderCurrentRoute(options = {}) ${bodyOf('renderCurrentRoute')}`;
     const names = [...parameters, 'clearInterval'];
     const render = compileSlice<(options?: unknown) => void>(source_, 'renderCurrentRoute', names)(
-      { version: 1 }, () => '/ops/settings', null, false, 41, 42, null,
+      { version: 1 }, () => '/ops/settings', null, false, 41, 42, null, null, false,
       () => {}, () => {}, () => {}, () => {}, () => {}, () => {}, () => {}, () => {},
       (id: number) => { cleared.push(id); }
     );
@@ -1934,5 +2026,52 @@ describe('raion polygons are a statement, not a zoom level', () => {
     expect(APP_SOURCE).not.toContain('RAION_ZOOM_FULL');
     // Рівно два пороги, обидва — перемикач рівня стеків: у zoomend і при першій побудові шарів.
     expect(occurrences(APP_SOURCE, '>= ICON_TIER_ZOOM')).toBe(2);
+  });
+});
+
+/**
+ * Рівень тривоги на карті (CONTEXT.md, «Рівень тривоги»).
+ *
+ * Колір уточнює ВЖЕ оголошену тривогу, тож на карті він не має ні власного шару, ні власного
+ * джерела, ні окремого проходу: це ще один ключ feature-state на тій самій фічі, який їде тим самим
+ * дифованим шляхом, що й решта станів. Саме тому перевіряється рівно одне — які ключі функція
+ * ставить і коли. Множини й Map тут не вибір фікстури, а та сама форма, яку читає сама функція
+ * (`fam.direct.has(id)`, `levels.get(id)`).
+ */
+describe('the alert level rides the alert, never its own state', () => {
+  const stateOf = lazy(() => evaluateSlice<(id: string, coverage: unknown) => Record<string, boolean>>(
+    `function territoryStateOf(id, coverage) ${bodyOf('territoryStateOf')}`, 'territoryStateOf'));
+
+  const empty = () => ({ direct: new Set<string>(), covered: new Set<string>(), unmapped: new Set<string>() });
+  const lit = (tone: 'direct' | 'covered' | 'unmapped', level?: string): unknown => {
+    const alert = { ...empty(), levels: new Map(level ? [['ua-32', level]] : []) };
+    alert[tone].add('ua-32');
+    if (tone === 'unmapped') alert.covered.add('ua-32');
+    return { alert, threat: empty(), consequence: empty(), analytic: empty() };
+  };
+
+  it('writes the yellow key beside the fill it recolours, and writes nothing for red', () => {
+    expect(stateOf()('ua-32', lit('direct', 'yellow'))).toEqual({ alert: true, alertYellow: true });
+    expect(stateOf()('ua-32', lit('unmapped', 'yellow'))).toEqual({ unmapped: true, alertYellow: true });
+    // Червоний — це той самий червоний, яким тривога малювалася завжди. Власний ключ зробив би з
+    // нього окремий стан, і перший же вираз фарби, який його прочитав би, почав би малювати
+    // «червоний рівень» інакше, ніж тривогу без рівня.
+    expect(stateOf()('ua-32', lit('direct', 'red'))).toEqual({ alert: true });
+  });
+
+  it('leaves a territory with no colour exactly as it was before levels existed', () => {
+    expect(stateOf()('ua-32', lit('direct'))).toEqual({ alert: true });
+    // Покриття, яке не малює нічого, кольору не дістає: жовта пляма без тривоги під нею була б
+    // кольором, за яким не стоїть жодної заяви.
+    expect(stateOf()('ua-32', lit('covered', 'yellow'))).toEqual({ partial: true });
+  });
+
+  it('changes the KEY SET when the colour changes, which is what the diffed pass watches', () => {
+    // applyTerritoryLayers порівнює підпис `Object.keys(state).join('|')` і пропускає фічу, підпис
+    // якої збігся. Якби рівень їхав ЗНАЧЕННЯМ наявного ключа, ескалація жовтого в червоний не
+    // змінила б підпису — і карта лишилася б жовтою до наступної зміни покриття.
+    const signature = (coverage: unknown): string => Object.keys(stateOf()('ua-32', coverage)).join('|');
+    expect(signature(lit('direct', 'yellow'))).not.toBe(signature(lit('direct', 'red')));
+    expect(signature(lit('direct', 'red'))).toBe(signature(lit('direct')));
   });
 });

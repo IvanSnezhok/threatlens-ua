@@ -45,9 +45,22 @@ export async function dockerAvailable(): Promise<boolean> {
   }
 }
 
+/**
+ * Готовність, яку не можна сплутати з готовністю ІНІЦІАЛІЗАЦІЙНОГО сервера.
+ *
+ * Офіційний образ postgres під час першого старту піднімає тимчасовий сервер, проганяє ініціалізацію
+ * й лише тоді перезапускає справжній. Тимчасовий слухає ТІЛЬКИ unix-сокет — `-c listen_addresses=''`
+ * в ентрипойнті, — але `pg_isready` без `-h` іде саме сокетом і бадьоро відповідає «готовий». Порт
+ * при цьому опублікований від самого `docker run`, тож docker-proxy приймає зʼєднання й одразу рве
+ * його: `read ECONNRESET` у першому ж запиті `ensureMigrated`. Саме так цей набір падав — випадково,
+ * частіше на одиночному файлі, де вікно перегонів найширше.
+ *
+ * `-h 127.0.0.1` перетворює перевірку на TCP-зʼєднання, якого тимчасовий сервер прийняти не може.
+ */
 async function containerIsReady(): Promise<boolean> {
   try {
-    await docker(['exec', CONTAINER_NAME, 'pg_isready', '-U', PG_USER, '-d', PG_DATABASE, '-q']);
+    await docker(['exec', CONTAINER_NAME, 'pg_isready', '-h', '127.0.0.1', '-p', '5432',
+      '-U', PG_USER, '-d', PG_DATABASE, '-q']);
     return true;
   } catch {
     return false;

@@ -1,3 +1,5 @@
+import { Counter, Histogram } from 'prom-client';
+
 /**
  * Скільки читач `system_event_log` має права взяти за один прохід.
  *
@@ -37,17 +39,102 @@ export interface EventLogRow {
 export const EVENT_LOG_GAP_GRACE_MS = 60_000;
 
 /**
+ * Хто саме читає журнал. Закритий перелік, бо це мітка метрики.
+ *
+ * Значень рівно стільки, скільки викликів {@link deliverableRun} у коді, і жодне з них не походить
+ * з даних — ні з рядка журналу, ні з запиту, ні з налаштувань. Розрив тримає читача, а не подію,
+ * тож мітка мусить називати читача; а оскільки читачів фіксована жменя, потужність міток фіксована
+ * теж, і жодна ніч не може її роздути.
+ *
+ * `unlabelled` — типове значення для виклику, який мітки не передав. Воно існує, щоб додавання
+ * метрики не змінювало жодного місця виклику одночасно з самою метрикою, і щоб читач, доданий
+ * завтра, рахувався хоч кудись, а не зникав. Ненульове `unlabelled` на /metrics означає рівно одне:
+ * є виклик, який ще не назвався.
+ */
+export type EventLogReader = 'notifications' | 'sse_live' | 'sse_internal' | 'sse_backfill' | 'unlabelled';
+
+/**
+ * Скільки разів читач зупинився перед розривом — і наскільки свіжий був рядок, що його тримав.
+ *
+ * ## Навіщо це міряти
+ *
+ * Правило вище коштує затримки: відрізок обривається перед розривом і чекає до
+ * {@link EVENT_LOG_GAP_GRACE_MS}. Обмін правильний — альтернатива є назавжди пропущене сповіщення —
+ * але досі він був німий. Під час загальнонаціональної тривоги `persistOfficialAlertSnapshot` тримає
+ * одну довгу транзакцію, тобто розриви трапляються саме тоді, коли затримка найдорожча, і ніщо в
+ * системі не показувало ні того, що читач узагалі стояв, ні скільки, ні котрий: між рядком у
+ * журналі й повідомленням у телефоні була ціла стадія затримки без жодного числа.
+ *
+ * ## Чому дві серії, а не одна
+ *
+ * `stalls_total` рахує проходи, на яких щось було стримано; `blocked_age_seconds` — вік рядка, що
+ * стримав. Перше відповідає «як часто», друге — «наскільки близько до межі»: вік біля нуля означає
+ * звичайну коротку транзакцію, вік біля хвилини — що читач ось-ось перестрибне, тобто що
+ * {@link EVENT_LOG_GAP_GRACE_MS} замалий для транзакцій, які тут насправді бувають. Корзини
+ * закінчуються на самій межі пільгового часу, бо більшого значення це число мати не може за
+ * побудовою.
+ *
+ * `crossed_total` — другий бік того самого правила: пільговий час вичерпано й читач перестрибнув
+ * версію, яка вже ніколи не з'явиться. Це не втрата (значення послідовності згоріло разом із
+ * відкоченою транзакцією), але це єдине місце, де видно, що відкоти взагалі трапляються, і воно
+ * відрізняє «чекаємо» від «здалися» — два стани, які в одній серії виглядають однаково.
+ *
+ * Метрики створені ВІДЧЕПЛЕНИМИ (`registers: []`) і прикріплені в `./publication.ts` поруч із
+ * `threatlens_sse_delivery_lag_seconds`: це та сама дорога доставки, виміряна на стадію раніше, і
+ * той самий реєстратор, який `buildServer()` уже викликає. Окремий рядок у `src/api/server.ts` був
+ * би другим місцем, яке можна забути.
+ */
+export const eventLogGapStalls = new Counter({
+  name: 'threatlens_event_log_gap_stalls_total',
+  help: 'Passes in which a reader withheld rows because a lower version had not committed yet',
+  labelNames: ['reader'], registers: []
+});
+
+export const eventLogGapBlockedAge = new Histogram({
+  name: 'threatlens_event_log_gap_blocked_age_seconds',
+  help: 'Age of the row a reader stopped in front of, at the moment it stopped',
+  labelNames: ['reader'], buckets: [0.5, 1, 2, 5, 10, 15, 30, 45, 60], registers: []
+});
+
+export const eventLogGapCrossed = new Counter({
+  name: 'threatlens_event_log_gap_crossed_total',
+  help: 'Versions a reader stepped over after the grace period: their transaction never committed',
+  labelNames: ['reader'], registers: []
+});
+
+/**
  * Префікс рядків, який можна віддати, не ризикуючи перестрибнути ще невидиму нижчу версію.
  *
  * `rows` мають бути відсортовані за `version` і всі бути вищими за `cursor` — тобто рівно те, що
  * повертає запит читача. Повертається новий масив, вхідний не змінюється.
+ *
+ * `reader` не впливає на рішення й існує лише як мітка метрик вище: правило однакове для розсилки й
+ * для SSE, а от питання «хто зараз стоїть» без мітки не має відповіді. Необов'язковий, щоб місця
+ * виклику могли назватися окремо від появи метрики; див. {@link EventLogReader}.
  */
-export function deliverableRun<T extends EventLogRow>(rows: readonly T[], cursor: number, now: number): T[] {
+export function deliverableRun<T extends EventLogRow>(
+  rows: readonly T[], cursor: number, now: number, reader: EventLogReader = 'unlabelled'
+): T[] {
   const run: T[] = [];
   let expected = cursor + 1;
   for (const row of rows) {
     const version = Number(row.version);
-    if (version !== expected && now - row.created_at.getTime() < EVENT_LOG_GAP_GRACE_MS) break;
+    if (version !== expected) {
+      // Порівняння лишається в цілих мілісекундах: межа пільгового часу — рівність, і поділ на
+      // тисячу перед нею зсунув би її на одиницю в останньому розряді подвійної точності.
+      const ageMs = now - row.created_at.getTime();
+      if (ageMs < EVENT_LOG_GAP_GRACE_MS) {
+        // Стримано. Рахується один раз на прохід — далі цикл виходить, — тож серія лічить проходи,
+        // на яких читач стояв, а не рядки, які він не взяв.
+        eventLogGapStalls.inc({ reader });
+        eventLogGapBlockedAge.observe({ reader }, Math.max(0, ageMs / 1000));
+        break;
+      }
+      // Пільговий час вичерпано: версії між `expected` і цією вже не з'являться. `max` тримає
+      // лічильник невід'ємним навіть на невпорядкованому вході — правило на ньому все одно вже
+      // зламане, але метрика не має права повалити розсилку винятком.
+      eventLogGapCrossed.inc({ reader }, Math.max(0, version - expected));
+    }
     run.push(row);
     expected = version + 1;
   }

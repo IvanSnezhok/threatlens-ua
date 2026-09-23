@@ -578,9 +578,24 @@ export async function reportedVectorsForEvents(
 ): Promise<ReportedVector[]> {
   if (!eventIds.length) return [];
   const result = await pool.query<VectorChainRow>(CHAIN_QUERY, [eventIds, cutoff]);
+  // ONE pass to bucket, instead of one pass over the whole result per event. `buildReportedVector`
+  // opens by skipping every row that is not its own, which made this loop O(events × rows): the
+  // live set is capped at 200 events (below) and an event carries ten to thirty chain rows, so a
+  // rebuild visited ~8·10⁵ rows to read ~4·10³ — synchronously, on the event loop, at the exact
+  // moment every open tab refetches on the same SSE event. Bucketing costs one visit per row and
+  // leaves the filter in `buildReportedVector` intact, which matters because that function is pure
+  // and `src/services/threat-vectors.test.ts` hands it rows of a FOREIGN event to prove it refuses
+  // them. The rows arrive `ORDER BY mc.event_id, …`, so a bucket keeps the order the query chose.
+  const rowsByEvent = new Map<string, VectorChainRow[]>();
+  for (const row of result.rows) {
+    const bucket = rowsByEvent.get(row.event_id);
+    if (bucket) bucket.push(row); else rowsByEvent.set(row.event_id, [row]);
+  }
   const vectors: ReportedVector[] = [];
   for (const eventId of eventIds) {
-    const vector = buildReportedVector(eventId, result.rows);
+    const rows = rowsByEvent.get(eventId);
+    if (!rows) continue;
+    const vector = buildReportedVector(eventId, rows);
     // A single-node chain is a place somebody named, not a vector. Publishing it as one would put a
     // dot on the map that looks like the start of a route nobody reported.
     if (vector && vector.segments.length) vectors.push(vector);

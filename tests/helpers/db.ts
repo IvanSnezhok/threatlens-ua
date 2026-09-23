@@ -188,10 +188,48 @@ export async function ensureMigrated(): Promise<void> {
   );
   if (applied.rowCount && newest) {
     const current = await sql(`SELECT 1 FROM schema_migrations WHERE filename=$1`, [newest]);
-    if (current.rowCount) return;
+    // Знімок прапорців каталогу — тут, бо це єдина точка, яку кожен файл проходить у `beforeAll`
+    // ДО того, як щось змінить. Див. {@link restoreSourceFlags}.
+    if (current.rowCount) { await snapshotSourceFlags(); return; }
   }
   const { migrate } = await import('../../src/db/migrate.js');
   await migrate();
+  await snapshotSourceFlags();
+}
+
+/**
+ * Стан `sources.enabled`, яким його засіяли міграції — і єдине місце, яке повертає його назад.
+ *
+ * `sources` — довідкові дані: вони не в `VOLATILE_TABLES`, бо файл, який щоразу відновлював би
+ * каталог, не зміг би перевірити нічого про вимкнене джерело. Зворотний бік — прапорці течуть МІЖ
+ * файлами, і текли: `ops-sources` вимикав гуртом офіційні канали тривог
+ * (`UPDATE … WHERE official=true AND adapter_type=ANY(…)`), чотири файли вмикали гуртом усі
+ * монітори (`UPDATE … WHERE adapter_type='mtproto_monitor'`), і жоден не прибирав за собою. Разом
+ * це давало `telegram-collector.test.ts` 52 канали замість 54 — але лише за того порядку файлів,
+ * який vitest обрав того разу. Вимірювання: −6 офіційних від `ops-sources`, +4 монітори від
+ * `analytics-archive`, `attack-research`, `classification-archive`, `threat-withdrawal`.
+ *
+ * Знімок береться ОДИН раз за процес — на першому `ensureMigrated()`, тобто до того, як будь-який
+ * файл щось змінив, — а повертається у `afterAll` кожного файла (`tests/helpers/setup-env.ts`).
+ * Саме тому це не `resetDatabase()`: скидання per-test знесло б `beforeAll`, у якому файл навмисно
+ * вимикає джерело на весь свій набір.
+ */
+let seededSourceFlags: Map<string, boolean> | null = null;
+
+async function snapshotSourceFlags(): Promise<void> {
+  if (seededSourceFlags) return;
+  const rows = await sql<{ id: string; enabled: boolean }>(`SELECT id,enabled FROM sources`);
+  seededSourceFlags = new Map(rows.rows.map((row) => [row.id, row.enabled]));
+}
+
+export async function restoreSourceFlags(): Promise<void> {
+  if (!seededSourceFlags?.size) return;
+  await sql(
+    `UPDATE sources SET enabled=seeded.enabled
+       FROM (SELECT unnest($1::text[]) AS id, unnest($2::boolean[]) AS enabled) seeded
+      WHERE sources.id=seeded.id AND sources.enabled<>seeded.enabled`,
+    [[...seededSourceFlags.keys()], [...seededSourceFlags.values()]]
+  );
 }
 
 export async function waitFor(

@@ -4,10 +4,24 @@
 # would build a SECOND stack beside the running one and the update would appear to do nothing.
 name: threatlens
 
+# Стеля журналу контейнерів. Драйвер `json-file` за замовчуванням не ротує НІЧОГО: файл росте, поки
+# не закінчиться диск на хості, і найгучніший його автор — сам застосунок, який писав два рядки pino
+# на кожен HTTP-запит. Рядки тепер пише лише помилка або повільна відповідь, але стеля має бути
+# однаково: журнал, який може заповнити диск, зупиняє й Postgres, і бекап, і сам деплой.
+#
+# 10 МіБ × 3 файли × 5 сервісів — щонайбільше 150 МіБ на весь стек, і це видно в `docker compose ps`
+# без жодного зовнішнього збирача.
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
 services:
   caddy:
     image: caddy:2-alpine
     restart: unless-stopped
+    logging: *default-logging
     ports:
       - "${HTTP_PORT:-8080}:80"
       - "${HTTPS_PORT:-8443}:443"
@@ -45,6 +59,7 @@ services:
         APP_COMMIT: "${APP_COMMIT:-unknown}"
         APP_BUILT_AT: "${APP_BUILT_AT:-}"
     restart: unless-stopped
+    logging: *default-logging
     env_file: .env
     # Жорстка стеля пари до `--max-old-space-size=640` у Dockerfile: heap впирається у власну межу
     # першим і виживає через GC, а cgroup-ліміт лишається останнім рубежем — OOM-kill із перезапуском
@@ -100,6 +115,7 @@ services:
       context: .
       dockerfile: deploy/Dockerfile
     restart: unless-stopped
+    logging: *default-logging
     # Defaults rather than compose's `${VAR:?}` required form on purpose: a required variable is
     # interpolated for the WHOLE file, so an unset one would break `docker compose ps`, the runner's
     # own `up -d app caddy`, and every routine command for deployments that never enabled this
@@ -131,6 +147,7 @@ services:
   postgres:
     image: postgres:18-alpine
     restart: unless-stopped
+    logging: *default-logging
     environment:
       POSTGRES_DB: ${POSTGRES_DB:-threatlens}
       POSTGRES_USER: ${POSTGRES_USER:-threatlens}
@@ -146,10 +163,14 @@ services:
   backup:
     image: postgres:18-alpine
     restart: unless-stopped
+    logging: *default-logging
     env_file: .env
     environment:
       BACKUP_RETENTION_DAYS: ${BACKUP_RETENTION_DAYS:-14}
       BACKUP_INTERVAL_SECONDS: ${BACKUP_INTERVAL_SECONDS:-86400}
+      # Година добового дампу за UTC. Дев'ята — полудень за Києвом: денне затишшя, а не ніч, коли
+      # цей хост і так під навантаженням. Дивіться `scripts/backup.sh` і docs/OPERATIONS.md.
+      BACKUP_AT_UTC_HOUR: ${BACKUP_AT_UTC_HOUR:-9}
       POSTGRES_ADMIN_URL: postgresql://${POSTGRES_USER:-threatlens}:${POSTGRES_PASSWORD:-change-me}@postgres:5432/postgres
     entrypoint: ["/bin/sh", "/usr/local/bin/backup.sh"]
     volumes:

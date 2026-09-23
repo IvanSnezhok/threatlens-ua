@@ -28,10 +28,16 @@ process.env.ALERTS_IN_UA_TOKEN = 'integration-alerts-in-ua-token';
 
 afterAll(async () => {
   if (!databaseUrl) return;
-  const [{ closeHarnessPool }, { pool }] = await Promise.all([
+  const [{ closeHarnessPool, restoreSourceFlags }, { pool }] = await Promise.all([
     import('./db.js'),
     import('../../src/db/pool.js')
   ]);
+  // ПЕРЕД закриттям пулів, і саме тут, а не в `resetDatabase()`: `sources` — довідкові дані, які
+  // переживають скидання, тож усе, що файл увімкнув або вимкнув, лишалося б таким для КОЖНОГО
+  // наступного файла набору. Саме так `telegram-collector.test.ts` бачив 52 канали замість 54 —
+  // залежно від порядку, який vitest обрав того разу. Прибирання per-file, а не per-test, бо файл
+  // має право вимкнути джерело у власному `beforeAll` на весь свій набір.
+  await restoreSourceFlags().catch(() => undefined);
   await closeHarnessPool();
   await pool.end().catch(() => undefined);
 });
