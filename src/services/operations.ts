@@ -1,4 +1,5 @@
 import { pool } from '../db/pool.js';
+import { pruneTrackActualizations } from './track-actualization.js';
 
 /**
  * Marks a batch of sources fresh in ONE transaction, and reports which of them were not fresh
@@ -158,16 +159,30 @@ export async function purgeNotificationState(): Promise<number> {
   return purged.rowCount ?? 0;
 }
 
+/**
+ * The track actualizations (migration 055) live seven days. Pruned from this tick, but once an hour
+ * rather than every thirty seconds: the DELETE has no index on `created_at` to ride — the table's one
+ * index leads with `event_id`, for the reads that matter — and a scan of a week of rows twice a minute
+ * would be the housekeeping costing more than the thing it keeps tidy.
+ */
+const ACTUALIZATION_PRUNE_EVERY_MS = 3_600_000;
+
 export function startOperationsScheduler(log: { info: Function; error: Function }): () => void {
   let running = false;
+  let actualizationsPrunedAt = 0;
   const run = async () => {
     if (running) return;
     running = true;
     try {
-      const [expired, stale, purged] = await Promise.all([
-        expireThreatEvents(), updateSourceFreshness(), purgeNotificationState()
+      const pruneActualizations = Date.now() - actualizationsPrunedAt >= ACTUALIZATION_PRUNE_EVERY_MS;
+      const [expired, stale, purged, actualizations] = await Promise.all([
+        expireThreatEvents(), updateSourceFreshness(), purgeNotificationState(),
+        pruneActualizations ? pruneTrackActualizations() : Promise.resolve(0)
       ]);
-      if (expired || stale || purged) log.info({ expired, stale, purged }, 'operational state updated');
+      if (pruneActualizations) actualizationsPrunedAt = Date.now();
+      if (expired || stale || purged || actualizations) {
+        log.info({ expired, stale, purged, actualizations }, 'operational state updated');
+      }
     } catch (error) {
       log.error({ error }, 'operational state update failed');
     } finally {

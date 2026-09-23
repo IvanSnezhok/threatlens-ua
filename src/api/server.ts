@@ -23,6 +23,7 @@ import { registerAttackResearchMetrics } from '../services/attack-research.js';
 import { registerAttackStatsMetrics } from '../services/attack-stats.js';
 import { registerCodexClassifierMetrics } from '../services/codex-classifier.js';
 import { registerModelContextMetrics } from '../services/model-context.js';
+import { registerTrackActualizationMetrics } from '../services/track-actualization.js';
 import { registerDowntimeDigestMetrics } from '../services/downtime-digest.js';
 import { registerAttackDebriefMetrics } from '../services/attack-debrief.js';
 import { registerOutboxMetrics } from '../bot/outbox.js';
@@ -286,6 +287,10 @@ export async function buildServer(options: BuildServerOptions = {}) {
   // — appends, compactions and trims of the per-location contexts (migration 049).
   registerCodexClassifierMetrics(registry);
   registerModelContextMetrics(registry);
+  // `threatlens_track_actualizations_total{outcome}` — how the fast model's track actualization
+  // (migration 055) answered: stored, rejected by validation, failed, or skipped over the per-minute
+  // budget. `rejected` is the one to watch: a model that keeps naming places the messages never did.
+  registerTrackActualizationMetrics(registry);
   // `threatlens_downtime_digests_total{outcome}` — чи склалося зведення після простою, і чи мав хто
   // його прочитати. Порожні проходи рахуються теж: «нічого не було» і «зведення не спрацювало» — це
   // два різні стани, і без цієї серії вони виглядають однаково.

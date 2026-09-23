@@ -597,6 +597,18 @@ export const envSchema = z.object({
   // hands more messages back to the rules, lowering it trusts the model's guesses.
   CODEX_PRIMARY_MIN_CONFIDENCE: z.coerce.number().min(0).max(1).default(0.5),
 
+  // ---- Track actualization (migration 055) ------------------------------------------------------------
+  // The fast model re-reads a live event's recent messages and says where the target is NOW. The
+  // answer only shapes the drawn track, and every bound here resolves to the same thing — the
+  // deterministic track — so none of them can lose a warning or a vector; what they cost is a model
+  // reading of one event. Thirty a minute is six events every fifteen-second tick with room for the
+  // other hot-path surfaces on the same account; zero switches the surface off without touching the
+  // /ops switch. Over budget nothing queues: the next tick asks about the newest input anyway.
+  ACTUALIZATION_MAX_PER_MINUTE: z.coerce.number().int().min(0).max(120).default(30),
+  // Eight seconds: gpt-6-luna answers a ping in 1.2–1.7 s (measured 23.09.2026), and an answer that
+  // arrives after the next tick has started describes a track that has already moved on.
+  ACTUALIZATION_TIMEOUT_MS: z.coerce.number().int().min(1000).max(60_000).default(8000),
+
   // ---- Per-location model context --------------------------------------------------------------------
   // One rolling text per oblast, raion, city or «ua»: what was reported about it, what was decided,
   // when alerts started and ended. It rides in every model request about that place and is compacted
@@ -1384,6 +1396,15 @@ export const APP_SETTINGS: Record<keyof AppConfig, SettingMeta> = {
   CODEX_PRIMARY_MIN_CONFIDENCE: {
     scope: 'db_tunable', group: 'analytics', apply: 'hot', ui: { kind: 'number', min: 0, max: 1 },
     applyNote: 'Нижче — вердикт моделі записується для звірки, а публікує класифікація правил.'
+  },
+  ACTUALIZATION_MAX_PER_MINUTE: {
+    scope: 'db_tunable', group: 'analytics', apply: 'hot', ui: { kind: 'number', min: 0, max: 120, unit: 'на хвилину' },
+    applyNote: 'Скільки подій на хвилину швидка модель актуалізує. Понад бюджет — детермінований трек, без черги; '
+      + '0 вимикає поверхню, не чіпаючи перемикача в /ops.'
+  },
+  ACTUALIZATION_TIMEOUT_MS: {
+    scope: 'db_tunable', group: 'analytics', apply: 'hot', ui: { kind: 'number', min: 1000, max: 60_000, unit: 'мс' },
+    applyNote: 'Скільки один виклик актуалізації може тривати. Вичерпано — трек лишається детермінованим. Діє з наступного тіку.'
   },
   MODEL_CONTEXT_ENABLED: {
     scope: 'db_tunable', group: 'analytics', apply: 'hot', ui: { kind: 'boolean' },

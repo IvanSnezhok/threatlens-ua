@@ -1119,6 +1119,16 @@ What `codex` changes, message by message (`src/services/codex-classifier.ts`, `s
   `model`, `model_confidence`, `timing`, `probability`; `shadow_classifications` gets the
   rules-versus-model comparison from the same verdict, so `/ops` agreement keeps working without a
   second call.
+- **The classifier runs on the fast model** (`tier: 'fast'`, migration 055) — `fastModel` in the
+  settings, or the main model while that is empty. See «Two models» below.
+- **A reported move keeps both ends.** When the verdict says the target moves (`redirected`, or a
+  course in `directionText`) and names where it came FROM and where it goes, the classification takes
+  the rules' own «повз A на B» shape: `intent='redirect'`, the origins as `retracted` places, the
+  destinations as `reported_direction`. The vector chain then draws the move as `reported_transit`.
+  The origins are history only: they are not asserted as threatened places, and — unlike the rules'
+  transit — a model-built one withdraws nothing (`ingestThreat` skips the transit withdrawal when the
+  classification carries a model `assessment`; all-clears stay the rules' alone). An origin the
+  catalogue cannot resolve is dropped; with no resolved origin it is an ordinary directional verdict.
 - Every failure falls back to the rules and is counted:
   `threatlens_codex_classifier_outcomes_total{outcome=fallback_timeout|fallback_model_failed|
   fallback_unparsable|fallback_rate_limited|fallback_busy|fallback_low_confidence|fallback_no_locations|
@@ -1203,6 +1213,7 @@ grant:
 | `movement_summary` | a model retelling of a threat's movement, sources named | subscriber threat messages |
 | `attack_stats` | attack statistics and Poisson probabilities per region, from open sources | public attacks page + nightly digest |
 | `risk` | the six-hour risk index written by Codex, with the location context, instead of `AI_*` | map assessments + Telegram |
+| `actualization` | the fast model's reading of where a live target is NOW — head, heading, loiter, passed/ended | the public track, only in `classifier_mode=codex` |
 
 `attacks` is the one whose name has outlived its meaning, and the console label now says so. It has
 **never** gated the public attacks page: its single reader is `refineWithCodex()` in
@@ -1227,9 +1238,10 @@ curl -fsS -u "$OPS_USER:$OPS_PASSWORD" http://localhost:3000/ops/codex
 # Current settings, the model catalogue and its provenance.
 curl -fsS -u "$OPS_USER:$OPS_PASSWORD" http://localhost:3000/ops/codex/settings
 
-# Pick a model and switch surfaces. Any subset of fields; omitted ones keep their value.
+# Pick the two models and switch surfaces. Any subset of fields; omitted ones keep their value.
+# "fastModel": null (or "") means «as the main model».
 curl -fsS -u "$OPS_USER:$OPS_PASSWORD" -X PUT -H 'Content-Type: application/json' \
-  -d '{"model":"gpt-5.6-luna","features":{"narrative":true,"digest":true,"attacks":true,"shadow":true,"tactics":false,"attack_research":false}}' \
+  -d '{"model":"gpt-5.6-luna","fastModel":"gpt-6-luna","serviceTier":"priority","features":{"narrative":true,"digest":true,"attacks":true,"shadow":true,"tactics":false,"attack_research":false}}' \
   http://localhost:3000/ops/codex/settings
 
 # The audit log: every call, including the ones that never left the process.
@@ -1245,8 +1257,9 @@ Reading it:
   selected. Against an OpenAI-compatible proxy the list comes from the service.
 - **The prose stopping is answered by `ai_runs`, not by guesswork.** Pre-flight refusals are recorded
   under the model that would have been used (`no_session`, `model_not_selected`, `not_configured`),
-  endpoint refusals keep the status code and never the response body, and a `session_expired` streak
-  means someone needs to press the sign-in button again.
+  endpoint refusals keep the status code AND what the endpoint said (JSON `detail`/`error.message`,
+  else the text; whitespace collapsed, 300 characters, the credential we sent cut out), and a
+  `session_expired` streak means someone needs to press the sign-in button again.
 - **The shadow switch spends quota during attacks by design.** Shadow classification runs on exactly
   the messages the classifier is already processing, capped by `SHADOW_CLASSIFIER_MAX_PER_MINUTE`
   (default 6, messages over budget dropped, never queued). The switch lives here and not in `.env`
@@ -1262,6 +1275,86 @@ Reading it:
   input. Telegram OGG voice notes are converted to WebM by `ffmpeg`, then transcribed through
   `${AI_BASE_URL}/audio/transcriptions` with `AI_API_KEY` and `AI_TRANSCRIPTION_MODEL`. A media-only
   model disagreement appears in `/ops`; it does not create or withdraw a live threat.
+
+### Two models: main and fast (migration 055)
+
+`model` (main) keeps the heavy surfaces — `narrative`, `digest`, `attack_stats`, `attack_research`,
+`tactics`, `risk`, `attacks`, context compaction. `fastModel` serves everything a message or the map
+waits on: the primary classifier, `shadow`, `retrospective_gate`, `movement_summary` and
+`actualization`. Surfaces never name a model; they ask for a tier (`CodexChatRequest.tier`), so one
+choice in the console moves the whole tier. `fastModel` empty = the main model
+(`effectiveFastModel = fastModel ?? effectiveModel`); an upgrade into 055 therefore calls exactly what
+it called before. Measured 23.09.2026 with `priority`/`default`: gpt-6-luna answers a ping in
+1.2–1.7 s, gpt-5.6-luna in 1.2–6.7 s; `gpt-6`, `gpt-6-mini` and `gpt-5.6` are refused for a ChatGPT
+account. The production intent is `fastModel = gpt-6-luna` — set it in the console, not in SQL.
+
+### Track actualization (migration 055, switch `actualization`, off by default)
+
+Every 15 s the worker (`src/services/track-actualization.ts`) picks live events (`timing='now'`,
+observed within 30 min) with at least two classifications whose newest classification is newer than
+their latest actualization, newest first — at most 6 per tick, 2 at a time — and gives the fast model
+the Kyiv time, the class and the event's last 12 classifications (time, channel, text ≤ 300 chars,
+the catalogue's places with relation and role). It answers `status` (`moving | loitering | passed |
+ended | unclear`), head/heading/origin/loiter place ids, `currentSince` and a ≤ 160-character summary.
+
+- **Refused whole** if any place id is not in the input, the heading is not a place a source named as
+  a direction, `currentSince` is not one of the input publication times, or the summary carries a
+  number no source text had or a forecast word. A refusal writes nothing to
+  `threat_track_actualizations` and one `ai_runs` row with `validation_status='rejected'` and the
+  reason in `fallback_reason`; the same input is not asked again for two minutes.
+- **Stored as answered otherwise**, low confidence included, keyed by `(event_id, input_digest)` —
+  sha256 of what the model read, without the clock — so an unchanged input is never stored or asked
+  twice. Rows older than seven days are deleted by the operations tick (once an hour).
+- **Applied to the public track only when** `classifier_mode=codex` AND the switch is on AND
+  confidence ≥ 0.6 AND the row saw the event's newest classification. In `rules` mode the worker is a
+  shadow: rows accumulate for comparison, the map ignores them. Every other case, and every failure,
+  is the deterministic track. It never creates, ends or merges an event and never touches alerts.
+- **Bounds, hot:** `ACTUALIZATION_MAX_PER_MINUTE` (30; 0 switches the surface off without touching the
+  console) and `ACTUALIZATION_TIMEOUT_MS` (8 s). Over budget nothing queues.
+
+```bash
+# Outcomes: stored | rejected | failed | skipped_budget. A climbing `rejected` is a model naming
+# places the messages never did — read the reasons before trusting the surface.
+curl -fsS -H "Authorization: Bearer $METRICS_TOKEN" localhost:3000/metrics |
+  grep threatlens_track_actualizations_total
+curl -fsS -u "$OPS_USER:$OPS_PASSWORD" 'http://localhost:3000/ops/ai-runs?surface=actualization&limit=20'
+```
+
+### Incident: every Codex call answered 400 (20.08–23.09.2026)
+
+The stored `service_tier` was `flex`; the backend answers `{"detail":"Unsupported service_tier:
+flex"}` for every model we measured (`default` and `priority` work). The client discarded response
+bodies, so `ai_runs` said only «Codex відповів 400» for a month, and production — in
+`classifier_mode=codex` — silently classified every message with the rules. Migration 055 rewrote
+the row to `priority` and the CHECK no longer admits `flex`; the console no longer offers it (a PUT
+with it is a 400). The signature, should something similar return: `endpoint_error` rows on every
+surface at once with the same status, and `threatlens_codex_classifier_outcomes_total{outcome=
+"fallback_model_failed"}` climbing with no `classified`. The body now in `ai_runs.error` names the cause.
+
+### Reading `ai_runs`
+
+One row per model call, written by `codexChat` whatever happens, plus one extra row when the caller
+refused an answer the model did give. Filter on `surface` (the feature: `classifier`, `shadow`,
+`actualization`, `narrative`, …), not on `prompt_version` (the prompt, e.g. `actualization-v1`).
+
+- `status='success'`, `validation_status='skipped'` — the transport worked; the caller's own check,
+  if any, is recorded separately.
+- `status='failed'`, `validation_status='skipped'` — no usable answer: `error` / `fallback_reason`
+  start with `not_configured | model_not_selected | no_session | session_expired | endpoint_error |
+  transport_error`, followed by the detail (for `endpoint_error`, what the endpoint said).
+- `status='failed'`, `validation_status='rejected'` — the model answered and the surface refused it;
+  `fallback_reason` names why (`unknown_place:…`, `heading_not_named_destination:…`,
+  `ungrounded_number:…`, `forecast_lexeme:…`, `schema:…`).
+- `model` is what was actually called — with two models, check that the hot-path surfaces show the
+  fast one. The actualization transport row carries ids, times and the input digest, not the texts
+  (those are in `source_messages`); its refusal row carries the full input the model read.
+
+```sql
+-- What failed in the last hour, by surface and cause.
+SELECT surface, split_part(fallback_reason, ':', 1) AS cause, count(*)
+  FROM ai_runs WHERE status = 'failed' AND created_at > now() - interval '1 hour'
+ GROUP BY 1, 2 ORDER BY 3 DESC;
+```
 
 ## Source trust (operator only)
 

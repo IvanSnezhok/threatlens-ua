@@ -18,6 +18,7 @@ import { startSourceTrustScheduler } from './services/source-trust.js';
 import { startAnalyticalOutcomeScheduler } from './services/analytical-outcomes.js';
 import { startAttackStatsScheduler } from './services/attack-stats.js';
 import { startModelContextScheduler } from './services/model-context.js';
+import { startTrackActualizationWorker } from './services/track-actualization.js';
 import { eventHub } from './services/sse.js';
 import { startTelegramCollector } from './sources/telegram.js';
 import { startTelegramWebCollector } from './sources/telegram-web.js';
@@ -65,6 +66,10 @@ const stopAttackStats = startAttackStatsScheduler(app.log);
 // повідомлення робить конвеєр класифікації. ПІСЛЯ eventHub.start() з тієї самої причини, що й
 // перерахунок аналітики: слухач хаба, який не опитує, не спрацює ніколи.
 const stopModelContext = startModelContextScheduler(app.log);
+// Кожні пʼятнадцять секунд: швидка модель актуалізує трек живих подій (міграція 055). Лише підказка
+// для намальованого треку, тож з вимкненим перемикачем у /ops тик читає один рядок налаштувань і
+// виходить, а будь-який збій лишає трек детермінованим.
+const stopTrackActualization = startTrackActualizationWorker(app.log);
 const bot = createBot();
 // BEFORE the collector starts, because the collector's very first pass can land in `failed` or
 // `flood_wait` and that transition is one of the three this notifier exists for.
@@ -113,7 +118,7 @@ async function shutdown(signal: string) {
   // `stopAnalyticsRecompute()` runs BEFORE `eventHub.stop()`: it detaches the listener while the hub
   // is still the thing that would call it, and bumps the generation token so an in-flight floor
   // callback cannot re-arm itself against a pool this function is about to end.
-  stopIngestion(); stopRisk(); stopOperations(); stopNightlyDigests(); stopLocationCatalog(); stopOccupation(); stopSourceTrust(); stopAnalyticalOutcomes(); stopAttackStats(); stopModelContext(); stopAnalytics(); stopAnalyticsRecompute(); stopNotifications(); eventHub.stop();
+  stopIngestion(); stopRisk(); stopOperations(); stopNightlyDigests(); stopLocationCatalog(); stopOccupation(); stopSourceTrust(); stopAnalyticalOutcomes(); stopAttackStats(); stopModelContext(); stopTrackActualization(); stopAnalytics(); stopAnalyticsRecompute(); stopNotifications(); eventHub.stop();
   bot?.stop();
   await stopCollector?.();
   await app.close();
