@@ -324,7 +324,20 @@ describe.skipIf(!integrationDatabaseAvailable)('snapshot and catalogue caching',
       expect(Array.isArray(rows)).toBe(true);
       expect(rows.length).toBeGreaterThan(0);
       expect(Object.keys(rows[0]!).sort())
-        .toEqual(['id', 'latitude', 'longitude', 'name_uk', 'parent_id', 'type']);
+        .toEqual(['id', 'latitude', 'longitude', 'name_uk', 'parent_id', 'primary_settlement', 'type']);
+    });
+
+    it('sends coordinates only for the primary settlements the city layer draws', async () => {
+      // Migration 056 gives OpenStreetMap points to the settlements migrations 024, 031 and 032 seeded,
+      // and in production to almost every city and hromada. The frontend reads coordinates from this
+      // route only to draw primary settlements. The other points would be bytes nobody reads, on
+      // every catalogue fetch.
+      const located = await sql(`SELECT 1 FROM locations WHERE latitude IS NOT NULL AND NOT primary_settlement`);
+      expect(located.rowCount).toBeGreaterThan(0);
+      const rows = await (await fetch(`${baseUrl}/api/v1/locations`)).json() as Array<Record<string, unknown>>;
+      expect(rows.filter((row) => row.latitude != null && !row.primary_settlement).map((row) => row.id)).toEqual([]);
+      expect(rows.find((row) => row.id === 'ua-city-mykolaiv'))
+        .toMatchObject({ primary_settlement: true, latitude: 46.975, longitude: 31.9946 });
     });
 
     it('answers 304 with the caching rule intact', async () => {

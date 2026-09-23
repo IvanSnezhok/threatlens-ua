@@ -132,11 +132,13 @@ export async function relatedLocationIds(locationId: string): Promise<string[]> 
  *
  * `type`, `geocoded` and `oblast_id` ride along with the names because two catalogue rows can spell
  * the same — Миколаїв the oblast capital and Миколаїв the town in Lviv oblast, Городок twice,
- * Південне twice — and the classifier refuses such a span unless something ranks the rows. Only the
- * hand-seeded first-order rows carry coordinates (the KATOTTG importer writes none), so
- * `latitude IS NOT NULL` is the catalogue's own statement that a row is the well-known one, and the
- * oblast walked up `parent_id` is what lets a message that already said "Одещина" pick the Південне
- * it means. All three are read for that tie-break and nothing else.
+ * Південне twice — and the classifier refuses such a span unless something ranks the rows.
+ * `geocoded` is `locations.primary_settlement`, the catalogue's own statement that a row is the
+ * hand-seeded, well-known one. It used to be `latitude IS NOT NULL`, back when only those rows had
+ * coordinates. Migration 056 gave OpenStreetMap coordinates to almost every city and hromada and
+ * copied the old marker into the column first, so a bare «Миколаїв» still means the oblast capital.
+ * The oblast walked up `parent_id` is what lets a message that already said "Одещина" pick the
+ * Південне it means. All three are read for that tie-break and nothing else.
  */
 export async function listLocationLexemes() {
   const result = await pool.query<{
@@ -150,7 +152,7 @@ export async function listLocationLexemes() {
          FROM ancestry JOIN locations child ON child.id = ancestry.ancestor_id
                        JOIN locations parent ON parent.id = child.parent_id
      )
-     SELECT l.id, l.name_uk, l.aliases, l.type, l.latitude IS NOT NULL AS geocoded,
+     SELECT l.id, l.name_uk, l.aliases, l.type, l.primary_settlement AS geocoded,
             (SELECT ancestor_id FROM ancestry
               WHERE ancestry.id = l.id AND ancestor_type IN ('oblast','special_city')
               LIMIT 1) AS oblast_id

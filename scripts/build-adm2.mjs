@@ -195,7 +195,7 @@ const sleep = (ms) => new Promise((done) => setTimeout(done, ms));
 /** Mirror -> timestamp until which it is skipped, shared across concurrent requests. */
 const mirrorCooldown = new Map();
 
-async function overpass(query, label) {
+async function overpass(query, label, { userAgent = USER_AGENT, reject = () => null } = {}) {
   for (let attempt = 0; attempt < 60; attempt++) {
     const rotation = MIRRORS.map((_, offset) => MIRRORS[(attempt + offset) % MIRRORS.length]);
     // A mirror that is simply down burns the full request deadline every time it is tried, which is
@@ -205,13 +205,22 @@ async function overpass(query, label) {
     try {
       const response = await fetch(mirror, {
         method: 'POST',
-        headers: { 'user-agent': USER_AGENT },
+        headers: { 'user-agent': userAgent },
         body: new URLSearchParams({ data: query }),
         signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS)
       });
       const text = await response.text();
-      if (response.ok && text.startsWith('{')) { mirrorCooldown.delete(mirror); return JSON.parse(text); }
-      process.stderr.write(`  ${label}: HTTP ${response.status} from ${mirror}, retrying\n`);
+      if (response.ok && text.startsWith('{')) {
+        const payload = JSON.parse(text);
+        // A caller may refuse an answer the mirror calls a success (truncated mid-output, or served
+        // from a database months behind). That mirror then sits out like one that did not answer.
+        const refusal = reject(payload);
+        if (!refusal) { mirrorCooldown.delete(mirror); return payload; }
+        mirrorCooldown.set(mirror, Date.now() + MIRROR_COOLDOWN_MS);
+        process.stderr.write(`  ${label}: ${refusal} from ${mirror}, cooling down\n`);
+      } else {
+        process.stderr.write(`  ${label}: HTTP ${response.status} from ${mirror}, retrying\n`);
+      }
     } catch (error) {
       networkFailure = true;
       mirrorCooldown.set(mirror, Date.now() + MIRROR_COOLDOWN_MS);
@@ -961,6 +970,9 @@ async function main() {
   process.stdout.write('\nall checks passed\n');
 }
 
-export { assemble, countVertices, douglasPeucker, readCatalog, selectRelations, serialise, signedArea, stitchRings, verify };
+export {
+  assemble, BBOX, cached, countVertices, douglasPeucker, METRES_PER_DEG_LAT, metresPerDegLon, overpass, readCatalog,
+  selectRelations, serialise, signedArea, stitchRings, verify
+};
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) await main();

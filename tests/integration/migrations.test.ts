@@ -51,7 +51,8 @@ const MIGRATION_FILES = [
   '052_downtime_digest.sql',
   '053_hot_path_indexes.sql',
   '054_alert_level.sql',
-  '055_track_actualization.sql'
+  '055_track_actualization.sql',
+  '056_location_coordinates.sql'
 ];
 
 /**
@@ -233,6 +234,46 @@ describe.skipIf(!integrationDatabaseAvailable)('migration runner against live Po
       `SELECT name_uk, 'ар крим' = ANY(aliases) AS has_alias FROM locations WHERE id='ua-43'`
     );
     expect(row.rows[0]).toEqual({ name_uk: 'Автономна Республіка Крим', has_alias: true });
+  });
+
+  it('gives migration-seeded settlements coordinates without making them first-order places', async () => {
+    // 056 copies "has coordinates" into `primary_settlement` BEFORE it writes the OpenStreetMap
+    // points. In the other order, Бородянка (a village seeded by migration 024) would come out as a
+    // first-order place and outrank every namesake in `pickAmongTied`.
+    const rows = await sql<{ id: string; primary_settlement: boolean; located: boolean }>(
+      `SELECT id, primary_settlement, latitude IS NOT NULL AND longitude IS NOT NULL AS located
+         FROM locations WHERE id IN ('katottg-ua32080030010080493', 'ua-city-mykolaiv') ORDER BY id`
+    );
+    expect(rows.rows).toEqual([
+      { id: 'katottg-ua32080030010080493', primary_settlement: false, located: true },
+      { id: 'ua-city-mykolaiv', primary_settlement: true, located: true }
+    ]);
+  });
+
+  it('keeps a bare «Миколаїв» on the oblast capital once its Lviv namesake has coordinates too', async () => {
+    // Until 056 the classifier's seeded-rank tie-break read `latitude IS NOT NULL`, and only the
+    // oblast capital had coordinates. 056 gives them to the KATOTTG town in Lviv oblast too. The row
+    // is written here the way the importer writes it, with the point 056 gives it.
+    await sql(
+      `INSERT INTO locations (id, parent_id, type, name_uk, official_code, aliases, latitude, longitude)
+       VALUES ('katottg-ua46100110010094231', 'ua-46', 'city', 'Миколаїв', 'UA46100110010094231',
+               ARRAY['миколаїв'], 49.5254, 23.9788)`
+    );
+    try {
+      const [{ listLocationLexemes }, { classifyMessage }] = await Promise.all([
+        import('../../src/repositories/events.js'),
+        import('../../src/domain/classifier.js')
+      ]);
+      const located = await sql<{ id: string }>(
+        `SELECT id FROM locations WHERE name_uk = 'Миколаїв' AND latitude IS NOT NULL ORDER BY id`
+      );
+      expect(located.rows.map((row) => row.id)).toEqual(['katottg-ua46100110010094231', 'ua-city-mykolaiv']);
+      const lexemes = await listLocationLexemes();
+      expect(classifyMessage('Шахед на Миколаїв', lexemes).locations.map((location) => location.id))
+        .toEqual(['ua-city-mykolaiv']);
+    } finally {
+      await sql(`DELETE FROM locations WHERE id = 'katottg-ua46100110010094231'`);
+    }
   });
 
   it('gives the codex switch row every switch, all of them off', async () => {

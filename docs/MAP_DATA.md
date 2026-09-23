@@ -1,18 +1,21 @@
 # Map data: provenance, licence, rebuild
 
-The map draws three boundary layers, from two different sources under the same licence.
+The map draws three boundary layers, and the location catalogue carries a point for its cities and
+hromadas. They come from two different sources under the same licence.
 
-| Layer | File | Source | Contents |
+| Dataset | File | Source | Contents |
 |---|---|---|---|
 | ADM0 | `public/data/ukraine-adm0.geojson` | geoBoundaries `UKR`, release commit `9469f09` | the recognised border of Ukraine |
 | ADM1 | `public/data/ukraine-adm1.geojson` | geoBoundaries `UKR`, release commit `9469f09` | 27 oblast-level units including the AR of Crimea and Sevastopol |
 | ADM2 | `public/data/ukraine-adm2.geojson` | OpenStreetMap via Overpass | the 136 raions of the 2020 reform |
+| Catalogue coordinates | `migrations/056_location_coordinates.sql` → `locations.latitude/longitude` | OpenStreetMap via Overpass | a point for 461 cities and 1 764 hromadas |
 
 Every one of them is derived from OpenStreetMap and is licensed under **ODbL 1.0**. See
 [Attribution](#attribution) — the obligation is not satisfied by the basemap's own credit line.
 
 `data/map/README.md` holds the operational notes for the basemap and the pinned ADM0/ADM1
-checksums. This file covers where the boundaries come from and how ADM2 is rebuilt.
+checksums. This file covers where the boundaries and the catalogue coordinates come from, and how
+ADM2 and the coordinates are rebuilt.
 
 ## Why ADM2 does not come from geoBoundaries
 
@@ -114,6 +117,120 @@ half of that at the map's opening zoom of 5.1. `--report` prints the whole curve
 Change it with `--tolerance`; the budget for this file is 1.5 MB, so 100 m still fits if the layer
 ever needs to look right past zoom 10.
 
+## Catalogue coordinates
+
+The KATOTTG importer writes the catalogue's names, codes and hierarchy, but never a coordinate.
+Until migration 056 only the hand-seeded rows had one: the oblasts, Kyiv, Sevastopol and 27 oblast
+capitals. That left 461 of 488 cities and all 1 772 hromadas NULL. A threat track is drawn between
+the catalogue places its messages named, so most of its nodes had nowhere to stand. The head of a
+live track at Ірпінь published `coordinates: null`.
+
+`scripts/build-location-coordinates.mjs` fills these rows from OpenStreetMap and writes the result
+as a migration, `migrations/056_location_coordinates.sql`.
+
+### How a row is matched
+
+The join is the one ADM2 uses, the `katotth` tag. The Ukrainian community puts it on raion
+relations, and also on 29 419 settlement nodes and on the 1 469 hromada relations
+(`admin_level=7`). Its value is the catalogue's `official_code`. A name is only a fallback, and
+only inside a polygon.
+
+| Row | Evidence, strongest first |
+|---|---|
+| city | 1. the `place=city\|town\|village\|hamlet` node carrying the row's `katotth`<br>2. the one node without a code that bears the row's name inside the raion's ADM2 polygon (the oblast's ADM1 polygon for the two rows parented straight to an oblast) |
+| hromada | 1. the centre of its `admin_level=7` relation (Overpass `out center`, the centre of the bounding box), if it falls inside the raion's polygon<br>2. otherwise, the relation's `admin_centre` member<br>3. with no relation at all (every Crimean hromada), the settlement of the hromada whose name the hromada's adjective is formed from: Андріївська ← Андріївка, Яркополенська ← Ярке Поле |
+| raion | nothing. `src/services/threat-vectors.ts` falls back to the ADM2 centroid and publishes it as approximate |
+
+- **Several candidates leave a row NULL.** That covers two nodes with one code, two same-name
+  untagged places in one raion, and two settlements matching a hromada's name equally well. A
+  wrong point draws a track through a place nobody named; a missing one only shortens the track.
+- **A node matched on its `katotth` may lie up to 15 km outside its raion polygon.** The code
+  already names the raion, so the check exists to catch a mis-tagged node, which lands tens or
+  hundreds of kilometres away. It must not reject two correct sources that disagree. At this
+  snapshot 23 of the 29 419 tagged nodes lie outside their KATOTTG raion, the furthest by 12.4 km.
+  These are villages around Sevastopol that KATOTTG places in Бахчисарайський район and OSM draws
+  inside the city. Every such acceptance is printed: Інкерман at 8.9 km, and four Crimean
+  hromada centres.
+- **A hromada's point is the centre of an area, not a position.** `threat-vectors.ts` publishes it
+  as `approximate`.
+
+### Coverage
+
+| Type | With coordinates after 056 | How |
+|---|---|---|
+| city | **488 of 488** (100%) | 27 seeded before; 459 by `katotth`; 2 by name (Сімферополь, Старий Крим, whose nodes carry no code) |
+| hromada | **1 764 of 1 772** (99.5%) | 1 453 relation centres; 16 `admin_centre` members where the centre fell outside the raion; 295 Crimean administrative centres by name |
+| raion | 0 of 136 | by design, see above |
+
+Eight hromadas stay NULL, all in Crimea. Курська has two equally good candidates, Курське and
+Курортне. For the other seven, no settlement named after the hromada appears among its tagged
+nodes or among the untagged nodes of its raion: Верхньосадівська, Орлинівська (Бахчисарайський),
+Зуйська (Білогірський), Побєдненська (Джанкойський), Завітненська (Керченський), Завітненська and
+Орджонікідзевська (Феодосійський).
+
+Two independent checks. The build compares OSM with the 27 capitals that were seeded by hand before
+any of this: median 0.4 km, maximum 2.4 km (Павлоград). The catalogue's points for ten places were
+also checked against Wikidata's coordinates (P625), and all are within 1.04 km: Ірпінь, Буча,
+Бровари, Біла Церква (a seeded row 056 leaves alone), Славутич, Васильків, Ромни, Кременчук,
+Нікополь, Ізмаїл.
+
+### Rebuild
+
+```bash
+node scripts/build-location-coordinates.mjs            # rebuild the migration from the cached snapshot
+node scripts/build-location-coordinates.mjs --refresh  # re-read the catalogue, re-fetch Overpass
+node scripts/build-location-coordinates.mjs --refresh --out migrations/0NN_location_coordinates_refresh.sql
+```
+
+- The catalogue is read the way the other map-data scripts read it, `docker exec
+  threatlens-ua-postgres-1 psql`. `THREATLENS_PG_CONTAINER` or `DATABASE_URL` points it elsewhere.
+  The catalogue snapshot and every Overpass answer are cached under
+  `node_modules/.cache/threatlens-coordinates`. A rerun without `--refresh` is offline and
+  byte-identical, and prints the SHA-256 recorded below.
+- **An applied migration is never edited.** When a KATOTTG release adds places, or OSM corrections
+  are worth a new snapshot, run with `--refresh` and a new `--out`. The new snapshot holds only the
+  rows that are still NULL, and the new file fills only those.
+- **The queries are not date-pinned.** ADM2 pins because a relation's membership and its ways must
+  agree across answers. Here each answer stands alone: a node carries its own coordinates, and
+  Overpass computes a relation's centre inside the answer that names it. The `timestamp_osm_base`
+  of each answer goes into the migration header instead. An answer from a database more than seven
+  days old is refused and another mirror asked. On 2026-09-23 one mirror answered from 2026-05-06,
+  and nothing else in its answer looked wrong. A truncated answer (a `remark`) is refused as well.
+- **Untagged settlements are fetched only where they are asked for.** The country-wide filter
+  returns 40 000 nodes, almost all of them outside Ukraine, and on a busy mirror it ran past the
+  90 s request deadline. The matching therefore runs twice. The first pass, with no untagged nodes,
+  records which raions it looked in. Only those raions' bounding boxes are fetched, in one request.
+  At this snapshot that is the ten Crimean raions.
+- **A fresh database needs the file twice.** Migrations run before the first KATOTTG import, so 056
+  finds only the settlements that migrations 024, 031 and 032 seeded. The file only writes where
+  both columns are NULL, so it is safe to apply again after the first import:
+  `docker compose exec -T postgres psql -U threatlens -d threatlens < migrations/056_location_coordinates.sql`.
+
+### `primary_settlement`
+
+Before 056, "has coordinates" also meant "hand-seeded first-order place", and the classifier relied
+on it. Its third homonym tie-break (`pickAmongTied`) resolves a bare «Миколаїв» to the oblast
+capital because only the capital had coordinates; the town in Lviv oblast had none. 056 gives both
+of them coordinates. So it first copies the old meaning into `locations.primary_settlement`, then
+writes the points. The column is added nullable, filled only where it is NULL, and then made
+`NOT NULL DEFAULT false`, so applying the file a second time cannot promote the rows it filled.
+`listLocationLexemes` reads the column as the lexeme's `geocoded` flag. The map's city layer
+(`cityCollection` in `web/app.js`) draws only primary settlements, so it keeps its 29 dots.
+`/api/v1/locations` sends coordinates only for primary rows. The other 2 225 points would add
+about 22 KB of zstd to every catalogue fetch (46.5 → 68.9 KB, measured on a copy of the production
+catalogue), and no client reads them there.
+
+### Provenance of the coordinates
+
+| Field | Value |
+|---|---|
+| Catalogue snapshot | `2026-09-23T08:52:26Z`, `threatlens-ua-postgres-1` |
+| `timestamp_osm_base` | `2026-09-23T08:50:51Z` (tagged settlements, hromada relations); `2026-09-23T08:58:00Z` (untagged settlements, the ten Crimean raions) |
+| Overpass mirrors | as ADM2: `overpass-api.de`, `overpass.kumi.systems`, `overpass.private.coffee` |
+| Rows written | 2 225: 461 cities, 1 764 hromadas |
+| Coordinate precision | 4 decimals (~11 m), as the seeded rows |
+| SHA-256 of `056_location_coordinates.sql` | `b422674ffaed218109b1c9b358fd1e4857ae57fe63e58e7e620d73c082a5bf8c` |
+
 ## Attribution
 
 The boundary layers are a **Derivative Database** under ODbL, not merely a Produced Work: the
@@ -128,6 +245,13 @@ GeoJSON itself is served to clients at `/data/*.geojson`. Two things follow.
 2. **Share-alike.** The derived database is offered under ODbL 1.0. It is already published in a
    machine-readable form at `/data/ukraine-adm2.geojson`, and each file carries `attribution` and
    `license` members so the licence travels with the bytes.
+
+The catalogue coordinates are a Derivative Database as well. `/api/v1/locations` sends coordinates
+only for the hand-seeded primary rows. The OpenStreetMap points reach clients through the payloads
+that name a place: threat events, risk assessments, a location's timeline and the vector nodes.
+They are offered under the same ODbL 1.0, and migration 056 names the source and the licence in its
+header. On the map, the OpenStreetMap notice is the attribution-control credit quoted above, and its
+wording names the boundaries only («Межі»).
 
 ## Provenance record
 

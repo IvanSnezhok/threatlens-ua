@@ -600,8 +600,16 @@ export async function buildServer(options: BuildServerOptions = {}) {
   // ревалідацію після нього 304-кою замість повторної передачі мегабайтів.
   const LOCATIONS_TTL_MS = 15 * 60_000;
   const locationsView = cachedBody(async () => {
+    // Координати — лише першорядних місць (`primary_settlement`, міграція 056). З 056 точку має майже
+    // кожне місто й громада, але фронтенд читає координати з цього маршруту тільки для шару міст, а
+    // той малює лише першорядні. Решта 2225 пар додала б кожному читачеві ~22 КБ zstd (46,5 → 68,9),
+    // яких ніхто не читає; треки й події беруть точки на сервері.
     const result = await pool.query(
-      `SELECT id,parent_id,type,name_uk,latitude,longitude FROM locations ORDER BY type,name_uk`
+      `SELECT id,parent_id,type,name_uk,
+              CASE WHEN primary_settlement THEN latitude END AS latitude,
+              CASE WHEN primary_settlement THEN longitude END AS longitude,
+              primary_settlement
+         FROM locations ORDER BY type,name_uk`
     );
     const body = Buffer.from(JSON.stringify(result.rows));
     return {
