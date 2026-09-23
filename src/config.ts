@@ -424,8 +424,11 @@ export const envSchema = z.object({
   // How many messages per minute may be sent for a shadow classification. This is a spending limit,
   // not a throughput setting: a mass attack is when the message rate peaks and when the account's
   // quota must still be there for the features that face users, so messages over budget are dropped
-  // rather than queued. The switch that turns the feature on at all is `shadow` in `codex_settings`,
-  // not an environment variable — see `src/services/codex-settings.ts`.
+  // rather than queued past the minute. Since migration 057 the messages of one minute travel in ONE
+  // call (`src/services/shadow-classifier.ts`), so this is the size of that minute's batch, capped
+  // at twenty whatever the value — one prompt must stay one readable prompt. The switch that turns
+  // the feature on at all is `shadow` in `codex_settings`, not an environment variable — see
+  // `src/services/codex-settings.ts`.
   SHADOW_CLASSIFIER_MAX_PER_MINUTE: z.coerce.number().int().min(0).max(120).default(6),
   SHADOW_CONTEXT_MESSAGES: z.coerce.number().int().min(0).max(20).default(8),
   SHADOW_CONTEXT_MINUTES: z.coerce.number().int().min(1).max(120).default(30),
@@ -598,16 +601,35 @@ export const envSchema = z.object({
   CODEX_PRIMARY_MIN_CONFIDENCE: z.coerce.number().min(0).max(1).default(0.5),
 
   // ---- Track actualization (migration 055) ------------------------------------------------------------
-  // The fast model re-reads a live event's recent messages and says where the target is NOW. The
+  // The fast model re-reads live events' recent messages and says where each target is NOW. The
   // answer only shapes the drawn track, and every bound here resolves to the same thing — the
   // deterministic track — so none of them can lose a warning or a vector; what they cost is a model
-  // reading of one event. Thirty a minute is six events every fifteen-second tick with room for the
-  // other hot-path surfaces on the same account; zero switches the surface off without touching the
+  // reading of one event. Since migration 057 the worker ticks once a minute and asks about up to
+  // eight changed events in ONE call, so this is the number of events per minute (at most eight
+  // reach the model per tick whatever it says); zero switches the surface off without touching the
   // /ops switch. Over budget nothing queues: the next tick asks about the newest input anyway.
   ACTUALIZATION_MAX_PER_MINUTE: z.coerce.number().int().min(0).max(120).default(30),
-  // Eight seconds: gpt-6-luna answers a ping in 1.2–1.7 s (measured 23.09.2026), and an answer that
-  // arrives after the next tick has started describes a track that has already moved on.
-  ACTUALIZATION_TIMEOUT_MS: z.coerce.number().int().min(1000).max(60_000).default(8000),
+  // Twenty seconds for the whole batch. gpt-6-luna answers a ping in 1.2–1.7 s (measured
+  // 23.09.2026), but one call now carries up to eight events and returns eight answers; eight
+  // seconds, the per-event bound this replaced, would kill most batches mid-answer. The tick is a
+  // minute, so an answer inside twenty seconds still describes the track the next tick will see.
+  ACTUALIZATION_TIMEOUT_MS: z.coerce.number().int().min(1000).max(60_000).default(20_000),
+
+  // ---- Бюджет Codex (міграція 057) ------------------------------------------------------------------
+  // Скільки відсотків вікна квоти (п'ятигодинного й тижневого, з заголовків `x-codex-*`) може бути
+  // витрачено, поки кожна смуга ще має право на виклик. Аналітика зупиняється першою, карта —
+  // другою, гарячий шлях (класифікатор, ретроспективний гейт, переказ руху) — останнім: резерв між
+  // 70 і 97 % існує для того, щоб попередження читала модель до самого кінця вікна, а не наратив.
+  // Відмова бюджету — це запасний шлях поверхні (правила, детермінований трек, текст без моделі),
+  // тож жодна з цих меж не може загубити попередження. Переставлені межі не переставляють
+  // пріоритетів: `src/services/codex-budget.ts` стискає їх до порядку аналітика ≤ карта ≤ гарячий
+  // шлях, тож квота ніколи не дістанеться аналітиці раніше, ніж попередженням.
+  CODEX_BUDGET_ANALYTICS_MAX_PERCENT: z.coerce.number().min(1).max(100).default(70),
+  CODEX_BUDGET_MAP_MAX_PERCENT: z.coerce.number().min(1).max(100).default(85),
+  CODEX_BUDGET_HOT_MAX_PERCENT: z.coerce.number().min(1).max(100).default(97),
+  // Темп аналітики: витрачено не більше, ніж минуло вікна, плюс ця поправка. Без неї нічна атака
+  // з'їдала б усе вікно за першу годину, і решту чотирьох годин класифікатор стояв би без моделі.
+  CODEX_BUDGET_PACE_SLACK_PERCENT: z.coerce.number().min(0).max(100).default(10),
 
   // ---- Per-location model context --------------------------------------------------------------------
   // One rolling text per oblast, raion, city or «ua»: what was reported about it, what was decided,
@@ -1266,7 +1288,9 @@ export const APP_SETTINGS: Record<keyof AppConfig, SettingMeta> = {
     ui: { kind: 'select', options: ['auto', 'chat', 'responses'] }
   },
   SHADOW_CLASSIFIER_MAX_PER_MINUTE: {
-    scope: 'db_tunable', group: 'analytics', apply: 'hot', ui: { kind: 'number', min: 0, max: 120 }
+    scope: 'db_tunable', group: 'analytics', apply: 'hot', ui: { kind: 'number', min: 0, max: 120, unit: 'на хвилину' },
+    applyNote: 'Скільки повідомлень за хвилину отримує другу думку моделі — одним викликом на хвилину, не більше '
+      + '20 у пакеті за будь-якого значення. Понад це повідомлення пропускаються без черги; 0 — тінь не кличе модель.'
   },
   SHADOW_CONTEXT_MESSAGES: {
     scope: 'db_tunable', group: 'analytics', apply: 'hot', ui: { kind: 'number', min: 0, max: 20 }
@@ -1399,12 +1423,34 @@ export const APP_SETTINGS: Record<keyof AppConfig, SettingMeta> = {
   },
   ACTUALIZATION_MAX_PER_MINUTE: {
     scope: 'db_tunable', group: 'analytics', apply: 'hot', ui: { kind: 'number', min: 0, max: 120, unit: 'на хвилину' },
-    applyNote: 'Скільки подій на хвилину швидка модель актуалізує. Понад бюджет — детермінований трек, без черги; '
-      + '0 вимикає поверхню, не чіпаючи перемикача в /ops.'
+    applyNote: 'Скільки подій на хвилину швидка модель актуалізує: один виклик на хвилинний тік, до восьми подій у ньому. '
+      + 'Понад бюджет — детермінований трек, без черги; 0 вимикає поверхню, не чіпаючи перемикача в /ops.'
   },
   ACTUALIZATION_TIMEOUT_MS: {
     scope: 'db_tunable', group: 'analytics', apply: 'hot', ui: { kind: 'number', min: 1000, max: 60_000, unit: 'мс' },
-    applyNote: 'Скільки один виклик актуалізації може тривати. Вичерпано — трек лишається детермінованим. Діє з наступного тіку.'
+    applyNote: 'Скільки може тривати один пакетний виклик актуалізації (до восьми подій). Вичерпано — трек лишається '
+      + 'детермінованим. Діє з наступного тіку.'
+  },
+  CODEX_BUDGET_ANALYTICS_MAX_PERCENT: {
+    scope: 'db_tunable', group: 'analytics', apply: 'hot', ui: { kind: 'number', min: 1, max: 100, unit: '%' },
+    applyNote: 'Аналітика (тінь, ризик, наратив, дайджест, тактика, дослідження, статистика, стискання контексту) '
+      + 'кличе модель, лише поки витрачено менше цієї частки вікна і не більше, ніж минуло вікна плюс поправка темпу. '
+      + 'Читається на кожному виклику.'
+  },
+  CODEX_BUDGET_MAP_MAX_PERCENT: {
+    scope: 'db_tunable', group: 'analytics', apply: 'hot', ui: { kind: 'number', min: 1, max: 100, unit: '%' },
+    applyNote: 'Межа для актуалізації треку. Не нижча за межу аналітики і не вища за межу гарячого шляху: '
+      + 'переставлене значення стискається до цього порядку.'
+  },
+  CODEX_BUDGET_HOT_MAX_PERCENT: {
+    scope: 'db_tunable', group: 'analytics', apply: 'hot', ui: { kind: 'number', min: 1, max: 100, unit: '%' },
+    applyNote: 'Межа для основного класифікатора, ретроспективного гейта й переказу руху — тих, на кого чекає '
+      + 'попередження. Понад неї класифікують правила; повідомлення не губиться.'
+  },
+  CODEX_BUDGET_PACE_SLACK_PERCENT: {
+    scope: 'db_tunable', group: 'analytics', apply: 'hot', ui: { kind: 'number', min: 0, max: 100, unit: '%' },
+    applyNote: 'Скільки відсоткових пунктів аналітика може йти попереду рівномірного темпу вікна. 0 — суворо '
+      + 'рівномірно; 100 — темп не перевіряється.'
   },
   MODEL_CONTEXT_ENABLED: {
     scope: 'db_tunable', group: 'analytics', apply: 'hot', ui: { kind: 'boolean' },

@@ -206,9 +206,12 @@ describe('classifyWithCodex', () => {
     const input = { message: message('Шахеди на Полтавщині.'), rules, ...base };
     const unsure = await classifyWithCodex(input, { chat: chatReturning(verdict({ confidence: 0.3 })), now, loadPrevious: noPrevious, loadContexts: noContexts });
     expect(unsure).toMatchObject({ status: 'fallback', reason: 'fallback_low_confidence' });
+    // Кожен наступний вердикт — про той самий текст, тож памʼять повторів відповіла б попереднім.
+    resetCodexClassifier();
     // Правила бачать загрозу; модель каже «не загроза» з 0.6 — замало, щоб придушити попередження.
     const timid = await classifyWithCodex(input, { chat: chatReturning(verdict({ significant: false, confidence: 0.6, probability: null })), now, loadPrevious: noPrevious, loadContexts: noContexts });
     expect(timid).toMatchObject({ status: 'fallback', reason: 'fallback_low_confidence' });
+    resetCodexClassifier();
     // З 0.9 — придушення: класифікація без наміру, правила вже не публікують.
     const sure = await classifyWithCodex(input, { chat: chatReturning(verdict({ significant: false, confidence: 0.9, probability: null })), now, loadPrevious: noPrevious, loadContexts: noContexts });
     expect(sure.status).toBe('suppressed');
@@ -224,12 +227,14 @@ describe('classifyWithCodex', () => {
 
   it('spends the per-minute budget and the concurrency slots, and falls back rather than queueing', async () => {
     const rules = classifyMessage('Шахеди на Полтавщині.', lexemes);
-    const input = { message: message('Шахеди на Полтавщині.'), rules, ...base };
+    // Різні тексти: однаковий передрук узяв би вердикт із памʼяті й бюджету не витратив би.
+    const numbered = (index: number) => ({ message: message(`Шахеди на Полтавщині, група ${index}.`), rules, ...base });
+    const input = numbered(0);
     const chat = chatReturning(verdict());
     for (let index = 0; index < 3; index += 1) {
-      expect((await classifyWithCodex(input, { chat, now, loadPrevious: noPrevious, loadContexts: noContexts })).status).toBe('classified');
+      expect((await classifyWithCodex(numbered(index), { chat, now, loadPrevious: noPrevious, loadContexts: noContexts })).status).toBe('classified');
     }
-    expect(await classifyWithCodex(input, { chat, now, loadPrevious: noPrevious, loadContexts: noContexts })).toMatchObject({ status: 'fallback', reason: 'fallback_rate_limited' });
+    expect(await classifyWithCodex(numbered(3), { chat, now, loadPrevious: noPrevious, loadContexts: noContexts })).toMatchObject({ status: 'fallback', reason: 'fallback_rate_limited' });
     expect(chat).toHaveBeenCalledTimes(3);
 
     resetCodexClassifier();
@@ -291,15 +296,75 @@ describe('classifyWithCodex', () => {
       config.CODEX_PRIMARY_MAX_CONCURRENT = 6;
       config.CODEX_PRIMARY_MAX_PER_MINUTE = 4;
       const chat = chatReturning(verdict());
-      const input = { message: message('Шахеди на Полтавщині.'), rules: rules(), ...base };
+      const numbered = (index: number) => ({ message: message(`Шахеди на Полтавщині, група ${index}.`), rules: rules(), ...base });
       for (let index = 0; index < 4; index += 1) {
-        await classifyWithCodex(input, { chat, now: late, loadPrevious: noPrevious, loadContexts: noContexts });
+        await classifyWithCodex(numbered(index), { chat, now: late, loadPrevious: noPrevious, loadContexts: noContexts });
       }
       // Половина бюджету — і ні викликом більше, хай скільки замітання приносить.
       expect(chat).toHaveBeenCalledTimes(2);
       // А живе повідомлення в ту саму хвилину ще має що витратити.
-      const live = await classifyWithCodex(input, { chat, now, loadPrevious: noPrevious, loadContexts: noContexts });
+      const live = await classifyWithCodex(numbered(9), { chat, now, loadPrevious: noPrevious, loadContexts: noContexts });
       expect(live.status).toBe('classified');
+      expect(chat).toHaveBeenCalledTimes(3);
+    });
+  });
+
+  // ----------------------------------------------------------------------------------------------
+  // Передрук і бюджет квоти
+  // ----------------------------------------------------------------------------------------------
+
+  describe('a repost of text the model has just read', () => {
+    const text = 'Увечері очікується масований удар балістикою по Полтавщині.';
+    const repost = (publishedAt: Date, tier = 'B') => ({
+      message: { ...message(`  УВЕЧЕРІ очікується масований удар\nбалістикою по Полтавщині.  `), publishedAt },
+      rules: classifyMessage(text, lexemes), lexemes, source: { name: 'Інший монітор', tier, official: false }
+    });
+
+    it('takes the verdict without a call, and still judges the repost as its own message', async () => {
+      const chat = chatReturning(verdict({ threatType: 'ballistic_missile', timing: 'within_hour', probability: 0.6 }));
+      const first = await classifyWithCodex({ message: message(text), rules: classifyMessage(text, lexemes), ...base },
+        { chat, now, loadPrevious: noPrevious, loadContexts: noContexts });
+      expect(first.status).toBe('classified');
+
+      // Три хвилини по тому, інший канал того самого рівня, інші пробіли й регістр.
+      const later = new Date(PUBLISHED_AT.getTime() + 3 * 60_000);
+      const second = await classifyWithCodex(repost(later), {
+        chat, now: () => new Date(later.getTime() + 30_000), loadPrevious: noPrevious, loadContexts: noContexts
+      });
+      expect(chat).toHaveBeenCalledTimes(1);
+      expect(second.status).toBe('classified');
+      if (second.status !== 'classified' || first.status !== 'classified') return;
+      // Вікно «протягом години» — від публікації САМЕ передруку, а не оригіналу.
+      expect(second.assessment.expectedFrom).toEqual(later);
+      expect(first.assessment.expectedFrom).toEqual(PUBLISHED_AT);
+      expect(second.assessment.model).toBe('gpt-5.2');
+    });
+
+    it('asks again for another source tier, for media, and once ten minutes have passed', async () => {
+      const chat = chatReturning(verdict({ threatType: 'ballistic_missile' }));
+      await classifyWithCodex({ message: message(text), rules: classifyMessage(text, lexemes), ...base },
+        { chat, now, loadPrevious: noPrevious, loadContexts: noContexts });
+      await classifyWithCodex(repost(PUBLISHED_AT, 'A'), { chat, now, loadPrevious: noPrevious, loadContexts: noContexts });
+      expect(chat).toHaveBeenCalledTimes(2);
+
+      const withPicture = repost(PUBLISHED_AT);
+      withPicture.message = { ...withPicture.message, media: [{ kind: 'image', mimeType: 'image/png', bytes: new Uint8Array([1]) }] };
+      await classifyWithCodex(withPicture, { chat, now, loadPrevious: noPrevious, loadContexts: noContexts });
+      expect(chat).toHaveBeenCalledTimes(3);
+
+      const muchLater = new Date(now().getTime() + 10 * 60_000);
+      await classifyWithCodex(repost(muchLater), { chat, now: () => muchLater, loadPrevious: noPrevious, loadContexts: noContexts });
+      expect(chat).toHaveBeenCalledTimes(4);
+    });
+
+    it('hands the message to the rules under its own outcome when the quota budget refuses the call', async () => {
+      const chat = vi.fn(async () => ({
+        ok: false as const, reason: 'budget_deferred' as const, detail: 'бюджет Codex: смугу hot відкладено (usage_limit)',
+        model: null, durationMs: 0
+      }));
+      const outcome = await classifyWithCodex({ message: message(text), rules: classifyMessage(text, lexemes), ...base },
+        { chat, now, loadPrevious: noPrevious, loadContexts: noContexts });
+      expect(outcome).toMatchObject({ status: 'fallback', reason: 'fallback_budget_deferred' });
     });
   });
 });

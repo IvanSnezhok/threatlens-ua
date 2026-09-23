@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { Counter, Histogram, type Registry } from 'prom-client';
 import { z } from 'zod';
 import { config } from '../config.js';
@@ -11,6 +12,7 @@ import {
 } from '../domain/threat-timing.js';
 import { withinDeliveryAge } from '../repositories/events.js';
 import { THREAT_TYPES, type ClassifiedMessage, type NormalizedMessage, type ThreatType } from '../types.js';
+import { codexBudgetMetrics } from './codex-budget.js';
 import { codexChat, type CodexChatRequest, type CodexChatResult } from './codex-client.js';
 import { imageDataUrl, transcribeAudio } from './media-enrichment.js';
 import { loadLocationContexts, renderContextsForPrompt } from './model-context.js';
@@ -68,6 +70,11 @@ import {
  *    правил.
  *  - Кожен виклик обмежений у часі (`CODEX_PRIMARY_TIMEOUT_MS`), за бюджетом на хвилину й за
  *    кількістю одночасних — повідомлення, яке чекає на модель, ще не на карті.
+ *  - Класифікатор — гаряча смуга бюджету квоти (`./codex-budget.ts`): модель читає повідомлення, доки
+ *    витрачено менше 97 % вікна, коли аналітика стоїть уже з 70 %. Відмова бюджету — правила
+ *    (`fallback_budget_deferred`), як і будь-який інший збій.
+ *  - Передрук того самого тексту джерелом того самого рівня протягом десяти хвилин бере вже
+ *    прочитаний вердикт без виклику, але проходить увесь шлях від вердикту до класифікації сам.
  */
 
 export const CODEX_CLASSIFIER_VERSION = 'codex-primary-v1';
@@ -93,6 +100,13 @@ export type PrimaryOutcomeLabel =
   | 'fallback_timeout' | 'fallback_model_failed' | 'fallback_unparsable' | 'fallback_low_confidence'
   | 'fallback_no_locations' | 'fallback_empty'
   /**
+   * Бюджет квоти (`./codex-budget.ts`) не пустив гарячий шлях до моделі: вікно понад
+   * `CODEX_BUDGET_HOT_MAX_PERCENT` або блок після 429. Окремо від `fallback_model_failed`, бо це не
+   * збій моделі, а рішення бюджету, — і саме його частка каже, що квота скінчилася навіть для
+   * попереджень.
+   */
+  | 'fallback_budget_deferred'
+  /**
    * Повідомлення, старше за стелю доставки, якому бюджет моделі віддали б за рахунок живого.
    *
    * Окреме значення, а не мовчання й не `fallback_rate_limited`: «модель була зайнята» і «ми самі
@@ -116,9 +130,26 @@ export const codexPrimaryDuration = new Histogram({
   registers: []
 });
 
+/**
+ * Вердикти, узяті з памʼяті повторів замість виклику (див. {@link verdictReuseKey}). Частка від
+ * `classified + suppressed` — це те, скільки репостів між каналами бюджет квоти більше не оплачує.
+ */
+export const codexVerdictReuses = new Counter({
+  name: 'threatlens_codex_classifier_reused_total',
+  help: 'Primary classifications answered from the verdict for the same normalized text and source tier seen within ten minutes, without a model call',
+  registers: []
+});
+
 export function registerCodexClassifierMetrics(registry: Registry): void {
   if (!registry.getSingleMetric('threatlens_codex_classifier_outcomes_total')) registry.registerMetric(codexPrimaryOutcomes);
   if (!registry.getSingleMetric('threatlens_codex_classifier_duration_seconds')) registry.registerMetric(codexPrimaryDuration);
+  if (!registry.getSingleMetric('threatlens_codex_classifier_reused_total')) registry.registerMetric(codexVerdictReuses);
+  // Лічильник відмов бюджету квоти живе поруч із бюджетом (`./codex-budget.ts`), а реєструється тут:
+  // цю функцію вже кличе `src/api/server.ts`, а класифікатор — найближчий до бюджету модуль, який
+  // сервер і так реєструє. Другий виклик у `buildServer()` був би другим місцем, де про нього забудуть.
+  for (const [name, metric] of codexBudgetMetrics()) {
+    if (!registry.getSingleMetric(name)) registry.registerMetric(metric);
+  }
 }
 
 // ------------------------------------------------------------------------------------------------
@@ -167,6 +198,54 @@ function withinMinuteBudget(now: number, stale = false): boolean {
 export function resetCodexClassifierBudget(): void {
   minuteWindow = [];
   inFlight = 0;
+}
+
+// ------------------------------------------------------------------------------------------------
+// Повтор того самого тексту
+// ------------------------------------------------------------------------------------------------
+
+/**
+ * Вердикт для тексту, який уже читали: репост між каналами не коштує другого виклику.
+ *
+ * Під час атаки той самий пост за хвилину-дві передруковують кілька каналів того самого рівня —
+ * дослівно або з іншими пробілами й регістром. Кожен передрук чекав на власний виклик класифікатора,
+ * і кожен ішов із квоти гарячого шляху, хоча модель прочитала б рівно те саме. Тепер вердикт для
+ * нормалізованого тексту й рівня джерела живе десять хвилин, і передрук бере його без виклику.
+ *
+ * Повторно береться лише ВЕРДИКТ — відповідь моделі про текст. Усе, що залежить від повідомлення,
+ * рахується наново, тим самим шляхом, що й після виклику: вікно очікування — від часу публікації
+ * САМЕ цього повідомлення, поріг упевненості, придушення проти правил ЦЬОГО повідомлення, місця
+ * через каталог. Тож передрук, що прийшов на годину пізніше, стає застарілим так само, як і без
+ * памʼяті, а передрук із правилами, які бачать загрозу, не придушується слабшим вердиктом.
+ *
+ * У ключі — рівень джерела, бо модель бачить його й зважає на нього (офіційний канал і монітор —
+ * різна ймовірність). Повідомлення з медіа в памʼять не йдуть і з неї не беруть: зображення й голос
+ * — частина того, що модель прочитала, а в ключі їх немає. Вікно рахується від ВИКЛИКУ, а не від
+ * останнього передруку: пост, який передруковують щодев'ять хвилин, не житиме на старому вердикті вічно.
+ */
+const VERDICT_REUSE_MS = 10 * 60_000;
+/** Стеля памʼяті: пікові 71 повідомлення на хвилину за десять хвилин — 710 різних текстів, із запасом. */
+const VERDICT_REUSE_MAX = 1_000;
+
+interface RememberedVerdict { verdict: CodexVerdict; model: string; atMs: number }
+
+/** Вставка в порядку часу виклику, тож найстаріші завжди спереду й прибираються першими. */
+const recentVerdicts = new Map<string, RememberedVerdict>();
+
+/** sha256 нормалізованого тексту й рівня джерела: NFKC, без невидимих символів, нижній регістр, один пробіл. */
+export function verdictReuseKey(text: string, sourceTier: string): string {
+  const normalized = text.normalize('NFKC').replace(/[\u200B-\u200D\u2060\uFEFF]/gu, '')
+    .toLocaleLowerCase('uk-UA').replace(/\s+/gu, ' ').trim();
+  return createHash('sha256').update(`${sourceTier}\n${normalized}`).digest('hex');
+}
+
+function rememberVerdict(key: string, verdict: CodexVerdict, model: string, atMs: number): void {
+  recentVerdicts.delete(key);
+  recentVerdicts.set(key, { verdict, model, atMs });
+  for (const [oldest, entry] of recentVerdicts) {
+    if (recentVerdicts.size <= VERDICT_REUSE_MAX && atMs - entry.atMs < VERDICT_REUSE_MS) break;
+    recentVerdicts.delete(oldest);
+  }
 }
 
 // ------------------------------------------------------------------------------------------------
@@ -270,6 +349,7 @@ export function setCodexClassifierDefaults(options: CodexClassifyOptions): void 
 export function resetCodexClassifier(): void {
   classifierDefaults = {};
   resetCodexClassifierBudget();
+  recentVerdicts.clear();
 }
 
 /** Області над переданими локаціями (і самі області, якщо передано їх) — для контексту. */
@@ -461,10 +541,63 @@ export async function classifyWithCodex(
   const contextLocationIds = await contextLocationIdsFor(input.rules).catch(() => ['ua']);
   const fallback = (reason: Exclude<PrimaryOutcomeLabel, 'classified' | 'suppressed'>): CodexClassifyOutcome =>
     finish({ status: 'fallback', reason, contextLocationIds });
+  const text = input.message.text.trim();
+
+  /**
+   * Вердикт → класифікація ЦЬОГО повідомлення: вікно від його часу публікації, поріг упевненості,
+   * придушення проти його правил, місця через каталог. Один шлях і для щойно прочитаного вердикту, і
+   * для взятого з памʼяті повторів — тож передрук проходить рівно ті самі перевірки, що й оригінал.
+   */
+  const judge = (verdict: CodexVerdict, model: string): CodexClassifyOutcome => {
+    // Звірка з правилами пишеться тим, хто знає id повідомлення (ingestion), — див. нижче; тут лише
+    // повертаємо все, що для неї треба, через `assessment.verdict`.
+    const windowBase = expectedWindow(verdict.timing, input.message.publishedAt, config.APP_TIMEZONE, {
+      from: parseIso(verdict.expectedFrom), until: parseIso(verdict.expectedUntil)
+    });
+    const assessment: ModelAssessment = {
+      model,
+      classifierVersion: CODEX_CLASSIFIER_VERSION,
+      confidence: verdict.confidence,
+      timing: verdict.timing,
+      probability: verdict.significant ? verdict.probability : null,
+      expectedFrom: windowBase.from,
+      expectedUntil: windowBase.until,
+      note: verdict.note?.trim() || null,
+      verdict
+    };
+    if (verdict.confidence < config.CODEX_PRIMARY_MIN_CONFIDENCE) return fallback('fallback_low_confidence');
+
+    const rulesSignificant = significanceRejection(input.rules) === null;
+    const asserting = verdict.significant && verdict.threatType !== 'unknown'
+      && (verdict.threatState === 'asserted' || verdict.threatState === 'redirected');
+    if (!asserting) {
+      // «Не загроза» проти правил, що бачили загрозу, — придушення; воно вимагає більшої впевненості.
+      if (rulesSignificant && verdict.confidence < SUPPRESSION_MIN_CONFIDENCE) return fallback('fallback_low_confidence');
+      return finish({ status: 'suppressed', classified: notSignificant(input.rules, text), assessment, contextLocationIds });
+    }
+    const built = classificationFromVerdict(verdict, input.rules, input.lexemes, text);
+    if (!built.classified.locations.length && !built.classified.nationalScope) {
+      // Модель стверджує загрозу, але ні її назви, ні правила не дали місця: правила скажуть
+      // `no_location` самі, а вердикт лишиться у звірці.
+      return fallback('fallback_no_locations');
+    }
+    return finish({ status: 'classified', classified: built.classified, assessment, contextLocationIds });
+  };
 
   if (options.enabled === false) return fallback('fallback_disabled');
-  const text = input.message.text.trim();
   if (!text && !input.message.media?.length) return fallback('fallback_empty');
+  // Передрук тексту, який модель щойно прочитала, — без виклику, а отже й поза бюджетами нижче:
+  // вони рахують виклики, а цей виклику не робить. Див. `recentVerdicts`.
+  const reuseKey = text && !input.message.media?.length ? verdictReuseKey(text, input.source?.tier ?? 'C') : null;
+  const remembered = reuseKey ? recentVerdicts.get(reuseKey) : undefined;
+  if (remembered && startedAt.getTime() - remembered.atMs < VERDICT_REUSE_MS) {
+    codexVerdictReuses.inc();
+    try {
+      return judge(remembered.verdict, remembered.model);
+    } catch {
+      return fallback('fallback_model_failed');
+    }
+  }
   // Застаріле — не «не варте моделі», а «не варте ЧУЖОГО бюджету». Стеля читається з того самого
   // місця, що й у `ingestThreat`, тож розійтися вони не можуть; резерв описано вище.
   const stale = !withinDeliveryAge(input.message.publishedAt, startedAt);
@@ -545,6 +678,7 @@ export async function classifyWithCodex(
       ok: false, reason: 'transport_error', detail: String(error).slice(0, 200), model: null, durationMs: 0
     }));
     if (!result.ok) {
+      if (result.reason === 'budget_deferred') return fallback('fallback_budget_deferred');
       return fallback(/abort|timeout/i.test(result.detail) ? 'fallback_timeout' : 'fallback_model_failed');
     }
     let verdict: CodexVerdict;
@@ -553,39 +687,8 @@ export async function classifyWithCodex(
     } catch {
       return fallback('fallback_unparsable');
     }
-    // Звірка з правилами пишеться тим, хто знає id повідомлення (ingestion), — див. нижче; тут лише
-    // повертаємо все, що для неї треба, через `assessment.verdict`.
-    const windowBase = expectedWindow(verdict.timing, input.message.publishedAt, config.APP_TIMEZONE, {
-      from: parseIso(verdict.expectedFrom), until: parseIso(verdict.expectedUntil)
-    });
-    const assessment: ModelAssessment = {
-      model: result.model,
-      classifierVersion: CODEX_CLASSIFIER_VERSION,
-      confidence: verdict.confidence,
-      timing: verdict.timing,
-      probability: verdict.significant ? verdict.probability : null,
-      expectedFrom: windowBase.from,
-      expectedUntil: windowBase.until,
-      note: verdict.note?.trim() || null,
-      verdict
-    };
-    if (verdict.confidence < config.CODEX_PRIMARY_MIN_CONFIDENCE) return fallback('fallback_low_confidence');
-
-    const rulesSignificant = significanceRejection(input.rules) === null;
-    const asserting = verdict.significant && verdict.threatType !== 'unknown'
-      && (verdict.threatState === 'asserted' || verdict.threatState === 'redirected');
-    if (!asserting) {
-      // «Не загроза» проти правил, що бачили загрозу, — придушення; воно вимагає більшої впевненості.
-      if (rulesSignificant && verdict.confidence < SUPPRESSION_MIN_CONFIDENCE) return fallback('fallback_low_confidence');
-      return finish({ status: 'suppressed', classified: notSignificant(input.rules, text), assessment, contextLocationIds });
-    }
-    const built = classificationFromVerdict(verdict, input.rules, input.lexemes, text);
-    if (!built.classified.locations.length && !built.classified.nationalScope) {
-      // Модель стверджує загрозу, але ні її назви, ні правила не дали місця: правила скажуть
-      // `no_location` самі, а вердикт лишиться у звірці.
-      return fallback('fallback_no_locations');
-    }
-    return finish({ status: 'classified', classified: built.classified, assessment, contextLocationIds });
+    if (reuseKey) rememberVerdict(reuseKey, verdict, result.model, now().getTime());
+    return judge(verdict, result.model);
   } catch {
     return fallback('fallback_model_failed');
   } finally {

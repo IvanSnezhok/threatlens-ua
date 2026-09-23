@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import {
-  actualizationFacts, validateActualization, type ActualizationInput
+  actualizationFacts, checkActualizationBatch, validateActualization, type ActualizationInput
 } from './track-actualization.js';
 
 /**
@@ -9,7 +9,8 @@ import {
  * Тут пінять єдине, що дає цій поверхні право на публічну карту: модель посилається лише на місця,
  * які назвали повідомлення події; курс — лише туди, куди його назвало джерело; «поточний відрізок»
  * починається з повідомлення, яке справді є у вході; публічний `summary` не вигадує чисел і не
- * прогнозує. Поріг упевненості сюди не належить — його застосовує карта.
+ * прогнозує. Поріг упевненості сюди не належить — його застосовує карта. І з міграції 057 — те, що
+ * пакет із кількох подій перевіряється по подіях: непридатна відповідь про одну не коштує іншим.
  */
 
 const input: ActualizationInput = {
@@ -34,7 +35,7 @@ const input: ActualizationInput = {
   ]
 };
 
-const reply = (overrides: Record<string, unknown> = {}) => JSON.stringify({
+const reply = (overrides: Record<string, unknown> = {}) => ({
   status: 'loitering', headPlaceId: 'ua-city-boryspil', headingPlaceId: null, originPlaceId: 'ua-city-brovary',
   loiterPlaceId: 'ua-city-boryspil', currentSince: null, summary: 'Шахеди з боку Броварів кружляють над Борисполем.',
   confidence: 0.8, ...overrides
@@ -61,11 +62,11 @@ describe('validateActualization', () => {
   });
 
   it('maps currentSince back to the exact publication it names, and refuses one that is not in the input', () => {
-    const facts = actualizationFacts(input, new Date('2026-09-22T22:40:00.000Z'));
+    const facts = actualizationFacts([input], new Date('2026-09-22T22:40:00.000Z'));
     // Модель бачить київський час із поясом і має повернути одне з цих значень дослівно.
-    expect(facts.messages.map((message) => message.publishedAt))
+    expect(facts.events[0]!.messages.map((message) => message.publishedAt))
       .toEqual(['2026-09-23T01:31:05+03:00', '2026-09-23T01:38:41+03:00']);
-    const check = validateActualization(reply({ currentSince: facts.messages[1]!.publishedAt }), input);
+    const check = validateActualization(reply({ currentSince: facts.events[0]!.messages[1]!.publishedAt }), input);
     expect(check.ok && check.value.currentSince).toEqual(input.messages[1]!.publishedAt);
     expect(validateActualization(reply({ currentSince: '2026-09-23T01:35:00+03:00' }), input))
       .toEqual({ ok: false, reason: 'current_since_not_in_input' });
@@ -79,8 +80,38 @@ describe('validateActualization', () => {
       .toMatchObject({ ok: false, reason: expect.stringMatching(/^forecast_lexeme:/u) });
   });
 
-  it('refuses prose and a status outside the vocabulary', () => {
-    expect(validateActualization('Ціль над Борисполем.', input)).toEqual({ ok: false, reason: 'unparsable' });
+  it('refuses a status outside the vocabulary', () => {
     expect(validateActualization(reply({ status: 'arrived' }), input)).toMatchObject({ ok: false, reason: 'schema:status' });
+  });
+});
+
+describe('checkActualizationBatch', () => {
+  const other: ActualizationInput = { ...input, eventId: '00000000-0000-4000-8000-000000000002' };
+  const third: ActualizationInput = { ...input, eventId: '00000000-0000-4000-8000-000000000003' };
+
+  it('rejects only the element that is wrong and keeps the rest of the batch', () => {
+    const content = JSON.stringify({
+      events: [
+        { eventId: other.eventId, ...reply({ headPlaceId: 'ua-city-kyiv' }) },
+        { eventId: input.eventId, ...reply() }
+      ]
+    });
+    const checks = checkActualizationBatch(content, [input, other, third]);
+    expect(checks.get(input.eventId)).toMatchObject({ ok: true, value: { status: 'loitering' } });
+    expect(checks.get(other.eventId)).toEqual({ ok: false, reason: 'unknown_place:headPlaceId:ua-city-kyiv' });
+    // Модель пропустила третю подію: це її відмова, а не чужа.
+    expect(checks.get(third.eventId)).toEqual({ ok: false, reason: 'missing_answer' });
+  });
+
+  it('refuses two answers about one event rather than picking one', () => {
+    const content = JSON.stringify({ events: [{ eventId: input.eventId, ...reply() }, { eventId: input.eventId, ...reply() }] });
+    expect(checkActualizationBatch(content, [input]).get(input.eventId)).toEqual({ ok: false, reason: 'duplicate_answer' });
+  });
+
+  it('refuses the whole batch only when there is no batch to read', () => {
+    expect(checkActualizationBatch('Ціль над Борисполем.', [input, other]).get(other.eventId))
+      .toEqual({ ok: false, reason: 'unparsable' });
+    expect(checkActualizationBatch(JSON.stringify(reply()), [input]).get(input.eventId))
+      .toEqual({ ok: false, reason: 'schema:events' });
   });
 });

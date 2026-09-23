@@ -14,6 +14,9 @@ process.env.CODEX_API_KEY = '';
 process.env.CODEX_MODEL = '';
 
 const { codexChat, listCodexModels } = await import('./codex-client.js');
+// Бюджет процесу читає й пише `codex_budget_state`; цей файл не торкається бази, тож лише памʼять.
+// Динамічно з тієї самої причини, що й клієнт: модуль тягне `config`, який парситься під час імпорту.
+const { resetCodexBudget } = await import('./codex-budget.js');
 type AiRunRecord = Parameters<NonNullable<Parameters<typeof codexChat>[1]['audit']>>[0];
 
 const TOKEN = 'sk-super-secret-access-token';
@@ -31,7 +34,7 @@ const settings = async () => ({
 
 let runs: AiRunRecord[] = [];
 const audit = async (row: AiRunRecord) => { runs.push(row); };
-beforeEach(() => { runs = []; });
+beforeEach(() => { runs = []; resetCodexBudget(null); });
 
 function sse(events: unknown[], status = 200): Response {
   const body = events.map((event) => `data: ${JSON.stringify(event)}\n`).join('\n') + '\ndata: [DONE]\n\n';

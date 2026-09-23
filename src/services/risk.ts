@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { z } from 'zod';
 import { config } from '../config.js';
 import { pool } from '../db/pool.js';
@@ -227,60 +228,10 @@ async function recordFailedRun(input: unknown, error: unknown): Promise<void> {
 }
 
 /**
- * One group's assessment, from the configured model when this pass is allowed to spend it.
- *
- * `allowModel` is a *budget*, not a feature switch. The model is called once per
- * `(location_id, threat_type)` group and one nationwide message fans out to every oblast for six
- * hours, so a caller that runs far more often than the fifteen-minute scheduler has to be able to
- * say "re-score everything, but not with the model this time". Declining it is not a degradation of
- * the contract: {@link fallbackAssessment} is the deployed default wherever `AI_*` is unset and
- * already produces a complete, clamped, Ukrainian assessment.
+ * Те, що модель бачить про одну групу, — ті самі факти і в пакеті Codex, і в запиті `AI_*`.
  */
-/**
- * Той самий системний промт для обох модельних шляхів — Codex і AI_*. Текст із відповіді потрапляє
- * людині в очі без редагування, тому вимога до повних українських речень стоїть у самому промті.
- */
-const RISK_SYSTEM_PROMPT = 'Return only JSON. Assess the relative risk that an official warning of the specified type will appear for this location within six hours. This is an index, not a statistical probability. Never infer an impact, target, exact route, or safety. Required fields: locationId, threatType, horizonHours=6, score 0-10, confidence low|medium|high, supportingSignalIds, raisingFactors, limitingFactors, summary. Write summary, raisingFactors and limitingFactors in Ukrainian, as complete calm sentences a civilian can read aloud; never emit raw field names, signal type identifiers, English terms or numeric weights in them.';
-
-/** Скільки токенів контексту локації їде в один запит оцінки ризику — груп за прохід десятки, тож менше, ніж у класифікатора. */
-const RISK_CONTEXT_TOKENS = 20_000;
-
-/**
- * Оцінка ризику моделлю Codex (міграція 049, перемикач `risk`), з контекстом локації в запиті.
- *
- * Той самий контракт, що й у AI_*-шляху нижче: та сама схема, той самий `clampAssessment` після, той
- * самий запасний шлях правил на будь-який збій. Що інше — транспорт (`codexChat`, який сам пише
- * `ai_runs`) і те, що модель бачить: не лише сигнали, а й те, що система знає про це місце.
- */
-async function callCodex(
-  location: { id: string; name_uk: string }, threatType: string, input: unknown
-): Promise<ModelAssessment | null> {
-  const contexts = await loadLocationContexts([location.id], Math.min(RISK_CONTEXT_TOKENS, config.MODEL_CONTEXT_REQUEST_TOKENS))
-    .catch(() => []);
-  const contextBlock = renderContextsForPrompt(contexts);
-  const result = await codexChat({
-    promptVersion: 'risk-v2',
-    surface: 'risk',
-    classifierVersion: CLASSIFIER_VERSION,
-    system: RISK_SYSTEM_PROMPT,
-    user: (contextBlock ? `## Контекст локації\n${contextBlock}\n\n` : '') + `## Сигнали\n${JSON.stringify(input)}`,
-    json: true,
-    auditInput: { ...(input as object), contextTokens: contexts.reduce((sum, context) => sum + context.tokens, 0) }
-  }).catch(() => null);
-  if (!result || !result.ok) return null;
-  try {
-    return modelAssessmentSchema.parse(JSON.parse(result.content));
-  } catch {
-    return null;
-  }
-}
-
-async function callModel(
-  location: { id: string; name_uk: string }, threatType: string, signals: RiskSignalRow[],
-  allowModel: boolean
-): Promise<ModelAssessment> {
-  if (!allowModel) return fallbackAssessment(location, threatType, signals);
-  const input = {
+function riskModelInput(location: { id: string; name_uk: string }, threatType: string, signals: RiskSignalRow[]) {
+  return {
     location: { id: location.id, name: location.name_uk },
     threatType,
     horizonHours: 6,
@@ -297,15 +248,177 @@ async function callModel(
       observedAt: signal.observed_at
     }))
   };
-  // Codex спершу, коли оператор увімкнув перемикач `risk`: це і є «Codex — основна аналітична модель».
-  // Не відповіла — AI_*-шлях, якщо налаштований; інакше правила. Жоден із трьох не кидає.
-  if (await codexFeatureEnabled('risk')) {
-    const fromCodex = await callCodex(location, threatType, input);
-    if (fromCodex) return fromCodex;
+}
+
+/**
+ * Системний промт шляху `AI_*` — по запиту на групу. Текст із відповіді потрапляє людині в очі без
+ * редагування, тому вимога до повних українських речень стоїть у самому промті.
+ */
+const RISK_SYSTEM_PROMPT = 'Return only JSON. Assess the relative risk that an official warning of the specified type will appear for this location within six hours. This is an index, not a statistical probability. Never infer an impact, target, exact route, or safety. Required fields: locationId, threatType, horizonHours=6, score 0-10, confidence low|medium|high, supportingSignalIds, raisingFactors, limitingFactors, summary. Write summary, raisingFactors and limitingFactors in Ukrainian, as complete calm sentences a civilian can read aloud; never emit raw field names, signal type identifiers, English terms or numeric weights in them.';
+
+/** Пакетний промт Codex (міграція 057): ті самі правила, по одній оцінці на кожну групу пакета. */
+const RISK_BATCH_SYSTEM_PROMPT = 'Return only JSON. For EACH group in "groups", assess the relative risk that an official warning of the group\'s threat type will appear for the group\'s location within six hours. This is an index, not a statistical probability. Never infer an impact, target, exact route, or safety. Groups are independent: assess each one only from its own signals and its own location context. Return {"assessments": [...]} with exactly one element per group. Each element has locationId and threatType copied from its group, horizonHours=6, score 0-10, confidence low|medium|high, supportingSignalIds (ids of that group\'s signals only), raisingFactors, limitingFactors and summary. Write summary, raisingFactors and limitingFactors in Ukrainian, as complete calm sentences a civilian can read aloud; never emit raw field names, signal type identifiers, English terms or numeric weights in them.';
+
+// ------------------------------------------------------------------------------------------------
+// Codex: один пакетний виклик на прохід
+// ------------------------------------------------------------------------------------------------
+
+/**
+ * Чому ризик був найбільшим споживачем квоти, і що тут змінилося (міграція 057).
+ *
+ * Замір 23.09.2026: 2232 виклики за дві години, 20,8 на хвилину. «Прохід двадцять разів на хвилину»
+ * — це не двадцять проходів: це ОДИН прохід з моделлю, який кликав Codex на кожну групу
+ * `(location_id, threat_type)` — 194 групи того дня, кожна з контекстом локації до 20 тис. токенів.
+ * За сім секунд на виклик такий прохід тривав близько 23 хвилин — довше за п'ятнадцятихвилинний
+ * ритм, — тож модель кликалася безперервно. Проходів із моделлю було більше, ніж здавалося:
+ * `startRiskScheduler` дозволяє модель кожні 15 хвилин і через три секунди після кожного старту, а
+ * перерахунок аналітики (у проді — раз на 5 с) дозволяє її раз на власні 15 хвилин, але не ставить
+ * свою позначку, коли прохід зайнятий іншим, — і наступна подія за 5 с просить модель знову, тож
+ * одразу за проходом планувальника йшов другий. Після вичерпання квоти кожен 429 приходив за
+ * пів секунди, і той самий прохід давав 80–90 відмов на хвилину.
+ *
+ * Тепер прохід кличе Codex щонайбільше ОДИН раз і не частіше ніж раз на хвилину, хоч би хто його
+ * запустив: до {@link RISK_BATCH_MAX_GROUPS} груп, чий набір сигналів змінився від останньої оцінки
+ * моделі, спершу з найвищим індексом правил, зі спільним бюджетом контексту {@link
+ * RISK_CONTEXT_TOKENS}, поділеним між локаціями пакета. Решта груп бере збережену оцінку моделі,
+ * якщо їхні сигнали ті самі, і правила — якщо ні. Прохід без права на модель (проміжні проходи
+ * перерахунку) теж бере збережену оцінку: без цього опублікований текст моделі щохвилини мінявся б
+ * на текст правил і назад.
+ */
+const RISK_CONTEXT_TOKENS = 20_000;
+const RISK_BATCH_MAX_GROUPS = 12;
+const RISK_MODEL_MIN_INTERVAL_MS = 60_000;
+/** Збережена оцінка живе, доки сигнали групи ті самі, але не довше години: індекс старіє з ними. */
+const RISK_ASSESSMENT_REUSE_MS = 60 * 60_000;
+/** Пакет із дванадцяти груп — довга відповідь; довше за хвилину прохід на неї не чекає. */
+const RISK_BATCH_TIMEOUT_MS = 60_000;
+
+interface PreparedRiskGroup {
+  key: string;
+  location: { id: string; name_uk: string };
+  threatType: string;
+  signals: RiskSignalRow[];
+  /** sha256 місця, класу й відсортованих id сигналів: новий сигнал чи сигнал, що вийшов, — новий відбиток. */
+  digest: string;
+  /** Індекс, який опублікували б правила: хто стоїть першим у пакеті. */
+  ruleScore: number;
+}
+
+const cachedAssessments = new Map<string, { digest: string; assessment: ModelAssessment; atMs: number }>();
+let lastRiskModelCallAt = Number.NEGATIVE_INFINITY;
+
+const riskBatchSchema = z.object({ assessments: z.array(z.unknown()) });
+const riskKeySchema = z.object({ locationId: z.string(), threatType: z.string() });
+
+/**
+ * Оцінки пакета, зіставлені з групами за `locationId|threatType`; група без придатної оцінки в мапі
+ * відсутня. Кожен елемент — тією самою схемою, що й раніше одиночна відповідь; непридатний відкидає
+ * лише себе, дві оцінки однієї групи — жодної, оцінка групи, якої в пакеті не було, ігнорується.
+ * Межі індексу застосовує потім `clampAssessment`, як і завжди.
+ */
+export function matchRiskAssessments(
+  content: string, groups: ReadonlyArray<{ locationId: string; threatType: string }>
+): Map<string, ModelAssessment> {
+  const matched = new Map<string, ModelAssessment>();
+  let batch: z.infer<typeof riskBatchSchema>;
+  try {
+    const parsed = riskBatchSchema.safeParse(JSON.parse(content));
+    if (!parsed.success) return matched;
+    batch = parsed.data;
+  } catch {
+    return matched;
   }
-  if (!config.AI_BASE_URL || !config.AI_API_KEY || !config.AI_MODEL) {
+  const wanted = new Set(groups.map((group) => `${group.locationId}|${group.threatType}`));
+  const byGroup = new Map<string, unknown[]>();
+  for (const answer of batch.assessments) {
+    const key = riskKeySchema.safeParse(answer);
+    if (!key.success) continue;
+    const groupKey = `${key.data.locationId}|${key.data.threatType}`;
+    if (wanted.has(groupKey)) byGroup.set(groupKey, [...(byGroup.get(groupKey) ?? []), answer]);
+  }
+  for (const [groupKey, own] of byGroup) {
+    const parsed = own.length === 1 ? modelAssessmentSchema.safeParse(own[0]) : null;
+    if (parsed?.success) matched.set(groupKey, parsed.data);
+  }
+  return matched;
+}
+
+async function assessBatchWithCodex(groups: readonly PreparedRiskGroup[]): Promise<Map<string, ModelAssessment>> {
+  const locationIds = [...new Set(groups.map((group) => group.location.id))];
+  const share = Math.floor(Math.min(RISK_CONTEXT_TOKENS, config.MODEL_CONTEXT_REQUEST_TOKENS) / locationIds.length);
+  const contexts = (await Promise.all(locationIds.map((id) => loadLocationContexts([id], share).catch(() => [])))).flat();
+  const contextBlock = renderContextsForPrompt(contexts);
+  const inputs = groups.map((group) => riskModelInput(group.location, group.threatType, group.signals));
+  const result = await codexChat({
+    promptVersion: 'risk-v3',
+    surface: 'risk',
+    classifierVersion: CLASSIFIER_VERSION,
+    system: RISK_BATCH_SYSTEM_PROMPT,
+    user: (contextBlock ? `## Контекст локацій\n${contextBlock}\n\n` : '') + `## Групи\n${JSON.stringify({ groups: inputs })}`,
+    json: true,
+    timeoutMs: RISK_BATCH_TIMEOUT_MS,
+    auditInput: { groups: inputs, contextTokens: contexts.reduce((sum, context) => sum + context.tokens, 0) }
+  }).catch(() => null);
+  if (!result || !result.ok) return new Map();
+  return matchRiskAssessments(result.content, groups.map((group) => ({ locationId: group.location.id, threatType: group.threatType })));
+}
+
+/**
+ * Оцінки Codex на цей прохід — свіжі з пакета й збережені з попередніх, — або `null`, коли перемикач
+ * `risk` вимкнено і групи йдуть шляхом `AI_*` чи правил, як і досі.
+ *
+ * Збій пакета, відмова бюджету квоти чи непридатний елемент означають для групи правила: другий
+ * модельний шлях на кожну групу повернув би рівно ту витрату на групу, яку пакет прибирає.
+ */
+async function codexAssessmentsFor(
+  groups: readonly PreparedRiskGroup[], allowModel: boolean
+): Promise<Map<string, ModelAssessment> | null> {
+  if (!(await codexFeatureEnabled('risk'))) {
+    cachedAssessments.clear();
+    return null;
+  }
+  const nowMs = Date.now();
+  const current = new Set(groups.map((group) => group.key));
+  for (const [key, cached] of cachedAssessments) {
+    if (!current.has(key) || nowMs - cached.atMs >= RISK_ASSESSMENT_REUSE_MS) cachedAssessments.delete(key);
+  }
+  const changed = groups.filter((group) => cachedAssessments.get(group.key)?.digest !== group.digest);
+  if (allowModel && changed.length && nowMs - lastRiskModelCallAt >= RISK_MODEL_MIN_INTERVAL_MS) {
+    lastRiskModelCallAt = nowMs;
+    const batch = [...changed].sort((left, right) => right.ruleScore - left.ruleScore).slice(0, RISK_BATCH_MAX_GROUPS);
+    const answers = await assessBatchWithCodex(batch);
+    for (const group of batch) {
+      const answer = answers.get(group.key);
+      if (answer) cachedAssessments.set(group.key, { digest: group.digest, assessment: answer, atMs: nowMs });
+    }
+  }
+  const usable = new Map<string, ModelAssessment>();
+  for (const group of groups) {
+    const cached = cachedAssessments.get(group.key);
+    if (cached?.digest === group.digest) usable.set(group.key, cached.assessment);
+  }
+  return usable;
+}
+
+/**
+ * One group's assessment through the `AI_*` endpoint when this pass is allowed to spend it, the rules
+ * otherwise. Only reached while the Codex `risk` switch is off.
+ *
+ * `allowModel` is a *budget*, not a feature switch. This path calls the model once per
+ * `(location_id, threat_type)` group and one nationwide message fans out to every oblast for six
+ * hours, so a caller that runs far more often than the fifteen-minute scheduler has to be able to
+ * say "re-score everything, but not with the model this time". Declining it is not a degradation of
+ * the contract: {@link fallbackAssessment} is the deployed default wherever `AI_*` is unset and
+ * already produces a complete, clamped, Ukrainian assessment.
+ */
+async function callModel(
+  location: { id: string; name_uk: string }, threatType: string, signals: RiskSignalRow[],
+  allowModel: boolean
+): Promise<ModelAssessment> {
+  if (!allowModel || !config.AI_BASE_URL || !config.AI_API_KEY || !config.AI_MODEL) {
     return fallbackAssessment(location, threatType, signals);
   }
+  const input = riskModelInput(location, threatType, signals);
   const started = Date.now();
   try {
     const response = await fetch(`${config.AI_BASE_URL.replace(/\/$/, '')}/chat/completions`, {
@@ -406,6 +519,8 @@ export async function runRiskAssessments(): Promise<number> {
 /** Test seam: a suite that aborts mid-pass must not leave the next file's first call blocked. */
 export function resetRiskRunGuard(): void {
   riskRunInFlight = false;
+  lastRiskModelCallAt = Number.NEGATIVE_INFINITY;
+  cachedAssessments.clear();
 }
 
 /**
@@ -439,7 +554,9 @@ async function runRiskAssessmentsPass(allowModel: boolean): Promise<number> {
      FROM risk_signals WHERE expires_at > now() AND location_id IS NOT NULL
      GROUP BY location_id,threat_type`
   );
-  let published = 0;
+  // Спершу всі групи прочитано, і лише потім модель: пакет Codex має знати, які групи змінилися, і
+  // вибрати з них ті, що важать найбільше.
+  const prepared: PreparedRiskGroup[] = [];
   for (const group of groups.rows) {
     const location = (await pool.query<{ id: string; name_uk: string }>(
       `SELECT id,name_uk FROM locations WHERE id=$1`, [group.location_id]
@@ -456,8 +573,24 @@ async function runRiskAssessmentsPass(allowModel: boolean): Promise<number> {
        WHERE rs.id=ANY($1::uuid[]) ORDER BY rs.observed_at DESC`, [group.signal_ids]
     )).rows;
     const signals = rawSignals.map((signal) => ({ ...signal, effective_contribution: effectiveContribution(signal) }));
+    prepared.push({
+      key: `${group.location_id}|${group.threat_type}`, location, threatType: group.threat_type, signals,
+      digest: createHash('sha256').update(JSON.stringify([
+        group.location_id, group.threat_type, signals.map((signal) => signal.id).sort()
+      ])).digest('hex'),
+      ruleScore: clampAssessment(fallbackAssessment(location, group.threat_type, signals), signals,
+        group.location_id, group.threat_type).score
+    });
+  }
+  const fromCodex = await codexAssessmentsFor(prepared, allowModel);
+
+  let published = 0;
+  for (const { location, threatType, signals, key } of prepared) {
+    const group = { location_id: location.id, threat_type: threatType };
     try {
-      const raw = await callModel(location, group.threat_type, signals, allowModel);
+      const raw = fromCodex
+        ? fromCodex.get(key) ?? fallbackAssessment(location, threatType, signals)
+        : await callModel(location, threatType, signals, allowModel);
       const assessment = clampAssessment(raw, signals, group.location_id, group.threat_type);
       // Only the columns the decision below reads, and the two predicates PostgreSQL is the only
       // honest judge of: `now()` here is the same clock that stamps `generated_at` and `expires_at`,

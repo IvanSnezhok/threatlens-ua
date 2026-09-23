@@ -318,11 +318,17 @@ const { codexFeatureEnabled } = await import('./codex-settings.js');
 const pooled = vi.fn(async () => ({ rows: [], rowCount: 0 }));
 vi.mock('../db/pool.js', () => ({ pool: { query: (...args: unknown[]) => pooled(...args as []) } }));
 
-const { shadowClassify, resetShadowRateLimit } = await import('./shadow-classifier.js');
+const { shadowClassify, resetShadowQueue } = await import('./shadow-classifier.js');
 
-const chatReturning = (value: unknown) => vi.fn(async () => ({
-  ok: true as const, content: JSON.stringify(value), model: 'test-model', durationMs: 5
-}));
+/** Відповідь пакета тіні (міграція 057): той самий вердикт на кожне повідомлення запиту, за його id. */
+const chatReturning = (value: Record<string, unknown>) => vi.fn(async (request: { user: string }) => {
+  // Запит будує сам модуль під тестом, тож форма `messages` відома; заглушка лише віддзеркалює id.
+  const { messages } = JSON.parse(request.user) as { messages: Array<{ id: string }> };
+  return {
+    ok: true as const, model: 'test-model', durationMs: 5,
+    content: JSON.stringify({ verdicts: messages.map(({ id }) => ({ id, ...value })) })
+  };
+});
 
 const modelVerdict = {
   threatType: 'ballistic_missile', locations: ['Одеса'], significant: true, confidence: 0.96,
@@ -345,7 +351,7 @@ const enrichable = () => ({
 
 describe('shadowClassify — the enrichment half', () => {
   beforeEach(() => {
-    resetShadowRateLimit();
+    resetShadowQueue();
     pooled.mockClear();
     vi.mocked(codexFeatureEnabled).mockImplementation(async () => true);
   });

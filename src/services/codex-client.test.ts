@@ -25,6 +25,9 @@ process.env.CODEX_API_KEY = '';
 process.env.CODEX_MODEL = '';
 
 const { codexChat, listCodexModels } = await import('./codex-client.js');
+// Бюджет процесу читає й пише `codex_budget_state`; цей файл не торкається бази, тож лише памʼять.
+// Динамічно з тієї самої причини, що й клієнт: модуль тягне `config`, який парситься під час імпорту.
+const { codexBudget, resetCodexBudget } = await import('./codex-budget.js');
 type AiRunRecord = Parameters<NonNullable<Parameters<typeof codexChat>[1]['audit']>>[0];
 
 const TOKEN = 'sk-super-secret-access-token';
@@ -42,7 +45,7 @@ const settings = async () => ({
 
 let runs: AiRunRecord[] = [];
 const audit = async (row: AiRunRecord) => { runs.push(row); };
-beforeEach(() => { runs = []; });
+beforeEach(() => { runs = []; resetCodexBudget(null); });
 
 function jsonResponse(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), { status, headers: { 'Content-Type': 'application/json' } });
@@ -261,6 +264,67 @@ describe('the two models', () => {
 
   it('lets an explicit model win over the tier', async () => {
     expect(await modelSent({ tier: 'fast', model: 'o5-mini' })).toBe('o5-mini');
+  });
+});
+
+/**
+ * Бюджет квоти на рівні клієнта: відмова без мережі й без рядка аудиту, і заголовки з КОЖНОЇ відповіді.
+ *
+ * 23.09.2026 квота вичерпалася, і за дві години поверхні зробили понад дві тисячі запитів, кожен із
+ * яких відповів 429. Тут пінять рівно те, що це зупиняє: після `usage_limit_reached` наступний виклик
+ * будь-якої поверхні не доходить до мережі, аж поки вікно не скинеться.
+ */
+describe('the quota budget', () => {
+  const resetsAt = Math.floor(Date.now() / 1000) + 3_600;
+  const exhausted = () => new Response(JSON.stringify({
+    error: {
+      type: 'usage_limit_reached', message: 'The usage limit has been reached', plan_type: 'plus',
+      resets_at: resetsAt, resets_in_seconds: 3_600
+    }
+  }), {
+    status: 429,
+    headers: {
+      'Content-Type': 'application/json',
+      'x-codex-primary-used-percent': '100', 'x-codex-primary-window-minutes': '300',
+      'x-codex-primary-reset-at': String(resetsAt)
+    }
+  });
+
+  it('stops every surface after usage_limit_reached — no request, no audit row — until the reset', async () => {
+    let requests = 0;
+    const fetchImpl = async () => { requests += 1; return exhausted(); };
+    const first = await codexChat(request, { credentials, settings, audit, fetchImpl });
+    expect(first).toMatchObject({ ok: false, reason: 'endpoint_error' });
+    expect(runs).toHaveLength(1);
+
+    // Гарячий шлях теж: вичерпане вікно — не квота, яку ще можна поділити.
+    const hot = await codexChat({ ...request, surface: 'classifier' }, { credentials, settings, audit, fetchImpl });
+    expect(hot).toMatchObject({ ok: false, reason: 'budget_deferred' });
+    expect(requests).toBe(1);
+    expect(runs).toHaveLength(1);
+
+    expect(await codexBudget.admit('classifier', new Date(resetsAt * 1000 - 1_000))).toMatchObject({ admitted: false });
+    expect(await codexBudget.admit('classifier', new Date(resetsAt * 1000 + 1_000))).toMatchObject({ admitted: true });
+  });
+
+  it('reads the quota off a successful answer too, and holds analytics back before the hot path', async () => {
+    let requests = 0;
+    const fetchImpl = async () => {
+      requests += 1;
+      return new Response(JSON.stringify({ choices: [{ message: { content: '{}' } }] }), {
+        status: 200,
+        headers: {
+          'Content-Type': 'application/json', 'x-codex-primary-used-percent': '72',
+          'x-codex-primary-window-minutes': '300', 'x-codex-primary-reset-after-seconds': '600'
+        }
+      });
+    };
+    expect((await codexChat(request, { credentials, settings, audit, fetchImpl })).ok).toBe(true);
+    expect(await codexChat(request, { credentials, settings, audit, fetchImpl }))
+      .toMatchObject({ ok: false, reason: 'budget_deferred' });
+    expect((await codexChat({ ...request, surface: 'classifier' }, { credentials, settings, audit, fetchImpl })).ok)
+      .toBe(true);
+    expect(requests).toBe(2);
   });
 });
 

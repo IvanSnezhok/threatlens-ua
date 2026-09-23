@@ -1,13 +1,14 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { config } from '../config.js';
 import { classifyMessage } from '../domain/classifier.js';
 import type { ClassifiedMessage } from '../types.js';
+import type { CodexChatRequest } from './codex-client.js';
 import {
-  buildAnalyticalClassification, deterministicVerdict, disagreementFields, normalizePlace,
+  SHADOW_BATCH_MAX, buildAnalyticalClassification, deterministicVerdict, disagreementFields,
+  enqueueShadowClassification, flushShadowQueue, matchShadowVerdicts, normalizePlace,
   releaseAnalyticalPromotion, reserveAnalyticalPromotion, resetAnalyticalPromotionQuota,
-  resetShadowMetrics, resetShadowRateLimit, scheduleShadowClassification, shadowClassifierMetrics,
-  shadowClassify, shadowSkipCounts,
-  withinRateLimit, type ShadowVerdict
+  resetShadowMetrics, resetShadowQueue, scheduleShadowClassification, setShadowClassifierDefaults,
+  shadowClassifierMetrics, shadowClassify, shadowSkipCounts, type ShadowVerdict
 } from './shadow-classifier.js';
 
 const locations = [
@@ -41,12 +42,18 @@ function verdict(overrides: Partial<ShadowVerdict> = {}): ShadowVerdict {
  * The client never throws and never parses: it returns a discriminated result whose `content` is the
  * raw model text. Mocking that shape rather than a convenience wrapper is the whole point — a mock
  * that handed back a parsed object would let a change in how this module reads the reply pass every
- * test here and fail in production.
+ * test here and fail in production. Since migration 057 the reply is a batch, so this one answers
+ * EVERY message the request carries with the same verdict, under that message's own id.
  */
-function chatReturning(value: unknown) {
-  return vi.fn(async () => ({
-    ok: true as const, content: JSON.stringify(value), model: 'test-model', durationMs: 5
-  }));
+function chatReturning(value: Record<string, unknown>) {
+  return vi.fn(async (request: CodexChatRequest) => {
+    // Запит будує сам модуль під тестом, тож форма `messages` відома; заглушка лише віддзеркалює id.
+    const { messages } = JSON.parse(request.user) as { messages: Array<{ id: string }> };
+    return {
+      ok: true as const, model: 'test-model', durationMs: 5,
+      content: JSON.stringify({ verdicts: messages.map(({ id }) => ({ id, ...value })) })
+    };
+  });
 }
 
 function chatFailing(reason: string) {
@@ -55,15 +62,15 @@ function chatFailing(reason: string) {
   }));
 }
 
-const input = (text: string) => ({
-  sourceMessageId: '00000000-0000-4000-8000-000000000001',
+const input = (text: string, id = '00000000-0000-4000-8000-000000000001') => ({
+  sourceMessageId: id,
   publishedAt: new Date('2026-03-01T20:00:00Z'),
   text,
   classified: classify(text)
 });
 
 beforeEach(() => {
-  resetShadowRateLimit();
+  resetShadowQueue();
   resetAnalyticalPromotionQuota();
   query.mockClear();
   vi.mocked(codexFeatureEnabled).mockResolvedValue(true);
@@ -196,21 +203,6 @@ describe('buildAnalyticalClassification', () => {
   });
 });
 
-describe('withinRateLimit', () => {
-  it('allows exactly the budget and refuses the next call', () => {
-    const now = 1_000_000;
-    for (let call = 0; call < 3; call += 1) expect(withinRateLimit(now, 3)).toBe(true);
-    expect(withinRateLimit(now, 3)).toBe(false);
-  });
-
-  it('lets the budget recover once the minute has rolled past', () => {
-    const now = 1_000_000;
-    expect(withinRateLimit(now, 1)).toBe(true);
-    expect(withinRateLimit(now + 59_000, 1)).toBe(false);
-    expect(withinRateLimit(now + 61_000, 1)).toBe(true);
-  });
-});
-
 /**
  * The publication budget, which is not the call budget.
  *
@@ -249,14 +241,6 @@ describe('reserveAnalyticalPromotion', () => {
     releaseAnalyticalPromotion(now);
     expect(reserveAnalyticalPromotion(now, 1)).toBe(true);
   });
-
-  it('does not count the shadow classifier\'s own call budget', () => {
-    // The independence is the whole point: a night that spends every model call must not be a night
-    // whose publication ceiling has already been consumed by the collection.
-    const now = 1_000_000;
-    for (let call = 0; call < 6; call += 1) withinRateLimit(now, 6);
-    expect(reserveAnalyticalPromotion(now, 1)).toBe(true);
-  });
 });
 
 describe('shadowClassify', () => {
@@ -267,7 +251,7 @@ describe('shadowClassify', () => {
     const outcome = await shadowClassify(input('Ударні БпЛА у напрямку Києва'), { chat: chat as never });
     expect(outcome).toMatchObject({ status: 'recorded', agrees: true, fields: [] });
     expect(chat).toHaveBeenCalledOnce();
-    expect(chat.mock.calls[0]![0]).toMatchObject({ promptVersion: 'shadow-classifier-v2', json: true });
+    expect(chat.mock.calls[0]![0]).toMatchObject({ promptVersion: 'shadow-classifier-v3', json: true, surface: 'shadow' });
   });
 
   it('audits the digest rather than the rendered prompt', async () => {
@@ -276,8 +260,10 @@ describe('shadowClassify', () => {
     const chat = chatReturning(verdict());
     await shadowClassify(input('Ударні БпЛА у напрямку Києва'), { chat: chat as never });
     expect(chat.mock.calls[0]![0].auditInput).toMatchObject({
-      text: 'Ударні БпЛА у напрямку Києва',
-      deterministic: { threatType: 'uav', locationNames: ['Київ'], significant: true }
+      messages: [{
+        id: '00000000-0000-4000-8000-000000000001', text: 'Ударні БпЛА у напрямку Києва',
+        deterministic: { threatType: 'uav', locationNames: ['Київ'], significant: true }
+      }]
     });
   });
 
@@ -286,7 +272,7 @@ describe('shadowClassify', () => {
       originLocations: ['Черкаси'], destinationLocations: ['Київ'],
       directionText: 'з Черкас у напрямку Києва', threatState: 'redirected'
     }));
-    await shadowClassify(input('далі на Київ'), {
+    await shadowClassify({ ...input('далі на Київ'), sourceId: 'monitor' }, {
       chat: chat as never,
       loadContext: async () => [{
         id: '00000000-0000-4000-8000-000000000099',
@@ -294,10 +280,10 @@ describe('shadowClassify', () => {
       }]
     });
     const prompt = JSON.parse(chat.mock.calls[0]![0].user);
-    expect(prompt.currentMessage).toBe('далі на Київ');
-    expect(prompt.previousMessages).toEqual([{
-      at: '2026-03-01T19:58:00.000Z', text: 'БпЛА над Черкасами'
-    }]);
+    expect(prompt.messages).toMatchObject([{ text: 'далі на Київ', channel: 'monitor' }]);
+    expect(prompt.channelContext).toEqual({
+      monitor: [{ at: '2026-03-01T19:58:00.000Z', text: 'БпЛА над Черкасами' }]
+    });
     const insert = query.mock.calls.find(([sql]) => String(sql).includes('INSERT INTO shadow_classifications'))!;
     expect(JSON.parse((insert[1] as unknown[])[14] as string)).toMatchObject({
       threatState: 'redirected', originLocations: ['Черкаси'], destinationLocations: ['Київ']
@@ -317,9 +303,11 @@ describe('shadowClassify', () => {
       transcribe: async () => ({ ok: true, text: 'БпЛА курсом на Київ' })
     });
     const request = chat.mock.calls[0]![0];
-    expect(JSON.parse(request.user).audioTranscripts).toEqual(['БпЛА курсом на Київ']);
+    expect(JSON.parse(request.user).messages[0].audioTranscripts).toEqual(['БпЛА курсом на Київ']);
     expect(request.images).toHaveLength(1);
-    expect(request.images[0].dataUrl).toMatch(/^data:image\/png;base64,/u);
+    expect(request.images![0]!.dataUrl).toMatch(/^data:image\/png;base64,/u);
+    // У пакеті модель має знати, до якого повідомлення картинка, а не вгадувати за порядком.
+    expect(request.images![0]!.caption).toContain('00000000-0000-4000-8000-000000000001');
   });
 
   it('does not ask the classifier to guess when a media-only transcription failed', async () => {
@@ -534,16 +522,14 @@ describe('shadowClassify', () => {
     expect(vi.mocked(codexFeatureEnabled)).toHaveBeenCalledWith('shadow');
   });
 
-  it('drops messages over the per-minute budget instead of queueing them', async () => {
-    const chat = chatReturning(verdict());
-    const message = input('Ударні БпЛА у напрямку Києва');
-    const limit = 6; // SHADOW_CLASSIFIER_MAX_PER_MINUTE default
-    for (let call = 0; call < limit; call += 1) {
-      expect((await shadowClassify(message, { chat: chat as never })).status).toBe('recorded');
-    }
-    expect(await shadowClassify(message, { chat: chat as never }))
-      .toEqual({ status: 'skipped', reason: 'rate_limited' });
-    expect(chat).toHaveBeenCalledTimes(limit);
+  it('names a refusal of the quota budget apart from a misbehaving model', async () => {
+    // Бюджет квоти (`./codex-budget.ts`) не пустив пакет — модель тут ні до чого, і лічильник
+    // `model_failed` не має рости через рішення, яке ухвалила сама система.
+    const outcome = await shadowClassify(input('Ударні БпЛА у напрямку Києва'), {
+      chat: chatFailing('budget_deferred') as never
+    });
+    expect(outcome).toEqual({ status: 'skipped', reason: 'budget_deferred' });
+    expect(query).not.toHaveBeenCalled();
   });
 
   it('reports a failed write as a skip rather than breaking the caller', async () => {
@@ -564,6 +550,112 @@ describe('shadowClassify', () => {
 });
 
 /**
+ * The minute's batch (migration 057): one call for many messages, and the comparison per message.
+ *
+ * What is pinned here is what a plausible bug in the batching would break: a verdict filed against
+ * the wrong message, one bad element costing its neighbours their rows, the queue growing past one
+ * minute's worth, the backfill crowding out a live message, and more than one call a minute.
+ */
+describe('the minute batch', () => {
+  const ids = ['00000000-0000-4000-8000-00000000000a', '00000000-0000-4000-8000-00000000000b', '00000000-0000-4000-8000-00000000000c'];
+  const rowFor = (id: string) => query.mock.calls
+    .map((call) => call as unknown as [string, unknown[]])
+    .find(([sql, params]) => sql.includes('INSERT INTO shadow_classifications') && params[0] === id);
+
+  afterEach(() => {
+    resetShadowQueue();
+    vi.useRealTimers();
+  });
+
+  it('files each verdict against its own message, whatever order the model answers in', async () => {
+    for (const id of ids) await enqueueShadowClassification(input('Ударні БпЛА у напрямку Києва', id));
+    const chat = vi.fn(async (_request: CodexChatRequest) => ({
+      ok: true as const, model: 'test-model', durationMs: 5,
+      content: JSON.stringify({
+        verdicts: [
+          { id: ids[2], ...verdict({ threatType: 'ballistic_missile' }) },
+          { id: '00000000-0000-4000-8000-0000000000ff', ...verdict({ threatType: 'mlrs' }) },
+          { id: ids[0], ...verdict({ threatType: 'uav', directionText: 'у напрямку Києва' }) },
+          // Непридатний елемент: клас, якого не існує. Він коштує лише своєму повідомленню.
+          { id: ids[1], ...verdict(), threatType: 'дрони' }
+        ]
+      })
+    }));
+
+    const outcomes = await flushShadowQueue({ chat: chat as never });
+
+    expect(chat).toHaveBeenCalledOnce();
+    expect(JSON.parse(chat.mock.calls[0]![0].user).messages.map((message: { id: string }) => message.id)).toEqual(ids);
+    expect(outcomes.map((outcome) => outcome.status)).toEqual(['recorded', 'skipped', 'recorded']);
+    expect(outcomes[1]).toEqual({ status: 'skipped', reason: 'model_failed' });
+    expect(rowFor(ids[0]!)![1][7]).toBe('uav');
+    expect(rowFor(ids[2]!)![1][7]).toBe('ballistic_missile');
+    expect(rowFor(ids[1]!)).toBeUndefined();
+  });
+
+  it('takes one minute’s worth and drops the rest instead of carrying it over', async () => {
+    const room = Math.min(SHADOW_BATCH_MAX, config.SHADOW_CLASSIFIER_MAX_PER_MINUTE);
+    const queued = Array.from({ length: room }, (_, index) =>
+      input('Ударні БпЛА у напрямку Києва', `00000000-0000-4000-8000-${String(index).padStart(12, '0')}`));
+    for (const message of queued) expect(await enqueueShadowClassification(message)).toBeNull();
+    expect(await enqueueShadowClassification(input('Ударні БпЛА у напрямку Києва', ids[0])))
+      .toEqual({ status: 'skipped', reason: 'rate_limited' });
+
+    const chat = chatReturning(verdict());
+    const outcomes = await flushShadowQueue({ chat: chat as never });
+    expect(chat).toHaveBeenCalledOnce();
+    expect(outcomes).toHaveLength(room);
+    expect(await flushShadowQueue({ chat: chat as never })).toEqual([]);
+  });
+
+  it('lets a live message push the backfill out of a full queue, never the other way round', async () => {
+    const room = Math.min(SHADOW_BATCH_MAX, config.SHADOW_CLASSIFIER_MAX_PER_MINUTE);
+    for (let index = 0; index < room; index += 1) {
+      await enqueueShadowClassification({
+        ...input('Ударні БпЛА у напрямку Києва', `00000000-0000-4000-8000-${String(index).padStart(12, '0')}`),
+        historical: true
+      });
+    }
+    expect(await enqueueShadowClassification({ ...input('Ударні БпЛА у напрямку Києва', ids[1]), historical: true }))
+      .toEqual({ status: 'skipped', reason: 'rate_limited' });
+    expect(await enqueueShadowClassification(input('Ударні БпЛА у напрямку Києва', ids[0]))).toBeNull();
+
+    const chat = chatReturning(verdict());
+    await flushShadowQueue({ chat: chat as never });
+    const asked = JSON.parse(chat.mock.calls[0]![0].user).messages.map((message: { id: string }) => message.id);
+    expect(asked).toHaveLength(room);
+    expect(asked).toContain(ids[0]);
+    expect(asked).not.toContain('00000000-0000-4000-8000-000000000000');
+  });
+
+  it('asks at most once a minute: the first batch after quiet at once, the next a minute later', async () => {
+    vi.useFakeTimers();
+    const chat = chatReturning(verdict());
+    setShadowClassifierDefaults({ chat: chat as never });
+    scheduleShadowClassification(input('Ударні БпЛА у напрямку Києва', ids[0]));
+    await vi.advanceTimersByTimeAsync(0);
+    expect(chat).toHaveBeenCalledTimes(1);
+
+    scheduleShadowClassification(input('Ударні БпЛА у напрямку Києва', ids[1]));
+    scheduleShadowClassification(input('Ударні БпЛА у напрямку Києва', ids[2]));
+    await vi.advanceTimersByTimeAsync(59_000);
+    expect(chat).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(chat).toHaveBeenCalledTimes(2);
+    expect(JSON.parse(chat.mock.calls[1]![0].user).messages).toHaveLength(2);
+  });
+
+  it('pairs a verdict with its message by id, and refuses a duplicated id rather than guessing', () => {
+    const content = JSON.stringify({
+      verdicts: [{ id: ids[0], ...verdict() }, { id: ids[1], ...verdict() }, { id: ids[1], ...verdict({ significant: false }) }]
+    });
+    const matched = matchShadowVerdicts(content, ids);
+    expect([...matched.keys()]).toEqual([ids[0]]);
+    expect(matchShadowVerdicts('Схоже на шахед.', ids).size).toBe(0);
+  });
+});
+
+/**
  * The entry point the pipeline actually calls.
  *
  * Two properties are worth pinning down here and are not covered by the suite above, because both
@@ -574,40 +666,38 @@ describe('shadowClassify', () => {
  * failing when it is merely unused.
  */
 describe('scheduleShadowClassification', () => {
-  const flush = () => new Promise((resolve) => setTimeout(resolve, 0));
+  afterEach(resetShadowQueue);
 
-  it('hands the pipeline nothing it could act on', () => {
-    expect(scheduleShadowClassification(
-      input('Ударні БпЛА у напрямку Києва'), { chat: chatReturning(verdict()) as never }
-    )).toBeUndefined();
+  it('hands the pipeline nothing it could act on', async () => {
+    const chat = chatReturning(verdict());
+    setShadowClassifierDefaults({ chat: chat as never });
+    expect(scheduleShadowClassification(input('Ударні БпЛА у напрямку Києва'))).toBeUndefined();
+    // Повідомлення все одно доходить до моделі — у пакеті й у свій час, а не на вимогу викликача.
+    await vi.waitFor(() => expect(chat).toHaveBeenCalledOnce());
   });
 
   it('counts a lost comparison under the reason it was lost for', async () => {
     const before = shadowSkipCounts().model_failed ?? 0;
-    scheduleShadowClassification(
-      input('Ударні БпЛА у напрямку Києва'), { chat: chatFailing('endpoint_error') as never }
-    );
-    await vi.waitFor(() => expect(shadowSkipCounts().model_failed ?? 0).toBe(before + 1));
+    await enqueueShadowClassification(input('Ударні БпЛА у напрямку Києва'));
+    await flushShadowQueue({ chat: chatFailing('endpoint_error') as never });
+    expect(shadowSkipCounts().model_failed ?? 0).toBe(before + 1);
   });
 
   it('does not count an operator switching the feature off', async () => {
     vi.mocked(codexFeatureEnabled).mockResolvedValue(false);
     const before = shadowSkipCounts().disabled ?? 0;
-    scheduleShadowClassification(
-      input('Ударні БпЛА у напрямку Києва'), { chat: chatReturning(verdict()) as never }
-    );
-    await flush();
+    expect(await enqueueShadowClassification(input('Ударні БпЛА у напрямку Києва')))
+      .toEqual({ status: 'skipped', reason: 'disabled' });
+    expect(await flushShadowQueue({ chat: chatReturning(verdict()) as never })).toEqual([]);
     expect(shadowSkipCounts().disabled ?? 0).toBe(before);
   });
 
   it('swallows a rejection instead of leaving it unhandled', async () => {
-    // The belt to `shadowClassify`'s braces: a client that starts throwing must not become an
+    // The belt to `shadowClassifyBatch`'s braces: a client that starts throwing must not become an
     // unhandled rejection that takes the ingestion process down during an attack.
     const chat = vi.fn(async () => { throw new Error('клієнт зламався'); });
-    expect(() => scheduleShadowClassification(
-      input('Ударні БпЛА у напрямку Києва'), { chat: chat as never }
-    )).not.toThrow();
-    await flush();
+    await enqueueShadowClassification(input('Ударні БпЛА у напрямку Києва'));
+    await expect(flushShadowQueue({ chat: chat as never })).resolves.toEqual([{ status: 'skipped', reason: 'model_failed' }]);
   });
 });
 
@@ -623,7 +713,7 @@ describe('scheduleShadowClassification', () => {
 describe('shadow coverage metrics', () => {
   beforeEach(() => {
     resetShadowMetrics();
-    resetShadowRateLimit();
+    resetShadowQueue();
     resetAnalyticalPromotionQuota();
   });
 

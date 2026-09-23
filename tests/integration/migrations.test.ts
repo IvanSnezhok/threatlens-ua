@@ -52,7 +52,8 @@ const MIGRATION_FILES = [
   '053_hot_path_indexes.sql',
   '054_alert_level.sql',
   '055_track_actualization.sql',
-  '056_location_coordinates.sql'
+  '056_location_coordinates.sql',
+  '057_codex_budget_state.sql'
 ];
 
 /**

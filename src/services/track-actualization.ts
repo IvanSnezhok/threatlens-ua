@@ -46,9 +46,21 @@ import { codexFeatureEnabled, readCodexSettings } from './codex-settings.js';
  *    записується як є. У режимі `rules` воркер може працювати тінню: рядки пишуться, карта їх не читає.
  *  - Кожен збій — вимкнений перемикач, бюджет, таймаут, відмова, непридатна відповідь — означає
  *    детермінований трек. Вектор ніколи не залежить від моделі.
+ *
+ * ================================================================================================
+ * Один виклик на хвилину, а не по виклику на подію
+ * ================================================================================================
+ *
+ * До міграції 057 воркер тікав щопʼятнадцять секунд і питав про кожну змінену подію окремим
+ * викликом — до шести за тік, тобто до двадцяти чотирьох на хвилину, кожен зі своїм системним
+ * промптом. Тепер тік — хвилина, і ОДИН виклик несе до восьми змінених подій масивом тих самих
+ * фактів, що й раніше, а відповідь — масив відповідей, по одній на подію, за `eventId`. Кожна
+ * відповідь перевіряється рівно так, як і раніше, і непридатна відкидає лише себе: решта подій пакета
+ * записуються. Відбиток входу й ідемпотентність — як і були, на кожну подію окремо. Ціна — трек
+ * наздоганяє канали до хвилини пізніше; карта при цьому весь час має детермінований трек.
  */
 
-export const ACTUALIZATION_PROMPT_VERSION = 'actualization-v1';
+export const ACTUALIZATION_PROMPT_VERSION = 'actualization-v2';
 
 export const TRACK_STATUSES = ['moving', 'loitering', 'passed', 'ended', 'unclear'] as const;
 export type TrackStatus = (typeof TRACK_STATUSES)[number];
@@ -59,12 +71,11 @@ export interface TrackActualization {
   loiterLocationId: string | null; currentSince: string | null; summary: string | null; confidence: number;
 }
 
-/** Тік воркера. Чверть хвилини — темп, з яким канали дописують трек під час атаки. */
-const TICK_MS = 15_000;
-/** Подій на один тік і одночасних викликів у ньому: шість за тік — це 24 на хвилину, під бюджетом. */
-const MAX_PER_TICK = 6;
-const CONCURRENCY = 2;
-/** Скільки кандидатів читати, щоб пам'ять повторів (нижче) не з'їла всі шість місць тіку. */
+/** Тік воркера — хвилина: один пакетний виклик на тік (див. шапку). */
+const TICK_MS = 60_000;
+/** Подій в одному пакеті, не більше: довший пакет — довша відповідь у межах одного таймауту. */
+const MAX_PER_BATCH = 8;
+/** Скільки кандидатів читати, щоб пам'ять повторів (нижче) не з'їла всі місця пакета. */
 const CANDIDATE_LIMIT = 24;
 const MESSAGES_PER_EVENT = 12;
 const TEXT_CHARS = 300;
@@ -76,7 +87,7 @@ const LIVE_LOOKBACK_MINUTES = 30;
 /**
  * Та сама подія з тим самим найновішим повідомленням після відмови чи збою питається знову не
  * раніше, ніж за дві хвилини: нове повідомлення все одно знімає цю паузу, а без неї непридатна
- * відповідь на тихий трек коштувала б виклик кожні пʼятнадцять секунд.
+ * відповідь на тихий трек займала б місце в кожному пакеті.
  */
 const RETRY_AFTER_MS = 2 * 60_000;
 const RETENTION_DAYS = 7;
@@ -89,7 +100,7 @@ export type ActualizationOutcome = 'stored' | 'rejected' | 'failed' | 'skipped_b
 
 export const trackActualizations = new Counter({
   name: 'threatlens_track_actualizations_total',
-  help: 'Track actualization outcomes: stored, rejected by validation, failed call, or skipped over the per-minute budget',
+  help: 'Track actualization outcomes per event: stored, rejected by validation, failed call, or skipped over the per-minute or quota budget',
   labelNames: ['outcome'],
   registers: []
 });
@@ -166,16 +177,17 @@ export interface ValidatedActualization {
 export type ActualizationCheck = { ok: true; value: ValidatedActualization } | { ok: false; reason: string };
 
 /**
- * Відповідь моделі — або причина, чому її не можна записати. Чиста: жодної бази, жодного годинника.
+ * Одна відповідь моделі про одну подію — або причина, чому її не можна записати. Чиста: жодної
+ * бази, жодного годинника.
  *
  * Упевненість тут НЕ порогується: рядок із 0,2 записується як є, а поріг карти (0,6) застосовує
  * `./threat-vectors.ts`. Так оператор бачить у таблиці, наскільки модель вагалася, а не лише те,
  * що пройшло.
  */
-export function validateActualization(content: string, input: ActualizationInput): ActualizationCheck {
+export function validateActualization(answer: unknown, input: ActualizationInput): ActualizationCheck {
   let reply: z.infer<typeof actualizationReplySchema>;
   try {
-    reply = actualizationReplySchema.parse(JSON.parse(content) as unknown);
+    reply = actualizationReplySchema.parse(answer);
   } catch (error) {
     return {
       ok: false,
@@ -232,6 +244,47 @@ export function validateActualization(content: string, input: ActualizationInput
   };
 }
 
+/** Оболонка пакетної відповіді. Елементи — `unknown`: кожен перевіряється окремо, і поганий — лише свій. */
+const batchReplySchema = z.object({ events: z.array(z.unknown()) });
+const answerKeySchema = z.object({ eventId: z.string() });
+
+/**
+ * Відповідь на пакет — перевірка на кожну подію окремо: одна непридатна відповідь відкидає лише себе.
+ *
+ * Відповідь без `eventId` не належить жодній події й відкидається мовчки; подія без відповіді —
+ * `missing_answer`; подія з двома — `duplicate_answer`, бо вибрати одну з двох означало б вгадувати,
+ * котра з них про цю подію. Лише проза замість JSON чи відповідь без масиву `events` відкидає весь
+ * пакет — тоді відповіді немає в жодної події.
+ */
+export function checkActualizationBatch(
+  content: string, inputs: readonly ActualizationInput[]
+): Map<string, ActualizationCheck> {
+  const checks = new Map<string, ActualizationCheck>();
+  let batch: z.infer<typeof batchReplySchema> | null = null;
+  let unparsable = false;
+  try {
+    const parsed = batchReplySchema.safeParse(JSON.parse(content));
+    if (parsed.success) batch = parsed.data;
+  } catch {
+    unparsable = true;
+  }
+  if (!batch) {
+    for (const input of inputs) checks.set(input.eventId, { ok: false, reason: unparsable ? 'unparsable' : 'schema:events' });
+    return checks;
+  }
+  const byEvent = new Map<string, unknown[]>();
+  for (const answer of batch.events) {
+    const key = answerKeySchema.safeParse(answer);
+    if (key.success) byEvent.set(key.data.eventId, [...(byEvent.get(key.data.eventId) ?? []), answer]);
+  }
+  for (const input of inputs) {
+    const own = byEvent.get(input.eventId) ?? [];
+    checks.set(input.eventId, own.length === 1 ? validateActualization(own[0], input)
+      : { ok: false, reason: own.length ? 'duplicate_answer' : 'missing_answer' });
+  }
+  return checks;
+}
+
 /**
  * Київський момент у формі ISO з поясом — «2026-09-23T01:40:12+03:00».
  *
@@ -253,35 +306,43 @@ function kyivStamper(): (at: Date) => string {
   };
 }
 
-/** Те, що бачить модель. Експортовано, щоб тести бачили той самий вхід, що й виклик. */
-export function actualizationFacts(input: ActualizationInput, now: Date) {
+/**
+ * Те, що бачить модель: поточний час один на пакет і масив фактів по подіях — тих самих, що
+ * раніше йшли окремим викликом, плюс `eventId`, за яким повертається відповідь. Експортовано, щоб
+ * тести бачили той самий вхід, що й виклик.
+ */
+export function actualizationFacts(inputs: readonly ActualizationInput[], now: Date) {
   const stamp = kyivStamper();
   return {
     now: stamp(now),
-    threatType: input.threatType,
-    threatLabel: THREAT_LABELS[input.threatType as keyof typeof THREAT_LABELS] ?? null,
-    messages: input.messages.map((message) => ({
-      publishedAt: stamp(message.publishedAt),
-      age: describeAge(message.publishedAt, now),
-      channel: message.channel,
-      text: message.text,
-      places: message.places
+    events: inputs.map((input) => ({
+      eventId: input.eventId,
+      threatType: input.threatType,
+      threatLabel: THREAT_LABELS[input.threatType as keyof typeof THREAT_LABELS] ?? null,
+      messages: input.messages.map((message) => ({
+        publishedAt: stamp(message.publishedAt),
+        age: describeAge(message.publishedAt, now),
+        channel: message.channel,
+        text: message.text,
+        places: message.places
+      }))
     }))
   };
 }
 
 const SYSTEM_PROMPT = [
-  'Ти актуалізуєш трек ОДНІЄЇ повітряної загрози в Україні для публічної карти: за повідомленнями джерел кажеш, де ціль зараз, звідки вона прийшла й куди прямує.',
-  'Тобі дано поточний київський час (now), клас загрози й до 12 останніх повідомлень про цю подію від найстарішого до найновішого: час публікації (publishedAt), вік, канал, текст і місця, які каталог розпізнав у повідомленні.',
+  'Ти актуалізуєш треки повітряних загроз в Україні для публічної карти: для КОЖНОЇ події окремо за повідомленнями джерел кажеш, де ціль зараз, звідки вона прийшла й куди прямує.',
+  'Тобі дано поточний київський час (now) і масив events. Кожна подія має eventId, клас загрози й до 12 останніх повідомлень про неї від найстарішого до найновішого: час публікації (publishedAt), вік, канал, текст і місця, які каталог розпізнав у повідомленні.',
+  'Події незалежні: відповідь про одну подію спирається лише на повідомлення цієї події, а не на сусідні.',
   'Кожне місце має id, назву, тип, relation і role. relation=reported_direction — джерело назвало місце напрямком або метою руху; explicit_threat — загроза для місця; mentioned — згадка; aftermath — наслідки. role=retracted — місце, яке ціль, за словами джерела, минула («повз») або звідки пішла: це історія, а не поточне положення.',
-  'Посилайся на місця ЛИШЕ через їхні id із вхідних даних. Не вигадуй місць, не підставляй сусідніх і не пиши назв замість id.',
+  'Посилайся на місця ЛИШЕ через їхні id із повідомлень ТІЄЇ САМОЇ події. Не вигадуй місць, не підставляй сусідніх і не пиши назв замість id.',
   'status: moving — ціль рухається; loitering — кружляє над місцем або тримається біля нього; passed — минула названі місця, а нового не названо; ended — джерело повідомило, що ціль збито, «мінус» або вона зникла; unclear — із повідомлень цього не встановити.',
   'headPlaceId — де ціль зараз за найсвіжішими повідомленнями; headingPlaceId — куди прямує, ЛИШЕ місце з relation=reported_direction, інакше null; originPlaceId — звідки прийшла; loiterPlaceId — над чим кружляє, лише коли status=loitering. Невідоме — null.',
-  'currentSince — publishedAt повідомлення, з якого починається поточний відрізок треку; усе раніше — історія. Скопіюй значення дослівно з вхідних даних або постав null.',
+  'currentSince — publishedAt повідомлення цієї події, з якого починається поточний відрізок треку; усе раніше — історія. Скопіюй значення дослівно з вхідних даних або постав null.',
   'summary — до 160 символів українською: що летить, звідки, де зараз, куди прямує. Жодних чисел, крім кількостей, які назвало саме джерело; жодних прогнозів, цілей удару, влучань, швидкостей чи часу прибуття.',
   'Ти не оголошуєш тривог і відбоїв і нічого не вирішуєш про саму загрозу: лише описуєш трек за тим, що написали джерела.',
-  'confidence — твоя впевненість у всій відповіді від 0 до 1; старі чи суперечливі повідомлення — нижча впевненість.',
-  'Поверни лише JSON: {"status": "moving"|"loitering"|"passed"|"ended"|"unclear", "headPlaceId": string|null, "headingPlaceId": string|null, "originPlaceId": string|null, "loiterPlaceId": string|null, "currentSince": string|null, "summary": string|null, "confidence": number}.'
+  'confidence — твоя впевненість у відповіді про цю подію від 0 до 1; старі чи суперечливі повідомлення — нижча впевненість.',
+  'Поверни лише JSON з однією відповіддю на кожну подію: {"events": [{"eventId": string, "status": "moving"|"loitering"|"passed"|"ended"|"unclear", "headPlaceId": string|null, "headingPlaceId": string|null, "originPlaceId": string|null, "loiterPlaceId": string|null, "currentSince": string|null, "summary": string|null, "confidence": number}]}.'
 ].join(' ');
 
 // ------------------------------------------------------------------------------------------------
@@ -464,8 +525,8 @@ export interface ActualizationPass {
 }
 
 /**
- * Один тік: до шести подій, по дві одночасно. Ніколи не кидає через модель — лише через базу, яку
- * ловить воркер; кожна подія, що не отримала рядка, лишається на детермінованому треку.
+ * Один тік: до восьми змінених подій ОДНИМ викликом. Ніколи не кидає через модель — лише через
+ * базу, яку ловить воркер; кожна подія, що не отримала рядка, лишається на детермінованому треку.
  */
 export async function runTrackActualization(deps: ActualizationDeps = {}): Promise<ActualizationPass> {
   const pass: ActualizationPass = { enabled: false, stored: 0, rejected: 0, failed: 0, skippedBudget: 0 };
@@ -480,7 +541,7 @@ export async function runTrackActualization(deps: ActualizationDeps = {}): Promi
 
   const candidates = (await pool.query<CandidateRow>(CANDIDATES_SQL, [now, LIVE_LOOKBACK_MINUTES, CANDIDATE_LIMIT])).rows
     .filter((candidate) => attempted.get(candidate.id)?.asOfMs !== candidate.newest_at.getTime())
-    .slice(0, MAX_PER_TICK);
+    .slice(0, MAX_PER_BATCH);
   if (!candidates.length) return pass;
 
   const inputs = (await loadInputs(candidates)).filter((input) => input.messages.length >= 2);
@@ -497,59 +558,78 @@ export async function runTrackActualization(deps: ActualizationDeps = {}): Promi
     [[...digests.keys()], [...digests.values()]]
   );
   const seen = new Set(known.rows.map((row) => `${row.event_id}:${row.input_digest}`));
-  const queue = inputs.filter((input) => !seen.has(`${input.eventId}:${digests.get(input.eventId)}`));
 
   const count = (outcome: ActualizationOutcome) => {
     trackActualizations.inc({ outcome });
     if (outcome === 'skipped_budget') pass.skippedBudget += 1; else pass[outcome] += 1;
   };
+  // Бюджет на хвилину рахує ПОДІЇ: скільки влізло, стільки й іде в пакет, решта — наступного тіку.
+  const batch: ActualizationInput[] = [];
+  for (const input of inputs) {
+    if (seen.has(`${input.eventId}:${digests.get(input.eventId)}`)) continue;
+    if (withinMinuteBudget(Date.now())) batch.push(input); else count('skipped_budget');
+  }
+  if (!batch.length) return pass;
 
-  const actualize = async (input: ActualizationInput): Promise<void> => {
-    const inputDigest = digests.get(input.eventId)!;
-    const asOf = input.messages.at(-1)!.publishedAt;
-    const remember = () => attempted.set(input.eventId, { asOfMs: asOf.getTime(), atMs: Date.now() });
-    if (!withinMinuteBudget(Date.now())) return count('skipped_budget');
-
-    const facts = actualizationFacts(input, now);
-    const result = await chat({
-      promptVersion: ACTUALIZATION_PROMPT_VERSION,
-      surface: 'actualization',
-      tier: 'fast',
-      system: SYSTEM_PROMPT,
-      user: JSON.stringify(facts),
-      json: true,
-      timeoutMs: config.ACTUALIZATION_TIMEOUT_MS,
-      // Транспортний рядок пишеться на кожен виклик, тож він тримає те, що ВПІЗНАЄ вхід — id, ролі,
-      // час і відбиток, — а не тексти: ті лежать у `source_messages`, а `ai_runs` не має ретенції.
-      // Повний вхід іде лише в рядок відмови нижче — той, який оператор відкриває, щоб зрозуміти чому.
-      auditInput: {
-        eventId: input.eventId, asOf: asOf.toISOString(), inputDigest, threatType: input.threatType,
+  const asOf = (input: ActualizationInput) => input.messages.at(-1)!.publishedAt;
+  const remember = (input: ActualizationInput) =>
+    attempted.set(input.eventId, { asOfMs: asOf(input).getTime(), atMs: Date.now() });
+  const facts = actualizationFacts(batch, now);
+  const result = await chat({
+    promptVersion: ACTUALIZATION_PROMPT_VERSION,
+    surface: 'actualization',
+    tier: 'fast',
+    system: SYSTEM_PROMPT,
+    user: JSON.stringify(facts),
+    json: true,
+    timeoutMs: config.ACTUALIZATION_TIMEOUT_MS,
+    // Транспортний рядок пишеться на кожен виклик, тож він тримає те, що ВПІЗНАЄ вхід — id, ролі,
+    // час і відбиток кожної події, — а не тексти: ті лежать у `source_messages`, а `ai_runs` не має
+    // ретенції. Повний вхід події іде лише в рядок відмови нижче — той, який оператор відкриває,
+    // щоб зрозуміти чому.
+    auditInput: {
+      events: batch.map((input) => ({
+        eventId: input.eventId, asOf: asOf(input).toISOString(), inputDigest: digests.get(input.eventId),
+        threatType: input.threatType,
         messages: input.messages.map((message) => ({
           publishedAt: message.publishedAt.toISOString(), channel: message.channel,
           places: message.places.map(({ id, relation, role }) => ({ id, relation, role }))
         }))
-      }
-    }).catch((error: unknown): CodexChatResult => ({
-      ok: false, reason: 'transport_error', detail: String(error).slice(0, 200), model: null, durationMs: 0
-    }));
-    if (!result.ok) {
-      remember();
-      return count('failed');
+      }))
     }
+  }).catch((error: unknown): CodexChatResult => ({
+    ok: false, reason: 'transport_error', detail: String(error).slice(0, 200), model: null, durationMs: 0
+  }));
+  if (!result.ok) {
+    // Відмова бюджету квоти нічого не коштувала — ні запиту, ні рядка, — тож і паузи на повтор не
+    // бере: наступний тік спитає знову, і бюджет вирішить знову.
+    for (const input of batch) {
+      if (result.reason === 'budget_deferred') {
+        count('skipped_budget');
+      } else {
+        remember(input);
+        count('failed');
+      }
+    }
+    return pass;
+  }
 
-    const check = validateActualization(result.content, input);
+  const checks = checkActualizationBatch(result.content, batch);
+  for (const [index, input] of batch.entries()) {
+    const inputDigest = digests.get(input.eventId)!;
+    const check = checks.get(input.eventId)!;
     if (!check.ok) {
       await audit({
         model: result.model, promptVersion: ACTUALIZATION_PROMPT_VERSION,
-        input: { eventId: input.eventId, asOf: asOf.toISOString(), inputDigest, ...facts },
+        input: { asOf: asOf(input).toISOString(), inputDigest, now: facts.now, ...facts.events[index]! },
         output: { content: result.content }, status: 'failed', error: `rejected: ${check.reason}`,
         durationMs: result.durationMs, surface: 'actualization', classifierVersion: null,
         validationStatus: 'rejected', fallbackReason: check.reason
       }).catch(() => undefined);
-      remember();
-      return count('rejected');
+      remember(input);
+      count('rejected');
+      continue;
     }
-
     const value = check.value;
     try {
       await pool.query(
@@ -557,27 +637,23 @@ export async function runTrackActualization(deps: ActualizationDeps = {}): Promi
            origin_location_id,loiter_location_id,current_since,summary,confidence,input_digest)
          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
          ON CONFLICT (event_id, input_digest) DO NOTHING`,
-        [input.eventId, asOf, result.model, value.status, value.headLocationId, value.headingLocationId,
+        [input.eventId, asOf(input), result.model, value.status, value.headLocationId, value.headingLocationId,
           value.originLocationId, value.loiterLocationId, value.currentSince, value.summary, value.confidence,
           inputDigest]
       );
       count('stored');
     } catch {
       // Подію могли щойно видалити або місце — прибрати з каталогу (FK). Трек лишається детермінованим.
-      remember();
+      remember(input);
       count('failed');
     }
-  };
-
-  await Promise.all(Array.from({ length: CONCURRENCY }, async () => {
-    for (let input = queue.shift(); input; input = queue.shift()) await actualize(input);
-  }));
+  }
   return pass;
 }
 
 /**
- * Воркер: тік кожні п'ятнадцять секунд, без накладання тіків. З вимкненим перемикачем тік читає
- * один рядок налаштувань і виходить.
+ * Воркер: тік щохвилини, без накладання тіків, один пакетний виклик на тік. З вимкненим
+ * перемикачем тік читає один рядок налаштувань і виходить.
  */
 export function startTrackActualizationWorker(log: { info: Function; error: Function }): () => void {
   let running = false;
@@ -587,7 +663,7 @@ export function startTrackActualizationWorker(log: { info: Function; error: Func
     try {
       const pass = await runTrackActualization();
       // Записані рядки видно на метриці; у журнал — лише те, що пішло не так, щоб ніч атаки не
-      // перетворилася на чотири рядки журналу щохвилини.
+      // перетворилася на рядок журналу на кожну подію.
       if (pass.rejected || pass.failed || pass.skippedBudget) log.info({ ...pass }, 'track actualization pass');
     } catch (error) {
       log.error({ error }, 'track actualization pass failed');

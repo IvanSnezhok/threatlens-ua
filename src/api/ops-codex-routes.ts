@@ -3,6 +3,7 @@ import { z } from 'zod';
 import { hasValidOpsAuth, opsUnauthorized } from './ops-auth.js';
 import { beginCodexLogin, cancelPendingLogin, codexStatus, disconnectCodex } from '../services/codex-auth.js';
 import { listCodexModels } from '../services/codex-client.js';
+import { codexBudget } from '../services/codex-budget.js';
 import {
   CLASSIFIER_MODES, CODEX_EFFORTS, CODEX_SERVICE_TIERS, readCodexSettings, resolveSettings, saveCodexSettings
 } from '../services/codex-settings.js';
@@ -84,18 +85,24 @@ const opsCodexRoutes: FastifyPluginAsync = async (app) => {
    * The catalogue is asked of the service on every read rather than cached. It is one small request
    * behind an operator-only route that a human opens by hand, and a cache here would exist purely to
    * serve an operator a stale list at the exact moment they came to change something.
+   *
+   * `budget` — стан квоти з заголовків `x-codex-*` (`src/services/codex-budget.ts`): скільки вікна
+   * витрачено, коли воно скинеться, чи стоїть блок після 429 і яка смуга зараз має право на виклик.
+   * Поруч із перемикачами, бо саме тут оператор вирішує, що вимкнути, коли квота добігає кінця.
+   * Читання пам'яті процесу: жодного запиту до Codex, щонайбільше одне читання рядка після старту.
    */
   app.get('/ops/codex/settings', async (request, reply) => {
     if (!authorised(request)) return opsUnauthorized(request, reply);
-    const [stored, catalogue, status] = await Promise.all([
-      readCodexSettings(), listCodexModels(), codexStatus()
+    const [stored, catalogue, status, budget] = await Promise.all([
+      readCodexSettings(), listCodexModels(), codexStatus(), codexBudget.view()
     ]);
     return {
       settings: resolveSettings(stored),
       availableModels: catalogue.models,
       modelsSource: catalogue.source,
       modelsError: catalogue.error,
-      status
+      status,
+      budget
     };
   });
 

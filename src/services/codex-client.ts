@@ -1,6 +1,7 @@
 import { config } from '../config.js';
 import { pool } from '../db/pool.js';
 import { codexCredentials, type CodexCredentials } from './codex-auth.js';
+import { codexBudget, type CodexBudgetGate } from './codex-budget.js';
 import {
   FALLBACK_CODEX_MODELS, mergeModelCatalogue, resolveCodexSettings,
   type CodexEffort, type ResolvedCodexSettings
@@ -77,7 +78,14 @@ export type CodexFailureReason =
   /** The endpoint answered, but not with something usable. */
   | 'endpoint_error'
   /** Timed out, DNS failed, connection refused. */
-  | 'transport_error';
+  | 'transport_error'
+  /**
+   * Бюджет квоти відмовив ДО запиту (`./codex-budget.ts`): смуга поверхні вичерпала свою частку вікна
+   * або 429 `usage_limit_reached` зупинив усі смуги до скидання. Мережі не було, тож і рядка в
+   * `ai_runs` немає — лише `threatlens_codex_budget_denied_total{lane}`. Для поверхні це такий самий
+   * збій, як і решта: запасний шлях, і попередження не губиться.
+   */
+  | 'budget_deferred';
 
 export interface CodexChatSuccess {
   ok: true;
@@ -101,6 +109,11 @@ export interface CodexImageInput {
   /** A bounded data URL produced from Telegram media. Remote URLs are intentionally not accepted. */
   dataUrl: string;
   detail?: 'low' | 'high' | 'auto';
+  /**
+   * Підпис, що їде текстом ПЕРЕД зображенням. Потрібен пакетному запиту тіні: двадцять повідомлень в
+   * одному виклику, і модель має знати, до якого з них належить картинка, а не вгадувати за порядком.
+   */
+  caption?: string;
 }
 
 export interface CodexChatRequest {
@@ -114,6 +127,9 @@ export interface CodexChatRequest {
    * writers is precisely the bug shape this file's header warns about: the fourth writer is the one
    * an operator goes looking for. Making the field required means every construction site moves in
    * the same commit or the build does not pass.
+   *
+   * Поверхня ж вирішує, до якої смуги бюджету квоти стає виклик (`./codex-budget.ts`): гарячий шлях,
+   * карта чи аналітика — і нова поверхня, не названа там, стає аналітикою, тобто зупиняється першою.
    */
   surface: 'narrative' | 'digest' | 'attacks' | 'shadow' | 'risk' | 'retrospective_gate'
     | 'tactics' | 'attack_research' | 'movement_summary' | 'attack_stats'
@@ -192,6 +208,8 @@ export interface CodexClientDeps {
   audit?: (row: AiRunRecord) => Promise<void>;
   credentials?: () => Promise<CodexCredentials | null>;
   settings?: () => Promise<ResolvedCodexSettings>;
+  /** Бюджет квоти: рішення до запиту й заголовки після нього. Типово — бюджет процесу. */
+  budget?: CodexBudgetGate;
 }
 
 export interface AiRunRecord {
@@ -342,16 +360,11 @@ const REFUSAL_DETAIL_CHARS = 300;
  * JSON `detail` (the Codex backend's shape: `{"detail":"Unsupported service_tier: flex"}`) or
  * `error.message` (the OpenAI-compatible shape) when present, the raw text otherwise. The credential
  * values we sent are cut out BEFORE truncation, so an endpoint that echoes a header back cannot leak
- * even a prefix of it past the cut. Never throws: a body that cannot be read is an empty detail, and
- * the status code alone still goes into the reason.
+ * even a prefix of it past the cut. The body is read once by the caller — the budget reads the same
+ * text for `usage_limit_reached` — and a body that could not be read arrives here empty, so the
+ * status code alone still goes into the reason.
  */
-async function refusalDetail(response: Response, secrets: readonly (string | undefined)[]): Promise<string> {
-  let raw: string;
-  try {
-    raw = await response.text();
-  } catch {
-    return '';
-  }
+function refusalDetail(raw: string, secrets: readonly (string | undefined)[]): string {
   let said: string = raw;
   try {
     const body = JSON.parse(raw) as { detail?: unknown; error?: { message?: unknown } | null };
@@ -394,6 +407,19 @@ export async function codexChat(request: CodexChatRequest, deps: CodexClientDeps
 
   if (!config.CODEX_BASE_URL) {
     return fail('not_configured', 'CODEX_BASE_URL не задано', request.model ?? null);
+  }
+
+  // Бюджет квоти — до будь-якого запиту, навіть до читання налаштувань: відмова не коштує нічого, і
+  // рядка в `ai_runs` вона не пише — мережі не було, а лічильник відмов веде сам бюджет. Бюджет, що
+  // сам зламався, пропускає виклик: облік квоти не має права вимкнути модель.
+  const budget = deps.budget ?? codexBudget;
+  const admission = await budget.admit(request.surface).catch(() => null);
+  if (admission && !admission.admitted) {
+    return {
+      ok: false, reason: 'budget_deferred',
+      detail: `бюджет Codex: смугу ${admission.lane} відкладено (${admission.reason})`,
+      model: request.model ?? null, durationMs: Date.now() - started
+    };
   }
 
   // Налаштування читаються ЗАВЖДИ, а не лише коли модель не задана явно.
@@ -443,9 +469,10 @@ export async function codexChat(request: CodexChatRequest, deps: CodexClientDeps
           input: [{
             type: 'message', role: 'user', content: [
               { type: 'input_text', text: request.user },
-              ...(request.images ?? []).map((item) => ({
-                type: 'input_image', image_url: item.dataUrl, detail: item.detail ?? 'auto'
-              }))
+              ...(request.images ?? []).flatMap((item) => [
+                ...(item.caption ? [{ type: 'input_text', text: item.caption }] : []),
+                { type: 'input_image', image_url: item.dataUrl, detail: item.detail ?? 'auto' }
+              ])
             ]
           }],
           // Вбудовані інструменти бекенду (вебпошук). Він виконує їх сам і стрімить уже фінальне
@@ -474,9 +501,10 @@ export async function codexChat(request: CodexChatRequest, deps: CodexClientDeps
               content: request.images?.length
                 ? [
                     { type: 'text', text: request.user },
-                    ...request.images.map((item) => ({
-                      type: 'image_url', image_url: { url: item.dataUrl, detail: item.detail ?? 'auto' }
-                    }))
+                    ...request.images.flatMap((item) => [
+                      ...(item.caption ? [{ type: 'text', text: item.caption }] : []),
+                      { type: 'image_url', image_url: { url: item.dataUrl, detail: item.detail ?? 'auto' } }
+                    ])
                   ]
                 : request.user
             }
@@ -491,13 +519,19 @@ export async function codexChat(request: CodexChatRequest, deps: CodexClientDeps
     return fail('transport_error', String(error).slice(0, 300), model);
   }
 
+  // Заголовки квоти — з КОЖНОЇ відповіді, не лише з відмови: саме 200 із «вікно на 68 %» дає бюджетові
+  // зупинити аналітику ДО того, як квота скінчиться. Тіло відмови читається один раз: і для бюджету
+  // (`usage_limit_reached` і момент скидання), і для оператора нижче.
+  const refusalBody = response.ok ? null : await response.text().catch(() => '');
+  budget.observe(response, refusalBody);
+
   if (response.status === 401 || response.status === 403) {
     return fail('session_expired', `Codex відхилив облікові дані (${response.status})`, model);
   }
   if (!response.ok) {
     // Тіло відмови — і є відповідь на «чому»: `Unsupported service_tier: flex` місяць лежав тут і
     // викидався. Облікові дані, які ми надіслали, вирізаються з нього до обрізання.
-    const said = await refusalDetail(response, [
+    const said = refusalDetail(refusalBody ?? '', [
       headers.Authorization?.replace(/^Bearer /u, ''), headers['ChatGPT-Account-Id']
     ]);
     return fail('endpoint_error', `Codex відповів ${response.status}${said ? `: ${said}` : ''}`, model);

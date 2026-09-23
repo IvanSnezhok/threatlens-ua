@@ -8,11 +8,13 @@ import {
 import { THREAT_LABELS, resolveModelPlace } from '../domain/model-place.js';
 import { describeAge, momentIn, type ThreatTiming } from '../domain/threat-timing.js';
 import { cachedLocationLexemes, ingestThreat } from '../repositories/events.js';
-import { THREAT_TYPES, type ClassifiedMessage, type NormalizedMessage } from '../types.js';
+import {
+  THREAT_TYPES, type ClassifiedMessage, type MessageMediaAttachment, type NormalizedMessage
+} from '../types.js';
 import {
   buildEnrichments, recordAnalyticalEnrichments, type PublishedClaim
 } from './analytical-enrichment.js';
-import { codexChat, type CodexFailureReason } from './codex-client.js';
+import { codexChat, type CodexFailureReason, type CodexImageInput } from './codex-client.js';
 import { codexFeatureEnabled } from './codex-settings.js';
 import { imageDataUrl, transcribeAudio } from './media-enrichment.js';
 
@@ -49,31 +51,46 @@ import { imageDataUrl, transcribeAudio } from './media-enrichment.js';
  * that are real become new patterns and new tests. The model's verdict is never right by
  * construction — it is a *question*, and the answer is a regex somebody wrote deliberately.
  *
- * ## One client, one audit row
+ * ## One client, one audit row per batch
  *
  * The call goes through {@link codexChat} like every other model call in this codebase. That is
  * where the transport decision lives (Responses API against the ChatGPT backend, `chat/completions`
- * against a proxy), and it is where the `ai_runs` row is written — including for the pre-flight
- * failures, which are exactly the ones an operator cannot otherwise see. This module therefore
- * writes no audit row of its own: one call, one row, under `shadow-classifier-v1`.
+ * against a proxy), where the quota budget decides whether the call may leave at all
+ * (`./codex-budget.ts`: the shadow is analytics, the first lane to stop), and where the `ai_runs`
+ * row is written — including for the pre-flight failures, which are exactly the ones an operator
+ * cannot otherwise see. This module therefore writes no audit row of its own: one call, one row,
+ * under `shadow-classifier-v3`, whose input lists every message of the batch.
  *
- * ## The rate limit is not an optimisation
+ * ## Один виклик на хвилину
  *
- * A mass attack is exactly when the message rate peaks and exactly when the account's quota must
- * still be there for the features that face users. The limiter is a fixed budget per minute
- * (`SHADOW_CLASSIFIER_MAX_PER_MINUTE`, default 6) applied before the call, and messages over budget
- * are dropped rather than queued: a queue would hand back the spend it was meant to prevent, one
- * minute late, and label a night's material with the wrong hour.
+ * До міграції 057 тінь кликала модель на кожне повідомлення, обмежена лише кількістю викликів на
+ * хвилину, і кожен виклик ніс той самий системний промпт і той самий контекст каналу. Під час атаки
+ * (до 71 повідомлення на хвилину 23.09.2026) це був окремий виклик на кожне повідомлення в межах
+ * ліміту — на поверхню, яку ніхто не читає наживо. Тепер повідомлення стають у чергу, і раз на
+ * хвилину черга йде ОДНИМ викликом:
+ * до `min(SHADOW_CLASSIFIER_MAX_PER_MINUTE, 20)` повідомлень, контекст каналів — один раз на канал,
+ * відповідь — масив вердиктів тієї самої схеми, зіставлений за id повідомлення. Звірка, запис і
+ * промоція лишаються по одному повідомленню — рівно такими, якими були.
+ *
+ * Черга обмежена одним пакетом: що не влізло в хвилину, те відкидається (`rate_limited`), а не
+ * переноситься, бо черга, яка росте, повертала б ту саму витрату з запізненням. Живе повідомлення
+ * витісняє з повної черги дозбір, а не навпаки. Година в рядку звірки — час публікації
+ * повідомлення, а не пакета, тож хвилина в черзі не міняє, до якої години ночі належить матеріал.
+ *
+ * Ціна — промоція (`analytical_threats`) приходить до хвилини пізніше, ніж приходила. Це аналітика,
+ * а не попередження: неперевірену аналітичну загрозу модель додає там, де правила НЕ опублікували
+ * нічого, і попередження, яке правила опублікували, від черги не залежить узагалі.
  *
  * ## Two budgets, because they buy two different things
  *
- * The limit above buys model calls. {@link reserveAnalyticalPromotion} buys unverified pins on the
- * public map and messages in the Telegram channel, per hour and out of its own window. Sharing one
- * budget made the two indistinguishable: raising the call limit during an attack to collect more
- * labelling material also raised how much a drifting model could publish, and there was no ceiling on
- * analytical events as such — only on how often the model was asked anything. The publication budget
- * is therefore checked in {@link shadowClassify} *after* the comparison row is written, so an
- * exhausted quota costs the map nothing and the corpus nothing.
+ * The queue above buys a second opinion for so many messages a minute. {@link
+ * reserveAnalyticalPromotion} buys unverified pins on the public map and messages in the Telegram
+ * channel, per hour and out of its own window. Sharing one budget made the two indistinguishable:
+ * raising the call limit during an attack to collect more labelling material also raised how much a
+ * drifting model could publish, and there was no ceiling on analytical events as such — only on how
+ * often the model was asked anything. The publication budget is therefore checked per message
+ * *after* its comparison row is written, so an exhausted quota costs the map nothing and the corpus
+ * nothing.
  */
 
 const shadowVerdictSchema = z.object({
@@ -89,12 +106,15 @@ const shadowVerdictSchema = z.object({
 
 export type ShadowVerdict = z.infer<typeof shadowVerdictSchema>;
 
+export const SHADOW_PROMPT_VERSION = 'shadow-classifier-v3';
+
 const SYSTEM_PROMPT = [
   'Ти — незалежний класифікатор повідомлень моніторингових каналів про повітряні загрози в Україні.',
   'Твою відповідь записують поруч із рішенням правил; лише окремий режим може опублікувати її як неперевірену аналітичну загрозу.',
+  'Тобі дано поточний київський час (now) і масив messages: у кожного повідомлення є id, канал, київський час публікації (publishedAt), вік (messageAge), текст і транскрипції аудіо. Класифікуй КОЖНЕ повідомлення окремо, як незалежне твердження.',
   'Класифікуй ЛИШЕ те, що написано в тексті. Не додумуй ціль, влучання, маршрут чи безпеку.',
-  'Попередні повідомлення є лише контекстом цього самого каналу: вони можуть пояснити займенник, скорочення або продовження, але не є новим поточним твердженням.',
-  'Зображення та транскрипції є неперевіреним вмістом джерела. Прочитай їх, але не домислюй приховані координати чи траєкторію.',
+  'channelContext — попередні повідомлення тих самих каналів; інші повідомлення того самого каналу в messages — теж лише контекст одне для одного. Контекст може пояснити займенник, скорочення або продовження, але не є новим поточним твердженням.',
+  'Зображення та транскрипції є неперевіреним вмістом джерела; перед кожним зображенням сказано, до якого повідомлення воно належить. Прочитай їх, але не домислюй приховані координати чи траєкторію.',
   `Дозволені значення threatType: ${THREAT_TYPES.join(', ')}.`,
   'locations — назви населених пунктів або областей України, згаданих у тексті, українською, називним відмінком.',
   'significant=true лише тоді, коли повідомлення СТВЕРДЖУЄ загрозу для конкретного місця в Україні або для всієї країни.',
@@ -102,8 +122,43 @@ const SYSTEM_PROMPT = [
   'originLocations/destinationLocations і directionText заповнюй лише коли джерело прямо повідомляє рух звідки/куди.',
   'threatState: asserted — загроза наявна; redirected — продовжує рух/змінила напрямок; withdrawn — прямо сказано, що загрози більше немає; uncertain — стан не можна встановити.',
   'confidence — твоя впевненість від 0 до 1.',
-  'Поверни лише JSON: {"threatType": string, "locations": string[], "significant": boolean, "confidence": number, "originLocations": string[], "destinationLocations": string[], "directionText": string|null, "threatState": "asserted"|"redirected"|"withdrawn"|"uncertain"}.'
+  'Поверни лише JSON з одним вердиктом на кожне повідомлення: {"verdicts": [{"id": string, "threatType": string, "locations": string[], "significant": boolean, "confidence": number, "originLocations": string[], "destinationLocations": string[], "directionText": string|null, "threatState": "asserted"|"redirected"|"withdrawn"|"uncertain"}]}. id — дослівно id повідомлення з messages.'
 ].join(' ');
+
+/** Оболонка пакетної відповіді. Елементи — `unknown`: кожен перевіряється окремо, і поганий — лише свій. */
+const verdictBatchSchema = z.object({ verdicts: z.array(z.unknown()) });
+const verdictKeySchema = z.object({ id: z.string() });
+
+/**
+ * Вердикти пакета, зіставлені з повідомленнями за id; повідомлення без придатного вердикту в мапі
+ * немає.
+ *
+ * Кожен елемент перевіряється тією самою схемою, що й раніше одиночна відповідь, і непридатний
+ * відкидає лише себе. Два вердикти для одного id — жодного: вибрати один означало б вгадувати, який
+ * із них про це повідомлення. Id, якого в пакеті не було, ігнорується.
+ */
+export function matchShadowVerdicts(content: string, ids: readonly string[]): Map<string, ShadowVerdict> {
+  const matched = new Map<string, ShadowVerdict>();
+  let batch: z.infer<typeof verdictBatchSchema>;
+  try {
+    const parsed = verdictBatchSchema.safeParse(JSON.parse(content));
+    if (!parsed.success) return matched;
+    batch = parsed.data;
+  } catch {
+    return matched;
+  }
+  const wanted = new Set(ids);
+  const byId = new Map<string, unknown[]>();
+  for (const answer of batch.verdicts) {
+    const key = verdictKeySchema.safeParse(answer);
+    if (key.success && wanted.has(key.data.id)) byId.set(key.data.id, [...(byId.get(key.data.id) ?? []), answer]);
+  }
+  for (const [id, own] of byId) {
+    const parsed = own.length === 1 ? shadowVerdictSchema.safeParse(own[0]) : null;
+    if (parsed?.success) matched.set(id, parsed.data);
+  }
+  return matched;
+}
 
 /** How much of a message is sent and stored. Longer than any real monitoring post, short by design. */
 const TEXT_LIMIT = 2000;
@@ -257,30 +312,44 @@ export function deterministicVerdict(classified: ClassifiedMessage): Determinist
 }
 
 // ------------------------------------------------------------------------------------------------
-// Rate limit
+// Хвилинна черга
 // ------------------------------------------------------------------------------------------------
 
 /**
- * A fixed budget of calls per rolling minute, held in memory.
+ * Повідомлення, що чекають на хвилинний пакет, у порядку надходження.
  *
- * In memory and not in the database because it protects a quota that is per-process-family and
- * because a limiter that needs a round trip to decide whether to make a round trip is not a limiter.
- * One process is the deployed shape; if that ever changes, the budget is per process and the config
- * value has to be divided by hand — which is a smaller surprise than a distributed counter that adds
- * a database write to every ingested message.
+ * У памʼяті, а не в базі, з тієї самої причини, з якої тут жив ліміт викликів до неї: обмежувач,
+ * якому для рішення потрібен запит у базу, — не обмежувач, а один процес — це і є розгорнута форма.
+ * Обмежена за побудовою одним пакетом ({@link SHADOW_BATCH_MAX}): що не влізло, відкидається, і
+ * тримає вона щонайбільше хвилину.
  */
-const callTimes: number[] = [];
+const queue: ShadowInput[] = [];
+let flushTimer: NodeJS.Timeout | null = null;
+let flushing = false;
+let lastFlushAt = Number.NEGATIVE_INFINITY;
+/** Параметри пакета, який будить таймер. У роботі — порожні: справжній клієнт і справжня база. */
+let shadowDefaults: ShadowOptions = {};
 
-/** Test seam: the window is wall-clock, and a suite that runs several cases in one tick needs it. */
-export function resetShadowRateLimit(): void {
-  callTimes.length = 0;
-}
+/** Пакет — раз на хвилину, і ніколи частіше. */
+const SHADOW_FLUSH_MS = 60_000;
+/** Жорстка стеля пакета, хоч би що стояло в `SHADOW_CLASSIFIER_MAX_PER_MINUTE`. */
+export const SHADOW_BATCH_MAX = 20;
+/**
+ * Зображень на весь пакет. Кожне на `high` коштує як сторінка тексту; повідомлення без тексту, для
+ * яких зображення — усе, що є, отримують їх першими.
+ */
+const SHADOW_BATCH_MAX_IMAGES = 6;
+/** Пакет не на гарячому шляху: хвилина — рівно стільки, скільки чекає наступний. */
+const SHADOW_BATCH_TIMEOUT_MS = 60_000;
 
-export function withinRateLimit(now = Date.now(), limit = config.SHADOW_CLASSIFIER_MAX_PER_MINUTE): boolean {
-  while (callTimes.length && callTimes[0]! <= now - 60_000) callTimes.shift();
-  if (callTimes.length >= limit) return false;
-  callTimes.push(now);
-  return true;
+/** Тестовий шов: черга, таймер і типові параметри пакета — стан модуля, який не скидає жоден TRUNCATE. */
+export function resetShadowQueue(): void {
+  if (flushTimer) clearTimeout(flushTimer);
+  flushTimer = null;
+  queue.length = 0;
+  flushing = false;
+  lastFlushAt = Number.NEGATIVE_INFINITY;
+  shadowDefaults = {};
 }
 
 // ------------------------------------------------------------------------------------------------
@@ -290,7 +359,7 @@ export function withinRateLimit(now = Date.now(), limit = config.SHADOW_CLASSIFI
 /**
  * The second window, and the only ceiling that exists on analytical events as such.
  *
- * Deliberately not `callTimes` above. That budget is a spending limit on the model account and is
+ * Deliberately not the minute queue above. That budget is a spending limit on the model account and is
  * raised precisely when a night is worth labelling; this one is a limit on how much unverified
  * material a drifting model may put in front of users, and there is no night on which raising the
  * first should raise the second. One shared window made "collect more" and "publish more" the same
@@ -298,13 +367,13 @@ export function withinRateLimit(now = Date.now(), limit = config.SHADOW_CLASSIFI
  *
  * An hour rather than a minute because the failure being bounded is a drip, not a burst: a
  * miscalibrated model produces a steady trickle that a per-minute cap of 1 passes at sixty an hour.
- * In memory for the same reasons the minute window is (see above); one process is the deployed shape,
+ * In memory for the same reasons the minute queue is (see above); one process is the deployed shape,
  * and the price of that assumption being wrong is a ceiling per process rather than a shared one,
  * which is the safe direction for a per-process cap on publishing.
  */
 const promotionTimes: number[] = [];
 
-/** Test seam, exactly like {@link resetShadowRateLimit} and for the same wall-clock reason. */
+/** Test seam, exactly like {@link resetShadowQueue} and for the same wall-clock reason. */
 export function resetAnalyticalPromotionQuota(): void {
   promotionTimes.length = 0;
 }
@@ -312,8 +381,8 @@ export function resetAnalyticalPromotionQuota(): void {
 /**
  * Takes one slot out of the hour, or refuses.
  *
- * Reserve-and-release rather than the plain check-and-consume of {@link withinRateLimit}, because
- * these two limiters count different things. There, one call is one unit of spend and the answer is
+ * Reserve-and-release rather than a plain check-and-consume counter, because this limiter counts a
+ * different thing from the queue above. There, one message is one unit of spend and the answer is
  * known at the moment of asking. Here the unit is a *published event*, and most attempts publish
  * nothing: `promoteAnalyticalThreat` below refuses a verdict that is not asserted, not confident
  * enough, or names a place the deterministic catalogue cannot resolve, and `ingestThreat` refuses one
@@ -321,11 +390,11 @@ export function resetAnalyticalPromotionQuota(): void {
  * ceiling of twelve events an hour into a ceiling of twelve *questions*, and a night of near-misses
  * would spend the quota that the one real promotion needed.
  *
- * The slot is taken up front rather than after the fact because {@link scheduleShadowClassification}
- * drops the promise: several classifications are in flight at once, and a counter incremented only on
- * success lets every one of them pass a check that no longer reflects what the others are about to
- * do. Reserving first bounds the overshoot at zero; {@link releaseAnalyticalPromotion} hands the slot
- * back the moment the attempt is known to have produced nothing.
+ * The slot is taken up front rather than after the fact because the check and the outcome are
+ * separated by an await — the promotion itself writes an event — and a counter incremented only on
+ * success lets every attempt that overlaps it pass a check that no longer reflects what the others
+ * are about to do. Reserving first bounds the overshoot at zero; {@link releaseAnalyticalPromotion}
+ * hands the slot back the moment the attempt is known to have produced nothing.
  *
  * A limit of 0 refuses before anything is recorded — the `>= limit` comparison is what makes zero an
  * off switch rather than a budget of one.
@@ -362,7 +431,7 @@ export interface ShadowInput {
   publishedAt: Date;
   text: string;
   classified: ClassifiedMessage;
-  media?: import('../types.js').MessageMediaAttachment[];
+  media?: MessageMediaAttachment[];
   /** Full original envelope; required to preserve source provenance if an analytical event is made. */
   message?: NormalizedMessage;
   /** True only for deterministic `unrecognized`/`no_location` refusals, never for withdrawals. */
@@ -415,7 +484,9 @@ export interface ShadowOutcome {
   status: 'recorded' | 'skipped';
   /** Why nothing was recorded. Present only for `skipped`, and never surfaced to a user. */
   reason?: 'disabled' | 'rate_limited' | 'empty_text' | 'media_unusable' | 'transcription_failed'
-    | 'no_provider' | 'model_failed' | 'write_failed';
+    | 'no_provider' | 'model_failed' | 'write_failed'
+    /** Бюджет квоти (`./codex-budget.ts`) не пустив пакет до моделі: аналітика стоїть першою. */
+    | 'budget_deferred';
   agrees?: boolean;
   fields?: DisagreementField[];
   promotedEventId?: string;
@@ -553,8 +624,9 @@ const PREFLIGHT_REASONS: ReadonlySet<CodexFailureReason> =
  * nothing finer. These two answer the question an operator actually has after switching the feature
  * on: **what fraction of classified messages got a second opinion, and where did the rest go**.
  *
- * `attempts` is incremented once per call and is therefore the denominator of coverage — one call
- * happens per archived deterministic decision, so
+ * `attempts` is incremented once per message — where it is dropped at the queue, or where its batch
+ * is classified — and is therefore the denominator of coverage: one message per archived
+ * deterministic decision, so
  *
  *     threatlens_shadow_outcomes_total{status="recorded"} / threatlens_classifications_total
  *
@@ -623,10 +695,10 @@ export function resetShadowMetrics(): void {
 /**
  * Counts an outcome and hands it straight back.
  *
- * Written as a pass-through so that every `return` in {@link shadowClassify} is also the place the
- * outcome is counted. The alternative — one `.inc()` before each of the eight returns — is one edit
- * away from a branch that returns without counting, and a coverage metric with a silently
- * unreachable branch is worse than none.
+ * Written as a pass-through so that every place an outcome is decided — at the queue, in the batch
+ * and per message — is also the place it is counted. The alternative — one `.inc()` beside each
+ * decision — is one edit away from a branch that returns without counting, and a coverage metric
+ * with a silently unreachable branch is worse than none.
  */
 function countOutcome(outcome: ShadowOutcome): ShadowOutcome {
   shadowOutcomes.inc({ status: outcome.status, reason: outcome.reason ?? 'none' });
@@ -634,14 +706,39 @@ function countOutcome(outcome: ShadowOutcome): ShadowOutcome {
 }
 
 /**
- * Runs the shadow classification for one message and records the comparison.
+ * The shadow classification for one message: a batch of one.
  *
- * Awaitable so tests can assert on it. Production code calls
- * {@link scheduleShadowClassification} instead, which is the same work with the promise
- * deliberately dropped.
+ * Awaitable so tests can assert on it. The pipeline never calls it — it calls
+ * {@link scheduleShadowClassification}, which puts the message into the minute's batch.
  */
 export async function shadowClassify(input: ShadowInput, options: ShadowOptions = {}): Promise<ShadowOutcome> {
-  shadowAttempts.inc();
+  return (await shadowClassifyBatch([input], options))[0]!;
+}
+
+/** Повідомлення пакета, готове до промпту: те, що модель прочитає, і те, з чим звірятимуть. */
+interface PreparedShadow {
+  index: number;
+  input: ShadowInput;
+  text: string;
+  transcripts: string[];
+  images: string[];
+  context: ShadowContextMessage[];
+  deterministic: DeterministicVerdict;
+}
+
+/**
+ * Друга думка для пакета повідомлень ОДНИМ викликом — і звірка, запис, промоція й доповнення по
+ * одному повідомленню, рівно такими, якими вони були, коли виклик був на повідомлення.
+ *
+ * Повертає вихід на кожне вхідне повідомлення в тому самому порядку. Ніколи не кидає: кожен збій —
+ * пропуск із причиною. Збій виклику — пропуск усього пакета; непридатний вердикт — пропуск лише свого
+ * повідомлення.
+ */
+export async function shadowClassifyBatch(
+  inputs: readonly ShadowInput[], options: ShadowOptions = {}
+): Promise<ShadowOutcome[]> {
+  if (!inputs.length) return [];
+  shadowAttempts.inc(inputs.length);
   // Three switches, one call. `analytical_enrichment` joins the other two here rather than gating
   // only the write below, because the verdict this module produces is the input all three consume:
   // an installation that wants only enrichment must still get the model asked, and one that wants
@@ -651,107 +748,176 @@ export async function shadowClassify(input: ShadowInput, options: ShadowOptions 
     codexFeatureEnabled('analytical_enrichment')
   ]);
   if (!shadowEnabled && !analyticalEnabled && !enrichmentEnabled) {
-    return countOutcome({ status: 'skipped', reason: 'disabled' });
+    return inputs.map(() => countOutcome({ status: 'skipped', reason: 'disabled' }));
   }
-  const text = input.text.trim();
-  if (!text && !input.media?.length) return countOutcome({ status: 'skipped', reason: 'empty_text' });
-  const now = options.now ?? Date.now;
-  if (!withinRateLimit(now())) return countOutcome({ status: 'skipped', reason: 'rate_limited' });
-
-  const chat = options.chat ?? codexChat;
-  const context = await (options.loadContext ?? loadShadowContext)(input).catch(() => []);
+  const outcomes = new Array<ShadowOutcome>(inputs.length);
   const transcribe = options.transcribe ?? transcribeAudio;
-  const transcripts: string[] = [];
-  let audioSeen = false;
-  for (const media of input.media ?? []) {
-    if (media.kind !== 'audio') continue;
-    audioSeen = true;
-    const result = await transcribe(media).catch(() => ({ ok: false as const }));
-    if (result.ok && result.text) transcripts.push(result.text);
+  const loadContext = options.loadContext ?? loadShadowContext;
+
+  // Зображення — у межах пакета, і першими їх отримують повідомлення без тексту: для них картинка —
+  // усе, що є, а текстове повідомлення без неї лишається повідомленням, яке правила теж читали текстом.
+  const offered = inputs.map((input) => (input.media ?? [])
+    .map(imageDataUrl).filter((dataUrl): dataUrl is string => Boolean(dataUrl)).slice(0, 2));
+  const images = inputs.map((): string[] => []);
+  let imagesLeft = SHADOW_BATCH_MAX_IMAGES;
+  for (const textless of [true, false]) {
+    for (const [index, input] of inputs.entries()) {
+      if (!input.text.trim() !== textless) continue;
+      images[index] = offered[index]!.slice(0, imagesLeft);
+      imagesLeft -= images[index]!.length;
+    }
   }
-  const images = (input.media ?? [])
-    .map(imageDataUrl).filter((dataUrl): dataUrl is string => Boolean(dataUrl))
-    .slice(0, 2).map((dataUrl) => ({ dataUrl, detail: 'high' as const }));
-  /**
-   * A media-only message the enrichment could not turn into anything to read.
-   *
-   * The `empty_text` gate above has already let this message through, because media *was* attached;
-   * what fails here is the extraction. `imageDataUrl` (src/services/media-enrichment.ts:99-103)
-   * answers null for anything that is not jpeg/png/webp/gif or is over `SHADOW_IMAGE_MAX_BYTES`, and
-   * a voice note can come back without text for reasons that range from an unconfigured
-   * transcription model to a missing `ffmpeg`. Either way there is nothing to send, so the call is
-   * not made.
-   *
-   * This used to be counted as `model_failed` — the same label the three genuine provider failures
-   * below carry. An operator watching
-   * `threatlens_shadow_outcomes_total{status="skipped",reason="model_failed"}` therefore saw a rising
-   * model-failure rate on a night with many stickers or oversized photos and went looking at the
-   * provider, the quota and `ai_runs`, where nothing was wrong and no row existed at all: the model
-   * had never been called. The separate reason is what makes those two nights distinguishable in the
-   * one place an operator actually looks.
-   *
-   * Split in two because the two halves are fixed in different places and only one of them is worth
-   * anybody's evening. `transcription_failed` means audio was attached and no attempt produced text —
-   * an ops problem (credentials, `AI_TRANSCRIPTION_MODEL`, the ffmpeg conversion in
-   * `convertTelegramVoice`) that a human can actually clear. `media_unusable` means nothing readable
-   * was attached in the first place — a format or size the pipeline deliberately declines — and is
-   * expected background noise on any channel that posts stickers or video. Audio wins when a message
-   * carries both, because the actionable cause should not be hidden behind the inert one.
-   */
-  if (!text && !transcripts.length && !images.length) {
-    return countOutcome({
-      status: 'skipped', reason: audioSeen ? 'transcription_failed' : 'media_unusable'
+
+  const prepared: PreparedShadow[] = [];
+  for (const [index, input] of inputs.entries()) {
+    const text = input.text.trim();
+    if (!text && !input.media?.length) {
+      outcomes[index] = countOutcome({ status: 'skipped', reason: 'empty_text' });
+      continue;
+    }
+    const transcripts: string[] = [];
+    let audioSeen = false;
+    for (const media of input.media ?? []) {
+      if (media.kind !== 'audio') continue;
+      audioSeen = true;
+      const result = await transcribe(media).catch(() => ({ ok: false as const }));
+      if (result.ok && result.text) transcripts.push(result.text);
+    }
+    /**
+     * A media-only message the enrichment could not turn into anything to read.
+     *
+     * The `empty_text` gate above has already let this message through, because media *was*
+     * attached; what fails here is the extraction. `imageDataUrl` (src/services/media-enrichment.ts)
+     * answers null for anything that is not jpeg/png/webp/gif or is over `SHADOW_IMAGE_MAX_BYTES`,
+     * and a voice note can come back without text for reasons that range from an unconfigured
+     * transcription model to a missing `ffmpeg`. Either way there is nothing to send, so the message
+     * does not go into the call.
+     *
+     * This used to be counted as `model_failed` — the same label the genuine provider failures below
+     * carry. An operator watching
+     * `threatlens_shadow_outcomes_total{status="skipped",reason="model_failed"}` therefore saw a
+     * rising model-failure rate on a night with many stickers or oversized photos and went looking at
+     * the provider, the quota and `ai_runs`, where nothing was wrong: the model had never been asked
+     * about this message. The separate reason is what makes those two nights distinguishable in the
+     * one place an operator actually looks.
+     *
+     * Split in two because the two halves are fixed in different places and only one of them is
+     * worth anybody's evening. `transcription_failed` means audio was attached and no attempt
+     * produced text — an ops problem (credentials, `AI_TRANSCRIPTION_MODEL`, the ffmpeg conversion in
+     * `convertTelegramVoice`) that a human can actually clear. `media_unusable` means nothing readable
+     * was attached in the first place — a format or size the pipeline deliberately declines — and is
+     * expected background noise on any channel that posts stickers or video. Audio wins when a message
+     * carries both, because the actionable cause should not be hidden behind the inert one.
+     */
+    if (!text && !transcripts.length && !images[index]!.length) {
+      outcomes[index] = countOutcome({
+        status: 'skipped', reason: audioSeen ? 'transcription_failed' : 'media_unusable'
+      });
+      continue;
+    }
+    prepared.push({
+      index, input, text, transcripts, images: images[index]!,
+      context: await loadContext(input).catch(() => []),
+      deterministic: deterministicVerdict(input.classified)
     });
   }
-  // Той самий часовий блок, що й у основного класифікатора (`./codex-classifier.ts`, рішення власника
-  // 20.08.2026). Тінь порівнюють з правилами й з основною моделлю, і вердикт, ухвалений без знання
-  // про те, коли канал це написав, порівнювати нема з чим: розбіжність читалася б як помилка моделі
-  // там, де це була різниця у вхідних даних.
-  const prompt = JSON.stringify({
-    now: momentIn(new Date(), config.APP_TIMEZONE),
-    publishedAt: momentIn(input.publishedAt, config.APP_TIMEZONE),
-    messageAge: describeAge(input.publishedAt, new Date()),
-    previousMessages: context.map((item) => ({ at: item.publishedAt.toISOString(), text: item.text })),
-    currentMessage: text.slice(0, TEXT_LIMIT),
-    audioTranscripts: transcripts
-  });
-  const deterministic = deterministicVerdict(input.classified);
+  if (!prepared.length) return outcomes;
 
+  // Контекст — один раз на канал: у пакеті з кількох повідомлень одного каналу ті самі попередні
+  // пости інакше їхали б стільки разів, скільки повідомлень. Повідомлення самого пакета в контекст не
+  // дублюються — вони вже є в `messages`. На канал — не більше `SHADOW_CONTEXT_MESSAGES` найсвіжіших,
+  // скільки досі їхало з одним повідомленням.
+  const batchIds = new Set(prepared.map((item) => item.input.sourceMessageId));
+  const byChannel = new Map<string, Map<string, ShadowContextMessage>>();
+  for (const item of prepared) {
+    const channel = item.input.sourceId ?? 'невідомий канал';
+    const known = byChannel.get(channel) ?? new Map<string, ShadowContextMessage>();
+    for (const previous of item.context) if (!batchIds.has(previous.id)) known.set(previous.id, previous);
+    byChannel.set(channel, known);
+  }
+  const channelContext: Record<string, Array<{ at: string; text: string }>> = {};
+  for (const [channel, known] of byChannel) {
+    if (!known.size) continue;
+    channelContext[channel] = [...known.values()]
+      .sort((left, right) => left.publishedAt.getTime() - right.publishedAt.getTime())
+      .slice(Math.max(0, known.size - config.SHADOW_CONTEXT_MESSAGES))
+      .map((previous) => ({ at: previous.publishedAt.toISOString(), text: previous.text }));
+  }
+  // Той самий часовий блок, що й у основного класифікатора (`./codex-classifier.ts`, рішення власника
+  // 20.08.2026), — на кожне повідомлення пакета. Тінь порівнюють з правилами й з основною моделлю, і
+  // вердикт, ухвалений без знання про те, коли канал це написав, порівнювати нема з чим: розбіжність
+  // читалася б як помилка моделі там, де це була різниця у вхідних даних.
+  const askedAt = new Date();
+  const facts = {
+    now: momentIn(askedAt, config.APP_TIMEZONE),
+    messages: prepared.map((item) => ({
+      id: item.input.sourceMessageId,
+      channel: item.input.sourceId ?? null,
+      publishedAt: momentIn(item.input.publishedAt, config.APP_TIMEZONE),
+      messageAge: describeAge(item.input.publishedAt, askedAt),
+      text: item.text.slice(0, TEXT_LIMIT),
+      audioTranscripts: item.transcripts
+    })),
+    channelContext
+  };
+  const requestImages: CodexImageInput[] = prepared.flatMap((item) => item.images.map((dataUrl, position) => ({
+    dataUrl, detail: 'high' as const,
+    caption: `Зображення ${position + 1} з ${item.images.length} до повідомлення ${item.input.sourceMessageId}`
+  })));
+
+  const chat = options.chat ?? codexChat;
   const result = await chat({
-    promptVersion: 'shadow-classifier-v2',
+    promptVersion: SHADOW_PROMPT_VERSION,
     surface: 'shadow',
-    // Той самий гарячий шлях, що й основний класифікатор: тінь звіряють із ним, тож і модель та сама.
+    // Та сама модель, що й в основного класифікатора: тінь звіряють із ним.
     tier: 'fast',
     classifierVersion: CLASSIFIER_VERSION,
     system: SYSTEM_PROMPT,
-    user: prompt,
-    images,
+    user: JSON.stringify(facts),
+    images: requestImages,
     json: true,
+    timeoutMs: SHADOW_BATCH_TIMEOUT_MS,
     // The audit row carries the digest rather than the rendered prompt: the system prompt is a
-    // constant that would be repeated on every row, and what is actually worth reading back is the
+    // constant that would be repeated on every row, and what is actually worth reading back is each
     // message together with the verdict it was being compared against.
     auditInput: {
-      text: text.slice(0, TEXT_LIMIT), deterministic, classifierVersion: CLASSIFIER_VERSION,
-      contextMessageIds: context.map((item) => item.id), mediaKinds: (input.media ?? []).map((item) => item.kind)
+      classifierVersion: CLASSIFIER_VERSION,
+      messages: prepared.map((item) => ({
+        id: item.input.sourceMessageId, text: item.text.slice(0, TEXT_LIMIT), deterministic: item.deterministic,
+        contextMessageIds: item.context.map((previous) => previous.id),
+        mediaKinds: (item.input.media ?? []).map((media) => media.kind)
+      }))
     }
   }).catch(() => null);
 
-  if (!result) return countOutcome({ status: 'skipped', reason: 'model_failed' });
-  if (!result.ok) {
-    return countOutcome({
-      status: 'skipped', reason: PREFLIGHT_REASONS.has(result.reason) ? 'no_provider' : 'model_failed'
-    });
+  if (!result || !result.ok) {
+    const reason: ShadowOutcome['reason'] = !result ? 'model_failed'
+      : result.reason === 'budget_deferred' ? 'budget_deferred'
+        : PREFLIGHT_REASONS.has(result.reason) ? 'no_provider' : 'model_failed';
+    for (const item of prepared) outcomes[item.index] = countOutcome({ status: 'skipped', reason });
+    return outcomes;
   }
 
   // Prose where JSON was asked for, and a threat class that does not exist, are the same kind of
   // failure and neither may reach the table: a corpus with invented labels is worse than no corpus.
-  let verdict: ShadowVerdict;
-  try {
-    verdict = shadowVerdictSchema.parse(JSON.parse(result.content) as unknown);
-  } catch {
-    return countOutcome({ status: 'skipped', reason: 'model_failed' });
+  // In a batch that failure is per message — one bad element costs only its own row.
+  const verdicts = matchShadowVerdicts(result.content, prepared.map((item) => item.input.sourceMessageId));
+  const switches = { analyticalEnabled, enrichmentEnabled };
+  for (const item of prepared) {
+    const verdict = verdicts.get(item.input.sourceMessageId);
+    outcomes[item.index] = verdict
+      ? await recordShadowVerdict(item, verdict, result.model, switches, options)
+      : countOutcome({ status: 'skipped', reason: 'model_failed' });
   }
+  return outcomes;
+}
 
+/** Звірка, запис, промоція й доповнення для одного повідомлення пакета. */
+async function recordShadowVerdict(
+  item: PreparedShadow, verdict: ShadowVerdict, model: string,
+  switches: { analyticalEnabled: boolean; enrichmentEnabled: boolean }, options: ShadowOptions
+): Promise<ShadowOutcome> {
+  const { input, deterministic } = item;
   const fields = disagreementFields(deterministic, verdict);
   const agrees = fields.length === 0;
   try {
@@ -766,9 +932,9 @@ export async function shadowClassify(input: ShadowInput, options: ShadowOptions 
       [
         input.sourceMessageId, CLASSIFIER_VERSION, input.publishedAt,
         deterministic.threatType, deterministic.locationNames, deterministic.significant,
-        result.model, verdict.threatType, verdict.locations, verdict.significant, verdict.confidence,
-        agrees, fields, text.slice(0, TEXT_LIMIT), JSON.stringify(verdict),
-        context.map((item) => item.id), (input.media ?? []).map((item) => item.kind)
+        model, verdict.threatType, verdict.locations, verdict.significant, verdict.confidence,
+        agrees, fields, item.text.slice(0, TEXT_LIMIT), JSON.stringify(verdict),
+        item.context.map((previous) => previous.id), (input.media ?? []).map((media) => media.kind)
       ]
     );
   } catch {
@@ -785,12 +951,12 @@ export async function shadowClassify(input: ShadowInput, options: ShadowOptions 
    * labelling material collected during exactly the hours worth labelling.
    */
   let promotedEventId: string | null = null;
-  if (analyticalEnabled && input.allowAnalyticalPromotion) {
-    const reservedAt = now();
+  if (switches.analyticalEnabled && input.allowAnalyticalPromotion) {
+    const reservedAt = (options.now ?? Date.now)();
     if (!reserveAnalyticalPromotion(reservedAt)) {
       analyticalPromotionsBlocked.inc();
     } else {
-      promotedEventId = await (options.promote ?? promoteAnalyticalThreat)(input, verdict, result.model)
+      promotedEventId = await (options.promote ?? promoteAnalyticalThreat)(input, verdict, model)
         .catch(() => null);
       if (!promotedEventId) {
         releaseAnalyticalPromotion(reservedAt);
@@ -819,8 +985,8 @@ export async function shadowClassify(input: ShadowInput, options: ShadowOptions 
    * `publishedClaim` (the rules published it), and `./ingestion.ts` sets exactly one of the two.
    */
   let enrichments = 0;
-  if (enrichmentEnabled && input.publishedClaim) {
-    enrichments = await (options.enrich ?? enrichPublishedEvent)(input, verdict, result.model)
+  if (switches.enrichmentEnabled && input.publishedClaim) {
+    enrichments = await (options.enrich ?? enrichPublishedEvent)(input, verdict, model)
       .catch(() => 0);
   }
   return countOutcome({
@@ -830,26 +996,104 @@ export async function shadowClassify(input: ShadowInput, options: ShadowOptions 
 }
 
 /**
+ * Ставить повідомлення в хвилинний пакет — або одразу каже, чому ні (`null` — стало в чергу).
+ *
+ * Awaitable для тестів; конвеєр кличе {@link scheduleShadowClassification}. Перемикачі читаються тут,
+ * а не лише в пакеті: інсталяція з вимкненою тінню не має ні тримати повідомлень у памʼяті, ні рахувати
+ * їх відкинутими бюджетом. Повна черга відкидає нове повідомлення — крім живого, яке витісняє
+ * найстаріше повідомлення дозбору: дозбір не має права з'їсти хвилину, на яку чекає жива промоція.
+ */
+export async function enqueueShadowClassification(input: ShadowInput): Promise<ShadowOutcome | null> {
+  const skip = (reason: NonNullable<ShadowOutcome['reason']>): ShadowOutcome => {
+    shadowAttempts.inc();
+    return countOutcome({ status: 'skipped', reason });
+  };
+  if (!input.text.trim() && !input.media?.length) return skip('empty_text');
+  const switches = await Promise.all([
+    codexFeatureEnabled('shadow'), codexFeatureEnabled('analytical_threats'),
+    codexFeatureEnabled('analytical_enrichment')
+  ]);
+  if (!switches.some(Boolean)) return skip('disabled');
+  // Перечитане після рестарту колектора повідомлення вже чекає в черзі — другий вердикт про нього
+  // нічого не додав би, а два вердикти з одним id пакет відкинув би обидва.
+  if (queue.some((queued) => queued.sourceMessageId === input.sourceMessageId)) return null;
+  if (queue.length >= Math.min(SHADOW_BATCH_MAX, config.SHADOW_CLASSIFIER_MAX_PER_MINUTE)) {
+    const evictable = input.historical ? -1 : queue.findIndex((queued) => queued.historical);
+    if (evictable < 0) return skip('rate_limited');
+    queue.splice(evictable, 1);
+    skip('rate_limited');
+    countSkip('rate_limited');
+  }
+  queue.push(input);
+  armShadowFlush();
+  return null;
+}
+
+/**
  * Fire-and-forget entry point for the ingestion path.
  *
  * The promise is dropped on purpose and the return type is void: ingestion never waits on a model.
- * When analytical publication is enabled, `shadowClassify` itself performs the bounded promotion
- * after recording the verdict; nothing upstream branches on the answer. It already swallows every
+ * The message waits for the minute's batch, and {@link flushShadowQueue} performs the bounded
+ * promotion after recording the verdict; nothing upstream branches on the answer. Both swallow every
  * failure; the `catch` here is the belt to that braces, so a bug in the swallowing cannot become an
  * unhandled rejection that takes the process down during an attack.
  *
- * Skips are counted in the process log and nowhere else. A metric would be a fine thing to add the
- * day somebody watches this feature; a warning per message would not — the failure mode this guards
- * against is a model having a bad night, which is thousands of messages.
+ * Skips are counted in the process log and nowhere else. A warning per message would not do — the
+ * failure mode this guards against is a model having a bad night, which is thousands of messages.
  */
-export function scheduleShadowClassification(input: ShadowInput, options: ShadowOptions = {}): void {
-  void shadowClassify(input, options)
+export function scheduleShadowClassification(input: ShadowInput): void {
+  void enqueueShadowClassification(input)
     .then((outcome) => {
-      if (outcome.status === 'recorded') return;
-      if (outcome.reason === 'disabled' || outcome.reason === 'empty_text') return;
+      if (!outcome || outcome.reason === 'disabled' || outcome.reason === 'empty_text') return;
       countSkip(outcome.reason ?? 'unknown');
     })
     .catch(() => undefined);
+}
+
+/** Тестовий шов для пакета, який будить таймер без параметрів, — як `setCodexClassifierDefaults`. */
+export function setShadowClassifierDefaults(options: ShadowOptions): void {
+  shadowDefaults = options;
+}
+
+/**
+ * Забирає чергу й класифікує її одним викликом. Тіло таймера й тестовий шов.
+ *
+ * Пропуски рахуються в журналі тут, а не в {@link shadowClassifyBatch}: пакет, який тест кличе
+ * напряму, не повинен рухати лічильник, що описує конвеєр.
+ */
+export async function flushShadowQueue(options: ShadowOptions = shadowDefaults): Promise<ShadowOutcome[]> {
+  if (flushTimer) clearTimeout(flushTimer);
+  flushTimer = null;
+  if (!queue.length) return [];
+  const batch = queue.splice(0, queue.length);
+  flushing = true;
+  lastFlushAt = Date.now();
+  try {
+    const outcomes = await shadowClassifyBatch(batch, options);
+    for (const outcome of outcomes) {
+      if (outcome.status === 'recorded' || outcome.reason === 'disabled' || outcome.reason === 'empty_text') continue;
+      countSkip(outcome.reason ?? 'unknown');
+    }
+    return outcomes;
+  } catch {
+    return [];
+  } finally {
+    flushing = false;
+    armShadowFlush();
+  }
+}
+
+/**
+ * Один таймер на чергу: перший пакет після тиші йде одразу, кожен наступний — не раніше ніж за
+ * хвилину після попереднього, і ніколи поверх того, що ще летить.
+ */
+function armShadowFlush(): void {
+  if (flushTimer || flushing || !queue.length) return;
+  flushTimer = setTimeout(() => {
+    flushTimer = null;
+    void flushShadowQueue();
+  }, Math.max(0, lastFlushAt + SHADOW_FLUSH_MS - Date.now()));
+  flushTimer.unref();
 }
 
 /**

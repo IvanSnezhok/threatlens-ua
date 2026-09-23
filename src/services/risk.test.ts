@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 /**
  * One group, one location, one signal — the smallest shape a pass can have.
@@ -10,42 +10,56 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
  */
 const db = vi.hoisted(() => ({
   statements: [] as string[],
+  /** Parameters of every `INSERT INTO risk_assessments(`, in order — what a pass actually published. */
+  published: [] as unknown[][],
   /** The published assessment the group already has, as `runRiskAssessmentsPass` would read it. */
-  previous: [] as Array<Record<string, unknown>>
+  previous: [] as Array<Record<string, unknown>>,
+  /** The group's live signal ids; a test that changes them changes the group's digest. */
+  signalIds: ['one', 'two', 'three']
 }));
 
 vi.mock('../db/pool.js', () => {
   // Three signals rather than one: the pass writes their `risk_assessment_signals` rows in a single
   // batched statement, and a group of one cannot tell a batch from a loop.
-  const signals = ['one', 'two', 'three'].map((id) => ({
+  const signals = () => db.signalIds.map((id) => ({
     id, signal_type: 'explicit_threat', source_tier: 'A', independence_group: 'a',
     reliability: 1, freshness: 1, geographic_relevance: 1, contribution: 1.5,
     observed_at: new Date(), source_id: null, source_trust: null
   }));
-  const answer = (text: string) => {
+  const answer = (text: string, params: unknown[] = []) => {
     db.statements.push(text);
-    if (text.includes('FROM risk_signals rs')) return { rows: signals, rowCount: signals.length };
+    if (text.includes('FROM risk_signals rs')) return { rows: signals(), rowCount: db.signalIds.length };
     if (text.includes('FROM risk_signals')) {
-      return { rows: [{ location_id: 'ua-80', threat_type: 'uav', signal_ids: signals.map((s) => s.id) }], rowCount: 1 };
+      return { rows: [{ location_id: 'ua-80', threat_type: 'uav', signal_ids: [...db.signalIds] }], rowCount: 1 };
     }
     if (text.includes('FROM locations')) return { rows: [{ id: 'ua-80', name_uk: 'Київ' }], rowCount: 1 };
     if (text.includes('FROM risk_assessments WHERE location_id')) {
       return { rows: db.previous, rowCount: db.previous.length };
     }
-    if (text.includes('INSERT INTO risk_assessments(')) return { rows: [{ id: 'assessment-1' }], rowCount: 1 };
+    if (text.includes('INSERT INTO risk_assessments(')) {
+      db.published.push(params);
+      return { rows: [{ id: 'assessment-1' }], rowCount: 1 };
+    }
     return { rows: [], rowCount: 0 };
   };
   return {
     pool: {
-      query: async (text: string) => answer(text),
-      connect: async () => ({ query: async (text: string) => answer(text), release: () => undefined })
+      query: async (text: string, params?: unknown[]) => answer(text, params),
+      connect: async () => ({ query: async (text: string, params?: unknown[]) => answer(text, params), release: () => undefined })
     }
   };
 });
 
+// The Codex `risk` switch is a database read; off unless a test turns it on, so the `AI_*` cases
+// below keep exercising the path they always did.
+vi.mock('./codex-settings.js', () => ({ codexFeatureEnabled: vi.fn(async () => false) }));
+vi.mock('./codex-client.js', () => ({ codexChat: vi.fn() }));
+
 import { config } from '../config.js';
+import { codexChat } from './codex-client.js';
+import { codexFeatureEnabled } from './codex-settings.js';
 import {
-  clampAssessment, effectiveContribution, fallbackAssessment, resetRiskRunGuard,
+  clampAssessment, effectiveContribution, fallbackAssessment, matchRiskAssessments, resetRiskRunGuard,
   runRiskAssessmentsGuarded, signalTypeLabel, type ModelAssessment, type RiskSignalRow
 } from './risk.js';
 
@@ -294,5 +308,89 @@ describe('what a pass writes for one group', () => {
 
     expect(outcome).toEqual({ published: 1, skipped: false });
     expect(db.statements.filter(matching('SET superseded_by'))).toHaveLength(1);
+  });
+});
+
+// ------------------------------------------------------------------------------------------------
+// Codex: one batched call per pass (migration 057)
+// ------------------------------------------------------------------------------------------------
+
+const modelAnswer = (overrides: Record<string, unknown> = {}) => ({
+  locationId: 'ua-80', threatType: 'uav', horizonHours: 6, score: 5, confidence: 'medium',
+  supportingSignalIds: ['one'], raisingFactors: ['Джерела повідомляють про загрозу.'],
+  limitingFactors: [], summary: 'Модельна оцінка для Києва.', ...overrides
+});
+
+describe('matchRiskAssessments', () => {
+  const groups = [{ locationId: 'ua-80', threatType: 'uav' }, { locationId: 'ua-53', threatType: 'uav' }];
+
+  it('pairs each element with its group and lets a bad element cost only itself', () => {
+    const matched = matchRiskAssessments(JSON.stringify({
+      assessments: [
+        modelAnswer({ locationId: 'ua-53', score: 11 }),
+        modelAnswer(),
+        modelAnswer({ locationId: 'ua-99' })
+      ]
+    }), groups);
+    expect([...matched.keys()]).toEqual(['ua-80|uav']);
+    expect(matched.get('ua-80|uav')).toMatchObject({ score: 5, summary: 'Модельна оцінка для Києва.' });
+  });
+
+  it('refuses two answers about one group, and prose instead of a batch', () => {
+    expect(matchRiskAssessments(JSON.stringify({ assessments: [modelAnswer(), modelAnswer({ score: 2 })] }), groups).size).toBe(0);
+    expect(matchRiskAssessments('Ризик помірний.', groups).size).toBe(0);
+  });
+});
+
+describe('the Codex risk pass', () => {
+  const summaries = () => db.published.map((params) => JSON.parse(params[7] as string).summary as string);
+
+  beforeEach(() => {
+    vi.mocked(codexFeatureEnabled).mockResolvedValue(true);
+    db.published = [];
+    vi.mocked(codexChat).mockReset();
+    vi.mocked(codexChat).mockImplementation(async () => ({
+      ok: true as const, model: 'gpt-5.6-luna', durationMs: 5, content: JSON.stringify({ assessments: [modelAnswer()] })
+    }));
+  });
+  afterEach(() => {
+    vi.mocked(codexFeatureEnabled).mockResolvedValue(false);
+    resetRiskRunGuard();
+    db.statements = [];
+    db.published = [];
+    db.previous = [];
+    db.signalIds = ['one', 'two', 'three'];
+  });
+
+  it('asks once, then reuses the answer while the signals stay the same — within the minute and without the model', async () => {
+    await runRiskAssessmentsGuarded();
+    await runRiskAssessmentsGuarded();
+    await runRiskAssessmentsGuarded({ allowModel: false });
+
+    expect(codexChat).toHaveBeenCalledOnce();
+    expect(vi.mocked(codexChat).mock.calls[0]![0]).toMatchObject({ surface: 'risk', promptVersion: 'risk-v3' });
+    expect(summaries()).toEqual(Array(3).fill('Модельна оцінка для Києва.'));
+  });
+
+  it('falls back to the rules once the signals change and the model may not be asked', async () => {
+    await runRiskAssessmentsGuarded();
+    db.signalIds = ['one', 'two', 'three', 'four'];
+    await runRiskAssessmentsGuarded({ allowModel: false });
+
+    expect(codexChat).toHaveBeenCalledOnce();
+    expect(summaries()[1]).toMatch(/^Оцінка загрози ударних БпЛА для території «Київ»/u);
+  });
+
+  it('puts the model’s answer through the same guardrails as ever', async () => {
+    vi.mocked(codexChat).mockImplementation(async () => ({
+      ok: true as const, model: 'gpt-5.6-luna', durationMs: 5,
+      content: JSON.stringify({ assessments: [modelAnswer({ score: 9.5, supportingSignalIds: ['one', 'invented'] })] })
+    }));
+    db.signalIds = ['one'];
+    await runRiskAssessmentsGuarded();
+    // Сигнал рівня A — тож стеля індексу 10 і 9,5 проходить; але група джерел одна, і впевненість
+    // стає «low», хоч би що сказала модель: межі ті самі, що й для правил.
+    expect(Number(db.published[0]![2])).toBe(9.5);
+    expect(db.published[0]![4]).toBe('low');
   });
 });

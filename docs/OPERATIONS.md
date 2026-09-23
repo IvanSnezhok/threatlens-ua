@@ -1260,12 +1260,15 @@ Reading it:
   endpoint refusals keep the status code AND what the endpoint said (JSON `detail`/`error.message`,
   else the text; whitespace collapsed, 300 characters, the credential we sent cut out), and a
   `session_expired` streak means someone needs to press the sign-in button again.
-- **The shadow switch spends quota during attacks by design.** Shadow classification runs on exactly
-  the messages the classifier is already processing, capped by `SHADOW_CLASSIFIER_MAX_PER_MINUTE`
-  (default 6, messages over budget dropped, never queued). The switch lives here and not in `.env`
-  precisely because the moment to turn it off — an exhausted quota mid-attack — is the worst moment
-  to edit a file and restart. Its runs audit under `shadow-classifier-v1`; `/ops` shows the agreement
-  rate and the newest disagreements, and the follow-up is a pattern and a test, never a state change.
+- **The shadow switch spends quota during attacks by design, but once a minute.** Since migration 057
+  shadow messages queue for the minute and go to the model as ONE call of at most
+  `min(SHADOW_CLASSIFIER_MAX_PER_MINUTE, 20)` messages (over that: dropped, `rate_limited`; a live
+  message evicts queued backfill, never the reverse). The comparison, the promotion and the
+  enrichment stay per message, so an `analytical_threats` promotion now appears up to 60 s later —
+  analytics, not a warning. The switch lives here and not in `.env` precisely because the moment to
+  turn it off — an exhausted quota mid-attack — is the worst moment to edit a file and restart. Its
+  runs audit under `shadow-classifier-v3`, one row per batch; `/ops` shows the agreement rate and the
+  newest disagreements, and the follow-up is a pattern and a test, never a state change.
 - **Context is bounded and source-local.** The model sees at most `SHADOW_CONTEXT_MESSAGES` preceding
   posts from the same `source_id`, no older than `SHADOW_CONTEXT_MINUTES`. Their ids are stored with
   the verdict. They are never concatenated into the deterministic classifier input, so an old threat
@@ -1290,12 +1293,14 @@ account. The production intent is `fastModel = gpt-6-luna` — set it in the con
 
 ### Track actualization (migration 055, switch `actualization`, off by default)
 
-Every 15 s the worker (`src/services/track-actualization.ts`) picks live events (`timing='now'`,
+Every minute the worker (`src/services/track-actualization.ts`) picks live events (`timing='now'`,
 observed within 30 min) with at least two classifications whose newest classification is newer than
-their latest actualization, newest first — at most 6 per tick, 2 at a time — and gives the fast model
-the Kyiv time, the class and the event's last 12 classifications (time, channel, text ≤ 300 chars,
-the catalogue's places with relation and role). It answers `status` (`moving | loitering | passed |
-ended | unclear`), head/heading/origin/loiter place ids, `currentSince` and a ≤ 160-character summary.
+their latest actualization, newest first — at most 8 per tick, in ONE call (migration 057) — and gives
+the fast model the Kyiv time and, per event, its `eventId`, class and last 12 classifications (time,
+channel, text ≤ 300 chars, the catalogue's places with relation and role). It answers
+`{"events":[…]}`, one element per event: `status` (`moving | loitering | passed | ended | unclear`),
+head/heading/origin/loiter place ids, `currentSince` and a ≤ 160-character summary. Each element is
+checked alone; a bad or missing one (`missing_answer`, `duplicate_answer`) rejects only its own event.
 
 - **Refused whole** if any place id is not in the input, the heading is not a place a source named as
   a direction, `currentSince` is not one of the input publication times, or the summary carries a
@@ -1309,8 +1314,9 @@ ended | unclear`), head/heading/origin/loiter place ids, `currentSince` and a �
   confidence ≥ 0.6 AND the row saw the event's newest classification. In `rules` mode the worker is a
   shadow: rows accumulate for comparison, the map ignores them. Every other case, and every failure,
   is the deterministic track. It never creates, ends or merges an event and never touches alerts.
-- **Bounds, hot:** `ACTUALIZATION_MAX_PER_MINUTE` (30; 0 switches the surface off without touching the
-  console) and `ACTUALIZATION_TIMEOUT_MS` (8 s). Over budget nothing queues.
+- **Bounds, hot:** `ACTUALIZATION_MAX_PER_MINUTE` (30 events a minute, at most 8 per tick; 0 switches
+  the surface off without touching the console) and `ACTUALIZATION_TIMEOUT_MS` (20 s for the whole
+  batch). Over budget nothing queues.
 
 ```bash
 # Outcomes: stored | rejected | failed | skipped_budget. A climbing `rejected` is a model naming
@@ -1355,6 +1361,63 @@ SELECT surface, split_part(fallback_reason, ':', 1) AS cause, count(*)
   FROM ai_runs WHERE status = 'failed' AND created_at > now() - interval '1 hour'
  GROUP BY 1, 2 ORDER BY 3 DESC;
 ```
+
+## Codex budget and per-minute batching (migration 057, ADR 0005)
+
+23.09.2026 the plan's five-hour window hit 100 % at 08:56 UTC and every surface kept calling at the
+same rate — over 2 000 `429 usage_limit_reached` in two hours, no backoff anywhere. The budget
+(`src/services/codex-budget.ts`) now decides BEFORE every `codexChat` request whether the surface may
+call at all, from the `x-codex-primary-*` (5 h) and `x-codex-secondary-*` (week) headers the backend
+sends on every answer, 200 and 429 alike.
+
+| lane | surfaces | admitted while (U = used %, E = elapsed % of the window) |
+| --- | --- | --- |
+| `hot` | `classifier`, `retrospective_gate`, `movement_summary` | U < `CODEX_BUDGET_HOT_MAX_PERCENT` (97) |
+| `map` | `actualization` | U < `CODEX_BUDGET_MAP_MAX_PERCENT` (85) |
+| `analytics` | everything else: `shadow` (and the enrichment on its verdict), `risk`, `narrative`, `digest`, `tactics`, `attack_research`, `attack_stats`, `context_compaction`, `attacks` | U < `CODEX_BUDGET_ANALYTICS_MAX_PERCENT` (70) AND U ≤ E + `CODEX_BUDGET_PACE_SLACK_PERCENT` (10) |
+
+- Both windows apply, each with the same caps and pace. A window whose reset time has passed counts
+  as 0 %; a window never seen (a chat/completions proxy sends no headers) stops nobody.
+- A `429` with `usage_limit_reached` blocks ALL lanes until `resets_at` (body), else the reset of the
+  exhausted window (headers), else 5 minutes.
+- Caps set out of order are clamped to analytics ≤ map ≤ hot: the reserve always belongs to warnings.
+- A refusal is `budget_deferred`: no request, no `ai_runs` row, one increment of
+  `threatlens_codex_budget_denied_total{lane}`, and the surface's usual fallback — the rules for the
+  classifier (`fallback_budget_deferred`), the deterministic track, the deterministic text. No
+  warning depends on the model.
+- The last snapshot lives in `codex_budget_state` (one row, written on change, at most every 10 s)
+  and is read on the first call after a start, so a restart does not hammer a window known to be spent.
+
+Reading it — `budget` in the settings payload (the console does not render it yet):
+
+```bash
+curl -fsS -u "$OPS_USER:$OPS_PASSWORD" http://localhost:3000/ops/codex/settings | jq .budget
+# primary/secondary: usedPercent (as the backend said), windowMinutes, resetsAt, elapsedPercent,
+#   expired (the window has reset since; the figure is history)
+# blockedUntil/blockedReason: only while a 429 block is in force
+# caps: the caps in force after clamping
+# lanes.{hot,map,analytics}: admitted + reason (usage_limit | primary_cap | secondary_cap |
+#   primary_pace | secondary_pace)
+curl -fsS -H "Authorization: Bearer $METRICS_TOKEN" localhost:3000/metrics |
+  grep -E 'threatlens_codex_budget_denied_total|threatlens_codex_classifier_reused_total'
+```
+
+What else changed to spend less per minute of attack:
+
+- **risk** — at most ONE Codex call per pass and at most one per 60 s whoever triggers it: up to 12
+  groups whose signal set changed since their last model assessment, highest rule score first, with
+  20 000 context tokens split between their locations (`risk-v3`). Other groups reuse their model
+  assessment while their signals are unchanged (at most an hour), else the rules. Before, the model
+  was called once per `(location, threat_type)` group — 194 groups, about 7 s each, so a model pass
+  outlasted the 15-minute cadence and the calls never stopped (20.8/min); two schedulers
+  (`startRiskScheduler` and the analytics recompute, which re-asks after an overlap skip) and every
+  restart added passes.
+- **shadow** — one call a minute (see «Codex analytics» above); promotion up to 60 s later.
+- **actualization** — one call a minute for up to 8 events (see «Track actualization»).
+- **classifier** — not batched (a warning waits on it). A repost of the same text (NFKC, case and
+  whitespace ignored) from a source of the same tier within 10 minutes reuses the verdict without a
+  call; the repost is still judged as itself (its own time window, its own rules, the catalogue).
+  Messages with media are never reused.
 
 ## Source trust (operator only)
 

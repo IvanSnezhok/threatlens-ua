@@ -11,7 +11,8 @@ import type * as TrackActualizationModule from '../../src/services/track-actuali
  * Юніт-тести поруч із `src/services/track-actualization.ts` доводять перевірку відповіді. Чого
  * заглушка бази довести не може — саме те, що тут: вибір кандидатів («найновіша класифікація новіша
  * за останню актуалізацію») справді зупиняє повторний виклик на незмінному вході, перемикач справді
- * вимикає поверхню, а відхилена відповідь справді лягає в `ai_runs` і не лягає в таблицю треку.
+ * вимикає поверхню, відхилена відповідь справді лягає в `ai_runs` і не лягає в таблицю треку, а
+ * пакет із кількох подій (міграція 057) — один виклик, у якому непридатна відповідь відкидає лише себе.
  */
 
 const SOURCE = 'osint-eradar';
@@ -48,9 +49,16 @@ const answer = (overrides: Record<string, unknown> = {}) => ({
   currentSince: null, summary: 'Шахед на Київщині, курс на Білу Церкву.', confidence: 0.3, ...overrides
 });
 
-const chatAnswering = (value: unknown) => vi.fn(async (_request: { surface: string; tier?: string; promptVersion: string }) => ({
-  ok: true as const, content: JSON.stringify(value), model: 'gpt-6-luna', durationMs: 5
-}));
+/** Заглушка моделі: відповідає на КОЖНУ подію пакета тим, що поверне `answerFor` для її id. */
+const chatAnswering = (answerFor: (eventId: string) => Record<string, unknown>) =>
+  vi.fn(async (request: { surface: string; tier?: string; promptVersion: string; user: string }) => {
+    const facts = JSON.parse(request.user) as { events: Array<{ eventId: string }> };
+    return {
+      ok: true as const,
+      content: JSON.stringify({ events: facts.events.map(({ eventId }) => ({ eventId, ...answerFor(eventId) })) }),
+      model: 'gpt-6-luna', durationMs: 5
+    };
+  });
 
 async function switchOn(mode: 'rules' | 'codex' = 'rules'): Promise<void> {
   await sql(`UPDATE codex_settings SET actualization_enabled=true, classifier_mode=$1 WHERE singleton`, [mode]);
@@ -79,7 +87,7 @@ describe.skipIf(!integrationDatabaseAvailable)('track actualization worker again
   });
 
   it('asks nothing and stores nothing while the switch is off', async () => {
-    const chat = chatAnswering(answer());
+    const chat = chatAnswering(() => answer());
     const pass = await actualization.runTrackActualization({ chat });
     expect(pass.enabled).toBe(false);
     expect(chat).not.toHaveBeenCalled();
@@ -88,12 +96,12 @@ describe.skipIf(!integrationDatabaseAvailable)('track actualization worker again
 
   it('stores the fast model’s reading, low confidence included, and hands it back as stored', async () => {
     await switchOn();
-    const chat = chatAnswering(answer());
+    const chat = chatAnswering(() => answer());
     const pass = await actualization.runTrackActualization({ chat });
 
     expect(pass).toMatchObject({ enabled: true, stored: 1, rejected: 0, failed: 0 });
     expect(chat).toHaveBeenCalledOnce();
-    expect(chat.mock.calls[0]![0]).toMatchObject({ surface: 'actualization', tier: 'fast', promptVersion: 'actualization-v1' });
+    expect(chat.mock.calls[0]![0]).toMatchObject({ surface: 'actualization', tier: 'fast', promptVersion: 'actualization-v2' });
     const latest = (await actualization.latestActualizations([eventId])).get(eventId);
     // Поріг 0,6 — справа карти: тут рядок лягає й читається рівно таким, яким модель його дала.
     expect(latest).toMatchObject({
@@ -109,14 +117,14 @@ describe.skipIf(!integrationDatabaseAvailable)('track actualization worker again
 
   it('does not ask again about an unchanged input, and does once a newer message arrives', async () => {
     await switchOn();
-    const chat = chatAnswering(answer());
+    const chat = chatAnswering(() => answer());
     await actualization.runTrackActualization({ chat });
     await actualization.runTrackActualization({ chat });
     expect(chat).toHaveBeenCalledOnce();
     expect(await count('threat_track_actualizations', 'event_id=$1', [eventId])).toBe(1);
 
     const later = await seedClassification(eventId, 0, 'Шахед минув Білу Церкву.', [[CITY_IN_OBLAST, 'asserted', 'mentioned']]);
-    await actualization.runTrackActualization({ chat: chatAnswering(answer({ status: 'passed', headingPlaceId: null })) });
+    await actualization.runTrackActualization({ chat: chatAnswering(() => answer({ status: 'passed', headingPlaceId: null })) });
     expect(await count('threat_track_actualizations', 'event_id=$1', [eventId])).toBe(2);
     expect((await actualization.latestActualizations([eventId])).get(eventId))
       .toMatchObject({ status: 'passed', asOf: later.toISOString() });
@@ -124,7 +132,7 @@ describe.skipIf(!integrationDatabaseAvailable)('track actualization worker again
 
   it('refuses a place the messages never named, audits the refusal, and does not retry the same input at once', async () => {
     await switchOn();
-    const chat = chatAnswering(answer({ headPlaceId: OTHER_OBLAST }));
+    const chat = chatAnswering(() => answer({ headPlaceId: OTHER_OBLAST }));
     const pass = await actualization.runTrackActualization({ chat });
 
     expect(pass).toMatchObject({ stored: 0, rejected: 1 });
@@ -133,12 +141,38 @@ describe.skipIf(!integrationDatabaseAvailable)('track actualization worker again
       `SELECT surface, prompt_version, validation_status, fallback_reason, status FROM ai_runs`
     );
     expect(audit.rows).toEqual([{
-      surface: 'actualization', prompt_version: 'actualization-v1', validation_status: 'rejected',
+      surface: 'actualization', prompt_version: 'actualization-v2', validation_status: 'rejected',
       fallback_reason: `unknown_place:headPlaceId:${OTHER_OBLAST}`, status: 'failed'
     }]);
 
     await actualization.runTrackActualization({ chat });
     expect(chat).toHaveBeenCalledOnce();
+  });
+
+  it('asks about several changed events in ONE call, stores the good answers and refuses only the bad one', async () => {
+    await switchOn();
+    const other = await seedThreatEvent({ locationIds: [OTHER_OBLAST] });
+    await seedClassification(other, 5, 'Шахед на Полтавщині.', [[OTHER_OBLAST, 'asserted', 'explicit_threat']]);
+    await seedClassification(other, 1, 'Шахед над Полтавщиною.', [[OTHER_OBLAST, 'asserted', 'mentioned']]);
+    // Про Полтавщину модель називає Київщину — місце, якого в повідомленнях ЦІЄЇ події немає.
+    const chat = chatAnswering((id) => (id === other
+      ? answer({ headPlaceId: OBLAST, headingPlaceId: null })
+      : answer()));
+
+    const pass = await actualization.runTrackActualization({ chat });
+
+    expect(chat).toHaveBeenCalledOnce();
+    const asked = JSON.parse(chat.mock.calls[0]![0].user) as { events: Array<{ eventId: string }> };
+    expect(asked.events.map((event) => event.eventId).sort()).toEqual([eventId, other].sort());
+    expect(pass).toMatchObject({ stored: 1, rejected: 1, failed: 0 });
+    expect(await count('threat_track_actualizations', 'event_id=$1', [eventId])).toBe(1);
+    expect(await count('threat_track_actualizations', 'event_id=$1', [other])).toBe(0);
+    const refusals = await sql<{ fallback_reason: string; input: { eventId: string } }>(
+      `SELECT fallback_reason, input FROM ai_runs WHERE validation_status='rejected'`
+    );
+    expect(refusals.rows).toEqual([
+      expect.objectContaining({ fallback_reason: `unknown_place:headPlaceId:${OBLAST}`, input: expect.objectContaining({ eventId: other }) })
+    ]);
   });
 
   it('lets the console set the fast model and the switch, and refuses the tier the backend answers with 400', async () => {
